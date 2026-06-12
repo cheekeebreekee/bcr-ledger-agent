@@ -1,0 +1,21 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "node",
+    "FUNCTIONS_EXTENSION_VERSION": "~4",
+    "WEBSITE_NODE_DEFAULT_VERSION": "~22",
+    "MICROSOFT_APP_ID": "",
+    "MICROSOFT_APP_PASSWORD": "",
+    "MICROSOFT_APP_TENANT_ID": "",
+    "MICROSOFT_APP_TYPE": "MultiTenant",
+    "INGESTION_BASE_URL": "http://localhost:7071",
+    "INGESTION_SCOPE": "api://00000000-0000-0000-0000-000000000000/.default",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": "",
+    "LOG_LEVEL": "debug"
+  },
+  "Host": {
+    "LocalHttpPort": 3978,
+    "CORS": "*"
+  }
+}

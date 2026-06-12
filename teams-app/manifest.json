@@ -1,0 +1,44 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "0.1.0",
+  "id": "REPLACE-WITH-BOT-APP-ID",
+  "packageName": "com.nbcu.bcr.ledgeragent",
+  "developer": {
+    "name": "NBCUniversal — BCR Platform",
+    "websiteUrl": "https://www.nbcuniversal.com",
+    "privacyUrl": "https://www.nbcuniversal.com/privacy",
+    "termsOfUseUrl": "https://www.nbcuniversal.com/terms"
+  },
+  "name": {
+    "short": "Ledger Filer",
+    "full": "BCR Ledger Filing Agent"
+  },
+  "description": {
+    "short": "Files document attachments into SharePoint automatically.",
+    "full": "Drop a document into a chat with me (Invoice, Receipt, Contract, Statement, Report) and I'll classify it and file it in the right SharePoint folder, with optional content extraction via Azure AI."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#0078D4",
+  "bots": [
+    {
+      "botId": "REPLACE-WITH-BOT-APP-ID",
+      "scopes": ["personal", "team", "groupchat"],
+      "supportsFiles": true,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": ["personal", "team", "groupchat"],
+          "commands": [
+            { "title": "help", "description": "Show the filename conventions I recognise" }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": ["*.sharepoint.com", "*.azurewebsites.net"]
+}

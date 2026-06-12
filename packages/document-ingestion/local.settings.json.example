@@ -1,0 +1,25 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "node",
+    "FUNCTIONS_EXTENSION_VERSION": "~4",
+    "WEBSITE_NODE_DEFAULT_VERSION": "~22",
+    "AZURE_TENANT_ID": "",
+    "INGESTION_APP_ID": "",
+    "EXPECTED_AUDIENCE": "api://00000000-0000-0000-0000-000000000000",
+    "SHAREPOINT_SITE_HOSTNAME": "contoso.sharepoint.com",
+    "SHAREPOINT_SITE_PATH": "/sites/BCR-Ledger",
+    "SHAREPOINT_DRIVE_NAME": "Documents",
+    "SHAREPOINT_ROOT_FOLDER": "",
+    "DOCUMENT_INTELLIGENCE_ENDPOINT": "",
+    "DOCUMENT_INTELLIGENCE_KEY": "",
+    "DOCUMENT_INTELLIGENCE_ENABLED": "false",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": "",
+    "LOG_LEVEL": "debug"
+  },
+  "Host": {
+    "LocalHttpPort": 7071,
+    "CORS": "*"
+  }
+}

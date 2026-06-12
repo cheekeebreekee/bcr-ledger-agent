@@ -1,0 +1,80 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: Target environment
+        required: true
+        options: [dev, qa, prod]
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # OIDC federation to Azure
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    timeout-minutes: 30
+    env:
+      ENV_NAME: ${{ inputs.environment || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build & test
+        run: |
+          yarn build
+          yarn test
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Bicep
+        uses: azure/arm-deploy@v2
+        with:
+          resourceGroupName: rg-bcr-ledger-${{ env.ENV_NAME }}
+          template: infrastructure/main.bicep
+          parameters: infrastructure/main.${{ env.ENV_NAME }}.parameters.json
+          deploymentName: bcr-ledger-${{ env.ENV_NAME }}-${{ github.run_id }}
+          failOnStdErr: false
+
+      - name: Package teams-bot
+        run: yarn workspace @bcr/teams-bot package
+
+      - name: Package document-ingestion
+        run: yarn workspace @bcr/document-ingestion package
+
+      - name: Deploy teams-bot function
+        uses: azure/functions-action@v1
+        with:
+          app-name: func-bcr-bot-${{ env.ENV_NAME }}-${{ secrets.AZURE_NAME_SUFFIX }}
+          package: artifacts/teams-bot.zip
+          respect-funcignore: true
+
+      - name: Deploy ingestion function
+        uses: azure/functions-action@v1
+        with:
+          app-name: func-bcr-ingest-${{ env.ENV_NAME }}-${{ secrets.AZURE_NAME_SUFFIX }}
+          package: artifacts/document-ingestion.zip
+          respect-funcignore: true

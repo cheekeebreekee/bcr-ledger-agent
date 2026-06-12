@@ -1,0 +1,16 @@
+*.js.map
+*.ts
+!*.d.ts
+.git*
+.vscode
+.env*
+local.settings.json
+test
+tests
+__tests__
+*.test.*
+*.spec.*
+tsconfig*.json
+jest.config.*
+.eslintrc*
+README*
