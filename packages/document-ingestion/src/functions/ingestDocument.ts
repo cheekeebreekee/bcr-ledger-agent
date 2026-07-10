@@ -7,21 +7,22 @@ import {
 import {
   createLogger,
   LedgerAgentError,
+  type IngestionBatchItemResult,
+  type IngestionBatchRequestPayload,
+  type IngestionBatchResponsePayload,
+  type IngestionDocument,
   type IngestionRequestPayload,
   type IngestionResponsePayload,
+  type IngestionUploadResult,
   type Logger,
 } from '@bcr/shared';
 import { loadIngestionConfig } from '../config';
 import { AuthMiddleware } from '../auth/authMiddleware';
 import { createGraphClient } from '../services/graphClient';
 import { SharePointService } from '../services/sharePointService';
-import {
-  ClassificationService,
-  FallbackClassifier,
-  FilenameRegexClassifier,
-} from '../services/classificationService';
-import { DocumentIntelligenceClassifier } from '../services/documentIntelligenceClassifier';
-import { validateIngestionPayload } from './validation';
+import { ClassificationService, FallbackClassifier } from '../services/classificationService';
+import { ClaudeClassifier } from '../services/claudeClassifier';
+import { validateBatchIngestionPayload, validateIngestionPayload } from './validation';
 
 const log = createLogger('ingestion/ingestDocument');
 
@@ -47,14 +48,15 @@ const sharePoint = new SharePointService(graph, {
 });
 
 const classification = new ClassificationService([
-  new FilenameRegexClassifier(),
-  ...(config.documentIntelligenceEnabled &&
-  config.documentIntelligenceEndpoint &&
-  config.documentIntelligenceKey
+  ...(config.anthropicEnabled && config.anthropicApiKey
     ? [
-        new DocumentIntelligenceClassifier({
-          endpoint: config.documentIntelligenceEndpoint,
-          apiKey: config.documentIntelligenceKey,
+        new ClaudeClassifier({
+          apiKey: config.anthropicApiKey,
+          model: config.anthropicModel,
+          maxContentBytes: config.anthropicMaxContentBytes,
+          confidenceThreshold: config.anthropicConfidenceThreshold,
+          ...(config.clientCompanyName ? { clientCompanyName: config.clientCompanyName } : {}),
+          ...(config.clientNip ? { clientNip: config.clientNip } : {}),
         }),
       ]
     : []),
@@ -70,6 +72,13 @@ app.http('ingestDocument', {
   methods: ['POST'],
   authLevel: 'anonymous', // we validate JWT ourselves
   handler: handleIngest,
+});
+
+app.http('ingestDocumentsBatch', {
+  route: 'ingest/batch',
+  methods: ['POST'],
+  authLevel: 'anonymous', // we validate JWT ourselves
+  handler: handleIngestBatch,
 });
 
 export async function handleIngest(
@@ -106,11 +115,78 @@ export async function handleIngest(
   }
 }
 
+/**
+ * Batch entry point. Classifies and files every document in the request,
+ * returning one consolidated table of per-document outcomes. A failure on
+ * a single document is captured as a `rejected` item rather than failing
+ * the whole batch, so a bad file never blocks the rest.
+ */
+export async function handleIngestBatch(
+  req: HttpRequest,
+  context: InvocationContext,
+): Promise<HttpResponseInit> {
+  const reqLog = log.child({ invocationId: context.invocationId });
+
+  try {
+    const caller = await auth.verify(req.headers.get('authorization'));
+    reqLog.info({ appId: caller.appId }, 'auth ok');
+
+    const raw = (await req.json()) as unknown;
+    const payload = validateBatchIngestionPayload(raw);
+    const batchLog = reqLog.child({
+      conversationId: payload.source.conversationId,
+      activityId: payload.source.activityId,
+      documentCount: payload.documents.length,
+    });
+    batchLog.info('batch received');
+
+    const results: IngestionBatchItemResult[] = [];
+    for (const document of payload.documents) {
+      results.push(await ingestOne(payload, document, batchLog));
+    }
+
+    return {
+      status: 200,
+      jsonBody: {
+        status: 'completed',
+        results,
+      } satisfies IngestionBatchResponsePayload,
+    };
+  } catch (err) {
+    return handleError(err, reqLog);
+  }
+}
+
+async function ingestOne(
+  payload: IngestionBatchRequestPayload,
+  document: IngestionDocument,
+  batchLog: Logger,
+): Promise<IngestionBatchItemResult> {
+  const docLog = batchLog.child({ filename: document.filename });
+  try {
+    const content = Buffer.from(document.contentBase64, 'base64');
+    docLog.info({ sizeBytes: content.length }, 'document received');
+    const result = await ingest(
+      { ...document, source: payload.source },
+      content,
+      docLog,
+    );
+    return { filename: document.filename, status: 'uploaded', result };
+  } catch (err) {
+    docLog.error({ err }, 'batch document failed');
+    const { code, message } =
+      err instanceof LedgerAgentError
+        ? { code: err.code, message: err.message }
+        : { code: 'InternalError', message: 'Internal error' };
+    return { filename: document.filename, status: 'rejected', error: { code, message } };
+  }
+}
+
 async function ingest(
   payload: IngestionRequestPayload,
   content: Buffer,
   reqLog: Logger,
-): Promise<NonNullable<IngestionResponsePayload['result']>> {
+): Promise<IngestionUploadResult> {
   const classified = await classification.classify({
     filename: payload.filename,
     contentType: payload.contentType,
@@ -138,6 +214,9 @@ async function ingest(
       documentType: classified.documentType,
       confidence: classified.confidence,
       classifier: classified.classifier,
+      ...(typeof classified.fields.reasoning === 'string'
+        ? { reasoning: classified.fields.reasoning }
+        : {}),
     },
   };
 }

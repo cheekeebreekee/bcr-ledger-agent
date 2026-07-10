@@ -127,13 +127,9 @@ KV=$(az deployment group show -g rg-bcr-ledger-dev -n bcr-ledger-dev-... \
 az keyvault secret set --vault-name "$KV" --name bot-app-password \
   --value "<paste-the-bot-client-secret-here>"
 
-# Only if Document Intelligence is enabled:
-DI_ENDPOINT=$(az deployment group show -g rg-bcr-ledger-dev -n bcr-ledger-dev-... \
-  --query "properties.outputs.documentIntelligenceEndpoint.value" -o tsv)
-DI_KEY=$(az cognitiveservices account keys list -g rg-bcr-ledger-dev \
-  -n di-bcr-dev-... --query key1 -o tsv)
-az keyvault secret set --vault-name "$KV" --name document-intelligence-key \
-  --value "$DI_KEY"
+# Only if Claude classification is enabled (enableAnthropic = true):
+az keyvault secret set --vault-name "$KV" --name anthropic-api-key \
+  --value "<paste-the-anthropic-api-key-here>"   # sk-ant-…
 ```
 
 Then restart both Function Apps so the new Key Vault references are picked up:

@@ -5,10 +5,14 @@ import {
   CardFactory,
   MessageFactory,
 } from 'botbuilder';
-import { createLogger, type IngestionResponsePayload } from '@bcr/shared';
+import {
+  createLogger,
+  type IngestionBatchItemResult,
+  type IngestionDocument,
+} from '@bcr/shared';
 import type { IngestionClient } from '../services/ingestionClient';
 import type { AttachmentDownloader } from '../services/attachmentDownloader';
-import { buildSuccessCard, buildFailureCard, buildHelpCard } from './responseBuilder';
+import { buildBatchResultCard, buildHelpCard } from './responseBuilder';
 
 export interface LedgerBotDeps {
   readonly ingestionClient: IngestionClient;
@@ -20,8 +24,9 @@ export interface LedgerBotDeps {
  *
  *   1. Greet new conversation members with a help card.
  *   2. For each incoming message, detect file attachments, download them,
- *      and forward to the ingestion API.
- *   3. Translate the API response into a friendly adaptive card.
+ *      and forward the whole set to the ingestion API in a single batch.
+ *   3. Translate the batch response into one consolidated table card that
+ *      shows, per document, where it was filed and why.
  *
  * We deliberately keep this class free of HTTP/SDK plumbing — that lives
  * in `functions/messages.ts` — so it stays trivially unit-testable with
@@ -69,19 +74,45 @@ export class LedgerBot extends ActivityHandler {
 
     await context.sendActivity({ type: 'typing' });
 
-    for (const attachment of attachments) {
-      const fileName = attachment.name ?? 'attachment.bin';
-      const childLog = turnLog.child({ filename: fileName });
+    // Download every attachment first. A download failure for one file is
+    // captured as a rejected row so it still shows up in the summary table
+    // rather than aborting the whole batch.
+    const documents: IngestionDocument[] = [];
+    const downloadFailures: IngestionBatchItemResult[] = [];
 
+    await Promise.all(
+      attachments.map(async (attachment) => {
+        const fileName = attachment.name ?? 'attachment.bin';
+        const childLog = turnLog.child({ filename: fileName });
+        try {
+          childLog.info('downloading attachment');
+          const { content, contentType } =
+            await this.deps.attachmentDownloader.download(attachment);
+          documents.push({
+            filename: fileName,
+            contentType,
+            contentBase64: content.toString('base64'),
+          });
+        } catch (err) {
+          childLog.error({ err }, 'failed to download attachment');
+          downloadFailures.push({
+            filename: fileName,
+            status: 'rejected',
+            error: {
+              code: 'DownloadFailed',
+              message: err instanceof Error ? err.message : 'Nieznany błąd',
+            },
+          });
+        }
+      }),
+    );
+
+    let batchResults: IngestionBatchItemResult[] = [];
+    if (documents.length > 0) {
       try {
-        childLog.info('downloading attachment');
-        const { content, contentType } = await this.deps.attachmentDownloader.download(attachment);
-
-        childLog.info({ sizeBytes: content.length }, 'forwarding to ingestion API');
-        const response = await this.deps.ingestionClient.ingest({
-          filename: fileName,
-          contentType,
-          contentBase64: content.toString('base64'),
+        turnLog.info({ documentCount: documents.length }, 'forwarding batch to ingestion API');
+        const response = await this.deps.ingestionClient.ingestBatch({
+          documents,
           source: {
             tenantId: activity.channelData?.tenant?.id ?? activity.conversation?.tenantId ?? '',
             channelId: activity.channelId ?? 'msteams',
@@ -91,38 +122,21 @@ export class LedgerBot extends ActivityHandler {
             userDisplayName: activity.from?.name,
           },
         });
-
-        await this.respondToIngestion(context, fileName, response);
+        batchResults = [...response.results];
       } catch (err) {
-        childLog.error({ err }, 'failed to ingest attachment');
-        await context.sendActivity(
-          MessageFactory.attachment(
-            CardFactory.adaptiveCard(
-              buildFailureCard(fileName, err instanceof Error ? err.message : 'Unknown error'),
-            ),
-          ),
-        );
+        turnLog.error({ err }, 'batch ingestion failed');
+        const message = err instanceof Error ? err.message : 'Archiwizacja nie powiodła się';
+        batchResults = documents.map((doc) => ({
+          filename: doc.filename,
+          status: 'rejected',
+          error: { code: 'IngestionFailed', message },
+        }));
       }
     }
-  }
 
-  private async respondToIngestion(
-    context: TurnContext,
-    fileName: string,
-    response: IngestionResponsePayload,
-  ): Promise<void> {
-    if (response.status === 'uploaded' && response.result) {
-      await context.sendActivity(
-        MessageFactory.attachment(CardFactory.adaptiveCard(buildSuccessCard(response.result))),
-      );
-      return;
-    }
+    const allResults = [...downloadFailures, ...batchResults];
     await context.sendActivity(
-      MessageFactory.attachment(
-        CardFactory.adaptiveCard(
-          buildFailureCard(fileName, response.error?.message ?? 'Ingestion failed'),
-        ),
-      ),
+      MessageFactory.attachment(CardFactory.adaptiveCard(buildBatchResultCard(allResults))),
     );
   }
 }

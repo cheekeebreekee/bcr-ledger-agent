@@ -8,14 +8,14 @@
 | Bot Function → Ingestion Function | Bot AAD App | Client secret (Key Vault) → access token | `AuthMiddleware` (this repo) |
 | Ingestion Function → Microsoft Graph | Function App's managed identity | Federated → AAD token | Microsoft Graph |
 | Ingestion Function → Key Vault | Function App's managed identity | RBAC: *Key Vault Secrets User* | Azure Key Vault |
-| Ingestion Function → Document Intelligence | Function App's managed identity | RBAC: *Cognitive Services User* | AI Document Intelligence |
+| Ingestion Function → Claude (Anthropic API) | API key (Key Vault) | TLS + bearer key | api.anthropic.com |
 
 ## 2. Secrets inventory
 
 | Secret | Where it lives | Who consumes it |
 |---|---|---|
 | `bot-app-password` | Key Vault | Bot Function — `MICROSOFT_APP_PASSWORD` |
-| `document-intelligence-key` | Key Vault (optional) | Ingestion Function — `DOCUMENT_INTELLIGENCE_KEY` |
+| `anthropic-api-key` | Key Vault | Ingestion Function — `ANTHROPIC_API_KEY` |
 | Function App master keys | Azure platform | Not used (we set `authLevel: 'anonymous'` and validate JWTs ourselves) |
 | Storage account key | Azure platform | Auto-managed by Functions runtime |
 
@@ -47,8 +47,15 @@ a `az keyvault secret set` followed by a Function App restart.
   `retentionInDays: 30`).
 - Document **content** is never logged; only filename, type, and folder path
   are written to telemetry.
-- Document Intelligence does not persist customer data beyond the analysis
-  call (see [Microsoft docs](https://learn.microsoft.com/azure/ai-services/document-intelligence/concept-privacy)).
+- **Document content is sent to Anthropic (Claude) for classification.** This
+  is an external, US-based processor. Per Anthropic's commercial terms, API
+  inputs/outputs are **not used to train models** and are retained only
+  transiently for abuse monitoring (request zero-data-retention / ZDR if
+  required). Because the documents are client financial records (faktury,
+  wyciągi, etc.), a signed **DPA with Anthropic** and a GDPR transfer
+  mechanism (SCCs) must be in place **before production use**; confirm the
+  legal sign-off and consider ZDR. Set `ANTHROPIC_ENABLED=false` to run the
+  deterministic fallback only (no content leaves Azure).
 - Audit log of every ingestion is written to App Insights with the Teams
   `activityId`, `conversationId`, `userAadObjectId`, the SharePoint
   `driveItemId`, and the classifier verdict.

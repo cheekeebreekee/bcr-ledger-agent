@@ -10,6 +10,10 @@
     "sharePointSitePath": { "value": "/sites/BCR-Ledger" },
     "sharePointDriveName": { "value": "Documents" },
     "sharePointRootFolder": { "value": "" },
-    "enableDocumentIntelligence": { "value": true }
+    "enableAnthropic": { "value": true },
+    "anthropicModel": { "value": "claude-opus-4-5-20251101" },
+    "anthropicConfidenceThreshold": { "value": "0.6" },
+    "clientCompanyName": { "value": "REPLACE-WITH-CLIENT-COMPANY-NAME" },
+    "clientNip": { "value": "REPLACE-WITH-CLIENT-NIP" }
   }
 }

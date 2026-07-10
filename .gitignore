@@ -70,6 +70,11 @@ web_modules/
 .env.*
 !.env.example
 
+# Azure Functions local settings (contain secrets — never commit)
+local.settings.json
+**/local.settings.json
+!**/local.settings.json.example
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache

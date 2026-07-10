@@ -1,22 +1,21 @@
 {
   "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
   "manifestVersion": "1.17",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "id": "REPLACE-WITH-BOT-APP-ID",
-  "packageName": "com.nbcu.bcr.ledgeragent",
   "developer": {
-    "name": "NBCUniversal — BCR Platform",
-    "websiteUrl": "https://www.nbcuniversal.com",
-    "privacyUrl": "https://www.nbcuniversal.com/privacy",
-    "termsOfUseUrl": "https://www.nbcuniversal.com/terms"
+    "name": "BCR Platform",
+    "websiteUrl": "https://www.bcr-group.pl/",
+    "privacyUrl": "https://www.bcr-group.pl/privacy",
+    "termsOfUseUrl": "https://www.bcr-group.pl/terms"
   },
   "name": {
-    "short": "Ledger Filer",
-    "full": "BCR Ledger Filing Agent"
+    "short": "Asystent BCR",
+    "full": "Asystent Archiwizacji Dokumentów BCR"
   },
   "description": {
-    "short": "Files document attachments into SharePoint automatically.",
-    "full": "Drop a document into a chat with me (Invoice, Receipt, Contract, Statement, Report) and I'll classify it and file it in the right SharePoint folder, with optional content extraction via Azure AI."
+    "short": "Automatycznie archiwizuje dokumenty (faktury, umowy, raporty) w SharePoint.",
+    "full": "Wyślij mi w czacie dokument (fakturę, paragon, umowę, wyciąg bankowy, raport lub deklarację), a ja przeanalizuję jego treść, rozpoznam typ i datę, a następnie umieszczę go w odpowiednim folderze w SharePoint. Klasyfikacja odbywa się na podstawie zawartości dokumentu — nazwa pliku nie ma znaczenia. Dokumenty, których nie uda się jednoznacznie rozpoznać, trafiają do folderu do ręcznej weryfikacji."
   },
   "icons": {
     "color": "color.png",
@@ -33,7 +32,7 @@
         {
           "scopes": ["personal", "team", "groupchat"],
           "commands": [
-            { "title": "help", "description": "Show the filename conventions I recognise" }
+            { "title": "pomoc", "description": "Pokaż jak działa archiwizacja dokumentów" }
           ]
         }
       ]

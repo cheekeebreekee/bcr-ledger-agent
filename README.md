@@ -1,9 +1,9 @@
 # bcr-ledger-agent
 
 A Microsoft Teams **AI Agent** that watches a chat for document attachments,
-classifies each file by its name (and optionally its content via Azure AI
-Document Intelligence), and uploads it to the correct folder in SharePoint
-Online — all hosted on Microsoft Azure and written in Node.js + TypeScript.
+classifies each file by analysing its **content with Claude** (Anthropic API),
+and uploads it to the correct folder in SharePoint Online — all hosted on
+Microsoft Azure and written in Node.js + TypeScript.
 
 > Example  
 > A user drops `Invoice_03_2026.pdf` into the chat with the bot.  
@@ -32,11 +32,11 @@ Online — all hosted on Microsoft Azure and written in Node.js + TypeScript.
                                          │ document-ingestion │
                                          │ (HTTP triggers)    │
                                          └─┬──────┬──────┬────┘
-                4. classify (regex + AI)   │      │      │ 6. write audit log
+                4. classify content (AI)   │      │      │ 6. write audit log
                                            ▼      ▼      ▼
                               ┌────────────┐ ┌──────┐ ┌────────────┐
-                              │ Document   │ │ MS   │ │ App        │
-                              │ Intelligence│ │Graph │ │ Insights   │
+                              │ Claude     │ │ MS   │ │ App        │
+                              │ (Anthropic)│ │Graph │ │ Insights   │
                               └────────────┘ └──┬───┘ └────────────┘
                                                 │ 5. PUT /drive/root:/path:/content
                                                 ▼
@@ -124,3 +124,14 @@ and drag any file named like `Invoice_03_2026.pdf` into the chat.
    correlation IDs so a single Teams message can be traced end to end.
 
 See [`docs/security.md`](./docs/security.md) for the full threat model.
+
+---
+
+## 📘 Setup & deployment
+
+- **[`docs/setup-guide.md`](./docs/setup-guide.md)** — end-to-end walkthrough:
+  Entra ID app registrations, `.env` reference (every variable explained and
+  *where to find it*), SharePoint `Sites.Selected` grant, Key Vault secrets,
+  and Teams app sideload.
+- [`docs/deployment.md`](./docs/deployment.md) — concise deploy commands.
+- [`docs/local-development.md`](./docs/local-development.md) — local dev loop.

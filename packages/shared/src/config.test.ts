@@ -20,9 +20,13 @@ const ingestionEnvMap = {
   sharepointSitePath: 'SHAREPOINT_SITE_PATH',
   sharepointDriveName: 'SHAREPOINT_DRIVE_NAME',
   sharepointRootFolder: 'SHAREPOINT_ROOT_FOLDER',
-  documentIntelligenceEndpoint: 'DOCUMENT_INTELLIGENCE_ENDPOINT',
-  documentIntelligenceKey: 'DOCUMENT_INTELLIGENCE_KEY',
-  documentIntelligenceEnabled: 'DOCUMENT_INTELLIGENCE_ENABLED',
+  anthropicEnabled: 'ANTHROPIC_ENABLED',
+  anthropicApiKey: 'ANTHROPIC_API_KEY',
+  anthropicModel: 'ANTHROPIC_MODEL',
+  anthropicMaxContentBytes: 'ANTHROPIC_MAX_CONTENT_BYTES',
+  anthropicConfidenceThreshold: 'ANTHROPIC_CONFIDENCE_THRESHOLD',
+  clientCompanyName: 'CLIENT_COMPANY_NAME',
+  clientNip: 'CLIENT_NIP',
   applicationInsightsConnectionString: 'APPLICATIONINSIGHTS_CONNECTION_STRING',
   logLevel: 'LOG_LEVEL',
 } as const;
@@ -69,7 +73,10 @@ describe('ingestionConfigSchema', () => {
     const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, baseEnv);
     expect(cfg.sharepointDriveName).toBe('Documents');
     expect(cfg.expectedRoles).toEqual(['Documents.Ingest']);
-    expect(cfg.documentIntelligenceEnabled).toBe(false);
+    expect(cfg.anthropicEnabled).toBe(false);
+    expect(cfg.anthropicModel).toBe('claude-opus-4-5-20251101');
+    expect(cfg.anthropicMaxContentBytes).toBe(10 * 1024 * 1024);
+    expect(cfg.anthropicConfidenceThreshold).toBe(0.6);
   });
 
   it('parses a CSV roles list', () => {
@@ -83,9 +90,28 @@ describe('ingestionConfigSchema', () => {
   it('interprets boolean-ish flags', () => {
     const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
       ...baseEnv,
-      DOCUMENT_INTELLIGENCE_ENABLED: 'true',
+      ANTHROPIC_ENABLED: 'true',
     });
-    expect(cfg.documentIntelligenceEnabled).toBe(true);
+    expect(cfg.anthropicEnabled).toBe(true);
+  });
+
+  it('parses numeric overrides', () => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      ANTHROPIC_MAX_CONTENT_BYTES: '2048',
+      ANTHROPIC_CONFIDENCE_THRESHOLD: '0.8',
+    });
+    expect(cfg.anthropicMaxContentBytes).toBe(2048);
+    expect(cfg.anthropicConfidenceThreshold).toBe(0.8);
+  });
+
+  it('rejects a non-numeric threshold', () => {
+    expect(() =>
+      loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+        ...baseEnv,
+        ANTHROPIC_CONFIDENCE_THRESHOLD: 'abc',
+      }),
+    ).toThrow(/ANTHROPIC_CONFIDENCE_THRESHOLD/);
   });
 
   it('rejects a site path that does not start with /', () => {

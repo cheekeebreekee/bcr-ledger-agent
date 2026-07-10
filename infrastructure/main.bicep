@@ -7,7 +7,7 @@
 //   - Key Vault for secrets (RBAC mode)
 //   - Two Function Apps (bot, ingestion) on a Linux consumption plan
 //   - Azure Bot resource with Teams channel
-//   - Azure AI Document Intelligence (optional, gated by parameter)
+//   - Anthropic Claude content classification (API key in Key Vault)
 //   - All RBAC grants needed by managed identities
 //
 // Subscription scope is intentionally avoided so the same template can be
@@ -46,8 +46,20 @@ param sharePointDriveName string = 'Documents'
 @description('Optional root folder prefix inside the drive.')
 param sharePointRootFolder string = ''
 
-@description('Provision Azure AI Document Intelligence?')
-param enableDocumentIntelligence bool = true
+@description('Enable Claude (Anthropic) content classification?')
+param enableAnthropic bool = true
+
+@description('Anthropic model id used for document classification.')
+param anthropicModel string = 'claude-opus-4-5-20251101'
+
+@description('Minimum classification confidence; below this → manual review.')
+param anthropicConfidenceThreshold string = '0.6'
+
+@description('Client legal/company name for this SharePoint space.')
+param clientCompanyName string = ''
+
+@description('Client tax id (NIP); used to decide invoice direction.')
+param clientNip string = ''
 
 @description('Tags applied to every resource.')
 param tags object = {
@@ -64,7 +76,6 @@ var planName = 'plan-bcr-${nameSuffix}'
 var kvName = 'kv-bcr-${take(nameSuffix, 20)}'
 var lawName = 'log-bcr-${nameSuffix}'
 var aiName = 'appi-bcr-${nameSuffix}'
-var diName = 'di-bcr-${nameSuffix}'
 var botName = 'bot-bcr-${nameSuffix}'
 var botFuncName = 'func-bcr-bot-${nameSuffix}'
 var ingestFuncName = 'func-bcr-ingest-${nameSuffix}'
@@ -117,15 +128,6 @@ module plan 'modules/appServicePlan.bicep' = {
   }
 }
 
-module documentIntelligence 'modules/documentIntelligence.bicep' = if (enableDocumentIntelligence) {
-  name: 'documentIntelligence'
-  params: {
-    name: diName
-    location: location
-    tags: tags
-  }
-}
-
 // ---- Bot Function App -------------------------------------------------------
 
 module botFunction 'modules/functionApp.bicep' = {
@@ -169,12 +171,15 @@ module ingestionFunction 'modules/functionApp.bicep' = {
         { name: 'SHAREPOINT_SITE_PATH', value: sharePointSitePath }
         { name: 'SHAREPOINT_DRIVE_NAME', value: sharePointDriveName }
         { name: 'SHAREPOINT_ROOT_FOLDER', value: sharePointRootFolder }
-        { name: 'DOCUMENT_INTELLIGENCE_ENABLED', value: string(enableDocumentIntelligence) }
+        { name: 'CLIENT_COMPANY_NAME', value: clientCompanyName }
+        { name: 'CLIENT_NIP', value: clientNip }
+        { name: 'ANTHROPIC_ENABLED', value: string(enableAnthropic) }
         { name: 'LOG_LEVEL', value: environmentName == 'prod' ? 'info' : 'debug' }
       ],
-      enableDocumentIntelligence ? [
-        { name: 'DOCUMENT_INTELLIGENCE_ENDPOINT', value: documentIntelligence.?outputs.endpoint }
-        { name: 'DOCUMENT_INTELLIGENCE_KEY', value: '@Microsoft.KeyVault(SecretUri=${keyVault.outputs.uri}secrets/document-intelligence-key/)' }
+      enableAnthropic ? [
+        { name: 'ANTHROPIC_MODEL', value: anthropicModel }
+        { name: 'ANTHROPIC_CONFIDENCE_THRESHOLD', value: anthropicConfidenceThreshold }
+        { name: 'ANTHROPIC_API_KEY', value: '@Microsoft.KeyVault(SecretUri=${keyVault.outputs.uri}secrets/anthropic-api-key/)' }
       ] : []
     )
   }
@@ -197,7 +202,9 @@ module bot 'modules/botService.bicep' = {
 // ---- RBAC -------------------------------------------------------------------
 
 // Both Function Apps can read Key Vault secrets via managed identity.
-var kvSecretsUserRoleId = '4633458b-17de-41a5-8b4b-ea7a4d3b6b1c'
+// Built-in role: "Key Vault Secrets User" — verified via
+// `az role definition list --name "Key Vault Secrets User"`.
+var kvSecretsUserRoleId = '4633458b-17de-408a-b874-0445c86b69e6'
 
 resource botKvAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: resourceGroup()
@@ -229,5 +236,5 @@ output botName string = bot.outputs.name
 output keyVaultName string = keyVault.outputs.name
 output keyVaultUri string = keyVault.outputs.uri
 output appInsightsName string = appInsights.outputs.name
-output documentIntelligenceEndpoint string = enableDocumentIntelligence ? (documentIntelligence.?outputs.endpoint ?? '') : ''
+output anthropicEnabled bool = enableAnthropic
 output ingestionFunctionPrincipalId string = ingestionFunction.outputs.principalId

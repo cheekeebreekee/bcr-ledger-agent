@@ -44,6 +44,24 @@ const optionalStr = (defaultValue = '') =>
     .optional()
     .transform((v) => v ?? defaultValue);
 
+/**
+ * Numeric env var with a default. Empty/undefined → default. Rejects values
+ * that don't parse to a finite number so misconfiguration fails fast.
+ */
+const numeric = (defaultValue: number) =>
+  z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      if (v === undefined || v.trim() === '') return defaultValue;
+      const n = Number(v);
+      if (!Number.isFinite(n)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'must be a number' });
+        return z.NEVER;
+      }
+      return n;
+    });
+
 const logLevel = z
   .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace'])
   .optional()
@@ -88,9 +106,19 @@ export const ingestionConfigSchema = z.object({
     .refine((p) => p.startsWith('/'), 'SHAREPOINT_SITE_PATH must start with /'),
   sharepointDriveName: optionalStr('Documents'),
   sharepointRootFolder: optionalStr(),
-  documentIntelligenceEndpoint: optionalStr(),
-  documentIntelligenceKey: optionalStr(),
-  documentIntelligenceEnabled: boolish(false),
+  // --- Claude (Anthropic) content classification ---
+  anthropicEnabled: boolish(false),
+  anthropicApiKey: optionalStr(),
+  anthropicModel: optionalStr('claude-opus-4-5-20251101'),
+  /** Hard cap on document bytes sent to the model. Default 10 MiB. */
+  anthropicMaxContentBytes: numeric(10 * 1024 * 1024),
+  /** Minimum confidence to accept a classification; below this → manual review. */
+  anthropicConfidenceThreshold: numeric(0.6),
+  // --- Client identity (per-client deployment) ---
+  /** Legal/company name of the client this SharePoint space belongs to. */
+  clientCompanyName: optionalStr(),
+  /** Client tax id (NIP), used to decide invoice direction (sales vs purchase). */
+  clientNip: optionalStr(),
   applicationInsightsConnectionString: optionalStr(),
   logLevel,
 });

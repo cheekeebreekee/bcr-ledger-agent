@@ -1,6 +1,12 @@
 import { ConfidentialClientApplication } from '@azure/msal-node';
 import { request } from 'undici';
-import { createLogger, type IngestionRequestPayload, type IngestionResponsePayload } from '@bcr/shared';
+import {
+  createLogger,
+  type IngestionBatchRequestPayload,
+  type IngestionBatchResponsePayload,
+  type IngestionRequestPayload,
+  type IngestionResponsePayload,
+} from '@bcr/shared';
 
 export interface IngestionClientOptions {
   readonly baseUrl: string;
@@ -36,10 +42,24 @@ export class IngestionClient {
   }
 
   async ingest(payload: IngestionRequestPayload): Promise<IngestionResponsePayload> {
-    const token = await this.acquireToken();
+    this.log.debug({ filename: payload.filename }, 'POST /api/ingest');
+    return this.post<IngestionResponsePayload>('/api/ingest', payload);
+  }
 
-    const url = new URL('/api/ingest', this.opts.baseUrl).toString();
-    this.log.debug({ url, filename: payload.filename }, 'POST /api/ingest');
+  /**
+   * Classifies and files several documents from the same Teams activity in a
+   * single request. Returns one consolidated table of per-document outcomes.
+   */
+  async ingestBatch(
+    payload: IngestionBatchRequestPayload,
+  ): Promise<IngestionBatchResponsePayload> {
+    this.log.debug({ documentCount: payload.documents.length }, 'POST /api/ingest/batch');
+    return this.post<IngestionBatchResponsePayload>('/api/ingest/batch', payload);
+  }
+
+  private async post<T>(path: string, payload: unknown): Promise<T> {
+    const token = await this.acquireToken();
+    const url = new URL(path, this.opts.baseUrl).toString();
 
     const { statusCode, body } = await this.fetcher(url, {
       method: 'POST',
@@ -51,17 +71,19 @@ export class IngestionClient {
     });
 
     const responseText = await body.text();
-    let parsed: IngestionResponsePayload;
+    let parsed: T;
     try {
-      parsed = JSON.parse(responseText) as IngestionResponsePayload;
+      parsed = JSON.parse(responseText) as T;
     } catch {
-      throw new Error(`Ingestion API returned non-JSON response (HTTP ${statusCode}): ${responseText.slice(0, 200)}`);
+      throw new Error(
+        `Ingestion API returned non-JSON response (HTTP ${statusCode}): ${responseText.slice(0, 200)}`,
+      );
     }
 
     if (statusCode < 200 || statusCode >= 300) {
-      throw new Error(
-        `Ingestion API HTTP ${statusCode}: ${parsed.error?.message ?? 'unknown error'}`,
-      );
+      const errorMessage =
+        (parsed as { error?: { message?: string } })?.error?.message ?? 'unknown error';
+      throw new Error(`Ingestion API HTTP ${statusCode}: ${errorMessage}`);
     }
     return parsed;
   }

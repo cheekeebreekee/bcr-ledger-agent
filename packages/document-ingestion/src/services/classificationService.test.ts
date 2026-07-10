@@ -1,8 +1,4 @@
-import {
-  ClassificationService,
-  FallbackClassifier,
-  FilenameRegexClassifier,
-} from './classificationService';
+import { ClassificationService, FallbackClassifier } from './classificationService';
 import type { Classifier, ClassifierContext } from '@bcr/shared';
 
 const ctx = (filename: string): ClassifierContext => ({
@@ -11,28 +7,12 @@ const ctx = (filename: string): ClassifierContext => ({
   readContent: async () => Buffer.from(''),
 });
 
-describe('FilenameRegexClassifier', () => {
-  it('returns a folder path for matching filenames', async () => {
-    const c = new FilenameRegexClassifier();
-    const result = await c.classify(ctx('Invoice_03_2026.pdf'));
-    expect(result).not.toBeNull();
-    expect(result?.documentType).toBe('Invoice');
-    expect(result?.folderPath).toBe('Invoices/2026/03');
-    expect(result?.confidence).toBeGreaterThanOrEqual(0.9);
-  });
-
-  it('returns null for unmatched filenames', async () => {
-    const c = new FilenameRegexClassifier();
-    expect(await c.classify(ctx('random.jpg'))).toBeNull();
-  });
-});
-
 describe('FallbackClassifier', () => {
-  it('always returns an Unsorted result', async () => {
+  it('always returns a dated Nieposortowane result', async () => {
     const c = new FallbackClassifier();
     const result = await c.classify(ctx('mystery.pdf'));
-    expect(result.documentType).toBe('Unknown');
-    expect(result.folderPath).toMatch(/^Unsorted\/\d{4}\/\d{2}$/);
+    expect(result.documentType).toBe('Nieposortowane');
+    expect(result.folderPath).toMatch(/^98_Nieposortowane\/\d{4}\/\d{2}$/);
     expect(result.confidence).toBeLessThan(0.5);
   });
 });

@@ -1,47 +1,34 @@
 import {
+  buildFolderPath,
   ClassificationError,
   createLogger,
-  defaultFilenameParser,
+  FALLBACK_CATEGORY,
+  getCategory,
   type Classification,
   type Classifier,
   type ClassifierContext,
-  type PatternRegistry,
 } from '@bcr/shared';
 
-/**
- * Filename-regex classifier. Wraps the shared {@link PatternRegistry} as a
- * `Classifier` so it composes naturally with content-based strategies.
- */
-export class FilenameRegexClassifier implements Classifier {
-  readonly name = 'filename-regex';
-  constructor(private readonly parser: PatternRegistry = defaultFilenameParser) {}
-
-  async classify(ctx: ClassifierContext): Promise<Classification | null> {
-    const parsed = this.parser.parse(ctx.filename);
-    if (!parsed.matched || !parsed.folderPath || !parsed.documentType) return null;
-    return {
-      documentType: parsed.documentType,
-      folderPath: parsed.folderPath,
-      confidence: parsed.confidence,
-      classifier: this.name,
-      fields: parsed.fields,
-    };
-  }
-}
-
-/** Always succeeds — routes uncategorised files into a "needs review" folder. */
+/** Always succeeds — routes uncategorised files into the manual-review folder. */
 export class FallbackClassifier implements Classifier {
   readonly name = 'fallback-unsorted';
   async classify(ctx: ClassifierContext): Promise<Classification> {
     const now = new Date();
-    const year = String(now.getUTCFullYear()).padStart(4, '0');
-    const month = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const def = getCategory(FALLBACK_CATEGORY);
     return {
-      documentType: 'Unknown',
-      folderPath: `Unsorted/${year}/${month}`,
+      documentType: def.polishLabel,
+      folderPath: buildFolderPath(FALLBACK_CATEGORY, {
+        year: now.getUTCFullYear(),
+        month: now.getUTCMonth() + 1,
+      }),
       confidence: 0.1,
       classifier: this.name,
-      fields: { filename: ctx.filename },
+      fields: {
+        filename: ctx.filename,
+        reasoning:
+          'Nie udało się pewnie rozpoznać typu dokumentu, więc trafił do folderu ' +
+          '„Nieposortowane” do ręcznej weryfikacji przez księgowego.',
+      },
     };
   }
 }

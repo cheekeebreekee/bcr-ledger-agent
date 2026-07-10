@@ -4,12 +4,16 @@
   "parameters": {
     "environmentName": { "value": "dev" },
     "location": { "value": "westeurope" },
-    "botAppId": { "value": "REPLACE-WITH-BOT-APP-ID" },
-    "ingestionAppId": { "value": "REPLACE-WITH-INGESTION-APP-ID" },
-    "sharePointSiteHostname": { "value": "REPLACE.sharepoint.com" },
-    "sharePointSitePath": { "value": "/sites/BCR-Ledger" },
-    "sharePointDriveName": { "value": "Documents" },
+    "botAppId": { "value": "3ee1ba6c-2501-4e2d-9971-ab156a9a6f9a" },
+    "ingestionAppId": { "value": "b8b90018-9af0-4d7a-ada2-71559952ebbe" },
+    "sharePointSiteHostname": { "value": "bcrgroupeu.sharepoint.com" },
+    "sharePointSitePath": { "value": "/sites/0000TESTSp.zo.o.-Ksigowo" },
+    "sharePointDriveName": { "value": "Dokumenty" },
     "sharePointRootFolder": { "value": "" },
-    "enableDocumentIntelligence": { "value": true }
+    "enableAnthropic": { "value": true },
+    "anthropicModel": { "value": "claude-opus-4-5-20251101" },
+    "anthropicConfidenceThreshold": { "value": "0.6" },
+    "clientCompanyName": { "value": "0000 TEST Sp. z o.o." },
+    "clientNip": { "value": "0000000000" }
   }
 }
