@@ -151,6 +151,47 @@ The relevant shared contracts live in
 `IngestionBatchRequestPayload`, `IngestionBatchItemResult`, and
 `IngestionBatchResponsePayload`.
 
+### 4.2 Multi-tenant client routing (planned, not yet implemented)
+
+Today the ingestion function is wired at cold start to exactly **one**
+`SharePointTarget` (one client's SharePoint site/drive) plus a static
+`CLIENT_COMPANY_NAME`/`CLIENT_NIP` pair used only to disambiguate invoice
+direction. The following design lets a **single deployment** route
+documents to **many** clients' SharePoint spaces:
+
+- **Client Directory** — a SharePoint list on the **BCR Group** site is
+  the single source of truth. One row per client:
+  `ClientId`, `NIP`, `CompanyNameAliases` (one alias per line),
+  `PersonNames` (one name per line), `TeamsChannelId`, `SiteHostname`,
+  `SitePath`, `DriveName`, `RootFolder`, `Status`. See
+  [`docs/client-directory-admin-guide.md`](./docs/client-directory-admin-guide.md)
+  for how to create and manage it.
+- **Channel-authoritative routing (non-admin uploads).** Each client has
+  their own dedicated Teams channel (Teams/AAD membership already
+  restricts non-admin users to only their own channel). The upload's
+  `source.conversationId` (already part of `IngestionSource`, populated
+  from `activity.conversation?.id` in `LedgerBot`) is looked up directly
+  against `TeamsChannelId` in the Client Directory — that row's site/drive
+  **is** the destination. No document content is consulted to make this
+  decision. **Do not confuse this with the Bot Framework `channelId`
+  field** (`activity.channelId`), which is always the literal platform
+  string `"msteams"` and carries no per-client information.
+- **Content-based routing (admin uploads only).** Uploaders whose
+  `source.userAadObjectId` is a registered admin are exempt from the
+  channel lookup — admins have access to every channel, so their upload's
+  destination is instead resolved from `ClaudeClassifier`'s extracted
+  NIP/company-name/person-name against the same Directory rows (exact,
+  normalized match only — no fuzzy matching, to avoid mis-filing into the
+  wrong client). No match → falls back to `BCR Group` → `Shared`, using
+  the same `buildFolderPath()` taxonomy.
+- **Invoice direction** becomes derived rather than static: compare the
+  *resolved* client's own `NIP` (from their Directory row) against the
+  extracted seller/buyer NIP on the invoice, instead of a fixed
+  `CLIENT_NIP` env var.
+- **No cross-check between channel and content** is performed for
+  non-admin uploads (a deliberate simplification — see repo history for
+  the reasoning): the channel is trusted as-is.
+
 ---
 
 ## 5. Auth model
