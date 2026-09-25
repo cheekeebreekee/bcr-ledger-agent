@@ -5,6 +5,7 @@ import {
   assessRow,
   buildPlan,
   changedSinceApply,
+  checkVerdict,
   classifyTeamPeople,
   diffBinding,
   evaluateWriteGrant,
@@ -14,6 +15,8 @@ import {
   forbiddenTargetReasons,
   healthExpectations,
   healthSatisfies,
+  idsRollbackAdds,
+  isBoundRow,
   isSiteCollectionPath,
   isTeamGroup,
   mapSitesToTeams,
@@ -717,7 +720,7 @@ describe('buildPlan', () => {
     const p = plan([rowA()], { 1: factsA() });
     const unbound = structuredClone(p);
     delete unbound.rows[0].patch.TeamId;
-    unbound.digest = planDigest(unbound.rows);
+    unbound.digest = planDigest(unbound);
     assert.ok(validatePlan(unbound).some((e) => /leaves TeamId empty/.test(e)));
   });
 
@@ -730,15 +733,39 @@ describe('buildPlan', () => {
 
     const forged = structuredClone(p);
     forged.rows[0].patch.Status = 'Inactive';
-    forged.digest = planDigest(forged.rows);
+    forged.digest = planDigest(forged);
     assert.ok(validatePlan(forged).some((e) => /not a binding field/.test(e)));
 
     const unsafe = structuredClone(p);
     unsafe.rows[0].patch.RootFolder = '../x';
-    unsafe.digest = planDigest(unsafe.rows);
+    unsafe.digest = planDigest(unsafe);
     assert.ok(validatePlan(unsafe).some((e) => /RootFolder unsafe/.test(e)));
 
     assert.ok(validatePlan({ ...p, rows: [null] }).length > 0);
+  });
+
+  test('the digest covers createdAt, directory and guards, not only the rows', () => {
+    const p = buildPlan({
+      rows: [rowA()],
+      assessments: [assessRow(rowA(), factsA(), ctxA())],
+      directory,
+      guards: { forbiddenSitePaths: ['/sites/bcrgroup'], quarantineSitePath: '', tenantHost: '', directorySiteCollectionId: 'x' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+    });
+    assert.deepEqual(validatePlan(p), []);
+    for (const [name, change] of [
+      ['createdAt', (x) => (x.createdAt = '2026-09-25T00:00:00.000Z')],
+      ['directory', (x) => (x.directory.listId = 'another')],
+      ['guards', (x) => (x.guards.forbiddenSitePaths = [])],
+      ['guards removed', (x) => delete x.guards],
+      ['ingestAppIds', (x) => x.ingestAppIds.push(INGEST)],
+    ]) {
+      const edited = structuredClone(p);
+      change(edited);
+      assert.ok(validatePlan(edited).some((e) => /digest does not match/.test(e)), name);
+    }
+    // A JSON round trip (the plan file) keeps it valid.
+    assert.deepEqual(validatePlan(JSON.parse(JSON.stringify(p))), []);
   });
 });
 
@@ -763,6 +790,17 @@ describe('apply and rollback helpers', () => {
       'RootFolder',
       'SitePath',
     ]);
+  });
+
+  test('idsRollbackAdds names the GUIDs a restore puts back, as the ingestion reads them', () => {
+    const current = { UserAadObjectIds: GUEST_A };
+    assert.deepEqual(
+      idsRollbackAdds({ UserAadObjectIds: `${GUEST_A}\n ${GUEST_2.toUpperCase()} \njunk\n${GUEST_2}` }, current),
+      [GUEST_2],
+    );
+    assert.deepEqual(idsRollbackAdds({ UserAadObjectIds: '' }, current), []);
+    assert.deepEqual(idsRollbackAdds({ RootFolder: '' }, current), [], 'ids not restored');
+    assert.deepEqual(idsRollbackAdds({ UserAadObjectIds: STAFF }, {}), [STAFF]);
   });
 
   test('rollbackPatch restores the before-state of patched fields only', () => {
@@ -792,5 +830,42 @@ describe('apply and rollback helpers', () => {
     assert.equal(healthSatisfies({ build: { phase: 'p0' } }, healthExpectations(['build.phase=p0'])).ok, false);
     const p0 = { status: 'ok', build: { phase: 'p0', routing: 'identity-only' } };
     assert.equal(healthSatisfies(p0, healthExpectations(['build.phase=p0'])).ok, true);
+  });
+});
+
+describe('checkVerdict', () => {
+  const bound = { RootFolder: CHANNEL, DriveId: DRIVE_A, TeamId: TEAM_A };
+  const rowOf = (id, fields) => parseDirectoryRow(item(id, { ClientId: `000${id}`, NIP: `000000000${id}`, ...fields }));
+  const assessed = (id, ...codes) => ({ listItemId: String(id), problems: codes.map((code) => ({ code, severity: 'skip' })) });
+
+  test('drift on a bound row is 3; on an unbound row it routes nobody and is only reported', () => {
+    const rows = [rowOf(1, { ...bound, UserAadObjectIds: STAFF }), rowOf(2, { UserAadObjectIds: STAFF })];
+    const v = checkVerdict(rows, [assessed(1, 'staff_ids'), assessed(2, 'staff_ids', 'unbound_target')]);
+    assert.deepEqual(v, { routingDrift: ['1'], incomplete: [], notRoutingUnbound: ['2'], exitCode: 3 });
+    const unboundOnly = checkVerdict([rows[1]], [assessed(2, 'bound_guest_ineligible')]);
+    assert.deepEqual([unboundOnly.exitCode, unboundOnly.notRoutingUnbound], [0, ['2']]);
+  });
+
+  test('a bound row with ids that could not be assessed is 4; 3 wins over 4', () => {
+    for (const code of ['site_unresolved', 'no_team', 'team_lookup_failed', 'membership_lookup_failed', 'guest_memberships_unreadable']) {
+      const rows = [rowOf(1, { ...bound, UserAadObjectIds: GUEST_A })];
+      assert.deepEqual(checkVerdict(rows, [assessed(1, code)]).exitCode, 4, code);
+      // No ids on it: it routes nobody, so there is nothing to assess.
+      assert.equal(checkVerdict([rowOf(1, bound)], [assessed(1, code)]).exitCode, 0, `${code}, no ids`);
+      // Unbound: routes nobody either.
+      assert.equal(checkVerdict([rowOf(1, { UserAadObjectIds: GUEST_A })], [assessed(1, code)]).exitCode, 0, `${code}, unbound`);
+    }
+    const rows = [rowOf(1, { ...bound, UserAadObjectIds: GUEST_A }), rowOf(2, { ...bound, TeamId: g('a002'), UserAadObjectIds: GUEST_2 })];
+    const v = checkVerdict(rows, [assessed(1, 'bound_guest_ineligible'), assessed(2, 'no_team')]);
+    assert.deepEqual(v, { routingDrift: ['1'], incomplete: ['2'], notRoutingUnbound: [], exitCode: 3 });
+  });
+
+  test('admin and inactive rows never count; isBoundRow needs all three binding fields', () => {
+    const admin = rowOf(3, { ...bound, IsAdmin: true, UserAadObjectIds: STAFF });
+    const inactive = rowOf(4, { ...bound, Status: 'Inactive', UserAadObjectIds: STAFF });
+    assert.equal(checkVerdict([admin, inactive], [assessed(3, 'staff_ids'), assessed(4, 'staff_ids')]).exitCode, 0);
+    assert.equal(isBoundRow(rowOf(1, bound)), true);
+    for (const field of Object.keys(bound)) assert.equal(isBoundRow(rowOf(1, { ...bound, [field]: '' })), false, field);
+    assert.equal(isBoundRow(admin), false);
   });
 });

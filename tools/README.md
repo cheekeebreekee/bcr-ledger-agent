@@ -17,7 +17,7 @@ without `yarn install`.
 ## Safety model (every tool)
 
 - **Read-only by default.** A change needs `--apply` (`-Apply` in PowerShell). Without it, a tool prints the change it would make, as the exact request or command.
-- **Before and after.** Every tool that writes prints the state it found and the state it left. `directory-bindings.mjs apply` also writes a log of both, which `rollback` restores from.
+- **Before and after.** Every tool that writes prints the state it found and the state it left. `directory-bindings.mjs apply` also writes a log of both, which `rollback` restores from, after re-checking every id it would put back on a row.
 - **Ambiguity is skipped, never guessed.** A duplicate key (a site, `DriveId` or `TeamId` shared with another row included), a SitePath that is not canonical, a Public team, a non-standard or missing channel, a drive mismatch, an unknown write grant, a fact that could not be read: each one makes the row **SKIP**, with the reason. A guest who is also in any other Team is never bound. This follows invariant I3 of the plan.
 - **Never BCR GROUP, never the quarantine.** `directory-bindings.mjs` requires the forbidden list, as the ingestion does, and skips a row on BCR GROUP's site collection whatever the list says. No tool here creates a site permission. A grant goes to the ingestion Function App's managed identity through [H-6/H-12](../docs/operations/human-steps.md), and checking one is a read.
 - **No real data leaves the tenant or reaches git.**
@@ -51,11 +51,29 @@ export GRAPH_TOKEN=$(node tools/graph-login.mjs)
 
 | Command | Delegated permissions |
 |---|---|
-| `directory-bindings.mjs check` / `propose` | `Sites.Read.All`, `Group.Read.All`, `GroupMember.Read.All`, `User.Read.All`, `Channel.ReadBasic.All`. Optional: `Sites.FullControl.All`, to read site permissions. Without it the write grant is "unknown" until you verify it read-only (see [Unknown write grant](#propose)). |
-| `directory-bindings.mjs apply` | `Sites.ReadWrite.All`, plus edit rights on the Client Directory list (it has unique permissions). Also `User.Read.All`, `GroupMember.Read.All` and `Group.Read.All`: apply re-reads every guest it binds |
-| `directory-bindings.mjs rollback` | `Sites.ReadWrite.All`, plus edit rights on the Client Directory list |
-| `directory-bindings.mjs --add-columns --apply` | `Sites.Manage.All` |
+| `directory-bindings.mjs check` / `propose` | `User.Read.All` (each id's `userType`), `GroupMember.Read.All` (a Team's members and owners, each guest's `memberOf`), `Group.Read.All` (the list of Teams), `Channel.ReadBasic.All` (the channels), `Sites.Read.All` (the Directory list, each Team's root site, the rows' sites, drives and channel folders). Optional: `Sites.FullControl.All`, to read site permissions. Without it the write grant is "unknown" until you verify it read-only (see [Unknown write grant](#propose)). |
+| `directory-bindings.mjs apply` | `Sites.ReadWrite.All` or `Sites.Manage.All`, plus edit rights on the Client Directory list (it has unique permissions). Also `User.Read.All`, `GroupMember.Read.All` and `Group.Read.All`: apply re-reads every guest it binds |
+| `directory-bindings.mjs rollback` | `Sites.ReadWrite.All` or `Sites.Manage.All`, plus edit rights on the Client Directory list. Also `User.Read.All`, `GroupMember.Read.All` and `Group.Read.All`: rollback re-reads every id it would put back |
+| `directory-bindings.mjs --add-columns --apply` | `Sites.Manage.All` (it creates the columns) |
 | `inventory-misfiled.mjs` | `Sites.Read.All` (or `Files.Read.All`), and the signed-in person must be an **Owner or site collection admin of every site walked**. After T-4/T-4b only the site Owners can open the root taxonomy folders, and SharePoint leaves a folder the caller cannot open out of a listing without an error: with a member's token the locked folders, and every file in them, are silently missing. See [IR-1](#inventory-misfiledmjs-ir-1) |
+
+For `directory-bindings.mjs`, the registration therefore needs these delegated
+Graph permissions, each **admin-consented** by a Global Admin once:
+`User.Read.All`, `GroupMember.Read.All`, `Group.Read.All`,
+`Channel.ReadBasic.All`, `Sites.Read.All`, and `Sites.Manage.All` (which also
+covers the list writes of `apply`, `rollback` and `--add-columns`). The tool
+prints the token's scopes (`scopes`) at the start of every run: compare them
+with this list before you start.
+
+**A 403 from the tool means missing consent on that app registration.** A
+permission that was added but not admin-consented, or never added, is refused
+by Graph with 403 on the first request that needs it. When that request is one
+the whole command depends on (the list of Teams, the Directory list),
+`directory-bindings.mjs` stops and says so. When it is one row's read (a site,
+a Team's members), that row shows it on its SKIP line, and `check` exits 4 if
+the row is bound and holds user ids (see [Exit codes](#check)). The fix is the same: consent the permission on the
+registration, then get a new token. A 403 on one site only can also mean the
+signed-in person cannot open that site.
 
 `GRAPH_TOKEN` expires in about an hour. The tools print who the token belongs
 to and when it expires, and they refuse an expired token.
@@ -75,12 +93,16 @@ export FORBIDDEN_TARGET_SITE_PATHS='/sites/BCRGROUP'                      # REQU
 export QUARANTINE_SITE_PATH='/sites/<quarantine site>'                    # always forbidden
 export QUARANTINE_SITE_HOSTNAME='contoso.sharepoint.com'                  # the only host a row may name
 
-node tools/directory-bindings.mjs check
-node tools/directory-bindings.mjs propose [--confirm-remove-staff <listItemId>] [--write-verified <sitePath|listItemId>]
-node tools/directory-bindings.mjs apply --plan <plan.json> --health-url https://<ingestion-host>/api/health [--expect-health <key=value>]... [--apply]
-node tools/directory-bindings.mjs rollback --log <apply-log.json> [--apply]
+node tools/directory-bindings.mjs check [--out <new report.json>]
+node tools/directory-bindings.mjs propose [--confirm-remove-staff <listItemId>] [--write-verified <sitePath|listItemId>] [--out <new plan.json>]
+node tools/directory-bindings.mjs apply --plan <plan.json> --health-url https://<ingestion-host>/api/health [--expect-health <key=value>]... [--only <listItemId>]... [--apply]
+node tools/directory-bindings.mjs rollback --log <apply-log.json> [--only <listItemId>]... [--apply]
 node tools/directory-bindings.mjs --add-columns [--apply]
 ```
+
+Every `--out` names a **new** file: `check`, `propose`, `apply` and `rollback`
+all refuse a path that exists, so a path reused from shell history can never
+replace an apply log that `rollback` needs, or a reviewed plan.
 
 Use the values the ingestion runs with (its app settings of the same names),
 so the tool refuses exactly what the ingestion refuses.
@@ -131,13 +153,38 @@ Reports on each **Active** row:
 - **The Team's guests.** A guest is eligible only if this Team is the **only** Team they belong to. `/users/{id}/memberOf` is read with `resourceProvisioningOptions`, and every group that is a Team counts, with or without the `BCR Group —` description. That includes the legacy client Teams and BCR GROUP. A group whose kind cannot be read counts as a Team. A guest who is also in another Team is excluded as `guest_in_other_team`, and the other Team is named. Binding them would file every upload of theirs into this client's channel, including another company's documents. Members and owners are never bound.
 - **The write grant.** Whether the ingestion's managed identity (`--ingest-app-ids`, its app id `INGEST_MI_APPID`) can write to the site, from `/sites/{id}/permissions`. If the caller cannot read that, the grant is reported as **"unknown"**, to be verified read-only (see below). A forbidden or non-canonical site gets no grant advice at all.
 
-`--out <file>` also writes the report as JSON, with `routingDrift`: the rows
-behind exit code 3.
+**Bound rows, unbound rows.** A row is **bound** when it is an Active client
+row (not `IsAdmin`) with `RootFolder`, `DriveId` and `TeamId` all set. Only a
+bound row routes anyone: the Phase-0 ingestion quarantines the users of any
+other row as `unbound_target`. So drift counts only on a bound row:
+- **Drift on a bound row** (`staff_ids`, `staff_ids_removed`, `bound_guest_ineligible`) routes an upload where it should not, today. `check` prints an ACTION line and exits 3.
+- **The same codes on an unbound row** are printed as **not routing (unbound)**, on the row and in the summary, and do not make `check` exit 3. The PATCH that binds such a row also takes those ids off (staff ids only with `--confirm-remove-staff`). So at H-7, before any row is bound, a staff id on a client row is reported and recorded, not raised as an action. This holds for the Phase-0 ingestion build: the pre-Phase-0 build routes by `UserAadObjectIds` alone, so until H-12 those ids still route, which is why H-7 records them and H-12 removes them.
+
+**Incomplete rows.** "No drift found" only counts where drift could be looked
+for. A bound row that holds user ids is **incomplete** when one of these left
+its ids unassessed: `site_unresolved`, `no_team` (an unreadable Team site
+included), `team_lookup_failed`, `membership_lookup_failed` or
+`guest_memberships_unreadable`. `check` marks the row `incomplete`, names it on
+an ACTION line, and exits 4 unless there is drift elsewhere. Fix the read (the
+row's SKIP line says which; a 403 is missing consent, see
+[Authentication](#authentication)) and run `check` again. A bound row with no
+user ids routes nobody and is never incomplete.
+
+`--out <file>` also writes the report as JSON (a new file: an existing one is
+refused before anything is read). Next to every row's problems it holds:
+- `exitCode`: 0, 3 or 4, as below;
+- `routingDrift`: the bound rows behind exit code 3;
+- `incomplete`: the bound rows behind exit code 4;
+- `notRoutingUnbound`: the unbound rows with a drift code, reported only.
 
 Exit codes:
-- `0`: nothing routes where it should not.
-- `1`: refused (a missing or malformed input, an expired token).
-- `3`: **action needed**. An Active client row holds an id that routes there and should not: staff (`staff_ids`, `staff_ids_removed`) or a guest who is no longer a guest of that row's Team alone (`bound_guest_ineligible`). Run `propose` and apply the whole plan. A scheduled run alerts on this.
+- `0`: every bound row that holds user ids was assessed, and none routes where it should not.
+- `1`: refused (a missing or malformed input, an expired token, an `--out` file that exists, a 403 that stops the whole run).
+- `3`: **action needed**. A bound client row holds an id that routes there and should not: staff (`staff_ids`, `staff_ids_removed`) or a guest who is no longer a guest of that row's Team alone (`bound_guest_ineligible`). Run `propose` and apply the whole plan, the same day. A scheduled run alerts on this.
+- `4`: **action needed**. No drift was found, but at least one bound row that holds user ids could not be fully assessed (`incomplete`, above). Fix the read and run `check` again; until then, drift on that row is unknown. A scheduled run alerts on this too.
+
+3 wins over 4: a run with drift on one row and an incomplete other row exits
+3, and the report lists both.
 
 ### Codes
 
@@ -159,13 +206,13 @@ not stop a PATCH. Each line also carries a detail with the ids involved.
 | `invalid_user_ids` | warn | A `UserAadObjectIds` line is not a GUID | The PATCH rewrites the list without it |
 | `unknown_user_ids` | warn | An id on the row matches no user | The PATCH drops it |
 | `user_lookup_failed` | skip | An id on the row could not be read | Re-run; check the token's `User.Read.All` |
-| `staff_ids` | skip | A staff (Member) id on a client row: it files that person's uploads into this client (exit 3) | Re-run `propose` with `--confirm-remove-staff <listItemId>` |
+| `staff_ids` | skip | A staff (Member) id on a client row: once the row is bound, it files that person's uploads into this client (exit 3 on a bound row; "not routing (unbound)" otherwise) | Re-run `propose` with `--confirm-remove-staff <listItemId>` |
 | `staff_ids_removed` | warn | Staff ids will be removed, as confirmed | Apply the plan |
-| `bound_guest_ineligible` | warn | An id on the row is not a guest of this Team alone any more: also in another Team, or no longer in this one. It routes here until the PATCH removes it (exit 3) | Run `propose` and apply the **whole** plan now |
+| `bound_guest_ineligible` | warn | An id on the row is not a guest of this Team alone any more: also in another Team, or no longer in this one. On a bound row it routes here until the PATCH removes it (exit 3); on an unbound row it routes nobody ("not routing (unbound)") | Run `propose` and apply the **whole** plan now |
 | `unbound_target` | warn | `RootFolder`, `DriveId` or `TeamId` is empty: the row routes nobody (the ingestion quarantines as `unbound_target`) | Apply the plan's PATCH, which sets all three |
-| `site_unresolved` | skip | Graph could not resolve `SiteHostname` + `SitePath` | Correct the row, or check the token's site access |
-| `team_lookup_failed` | skip | More than one Team claims the site | Report it; Teams should never allow this |
-| `no_team` | skip | The site is not the root site of any Team (the detail says if some Team sites could not be read) | The row must name the client Team's root site |
+| `site_unresolved` | skip | Graph could not resolve `SiteHostname` + `SitePath`. On a bound row with ids: `incomplete` (exit 4) | Correct the row, or check the token's site access |
+| `team_lookup_failed` | skip | More than one Team claims the site. On a bound row with ids: `incomplete` (exit 4) | Report it; Teams should never allow this |
+| `no_team` | skip | The site is not the root site of any Team (the detail says if some Team sites could not be read). On a bound row with ids: `incomplete` (exit 4) | The row must name the client Team's root site; if Team sites could not be read, check `Group.Read.All` and `Sites.Read.All` |
 | `public_team` | skip | The client's Team is Public. This tool never changes visibility | The Teams admin makes it Private; then re-run |
 | `team_not_bcr` | warn | The Team's description is not `BCR Group — {recordNumber}`. Expected for the Teams that predate onboarding (TEST, PESKOVOI) | Nothing, for those |
 | `team_id_conflict` | skip | The row already has a different `TeamId` (I10) | A person decides; change bindings by hand |
@@ -181,8 +228,8 @@ not stop a PATCH. Each line also carries a detail with the ids involved.
 | `drive_mismatch` | skip | The channel folder is in another drive than `DriveName` | Correct `DriveName` |
 | `drive_id_conflict` | skip | The row already has a different `DriveId` (I10) | A person decides; change bindings by hand |
 | `root_folder_conflict` | skip | The row already has a different `RootFolder` (I10) | A person decides; change bindings by hand |
-| `membership_lookup_failed` | skip | The Team's members or owners could not be read | Re-run; check `GroupMember.Read.All` |
-| `guest_memberships_unreadable` | skip | A guest's own memberships could not be read, so they cannot be shown to be in this Team alone | Re-run; check `GroupMember.Read.All` |
+| `membership_lookup_failed` | skip | The Team's members or owners could not be read. On a bound row with ids: `incomplete` (exit 4) | Re-run; check `GroupMember.Read.All` |
+| `guest_memberships_unreadable` | skip | A guest's own memberships could not be read, so they cannot be shown to be in this Team alone. On a bound row with ids: `incomplete` (exit 4) | Re-run; check `GroupMember.Read.All` |
 | `guest_in_other_team` | warn | A guest of this Team is also in another Team (named) and is not bound; their uploads go to quarantine | Record it (H-7). Binding them would file another company's documents here |
 | `guest_not_in_this_team` | warn | Listed as a member, but their memberships do not include this Team; not bound | Re-run later; the two reads disagree |
 | `no_eligible_guest` | warn | No guest belongs to this Team alone; the client's uploads go to quarantine | Record it; invite the client's contact to this Team only |
@@ -223,14 +270,17 @@ An existing, different `RootFolder`, `DriveId` or `TeamId` is never overwritten.
 The row is skipped for a person to decide (I10).
 
 The plan is written to `tools/out/directory-bindings-plan-<UTC>.json`, or to
-`--out`, and its sha256 is printed. It carries a digest of its rows, and the
-guards it was made with (`guards`).
+`--out` (a new file: an existing one is refused before anything is read), and
+its sha256 is printed. It records the guards it was made with (`guards`), and
+carries a `digest` of **every other field**: `kind`, `version`, `createdAt`,
+`directory`, `ingestAppIds`, `guards` and `rows`. So a plan whose date, target
+list or guards were edited is refused as surely as one whose rows were.
 
 ### `apply`
 
 Before it writes anything, `apply` refuses a plan in any of these cases:
-- the plan's digest no longer matches: it was **edited** after `propose`;
-- the plan is **older** than `--max-plan-age-hours`. The default is 72, and 72 is also the most it accepts: no flag widens it;
+- the plan's digest no longer matches: it was **edited** after `propose`, in its rows, its `createdAt`, its `directory` or its `guards`;
+- the plan is **older** than `--max-plan-age-hours`. The default is 72, and 72 is also the most it accepts: no flag widens it. Changing `createdAt` breaks the digest: an old plan needs a new `propose`;
 - the forbidden list is not given (`FORBIDDEN_TARGET_SITE_PATHS` or `--forbidden-site-paths`), or a guard value is malformed;
 - `--only` asks for a **SKIP** row;
 - the **ingestion health** check fails. `--health-url` must be `https` and answer 200, and its JSON must report `build.routing=identity-only`. Only the Phase-0 build does (`"build":{"phase":"p0","routing":"identity-only"}`). This is always required. `--expect-health key=value` adds further checks, with dotted keys reaching into nested objects; it can never replace this one. A value such as `status=ok`, which the old build also reports, does not open the gate;
@@ -274,17 +324,48 @@ Exit codes:
 
 ### `rollback`
 
-Restores the before-state of every row that an apply log says it wrote. A row
-someone has changed since the apply is refused, not overwritten.
+Restores the before-state of the rows that an apply log says it wrote: every
+one, or with `--only <listItemId>` (repeatable) only those. `--only` naming a
+row the log records no write to is refused.
+
+**Rolling back is not safe by default.** It is safe when the apply only bound
+rows that were unbound: the restore unbinds them, and they route nobody. It is
+not when the apply took ids **off** a row (a guest now in a second Team, staff
+removed with `--confirm-remove-staff`, a canary guest): the restore would put
+them back, and a guest in two Teams would route the second company's
+documents into the first client's channel again. So rollback re-checks every
+id the restore would **add** to `UserAadObjectIds` (the restored list minus
+the ids on the row now), as `apply` re-checks the guests it binds, against the
+`TeamId` the row will have after the restore: each must still be a `Guest`,
+and the Teams in its `memberOf` must be exactly that `TeamId`. A Member (staff)
+never passes, and neither does any id when the restore leaves the row without
+a `TeamId`. If one fails, the row is refused as **`guest_recheck_failed`**
+(with `readdedUserIds` and `recheckReasons` in the rollback log), nothing is
+written to it, and the run exits 2. A row whose restore adds no id is
+restored as before.
+
+To undo an apply that took ids off a row, **prefer re-running `propose` and
+applying the whole plan** over a rollback: the new plan binds exactly the
+guests of each Team alone. Never put a refused id back by hand.
+
+For each row, rollback also refuses:
+- a row someone has changed since the apply (`changed_since_apply`), rather than overwrite it;
+- a `writing` or `write_unknown` row with no before-state in the log (`no_before_state`).
 
 A `writing` or `write_unknown` row is checked against the live row:
 - if the live row still holds its before-state, the PATCH never landed. It is recorded as `not_written` and left alone;
-- if the live row holds the planned values, it is restored;
+- if the live row holds the planned values, it is restored (after the re-check above);
 - anything else is refused.
 
-Without `--apply` it is a dry run. With `--apply` it writes its own log
+Without `--apply` it is a dry run: it does every read and check, the guest
+re-check included, and writes nothing. With `--apply` it writes its own log
 (`--out` must not exist yet), also flushed before each PATCH, in the same
 crash-safe way.
+
+Exit codes:
+- `0`: every selected row was restored or found `not_written`.
+- `1`: refused before any write (not an apply log, `--only` naming a row the log did not write, an `--out` file that exists).
+- `2`: some rows were refused (`guest_recheck_failed`, `changed_since_apply`, `no_before_state`), failed, read back differently, or ended `write_unknown`. See the log.
 
 ### `--add-columns`
 
@@ -315,9 +396,13 @@ holds until someone applies a new plan. So, as a standing rule:
   that takes the reused guest off the first client. Once applied, a guest in
   two Teams is on no row, and the ingestion quarantines their uploads.
 - **Run `check` at least weekly**, and after any onboarding that reuses an
-  existing guest. Exit code 3 (`bound_guest_ineligible` or `staff_ids`) means
-  an id routes where it should not: propose and apply the whole plan the
-  same day.
+  existing guest. Exit code 3 (`bound_guest_ineligible` or `staff_ids` on a
+  bound row) means an id routes where it should not: propose and apply the
+  whole plan the same day. Exit code 4 means a bound row could not be
+  assessed (`incomplete`): fix the read and run `check` again the same day,
+  because 0 is the only "all clear".
+- **Do not undo an onboarding with `rollback`.** Re-run `propose` and apply
+  the whole plan instead (see [rollback](#rollback)).
 
 The robust fix, a membership check at upload time, is Phase 2. Onboarding
 writing the guest's id to the new row waits on Roman's re-ruling of Q21.

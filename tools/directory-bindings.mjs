@@ -11,10 +11,13 @@
  * client's upload "unknown", which Phase 0 now sends to quarantine (R1). This
  * tool fills both from Graph, per row, with a reviewed plan in between:
  *
- *   check     report what each Active row is bound to and what is wrong
+ *   check     report what each Active row is bound to and what is wrong;
+ *             exit 3 on drift on a bound row, 4 when a bound row could not
+ *             be fully assessed
  *   propose   compute the binding and write a plan file for review
  *   apply     apply a reviewed plan (PATCH list item fields), with a log
- *   rollback  restore the before-state from an apply log
+ *   rollback  restore the before-state from an apply log, re-checking every
+ *             id it would put back
  *   --add-columns   create the DriveId and TeamId text columns if missing
  *
  * ## Safety model
@@ -34,17 +37,24 @@
  *   required, the quarantine path is always forbidden, a row on another host
  *   than `--tenant-host` is skipped, and a row whose site resolves to the
  *   Client Directory's own site collection is skipped whatever the flags say.
- * - `apply` refuses a plan that was edited after `propose` (digest), is older
- *   than `--max-plan-age-hours` (at most 72), or whose row changed since
- *   (stale guard). Before each PATCH it checks the row again against the
+ * - `apply` refuses a plan that was edited after `propose` (the digest covers
+ *   every field: rows, createdAt, directory, guards), is older than
+ *   `--max-plan-age-hours` (at most 72), or whose row changed since (stale
+ *   guard). Before each PATCH it checks the row again against the
  *   guards it is given, and re-reads every guest the row will route: each
  *   must still be a Guest in the row's Team and in no other Team. It refuses
  *   to run unless the ingestion `/api/health` reports
  *   `build.routing=identity-only`, the marker only the P0 build has.
+ * - `rollback` puts ids back only after the same guest re-check: each id the
+ *   restore would add to a row must be a Guest whose Teams are exactly the
+ *   row's TeamId. Otherwise the row is refused (`guest_recheck_failed`):
+ *   rolling back an apply that took a guest off must never route them to
+ *   the old client again. `--only` limits it to named rows.
  * - Every applied row is logged before the PATCH is sent (`writing`) and again
  *   after it, and the log is on disk at both points, so `rollback` knows every
  *   row an interrupted run may have written. The log is created fresh (an
- *   existing file is refused) and every rewrite is atomic and fsynced.
+ *   existing file is refused) and every rewrite is atomic and fsynced. The
+ *   check report and the plan are created fresh too.
  * - The token is read from `GRAPH_TOKEN` and never printed.
  *
  * See tools/README.md for scopes and the full procedure.
@@ -52,6 +62,7 @@
 
 import {
   CliError,
+  assertNewFile,
   bad,
   bold,
   csvList,
@@ -77,12 +88,15 @@ import {
   assessRow,
   buildPlan,
   changedSinceApply,
+  checkVerdict,
+  DRIFT_UNASSESSED_CODES,
   fieldString,
   findDuplicates,
   findTeamForSite,
   forbiddenTargetReasons,
   healthExpectations,
   healthSatisfies,
+  idsRollbackAdds,
   isSiteCollectionPath,
   isTeamGroup,
   mapSitesToTeams,
@@ -120,8 +134,14 @@ Usage:
 
   apply always requires the health body to report ${P0_HEALTH_EXPECTATION};
   --expect-health adds further checks, it never replaces that one.
-  node tools/directory-bindings.mjs rollback --log <apply-log.json> [--out <new log file>] [--apply]
+  node tools/directory-bindings.mjs rollback --log <apply-log.json> [--only <listItemId>]...
+            [--out <new log file>] [--apply]
   node tools/directory-bindings.mjs --add-columns [--site-id ..] [--list-id ..] [--apply]
+
+  check exits 0 when every bound row with ids was assessed and none routes where it
+  should not, 3 on drift on a bound row, 4 when a bound row could not be fully
+  assessed (3 wins). rollback refuses a row whose restore would put back an id that
+  is not a Guest of that row's Team alone. --out never replaces an existing file.
 
 Common:
   --site-id <id>              Graph site id of the Client Directory site (BCR GROUP)
@@ -180,7 +200,7 @@ const ALLOWED = {
     'confirm-remove-staff', 'channel-name', 'concurrency', 'out'],
   apply: ['plan', 'apply', 'only', 'health-url', 'expect-health', 'max-plan-age-hours', 'site-id',
     'list-id', ...GUARD_FLAGS, 'out'],
-  rollback: ['log', 'apply', 'out'],
+  rollback: ['log', 'apply', 'only', 'out'],
   'add-columns': ['add-columns', 'apply', 'site-id', 'list-id'],
 };
 
@@ -234,18 +254,33 @@ export async function main(argv, deps = {}) {
       }),
   };
 
-  switch (command) {
-    case 'check':
-      return runCheck(ctx);
-    case 'propose':
-      return runPropose(ctx);
-    case 'apply':
-      return runApply(ctx);
-    case 'rollback':
-      return runRollback(ctx);
-    default:
-      return runAddColumns(ctx);
+  const run = {
+    check: runCheck,
+    propose: runPropose,
+    apply: runApply,
+    rollback: runRollback,
+    'add-columns': runAddColumns,
+  }[command];
+  try {
+    return await run(ctx);
+  } catch (err) {
+    throw withConsentHint(err);
   }
+}
+
+/**
+ * A 403 that stops a whole command (the Teams listing, the Directory list)
+ * is most often a delegated permission the app registration behind
+ * GRAPH_TOKEN was never admin-consented for. Say so, next to Graph's own words.
+ */
+function withConsentHint(err) {
+  if (!(err instanceof GraphError) || err.status !== 403) return err;
+  return new CliError(
+    `${err.message}\n  Graph refused this request (403). Most often the app registration that ` +
+      'issued GRAPH_TOKEN lacks admin consent for a delegated permission this command needs ' +
+      '(tools/README.md, "Authentication"). For a site or the Directory list, the signed-in ' +
+      'person may also lack access to it.',
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -625,7 +660,7 @@ function printProblems(print, problems) {
   }
 }
 
-function printRowCheck(print, row, a, facts, usersById) {
+function printRowCheck(print, row, a, facts, usersById, verdict) {
   const e = a.evidence;
   print('');
   print(bold(`Row ${row.listItemId} · ClientId ${row.clientId || '?'} · ${q(row.title)} · ${row.sitePath || '(no site)'}`));
@@ -667,6 +702,15 @@ function printRowCheck(print, row, a, facts, usersById) {
     print(`    bound now  RootFolder ${q(row.rootFolder)} · DriveId ${q(row.driveId)} · TeamId ${q(row.teamId)}`);
   }
   printProblems(print, a.problems);
+  if (verdict?.notRoutingUnbound.includes(row.listItemId)) {
+    print(
+      `    ${warn('not routing (unbound)')} the ingestion quarantines this row's users (unbound_target); ` +
+        'the PATCH that binds it also takes these ids off',
+    );
+  }
+  if (verdict?.incomplete.includes(row.listItemId)) {
+    print(`    ${bad('incomplete')} bound and holding user ids, but its drift could not be assessed`);
+  }
   const skips = a.problems.filter((p) => p.severity === 'skip').length;
   print(`    → ${skips ? bad(`SKIP (${skips} reason${skips > 1 ? 's' : ''})`) : ok('ready for propose')}`);
 }
@@ -706,6 +750,7 @@ async function gatherAndAssess(ctx, heading) {
 
 async function runCheck(ctx) {
   const { print, values } = ctx;
+  if (values.out) assertNewFile(values.out);
   const { ids, opts, gathered, assessments } = await gatherAndAssess(
     ctx,
     'Client Directory binding check (read-only)',
@@ -716,25 +761,45 @@ async function runCheck(ctx) {
     print(warn(`${gathered.teamIndex.unreadable.length} Team site(s) could not be read:`));
     for (const u of gathered.teamIndex.unreadable) print(`  ${u.displayName} ${dim(u.teamId)} — ${u.error}`);
   }
+  const verdict = checkVerdict(gathered.rows, assessments);
   const rowById = new Map(gathered.rows.map((r) => [r.listItemId, r]));
   for (const a of assessments) {
     const row = rowById.get(a.listItemId);
-    printRowCheck(print, row, a, gathered.factsByRow.get(a.listItemId), gathered.usersById);
+    printRowCheck(print, row, a, gathered.factsByRow.get(a.listItemId), gathered.usersById, verdict);
   }
   const ready = assessments.filter((a) => !a.problems.some((p) => p.severity === 'skip'));
-  const drift = assessments.filter((a) => a.problems.some((p) => ROUTING_DRIFT_CODES.includes(p.code)));
   print('');
   print(bold('Summary'));
   print(`  ${assessments.length} Active row(s): ${ok(`${ready.length} ready`)}, ${bad(`${assessments.length - ready.length} skipped`)}`);
   print(`  ${gathered.rows.length - gathered.active.length} inactive row(s) not examined`);
-  if (drift.length) {
+  if (verdict.notRoutingUnbound.length) {
+    print(
+      warn(
+        `  not routing (unbound): row(s) ${verdict.notRoutingUnbound.join(', ')} hold staff ids or ids that ` +
+          "are not guests of that row's Team alone, but lack RootFolder, DriveId or TeamId, so the Phase-0 " +
+          'ingestion routes nobody there (unbound_target). The PATCH that binds such a row takes them off.',
+      ),
+    );
+  }
+  if (verdict.routingDrift.length) {
     print(
       bad(
-        `  ACTION: row(s) ${drift.map((a) => a.listItemId).join(', ')} hold an id that routes there and ` +
+        `  ACTION: row(s) ${verdict.routingDrift.join(', ')} hold an id that routes there and ` +
           `should not (${ROUTING_DRIFT_CODES.join(' / ')}). Run propose and apply the whole plan.`,
       ),
     );
   }
+  if (verdict.incomplete.length) {
+    print(
+      bad(
+        `  ACTION: row(s) ${verdict.incomplete.join(', ')} are bound and hold user ids, but could not be ` +
+          `fully assessed (${DRIFT_UNASSESSED_CODES.join(' / ')}): whether an id routes there and should ` +
+          "not is unknown. Fix the read (each row's SKIP line says which; a 403 is missing consent or " +
+          'site access), then run check again.',
+      ),
+    );
+  }
+  if (verdict.exitCode === 0) print(`  ${ok('every bound row with user ids was assessed; none routes where it should not')}`);
 
   if (values.out) {
     const report = {
@@ -745,14 +810,17 @@ async function runCheck(ctx) {
       guards: opts.guards,
       duplicates: gathered.duplicates,
       unreadableTeamSites: gathered.teamIndex.unreadable,
-      routingDrift: drift.map((a) => a.listItemId),
+      exitCode: verdict.exitCode,
+      routingDrift: verdict.routingDrift,
+      incomplete: verdict.incomplete,
+      notRoutingUnbound: verdict.notRoutingUnbound,
       rows: assessments,
     };
-    const written = writeJsonFile(values.out, report);
+    const written = writeJsonFile(values.out, report, { exclusive: true });
     print(`  report     ${written.path}  sha256 ${written.sha256}`);
   }
   print('');
-  return drift.length ? 3 : 0;
+  return verdict.exitCode;
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +858,7 @@ function printPlanRow(print, r) {
 
 async function runPropose(ctx) {
   const { print, values } = ctx;
+  if (values.out) assertNewFile(values.out);
   const { ids, opts, gathered, assessments } = await gatherAndAssess(
     ctx,
     'Client Directory binding proposal (read-only)',
@@ -807,7 +876,7 @@ async function runPropose(ctx) {
 
   const count = (action) => plan.rows.filter((r) => r.action === action).length;
   const file = values.out ?? outPath(ctx.outDir, `directory-bindings-plan-${stamp(ctx.now())}.json`);
-  const written = writeJsonFile(file, plan);
+  const written = writeJsonFile(file, plan, { exclusive: true });
   print('');
   print(bold('Plan'));
   print(`  ${ok(`${count('PATCH')} PATCH`)} · ${dim(`${count('NOOP')} NOOP`)} · ${bad(`${count('SKIP')} SKIP`)}`);
@@ -915,20 +984,29 @@ async function recheckTarget(graph, planRow, current, guardCtx) {
   return { forbidden, stale };
 }
 
+/** Every Team in the tenant, read once and only when first needed. */
+function lazyTeamIds(graph) {
+  let teamIds;
+  return async () => {
+    teamIds ??= graph.all(TEAMS_QUERY).then((ts) => new Set(ts.map((t) => normalizeGuid(t.id)).filter(Boolean)));
+    return teamIds;
+  };
+}
+
 /**
- * Whether every id the row will route after the PATCH is still a Guest who
- * belongs to the row's Team and to no other Team (C8, R19). Propose checked
- * it; memberships change, and a guest added to a second client's Team would
- * file that client's documents here. Reads only; a read that fails throws,
- * and the row is not written.
+ * Whether each of `ids` is a Guest who belongs to the Team `teamId` and to no
+ * other Team (C8, R19), so that it may route to a row with that TeamId.
+ * Memberships change, and a guest added to a second client's Team would file
+ * that client's documents here. Reads only; a read that fails throws, and the
+ * row is not written. A Member (staff) never qualifies, and neither does any
+ * id when the row has no TeamId to check it against.
  *
+ * @param {string[]} ids  normalised GUIDs
+ * @param {string} teamId  normalised GUID, or ''
  * @param {() => Promise<Set<string>>} knownTeamIds  every Team in the tenant, read once
- * @returns {Promise<string[]>} why not; empty when every id still qualifies
+ * @returns {Promise<string[]>} why not; empty when every id qualifies
  */
-async function recheckGuests(graph, planRow, knownTeamIds) {
-  const final = (field) => fieldString(field in planRow.patch ? planRow.patch[field] : planRow.before?.[field]);
-  const ids = splitLines(final('UserAadObjectIds')).map(normalizeGuid).filter(Boolean);
-  const teamId = normalizeGuid(final('TeamId'));
+async function recheckIds(graph, ids, teamId, knownTeamIds) {
   const why = [];
   for (const id of ids) {
     const user = await lookupUser(graph, id);
@@ -948,11 +1026,23 @@ async function recheckGuests(graph, planRow, knownTeamIds) {
     ).filter(isGroup);
     const known = await knownTeamIds();
     const teams = new Set(groups.filter((g) => isTeamGroup(g, known)).map((g) => normalizeGuid(g.id) || String(g.id)));
-    if (!teamId || !teams.has(teamId)) why.push(`${id} is no longer in the row's Team`);
+    if (!teamId) why.push(`${id}: the row would have no TeamId, so it cannot be shown to be that Team's guest`);
+    else if (!teams.has(teamId)) why.push(`${id} is no longer in the row's Team`);
     const others = [...teams].filter((t) => t !== teamId);
     if (others.length) why.push(`${id} is also in Team(s) ${others.join(', ')}`);
   }
   return why;
+}
+
+/**
+ * Whether every id the row will route after the PATCH still qualifies
+ * (`recheckIds` against the row's final TeamId). Propose checked it; apply
+ * checks it again right before the write.
+ */
+async function recheckGuests(graph, planRow, knownTeamIds) {
+  const final = (field) => fieldString(field in planRow.patch ? planRow.patch[field] : planRow.before?.[field]);
+  const ids = splitLines(final('UserAadObjectIds')).map(normalizeGuid).filter(Boolean);
+  return recheckIds(graph, ids, normalizeGuid(final('TeamId')), knownTeamIds);
 }
 
 async function runApply(ctx) {
@@ -1069,11 +1159,7 @@ async function runApply(ctx) {
   };
   flush();
 
-  let teamIds;
-  const knownTeamIds = async () => {
-    teamIds ??= graph.all(TEAMS_QUERY).then((ts) => new Set(ts.map((t) => normalizeGuid(t.id)).filter(Boolean)));
-    return teamIds;
-  };
+  const knownTeamIds = lazyTeamIds(graph);
 
   let failures = 0;
   for (const r of selected) {
@@ -1169,7 +1255,13 @@ async function runApply(ctx) {
     for (const e of log.rows) print(`  row ${e.listItemId}: ${e.result === 'patched' ? ok(e.result) : bad(e.result)}`);
     print(`  log     ${written.path}`);
     print(`  sha256  ${written.sha256}`);
-    print(`  undo    node tools/directory-bindings.mjs rollback --log ${written.path}`);
+    print(`  rollback node tools/directory-bindings.mjs rollback --log ${written.path} [--only <listItemId>]`);
+    print(
+      dim(
+        '           A dry run first. It refuses to put back an id that is not a Guest of that row\'s ' +
+          'Team alone; to undo an apply that took ids off, re-run propose and apply the whole plan.',
+      ),
+    );
     print('');
     print('Next: one canary upload per bound client, then `check` again.');
   }
@@ -1194,16 +1286,27 @@ async function runRollback(ctx) {
 
   // `writing` (the run died with the PATCH in flight) and `write_unknown` (the
   // PATCH threw) may or may not have landed; each is checked against the row.
-  const candidates = log.rows.filter((r) =>
+  const written = log.rows.filter((r) =>
     ['patched', 'patched_mismatch', 'patched_unverified', ...UNCERTAIN_WRITES].includes(r.result),
   );
+  const only = new Set(csvList(values.only));
+  for (const id of only) {
+    if (!written.some((r) => r.listItemId === id)) {
+      throw new CliError(`--only ${id}: the log records no write to that row`);
+    }
+  }
+  const candidates = written.filter((r) => !only.size || only.has(r.listItemId));
   print('');
   print(bold(`Rollback directory bindings — ${APPLY ? bad('APPLY') : 'DRY RUN (nothing is written)'}`));
   print(`  log        ${values.log}  sha256 ${logSha256}`);
   print(`  directory  site ${directory.siteId} · list ${directory.listId}`);
   tokenBanner(ctx);
   const graph = ctx.graph();
-  print(`  rows       ${candidates.length} written by that apply`);
+  const knownTeamIds = lazyTeamIds(graph);
+  print(
+    `  rows       ${candidates.length} of the ${written.length} written by that apply` +
+      (only.size ? ` (--only ${[...only].join(', ')})` : ''),
+  );
 
   const outFile = values.out ?? outPath(ctx.outDir, `directory-bindings-rollback-${stamp(ctx.now())}.json`);
   const out = {
@@ -1212,6 +1315,7 @@ async function runRollback(ctx) {
     mode: APPLY ? 'apply' : 'dry-run',
     applyLog: values.log,
     applyLogSha256: logSha256,
+    ...(only.size ? { only: [...only] } : {}),
     directory,
     operator: describeToken(ctx.env.GRAPH_TOKEN ?? '')?.who ?? '',
     startedAt: ctx.now().toISOString(),
@@ -1267,6 +1371,27 @@ async function runRollback(ctx) {
         flush();
         continue;
       }
+      // An id the restore puts back routes to this row again. The apply took
+      // it off for a reason (a second Team, staff), so it is re-read as apply
+      // re-reads the guests it binds, against the TeamId the row will have.
+      const readded = idsRollbackAdds(patch, current);
+      if (readded.length) {
+        const teamId = normalizeGuid('TeamId' in patch ? patch.TeamId : fieldString(current.TeamId));
+        const why = await recheckIds(graph, readded, teamId, knownTeamIds);
+        entry.readdedUserIds = readded;
+        if (why.length) {
+          entry.result = 'guest_recheck_failed';
+          entry.recheckReasons = why;
+          failures += 1;
+          print(`    ${bad('refused')} it would put back id(s) that must not route here: ${why.join('; ')}.`);
+          const next =
+            'Nothing written. Re-run propose and apply the whole plan instead (tools/README.md, ' +
+            'rollback); never put these ids back by hand.';
+          print(`    ${dim(next)}`);
+          flush();
+          continue;
+        }
+      }
       for (const [field, value] of Object.entries(patch)) {
         print(`    ${field.padEnd(17)} ${q(entry.before[field])} → ${q(value)}`);
       }
@@ -1302,10 +1427,10 @@ async function runRollback(ctx) {
     flush();
   }
   out.finishedAt = ctx.now().toISOString();
-  const written = flush();
+  const logWritten = flush();
   print('');
   if (!APPLY) print('Dry run. Re-run with --apply to write.');
-  else print(`  log     ${written.path}  sha256 ${written.sha256}`);
+  else print(`  log     ${logWritten.path}  sha256 ${logWritten.sha256}`);
   print('');
   return failures ? 2 : 0;
 }

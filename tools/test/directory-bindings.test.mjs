@@ -58,13 +58,32 @@ async function proposePlan(h, extra = []) {
   return { file, plan: JSON.parse(readFileSync(file, 'utf8')) };
 }
 
+/** A fresh output path in the harness's directory. */
+const fresh = (h, name) => join(h.outDir, `${name}-${Math.random().toString(16).slice(2)}.json`);
+
+/** Propose and apply the whole plan with --apply; returns the apply log path. */
+async function bind(h, extra = []) {
+  if (!h.tenant.state.columns.some((c) => c.name === 'DriveId')) {
+    h.tenant.state.columns.push({ name: 'DriveId', text: {} }, { name: 'TeamId', text: {} });
+  }
+  const { file } = await proposePlan(h, extra);
+  const log = fresh(h, 'apply-log');
+  assert.equal(await h.run(['apply', '--plan', file, '--apply', ...HEALTH_ARGS, '--out', log]), 0);
+  return log;
+}
+
+const denied = () => jsonResponse(403, { error: { code: 'accessDenied', message: 'Access denied' } });
+const pathOf = (url) => decodeURIComponent(new URL(url).pathname.replace(/^\/v1\.0/, ''));
+
 describe('directory-bindings check', () => {
   test('reports each Active row read-only, and never prints the token', async () => {
     const h = harness();
-    // 3: row 2 holds a staff id, which routes that person's uploads to client B.
-    assert.equal(await h.run(['check', ...DIR_ARGS]), 3);
+    // 0: row 2 holds a staff id, but it is unbound, so the ingestion routes nobody there.
+    assert.equal(await h.run(['check', ...DIR_ARGS]), 0);
     const text = h.out.text();
-    assert.match(text, /ACTION: row\(s\) 2 hold an id that routes there and should not/);
+    assert.match(text, /not routing \(unbound\): row\(s\) 2 hold staff ids/);
+    assert.match(text, /Row 2 · ClientId 0002[\s\S]*not routing \(unbound\)[\s\S]*Row 3/);
+    assert.doesNotMatch(text, /ACTION/);
     assert.match(text, /Row 1 · ClientId 0001[\s\S]*ready for propose/);
     assert.match(text, /Row 2 · ClientId 0002[\s\S]*SKIP staff_ids/);
     assert.match(text, /Row 2 · ClientId 0002[\s\S]*WARN team_not_bcr[\s\S]*Row 3/);
@@ -101,8 +120,9 @@ describe('directory-bindings check', () => {
     await assert.rejects(h.run(['apply', '--plan', file, ...HEALTH_ARGS]), /--forbidden-site-paths is required/);
     await assert.rejects(h.run(['check', ...DIR_ARGS, '--quarantine-site-path', '/sites/Q/sub']), /--quarantine-site-path/);
     await assert.rejects(h.run(['check', ...DIR_ARGS, '--tenant-host', 'contoso.example']), /--tenant-host/);
-    // The environment counts as the flag does (3: row 2's staff id).
-    assert.equal(await withList.run(['check', ...DIR_ONLY]), 3);
+    // The environment counts as the flag does.
+    assert.equal(await withList.run(['check', ...DIR_ONLY]), 0);
+    assert.match(withList.out.text(), /forbidden +\/sites\/bcrgroup/);
     assert.deepEqual([...h.writes(), ...withList.writes()], []);
   });
 
@@ -184,11 +204,92 @@ describe('directory-bindings check', () => {
     assert.equal(r1.patch.UserAadObjectIds, '');
   });
 
+  test('staff ids on a bound row are drift (exit 3); on an unbound row they route nobody (exit 0)', async () => {
+    const h = harness();
+    const unboundReport = fresh(h, 'report');
+    assert.equal(await h.run(['check', ...DIR_ARGS, '--out', unboundReport]), 0);
+    const unbound = JSON.parse(readFileSync(unboundReport, 'utf8'));
+    assert.deepEqual(
+      [unbound.exitCode, unbound.routingDrift, unbound.incomplete, unbound.notRoutingUnbound],
+      [0, [], [], ['2']],
+    );
+
+    await bind(h);
+    h.tenant.state.items.get('1').UserAadObjectIds = `${IDS.guestA}\n${IDS.staff}`;
+    const boundReport = fresh(h, 'report');
+    assert.equal(await h.run(['check', ...DIR_ARGS, '--out', boundReport]), 3);
+    assert.match(h.out.text(), /ACTION: row\(s\) 1 hold an id that routes there and should not/);
+    const bound = JSON.parse(readFileSync(boundReport, 'utf8'));
+    assert.deepEqual([bound.exitCode, bound.routingDrift, bound.notRoutingUnbound], [3, ['1'], ['2']]);
+  });
+
+  test('exits 4 when a bound row holding user ids could not be fully assessed', async () => {
+    const teamSiteOf = (team) => `/groups/${team}/sites/root`;
+    const cases = [
+      ['site_unresolved', (p) => p === `/sites/${IDS.host}:/sites/0001CLIENTA` && denied()],
+      ['no_team', (p) => p === teamSiteOf(IDS.teamA) && denied()],
+      [
+        'team_lookup_failed',
+        // A second Team claims row 1's site as its root site.
+        (p) => p === teamSiteOf(IDS.teamC) && jsonResponse(200, { id: IDS.siteA, webUrl: `https://${IDS.host}/sites/0001CLIENTA` }),
+      ],
+      ['membership_lookup_failed', (p) => p === `/groups/${IDS.teamA}/members` && denied()],
+      // Guest "multi" is in Team A but not on row 1: row 1's own guest reads fine.
+      ['guest_memberships_unreadable', (p) => p === `/users/${IDS.guestMulti}/memberOf` && denied()],
+    ];
+    for (const [code, fault] of cases) {
+      let failing = false;
+      const h = harness({
+        intercept: async (url, init, next) => (failing && fault(pathOf(url))) || next(url, init),
+      });
+      await bind(h);
+      assert.equal(await h.run(['check', ...DIR_ARGS]), 0, `${code}: clean before the fault`);
+      failing = true;
+      const report = fresh(h, 'report');
+      assert.equal(await h.run(['check', ...DIR_ARGS, '--out', report]), 4, code);
+      const r = JSON.parse(readFileSync(report, 'utf8'));
+      assert.deepEqual([r.exitCode, r.routingDrift, r.incomplete], [4, [], ['1']], code);
+      assert.ok(r.rows.find((a) => a.listItemId === '1').problems.some((p) => p.code === code), code);
+      assert.match(h.out.text(), /ACTION: row\(s\) 1 are bound and hold user ids, but could not be fully assessed/, code);
+
+      // A bound row that holds no ids routes nobody: nothing to assess.
+      h.tenant.state.items.get('1').UserAadObjectIds = '';
+      assert.equal(await h.run(['check', ...DIR_ARGS]), 0, `${code}: no ids`);
+    }
+  });
+
+  test('drift on one bound row wins over another that could not be assessed (3, not 4)', async () => {
+    let failing = false;
+    const h = harness({
+      intercept: async (url, init, next) =>
+        failing && pathOf(url) === `/groups/${IDS.teamB}/members` ? denied() : next(url, init),
+    });
+    await bind(h, ['--confirm-remove-staff', '2', '--write-verified', '/sites/0002CLIENTB']);
+    h.tenant.state.members.get(IDS.teamC).push(IDS.guestA);
+    failing = true;
+    const report = fresh(h, 'report');
+    assert.equal(await h.run(['check', ...DIR_ARGS, '--out', report]), 3);
+    const r = JSON.parse(readFileSync(report, 'utf8'));
+    assert.deepEqual([r.exitCode, r.routingDrift, r.incomplete], [3, ['1'], ['2']]);
+  });
+
   test('refuses flags that belong to another command', async () => {
     const h = harness();
     await assert.rejects(h.run(['check', ...DIR_ARGS, '--apply']), CliError);
     await assert.rejects(h.run(['check', ...DIR_ARGS, '--plan', 'x']), /not valid for "check"/);
     await assert.rejects(h.run(['chek']), /unknown command/);
+  });
+
+  test('a 403 that stops the whole run says the app registration lacks consent', async () => {
+    const h = harness({
+      intercept: async (url, init, next) => (pathOf(url) === '/groups' ? denied() : next(url, init)),
+    });
+    await assert.rejects(h.run(['check', ...DIR_ARGS]), (err) => {
+      assert.ok(err instanceof CliError);
+      assert.match(err.message, /GET \/groups → 403 accessDenied/);
+      assert.match(err.message, /Graph refused this request \(403\)[\s\S]*lacks admin consent/);
+      return true;
+    });
   });
 
   test('refuses to run without the directory ids or the token', async () => {
@@ -198,6 +299,17 @@ describe('directory-bindings check', () => {
       main(['check', ...DIR_ARGS], { env: {}, print: () => {} }),
       /no GRAPH_TOKEN/,
     );
+  });
+
+  test('--out never replaces an existing file, and refuses before reading anything', async () => {
+    const h = harness();
+    const existing = join(h.outDir, 'apply-log-from-history.json');
+    writeFileSync(existing, '{"keep":true}\n');
+    for (const command of ['check', 'propose']) {
+      await assert.rejects(h.run([command, ...DIR_ARGS, '--out', existing]), /exists; choose a new name/, command);
+    }
+    assert.equal(readFileSync(existing, 'utf8'), '{"keep":true}\n');
+    assert.deepEqual(h.tenant.calls, [], 'refused before any Graph read');
   });
 });
 
@@ -351,6 +463,25 @@ describe('directory-bindings apply', () => {
     copy.rows[0].patch.UserAadObjectIds = IDS.staff;
     writeFileSync(edited, JSON.stringify(copy));
     await assert.rejects(h.run(['apply', '--plan', edited, '--apply', ...HEALTH_ARGS]), /digest/);
+
+    // A plan too old to apply is not revived by a new date, and its guards
+    // and directory are covered as well as its rows.
+    const late = new Date(NOW.getTime() + 73 * 3_600_000);
+    for (const [name, change] of [
+      ['createdAt', (p) => (p.createdAt = late.toISOString())],
+      ['guards', (p) => (p.guards.forbiddenSitePaths = [])],
+      ['directory', (p) => (p.directory.listId = 'another-list')],
+    ]) {
+      const copy2 = structuredClone(plan);
+      change(copy2);
+      const f = join(h.outDir, `edited-${name}.json`);
+      writeFileSync(f, JSON.stringify(copy2));
+      await assert.rejects(
+        h.run(['apply', '--plan', f, '--apply', ...HEALTH_ARGS], { now: late }),
+        /digest does not match/,
+        name,
+      );
+    }
 
     const later = new Date(NOW.getTime() + 73 * 3_600_000);
     await assert.rejects(
@@ -552,6 +683,66 @@ describe('directory-bindings rollback', () => {
     const f = join(h.outDir, 'not-a-log.json');
     writeFileSync(f, JSON.stringify({ kind: 'bcr.directory-bindings.apply-log', mode: 'dry-run', rows: [] }));
     await assert.rejects(h.run(['rollback', '--log', f, '--apply']), /not an apply log/);
+  });
+
+  test('never puts back a guest who is now in another Team, and restores them once they qualify again', async () => {
+    const h = harness();
+    await bind(h);
+    // R46: guest A joins company C's Team; the whole plan takes them off row 1.
+    h.tenant.state.members.get(IDS.teamC).push(IDS.guestA);
+    const removal = await bind(h);
+    assert.equal(h.tenant.state.items.get('1').UserAadObjectIds, '');
+    const patches = () => h.writes().filter((c) => c.method === 'PATCH').length;
+    const before = patches();
+
+    assert.equal(await h.run(['rollback', '--log', removal]), 2, 'the dry run refuses too');
+    const rb = fresh(h, 'rollback-log');
+    assert.equal(await h.run(['rollback', '--log', removal, '--apply', '--out', rb]), 2);
+    assert.equal(patches(), before, 'nothing written');
+    assert.equal(h.tenant.state.items.get('1').UserAadObjectIds, '', 'guest A routes to client A again');
+    const [row] = JSON.parse(readFileSync(rb, 'utf8')).rows;
+    assert.equal(row.result, 'guest_recheck_failed');
+    assert.deepEqual(row.readdedUserIds, [IDS.guestA]);
+    assert.match(row.recheckReasons.join(' | '), new RegExp(`${IDS.guestA} is also in Team\\(s\\) ${IDS.teamC}`));
+    assert.match(h.out.text(), /refused.*it would put back id\(s\) that must not route here/);
+
+    // Guest A leaves Team C: a guest of Team A alone again, so the restore may add them.
+    h.tenant.state.members.set(IDS.teamC, h.tenant.state.members.get(IDS.teamC).filter((id) => id !== IDS.guestA));
+    const rb2 = fresh(h, 'rollback-log');
+    assert.equal(await h.run(['rollback', '--log', removal, '--apply', '--out', rb2]), 0);
+    assert.equal(h.tenant.state.items.get('1').UserAadObjectIds, IDS.guestA);
+    const [row2] = JSON.parse(readFileSync(rb2, 'utf8')).rows;
+    assert.deepEqual([row2.result, row2.readdedUserIds], ['restored', [IDS.guestA]]);
+  });
+
+  test('never puts back a staff id, and --only limits the rollback to the rows named', async () => {
+    const h = harness();
+    // Row 2's staff id comes off as confirmed; row 1 is bound from nothing.
+    const log = await bind(h, ['--confirm-remove-staff', '2', '--write-verified', '/sites/0002CLIENTB']);
+    assert.equal(h.tenant.state.items.get('2').UserAadObjectIds, IDS.guestB);
+    const patchedItems = () => h.writes().filter((c) => c.method === 'PATCH').map((c) => c.path.match(/items\/(\d+)/)[1]);
+    const before = patchedItems().length;
+
+    await assert.rejects(h.run(['rollback', '--log', log, '--only', '9']), /--only 9: the log records no write/);
+
+    // Row 1's restore adds no id: it is restored, and row 2 is not touched.
+    const rb1 = fresh(h, 'rollback-log');
+    assert.equal(await h.run(['rollback', '--log', log, '--only', '1', '--apply', '--out', rb1]), 0);
+    assert.deepEqual(patchedItems().slice(before), ['1']);
+    assert.equal(h.tenant.state.items.get('1').TeamId, '');
+    assert.equal(h.tenant.state.items.get('2').TeamId, IDS.teamB, 'row 2 still bound');
+    const out1 = JSON.parse(readFileSync(rb1, 'utf8'));
+    assert.deepEqual(out1.only, ['1']);
+    assert.deepEqual(out1.rows.map((r) => [r.listItemId, r.result]), [['1', 'restored']]);
+
+    // Row 2's restore would put the staff (Member) id back: refused.
+    const rb2 = fresh(h, 'rollback-log');
+    assert.equal(await h.run(['rollback', '--log', log, '--only', '2', '--apply', '--out', rb2]), 2);
+    assert.deepEqual(patchedItems().slice(before), ['1'], 'row 2 not written');
+    const [row2] = JSON.parse(readFileSync(rb2, 'utf8')).rows;
+    assert.equal(row2.result, 'guest_recheck_failed');
+    assert.match(row2.recheckReasons.join(' | '), new RegExp(`${IDS.staff} is a Member`));
+    assert.equal(h.tenant.state.items.get('2').UserAadObjectIds, IDS.guestB);
   });
 });
 
