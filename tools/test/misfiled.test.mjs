@@ -9,7 +9,10 @@ import {
   classifyItem,
   dedupeTraces,
   indexIr0,
+  isTaxonomyFolder,
+  missingRootFolders,
   normalizeTrace,
+  parseExpectRootFolders,
   parseIr0Export,
   parseSiteGuests,
   parseSiteSpec,
@@ -54,6 +57,31 @@ describe('site specs', () => {
       if (canonical === null) assert.throws(() => parseSiteSpec(spec), Error, spec);
       else assert.equal(parseSiteSpec(spec).sitePath.toLowerCase(), canonical, spec);
     }
+  });
+
+  test('expected root folders: parsed per site, compared case-insensitively, missing ones named', () => {
+    const sites = [
+      { label: 'BCR', sitePath: '/sites/BCRGROUP' },
+      { label: 'A', sitePath: '/sites/0001CLIENTA' },
+    ];
+    const expected = parseExpectRootFolders(
+      ['BCR=01_Faktury, 98_Nieposortowane', '/sites/bcrgroup=02_Wyciągi_bankowe', 'A=01_Faktury'],
+      sites,
+    );
+    assert.deepEqual(expected.get('/sites/bcrgroup'), ['01_Faktury', '98_Nieposortowane', '02_Wyciągi_bankowe']);
+    const seen = new Map([
+      ['/sites/bcrgroup', ['01_faktury', '98_Nieposortowane', 'General']],
+      ['/sites/0001clienta', ['01_Faktury']],
+    ]);
+    assert.deepEqual(missingRootFolders(expected, seen), [
+      { sitePath: '/sites/bcrgroup', missing: ['02_Wyciągi_bankowe'] },
+    ]);
+    assert.deepEqual(missingRootFolders(expected, new Map()).map((m) => m.missing.length), [3, 1]);
+    assert.throws(() => parseExpectRootFolders(['Z=01_Faktury'], sites), /not one of the --site values/);
+    assert.throws(() => parseExpectRootFolders(['BCR='], sites), /no folder names/);
+    assert.throws(() => parseExpectRootFolders(['01_Faktury'], sites), /expected/);
+    assert.equal(isTaxonomyFolder('98_Nieposortowane'), true);
+    assert.equal(isTaxonomyFolder('Dokumenty księgowe'), false);
   });
 
   test('sitePathFromWebUrl', () => {
@@ -340,11 +368,10 @@ describe('register', () => {
     assert.ok(unreadable.flags.includes('versions_unreadable'));
     assert.equal(unreadable.suspect, true);
     assert.ok(classifyItem(file('zz', '', 'n.pdf'), cliA, ctx).flags.includes('no_ir0_record'));
-    assert.equal(
-      classifyItem(file('zz', '', 'n.pdf'), cliA, { ...ctx, ir0: null }).flags.includes('no_ir0_record'),
-      false,
-      'without an IR-0 export there is nothing to be missing from',
-    );
+    const noExport = classifyItem(file('zz', '', 'n.pdf'), cliA, { ...ctx, ir0: null });
+    assert.equal(noExport.flags.includes('no_ir0_record'), false, 'without an IR-0 export there is nothing to be missing from');
+    assert.ok(noExport.flags.includes('no_ir0_given'));
+    assert.equal(noExport.suspect, true, 'without IR-0 nothing the ingestion wrote is clean (R24)');
     const overwritten = classifyItem(file('zz', '', 'o.pdf', { createdBy: app(g('e9')) }), cliA, ctx);
     assert.ok(overwritten.flags.includes('overwritten_by_ingest'));
   });
@@ -373,6 +400,9 @@ describe('register', () => {
 
     const all = buildRegister({ walked, ir0: null, ingestAppIds, fallbackSitePaths: new Set(), includeAll: true });
     assert.equal(all.length, 3);
+    const byName = Object.fromEntries(all.map((r) => [r.name, r]));
+    assert.ok(byName['c.pdf'].flags.includes('no_ir0_given'));
+    assert.ok(!byName['staff.docx'].flags.includes('no_ir0_given'), 'only what the ingestion wrote');
 
     const summary = summarizeRegister(rows);
     assert.equal(summary.rows, rows.length);
