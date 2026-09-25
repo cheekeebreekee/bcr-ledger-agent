@@ -143,6 +143,9 @@ export function createTenant() {
     [IDS.siteC, [{ id: 'p3', roles: ['write'], grantedToIdentitiesV2: [{ application: { id: IDS.ingestApp } }] }]],
   ]);
 
+  // Live views for a test that changes the tenant between two commands.
+  Object.assign(state, { users, members, sites });
+
   const listBase = `/sites/${IDS.dirSite}/lists/${IDS.list}`;
   const userOut = (id) => ({ '@odata.type': '#microsoft.graph.user', ...users.get(id), displayName: id.slice(-4) });
 
