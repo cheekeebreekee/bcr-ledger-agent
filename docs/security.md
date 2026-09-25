@@ -128,7 +128,9 @@ chosen NIP, could plant a file in any client's space. This was root cause R3 of 
 only flip an invoice's direction inside that client. A source-scan test fails if a
 promote-by-NIP path comes back. Until that build is live, promotion is switched off on the
 running build with `ANTHROPIC_ENABLED=false` (human steps H-3), and no further client site is
-granted to the ingestion identity. **Status: Removed in P0.** It is a permanent invariant (I2) and
+granted to the ingestion identity. Documents already promoted sit in the taxonomy folders at
+the receiving client's library root; those folders are locked to the site's Owners (tenant step
+T-4b) until IR-2 moves each item. **Status: Removed in P0.** It is a permanent invariant (I2) and
 a `CLAUDE.md` rule.
 
 ### T9. Fallback commingling

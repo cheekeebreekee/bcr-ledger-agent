@@ -88,7 +88,7 @@ whether anyone used it. Dates marked *record* are filled in from the IR-0 export
 | W1 | **Fallback bucket** at the BCR GROUP library root | Every unrouted upload, from every client, plus staff uploads | Members of BCR GROUP: Roman, Yahor and `AuthoriseMe@` | Multi-tenant routing go-live, on or before 16 Jul 2026 (*record* the deploy date) | New uploads: the Phase-0 ingestion deploy. Existing items: the folder lock in [tenant hardening](tenant-hardening.md#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root), then IR-2 moves them out. |
 | W2 | **BCR GROUP was Public** | Everything in W1, and the `Onboarding klientów` channel | Any internal account, including the three `{NIP}@` accounts, which could sign in | Unknown (*record* from the group's history) | Made Private between 23 and 25 Sep (*record*) |
 | W3 | **`{NIP}@` accounts could sign in** | Their own client team (added by hand), any Public team, Viva Engage Communities | Whoever held those credentials | Account creation, by hand | Sign-in blocked: [tenant hardening T-1](tenant-hardening.md#t-1-block-sign-in-on-the-nip-client-addresses) |
-| W4 | **Content promotion** | A document moved into the site of whichever client's NIP it named, at that site's library root | Members of that client's Team, including the client's guest | Go-live (as W1) | The Phase-0 ingestion deploy (P0-1). Items already moved: IR-2. |
+| W4 | **Content promotion** | A document moved into the site of whichever client's NIP it named, at that site's library root | Members of that client's Team, including the client's guest | Go-live (as W1) | New moves: `ANTHROPIC_ENABLED=false` ([H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy)), then the Phase-0 ingestion deploy (P0-1). Items already moved: the client-site folder lock ([tenant hardening T-4b](tenant-hardening.md#t-4b-lock-the-ledger-folders-at-the-library-root-of-the-client-sites)), then IR-2 moves them. |
 | W5 | **Personal Tab IDOR** | The client name, ClientId and SharePoint URL of any user whose object id is known | Anyone on the internet with the URL | Manifest 0.1.5 and `/api/mydocs` (about 16 Jul) | The Phase-0 bot deploy (the page becomes static), manifest 0.2.0, and the Phase-0 ingestion deploy (`/api/user-target` deleted) |
 | W6 | **The upload register in App Insights** | File names, client titles, site paths, user ids | Anyone with read on the App Insights resource | First deploy | P0-9 logs ids only. Old lines age out after 30 days, except the copy IR-0 takes deliberately. |
 | W7 | **Bricore team Public** | Its `Dokumenty księgowe` channel | Any internal account | Unknown | [Tenant hardening T-6](tenant-hardening.md#t-6-the-bricore-team) |
@@ -119,7 +119,7 @@ item closes a named root cause. The human-run steps and their order are in
 | P0-8 | Ingestion accepts only the bot's app id; the single-document route is deleted. | R6 |
 | P0-9 | Logs carry ids only (after IR-0 has copied the old ones). | W6 |
 | Bindings | `tools/directory-bindings.mjs` writes each row's guest ids, channel folder, `DriveId` and `TeamId` from Graph, and removes staff ids from client rows. | R1, R4, R5 |
-| Tenant | `{NIP}@` sign-in blocked and mailboxes unlicensed; ledger folders on BCR GROUP locked to Owners; the Directory list locked and versioned; guest and sharing defaults tightened. | R2, W2, W3, W7 |
+| Tenant | `{NIP}@` sign-in blocked and mailboxes unlicensed; ledger folders on BCR GROUP locked to Owners (T-4); the same folders at the library root of every client site the ingestion identity could write to locked to Owners (T-4b); the Directory list locked and versioned; guest and sharing defaults tightened. | R2, W2, W3, W4 (items already moved), W7 |
 
 **Until the Phase-0 build is live, without a deploy** (mandatory, from the day IR-0 is stored):
 
@@ -325,8 +325,11 @@ an item in W1 or W4.
 
 ## IR-2: relocation
 
-Nothing moves before IR-0 is stored, IR-1 is complete for that site, and the quarantine site
-exists. Moves are done by staff, by hand, with a second person checking each one.
+Nothing moves before IR-0 is stored, IR-1 is complete for that site, that site's folders are
+locked ([T-4](tenant-hardening.md#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root) for
+BCR GROUP, [T-4b](tenant-hardening.md#t-4b-lock-the-ledger-folders-at-the-library-root-of-the-client-sites)
+for a client site), and the quarantine site exists. Moves are done by staff, by hand, with a
+second person checking each one.
 
 ### Who owns an item: the rules, in order
 
@@ -483,6 +486,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-3: `ANTHROPIC_ENABLED=false` (mandatory) | Yahor | todo | | |
 | BCR GROUP made Private (time from Purview) | — | done | *record* | T-3 |
 | H-4: tenant hardening T-1 … T-9 | per step | todo | | [`tenant-hardening.md`](tenant-hardening.md#status) |
+| T-4b: client-site root folders locked (end of W4 for items already moved) | SharePoint Admin | todo | | sites and lock times in [`tenant-hardening.md`](tenant-hardening.md#status) |
 | IR-1 inventory | Yahor | todo | | `SHA256SUMS` |
 | H-5, H-6: quarantine site and ingestion write grant | SharePoint Admin, Global Admin | todo | | |
 | H-6b: running build's fallback re-pointed at the quarantine | Yahor | todo | | `FALLBACK_*` names; values in the evidence store (`SHA256SUMS`) |

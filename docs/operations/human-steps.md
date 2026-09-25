@@ -74,7 +74,7 @@ Graph and SharePoint tokens are set up as described in
 | H-1 | GDPR: processor notice and breach register | Roman + IOD | by 26–28 Sep | — |
 | H-2 | IR-0: evidence export, stored immutably | Yahor, Global Admin, Roman | today | — |
 | H-3 | **Mandatory:** stop promotion with a setting | Yahor | as soon as H-2 is stored | H-2 |
-| H-4 | Tenant hardening T-1 to T-9 | per step | today–tomorrow | T-4, T-5 before H-12 |
+| H-4 | Tenant hardening T-1 to T-9, T-4b included | per step | today–tomorrow | T-4, T-4b, T-5 before H-12; T-4b before IR-2 |
 | H-5 | Quarantine site | SharePoint Admin | day 1 | — |
 | H-6 | Ingestion identity write grant on quarantine | Global Admin | day 1 | H-5 |
 | H-6b | Running build's fallback re-pointed at the quarantine | Yahor | day 1 | H-3, H-6 verified |
@@ -83,7 +83,7 @@ Graph and SharePoint tokens are set up as described in
 | H-9 | Bot deploy, gate in `log` | Yahor | day 1 | H-2, H-8 |
 | H-10 | Manifest 0.2.0 and availability | Teams Admin | day 1 | H-9 |
 | H-11 | Gate to `enforce` | Yahor | day 2 | 24 h of clean logs |
-| H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-6, H-6b, H-7, H-11, T-4, T-5 |
+| H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-6, H-6b, H-7, H-11, T-4, T-4b, T-5 |
 | H-13 | Ingestion grant on BCR GROUP to `read` | Global Admin | after H-12 | H-12 verified |
 | H-14 | `FALLBACK_*` settings removed | Yahor | ≥ 24 h after H-12 | H-12 verified |
 | H-15 | Exit criteria checked | Yahor, Roman | end of phase | all |
@@ -193,12 +193,15 @@ the Phase-0 build, which has no promotion, is live.
 ### H-4: Tenant hardening
 
 **Owner:** per step. **When:** today and tomorrow. Run T-1 to T-9 from
-[`tenant-hardening.md`](tenant-hardening.md). T-10 comes with H-10.
+[`tenant-hardening.md`](tenant-hardening.md), T-4b included. T-10 comes with H-10.
 
 These must be done before H-12:
 
 - **T-4** (lock the ledger folders at the BCR GROUP root), because IR-2 needs the fallback
   documents to stay put and unread until they are moved;
+- **T-4b** (lock the same folders at the library root of PESKOVOI, TEST and any site IR-1
+  lists), **today or tomorrow and before IR-2 starts**, for the same reason, and because there
+  the audience is another client's guest. It closes W4 for documents already promoted;
 - **T-5** (lock and version the Client Directory), because H-12 edits the rows, and versioning
   is the record of that edit.
 
@@ -599,7 +602,7 @@ These steps go in **one** window because each fixes a failure the others would c
 - H-6's grant is in place.
 - H-8's settings are present.
 - The gate is in `enforce` (H-11).
-- T-4 and T-5 are done.
+- T-4, T-4b and T-5 are done.
 - Every H-7 finding has a decision.
 
 **Emergency stop,** at any point: `az functionapp stop -g $RG -n $INGEST`. Nothing is filed
@@ -764,5 +767,6 @@ Bicep drift fix (gate G1), not here.
 | App-id pinning is live | `BOT_CALLER_APP_IDS` set; `ingestion.caller.rejected` appears for a token from any other app |
 | Every onboarded client's guest is bound, or quarantined with a known reason | H-7 and H-12 records in the incident's status table |
 | The IR-0 export is stored | H-2 verification |
+| The taxonomy folders at the library root of every client site the ingestion identity could write to are Owners-only | T-4b's status row lists every such site (PESKOVOI, TEST and each site IR-1 added); **Check permissions** for each client's guest returns *None* |
 | `CLAUDE.md` is updated | Merged with the promotion removal |
 | CI runs coverage, green | The CI run on `main` |

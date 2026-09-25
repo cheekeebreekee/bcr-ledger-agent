@@ -107,6 +107,10 @@ Zrobione (z datami):
   a zespół BCR GROUP jest ustawiony jako prywatny;
 - {{DATA}}: dostęp do folderów z dokumentami w bibliotece zespołu BCR GROUP ograniczyliśmy do
   kierownictwa BCR;
+- **[Wariant B]** {{DATA}}: wyłączyliśmy funkcję, która przypisywała dokumenty do klienta na
+  podstawie ich treści;
+- **[Wariant B]** {{DATA}}: ograniczyliśmy dostęp do folderów w przestrzeni innego klienta BCR,
+  w których zapisano Państwa dokument(y), tak że jego członkowie nie mogą ich już otworzyć;
 - {{DATA}}: zabezpieczyliśmy dzienniki zdarzeń w magazynie, którego zawartości nie można zmienić
   ani usunąć, z dostępem ograniczonym do kierownictwa BCR i inspektora ochrony danych;
 - {{DATA}}: wstrzymaliśmy automatyczne wdrażanie zmian w systemie.

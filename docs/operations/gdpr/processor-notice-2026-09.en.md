@@ -108,6 +108,10 @@ Done (with dates):
   is set to private;
 - {{DATE}}: we restricted access to the document folders in the BCR GROUP team library to BCR
   management;
+- **[Variant B]** {{DATE}}: we switched off the function that assigned documents to a client from
+  their content;
+- **[Variant B]** {{DATE}}: we restricted access to the folders in the other client's space where
+  your document(s) were stored, so that its members can no longer open them;
 - {{DATE}}: we secured the event logs in a store whose contents cannot be changed or deleted,
   readable only by BCR management and the data protection officer;
 - {{DATE}}: we stopped automatic deployment of changes to the system.
