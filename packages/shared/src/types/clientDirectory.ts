@@ -33,7 +33,12 @@ export interface ClientDirectoryEntry {
   readonly userAadObjectIds: readonly string[];
   /** Where documents for this client are filed. */
   readonly target: SharePointTarget;
-  /** Team (M365 group) id from the `TeamId` column, when recorded. Logged only. */
+  /**
+   * Team (M365 group) id from the `TeamId` column, when recorded. Written by
+   * the binding tool together with RootFolder and DriveId; a client row
+   * without it routes nobody (`unbound_target`), and two rows sharing it are a
+   * target conflict. Logged with the routing decision and `document.filed`.
+   */
   readonly teamId?: string;
   /**
    * True for BCR staff rows. A staff member's uploads are held in quarantine;
@@ -54,13 +59,19 @@ export interface ClientDirectoryEntry {
  *  - `staff`: the uploader is BCR staff (an `IsAdmin` row). Staff pick the
  *    client explicitly in a later phase; until then their uploads are held.
  *  - `conflict`: the uploader's id is on more than one row (two clients, or a
- *    client and an admin row), or their row shares a target with another row.
+ *    client and an admin row), or their row shares a site, DriveId or TeamId
+ *    with another row.
  *  - `stale_directory`: the Directory could not be read recently enough, or the
  *    row's drive no longer matches the drive id recorded for it.
  *  - `forbidden_target`: the row points at a site no client may be filed to
- *    (BCR GROUP, the quarantine itself, another SharePoint host).
+ *    (BCR GROUP, the quarantine itself, another SharePoint host, a path that
+ *    is not exactly `/sites|teams/<name>`), or its path resolved in Graph to
+ *    BCR GROUP's or the quarantine's site collection.
  *  - `target_unwritable`: the client's site could not be written (no grant,
  *    site or drive gone) after retries.
+ *  - `unbound_target`: the uploader's one row lacks RootFolder, DriveId or
+ *    TeamId — the binding tool, which writes all three together, has not
+ *    bound it — so it routes nobody.
  */
 export type QuarantineReason =
   | 'unmapped'
@@ -68,7 +79,8 @@ export type QuarantineReason =
   | 'conflict'
   | 'stale_directory'
   | 'forbidden_target'
-  | 'target_unwritable';
+  | 'target_unwritable'
+  | 'unbound_target';
 
 /** The uploader is bound to exactly one active client row. */
 export interface DirectoryClientResolution {
@@ -83,6 +95,8 @@ export interface DirectoryClientResolution {
   readonly matchedBy: 'userAadObjectId';
   /** Where to file the document. */
   readonly target: SharePointTarget;
+  /** The row's Team (M365 group) id. An id, so it may be logged. */
+  readonly teamId: string;
   /** The bound client's own NIP, used only to derive invoice direction. May be empty. */
   readonly nip: string;
   /** The bound client's name, used only to prime classification. May be empty. */

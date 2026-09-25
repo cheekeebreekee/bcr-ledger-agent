@@ -37,6 +37,7 @@ const clientA: DirectoryClientResolution = {
   title: '[0002] Client A',
   matchedBy: 'userAadObjectId',
   target: clientTarget,
+  teamId: 'team-0002',
   nip: '1111111111',
   companyName: 'Client A Sp. z o.o.',
 };

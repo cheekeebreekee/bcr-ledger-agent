@@ -6,11 +6,12 @@ import {
   isDocumentCategory,
   type Classification,
   type IngestionSource,
+  type Logger,
   type QuarantineReason,
   type ResolvedClient,
   type SharePointTarget,
 } from '@bcr/shared';
-import type { ClientDirectoryReader } from './clientDirectoryReader';
+import { isBoundRow, type ClientDirectoryReader } from './clientDirectoryReader';
 
 export interface ClientResolverOptions {
   /**
@@ -19,6 +20,8 @@ export interface ClientResolverOptions {
    * BCR GROUP.
    */
   readonly quarantineTarget: SharePointTarget;
+  /** Injected in tests; defaults to the `ingestion/clientResolver` logger. */
+  readonly log?: Logger;
 }
 
 /**
@@ -49,12 +52,14 @@ export interface PostClassificationResolution {
  *    the bound client (sales ⇄ purchase, from the client's own NIP).
  */
 export class ClientResolver {
-  private readonly log = createLogger('ingestion/clientResolver');
+  private readonly log: Logger;
 
   constructor(
     private readonly directory: ClientDirectoryReader,
     private readonly opts: ClientResolverOptions,
-  ) {}
+  ) {
+    this.log = opts.log ?? createLogger('ingestion/clientResolver');
+  }
 
   async resolve(source: IngestionSource): Promise<ResolvedClient> {
     const snapshot = await this.directory.getSnapshot();
@@ -68,12 +73,18 @@ export class ClientResolver {
     if (snapshot.conflictedUserIds.has(oid)) return this.quarantine('conflict');
     if (snapshot.forbiddenUserIds.has(oid)) return this.quarantine('forbidden_target');
     if (snapshot.staffUserIds.has(oid)) return this.quarantine('staff');
+    if (snapshot.unboundUserIds.has(oid)) return this.quarantine('unbound_target');
 
     const row = snapshot.byUserAadObjectId.get(oid);
     if (!row) return this.quarantine('unmapped');
+    // The snapshot never routes a row the binding tool has not bound; checked
+    // again where it is used. Such a row would file into the library root, and
+    // nobody checked that its guests are in this client's Team and no other.
+    const teamId = row.teamId;
+    if (!teamId || !isBoundRow(row)) return this.quarantine('unbound_target');
 
     this.log.info(
-      { clientId: row.clientId, listItemId: row.listItemId },
+      { clientId: row.clientId, listItemId: row.listItemId, teamId },
       'routed to client via userAadObjectId',
     );
     return {
@@ -83,6 +94,7 @@ export class ClientResolver {
       title: row.title,
       matchedBy: 'userAadObjectId',
       target: row.target,
+      teamId,
       nip: row.nip,
       companyName: row.companyNameAliases[0] ?? row.title,
     };
