@@ -174,8 +174,16 @@ version history, and the duplicate check failed open once three rows shared a ke
 - routing fields written by `tools/directory-bindings.mjs` from Graph, with a before/after log,
   not typed by hand.
 
+**Not covered in Phase 0: a binding goes stale.** The tool checks each guest's Team memberships
+when it runs; ingestion never re-checks them. A guest bound to client A and later added to client
+B's Team, for example because B's onboarding invited the same email, keeps routing everything
+into A's space, B's documents included, until the tool runs again and the whole plan is applied.
+A guest removed from A's Team keeps writing into A's folder until then. Meanwhile the whole plan
+is applied after every onboarding, never only the new row, and `check` runs at least weekly
+([admin guide](client-directory-admin-guide.md#keeping-the-bindings-current)).
+
 **Status: Partly mitigated in P0; Phase 2** replaces the list with a registry whose bindings
-cannot change without two approvals.
+cannot change without two approvals, and checks Team membership when a document arrives.
 
 ### T11. Key Vault readable at resource-group scope
 

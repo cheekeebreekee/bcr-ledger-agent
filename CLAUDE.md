@@ -167,6 +167,13 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
   `tools/lib/bindings.mjs` must agree exactly and share one edge-case table in their tests; change
   both or neither. `QUARANTINE_SITE_PATH` and `FORBIDDEN_TARGET_SITE_PATHS` must pass it at cold
   start.
+- **A guest binding is only as fresh as the last tool run.** Routing never checks Team
+  membership: a guest bound to client A and later added to client B's Team (B's onboarding
+  re-invited the same email) keeps routing everything, B's documents included, into A until
+  `tools/directory-bindings.mjs` runs again and the **whole** plan is applied. After any
+  onboarding, apply the whole plan, never `--only <new row>`, and run `check` at least weekly
+  (`docs/client-directory-admin-guide.md` → Keeping the bindings current). The runtime `memberOf`
+  check is Phase 2; until then, never describe or build a flow that binds only the new row.
 - **Nothing is written into BCR GROUP or the quarantine site as a client target, whatever a row
   says.** The path checks compare spellings; `SharePointService` also compares the *resolved*
   site-collection id with BCR GROUP's (from `CLIENT_DIRECTORY_SITE_ID`) and the quarantine site's
@@ -267,7 +274,7 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
 
 ## Azure / SharePoint facts that bite
 
-`PROJECT_OVERVIEW.md` → *Lessons learned* has the full list (19 items). The ones that affect code:
+`PROJECT_OVERVIEW.md` → *Lessons learned* has the full list (24 items). The ones that affect code:
 
 - **SharePoint drive names are locale-dependent** — Polish tenants use `Dokumenty`, not `Documents`.
   Always resolve via `GET /sites/{id}/drives`; per-client names come from the Directory's `DriveName`

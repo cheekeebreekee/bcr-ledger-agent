@@ -236,6 +236,14 @@ columns and the rules for maintaining them. What matters for routing:
 The routing fields are written by `tools/directory-bindings.mjs` from Graph, not typed by hand.
 `NIP` is used only to decide invoice direction inside the bound client.
 
+The tool binds a guest only if the row's Team is the only Team they belong to, but it checks that
+when it runs. Ingestion does not re-check Team membership at upload time, so a binding is only as
+current as the last applied plan: a guest later added to a second client's Team keeps routing to
+the first until the whole plan is applied again. The operating rule (apply the whole plan after
+every onboarding, `check` at least weekly) is in the admin guide's
+[Keeping the bindings current](./docs/client-directory-admin-guide.md#keeping-the-bindings-current).
+A membership check at upload time is Phase 2.
+
 **Canonical site path.** A `SitePath`, `QUARANTINE_SITE_PATH` and every
 `FORBIDDEN_TARGET_SITE_PATHS` entry are read the same way: trim the string, split it on `/`, and
 drop empty segments. The path is canonical only if exactly two segments remain: `sites` or `teams`

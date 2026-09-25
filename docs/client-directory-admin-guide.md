@@ -108,7 +108,7 @@ grant is read-only, and ingestion can never write to BCR GROUP again.
 | `DriveName` | Single line | Onboarding | The library name. `Dokumenty` on this Polish tenant. |
 | `RootFolder` | Single line | **The tool** | The channel folder's name, exactly as Graph returns it for the "Dokumenty księgowe" channel (`GET /teams/{id}/channels/{id}/filesFolder`). Documents then appear in the channel's files tab. **Required:** an empty `RootFolder` means the row is not bound, and it routes nobody (`unbound_target`). Before Phase 0, empty meant the library root, which is where the incident's documents went and where clients never look. |
 | `DriveId` | Single line | **The tool** | New, **required** (`unbound_target` without it). The id of the drive holding the channel folder. Ingestion checks that the path still resolves to this drive; if not, the upload goes to quarantine as `stale_directory`. This protects against a deleted Team whose site URL is later reused by a new Team. No two `Active` client rows may share it. |
-| `TeamId` | Single line | **The tool** | New, **required** (`unbound_target` without it). The client's Team id. No two `Active` client rows may share it. Logged as `teamId` when an upload is routed and filed, and used by the tools and audits. Routing does not check the uploader's Team membership against it; see [Onboarding a client](#onboarding-a-client-phase-0). |
+| `TeamId` | Single line | **The tool** | New, **required** (`unbound_target` without it). The client's Team id. No two `Active` client rows may share it. Logged as `teamId` when an upload is routed and filed, and used by the tools and audits. Routing does not check the uploader's Team membership against it; see [Keeping the bindings current](#keeping-the-bindings-current). |
 | `IsAdmin` | Yes/No | By hand | `Yes` only on the staff row. See [Staff](#staff). |
 | `Status` | `Active` / `Inactive` | By hand | Only `Active` rows route. |
 | `TeamsChannelId` | Single line | Onboarding | Written by onboarding, read by nothing. Channel uploads never reach a bot, so channels do not route. |
@@ -171,12 +171,23 @@ but slow, so bind soon after onboarding:
    does not count; record it for deletion. The runbook is not a check: when it finds no grant it
    creates one, so never run it against BCR GROUP or any other forbidden site.
 2. `node tools/directory-bindings.mjs check`, with the variables from
-   [human-steps H-7](operations/human-steps.md#h-7-check-the-directory-before-the-deploy-and-add-the-new-columns):
-   review what it reports for the row.
+   [human-steps H-7](operations/human-steps.md#h-7-check-the-directory-before-the-deploy-and-add-the-new-columns).
+   `FORBIDDEN_TARGET_SITE_PATHS` is required. Set `QUARANTINE_SITE_PATH` and
+   `QUARANTINE_SITE_HOSTNAME` as on the ingestion app too, so the tool skips exactly the rows
+   ingestion excludes. Review what it reports for **every** row, not only the new one: if the new
+   client's contact person was already a guest of another client, that other row now reports
+   them as `guest_in_other_team`.
 3. `node tools/directory-bindings.mjs propose --write-verified <that site's path>`: read the
-   proposed `UserAadObjectIds`, `RootFolder`, `DriveId` and `TeamId`.
-4. A second person reviews the proposal. Then apply it (`--help` gives the command). The tool
-   prints the row before and after, and writes a rollback log.
+   proposed `UserAadObjectIds`, `RootFolder`, `DriveId` and `TeamId` for the new row, **and every
+   other PATCH in the plan**. After an onboarding, the plan can also take ids off other rows,
+   typically a guest the new client shares with an existing one.
+4. A second person reviews the whole plan. Then apply **the whole plan**, first as a dry run and
+   then with `--apply` (`--help` gives the full command):
+   `node tools/directory-bindings.mjs apply --plan <plan.json> --health-url https://<ingestion-host>/api/health`.
+   **Never `--only <the new row>` after an onboarding.** `--only` binds the new row and leaves the
+   plan's other PATCHes unapplied, so a guest now in two Teams keeps routing everything, the new
+   client's documents included, into the first client's space. The tool re-reads each guest
+   before writing, prints every row before and after, and writes a rollback log.
 5. **Canary:** a synthetic document, never a real one, uploaded by an identity bound to that
    client, lands in the client's `Dokumenty księgowe` channel folder. Then delete the canary
    file.
@@ -186,6 +197,33 @@ but slow, so bind soon after onboarding:
    ([tenant-hardening T-10](operations/tenant-hardening.md#t-10-teams-app-availability-for-the-bot)).
    If availability is ever restricted to groups, add the guest to that group first; nothing
    does it automatically.
+
+## Keeping the bindings current
+
+Routing reads only the Directory. Nothing checks, when a document arrives, that the uploader is
+still a guest of that row's Team and of no other Team. The tool checks that when it runs, so a
+binding is only as current as the last applied plan:
+
+- **A guest bound to client A who is later added to client B's Team** keeps routing everything
+  into A's channel folder, B's documents included, and nothing raises a conflict. This happens on
+  an ordinary business event: one person runs two client companies, and B's onboarding invites
+  the same email, which returns the same guest. Only a new `propose` and an apply of the whole
+  plan take that guest off A's row; from then on their uploads go to quarantine.
+- **A guest removed from A's Team** keeps writing into A's folder until the tool runs again.
+
+So:
+
+1. After **any** onboarding, run `check` and `propose`, and apply the whole plan (steps 2 to 4
+   above), even when the new client's own row is not ready to bind yet.
+2. Run `check` at least **weekly**, and at once after an onboarding whose contact person was
+   already a guest in the tenant. A guest in two Teams is excluded by the next plan and
+   quarantined; nothing is filed on a guess.
+3. When `check` reports `guest_in_other_team` on a bound row, run `propose` and apply the whole
+   plan the same day.
+
+The robust fix, a Team-membership check at upload time (or a registry that keeps memberships in
+sync), is Phase 2. Onboarding writing the new guest's id onto the new row, which would make a
+shared guest a Directory conflict at once, waits on Roman's re-ruling of Q21.
 
 ## Staff
 
@@ -199,8 +237,8 @@ Until the full implementation is done, staff do not upload through the bot at al
 
 ## Changing a client
 
-- **A guest joins or leaves the client's Team:** run the tool again (`check`, `propose`, apply).
-  Do not edit `UserAadObjectIds` by hand.
+- **A guest joins or leaves the client's Team:** run the tool again (`check`, `propose`, apply
+  the whole plan). Do not edit `UserAadObjectIds` by hand.
 - **The company is renamed:** add a line to `CompanyNameAliases`, keeping the old ones.
 - **The NIP changes:** update `NIP`. It only affects invoice direction for future uploads.
 - **The client's Team, site or drive changes:** this is a rebind, not an edit. Two people agree

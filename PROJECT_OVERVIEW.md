@@ -539,3 +539,13 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
 23. **`Sites.Selected` is not a single-site scope.** It is an allow-list of per-site grants. An
     identity that files for many clients holds write on all of their sites. Design as if the
     ingestion identity can reach every client, because it can (`docs/security.md` T3).
+
+24. **A guest binding is checked when the tool runs, never at upload.** Routing reads only the
+    Directory. When an onboarding invites someone who is already a guest of another client (one
+    owner, two companies), Entra returns the same user, onboarding adds them to the new Team, and
+    their existing row keeps routing everything, the new company's documents included, into the
+    first client's space. Only a fresh `directory-bindings.mjs propose` and an apply of the whole
+    plan take them off it. After every onboarding, apply the whole plan, never `--only` the new
+    row, and run `check` at least weekly
+    ([admin guide](docs/client-directory-admin-guide.md#keeping-the-bindings-current)). Phase 2
+    checks membership at upload time.
