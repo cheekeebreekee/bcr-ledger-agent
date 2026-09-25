@@ -16,20 +16,57 @@
 
 set -euo pipefail
 
-ENV_NAME="${1:?missing environment (dev|qa|prod)}"
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Lower-cased before any use: resource-group names are case-insensitive in
+# Azure, and on the default case-insensitive macOS file system "Dev" opens
+# main.dev.parameters.json, so "Dev" is dev.
+ENV_NAME="$(lower "${1:?missing environment (dev|qa|prod)}")"
+if [[ ! "$ENV_NAME" =~ ^[a-z0-9-]+$ ]]; then
+  echo "Refusing: '$1' is not an environment name (dev|qa|prod)." >&2
+  exit 1
+fi
 RG="${2:-rg-bcr-ledger-${ENV_NAME}}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PARAMS="$ROOT/infrastructure/main.${ENV_NAME}.parameters.json"
+if [[ ! -f "$PARAMS" ]]; then
+  echo "Refusing: no parameter file infrastructure/main.${ENV_NAME}.parameters.json." >&2
+  exit 1
+fi
+PARAM_ENV="$(lower "$(jq -r '.parameters.environmentName.value // empty' "$PARAMS")")"
 
 # "dev" is production (it serves a real client), and main.bicep has drifted
 # from its hand-set app settings: this deploy would replace them all and
 # ingestion would fail at cold start. Until the drift fix (gate G1), deploy
-# dev as code-only zips (docs/operations/human-steps.md).
-if [[ "$ENV_NAME" == "dev" && "${ALLOW_DEV_BICEP:-}" != "i-have-fixed-the-drift" ]]; then
+# dev as code-only zips (docs/operations/human-steps.md). Dev is recognised by
+# the environment name, by its resource group (an explicit second argument
+# too) and by the parameter file's environmentName, all case-insensitively.
+if [[ "${ALLOW_DEV_BICEP:-}" != "i-have-fixed-the-drift" ]] &&
+  [[ "$ENV_NAME" == "dev" || "$(lower "$RG")" == "rg-bcr-ledger-dev" || "$PARAM_ENV" == "dev" ]]; then
   echo "Refusing: dev is production and main.bicep has drifted (gate G1)." >&2
   echo "Deploy code-only zips as in docs/operations/human-steps.md." >&2
   exit 1
 fi
 LOCATION="${AZURE_LOCATION:-westeurope}"
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Build and package before touching Azure: a failed package stops here, with
+# no infrastructure changed and no zip left at artifacts/ (the package script
+# deletes the old one first).
+echo "==> Installing dependencies (yarn.lock, immutable)"
+(cd "$ROOT" && corepack yarn install --immutable)
+
+echo "==> Packaging teams-bot (clean build, lockfile dependencies)"
+(cd "$ROOT" && corepack yarn workspace @bcr/teams-bot package)
+
+echo "==> Packaging document-ingestion (clean build, lockfile dependencies)"
+(cd "$ROOT" && corepack yarn workspace @bcr/document-ingestion package)
+
+for pkg in teams-bot document-ingestion; do
+  if [[ ! -s "$ROOT/artifacts/$pkg.zip" ]]; then
+    echo "Refusing: artifacts/$pkg.zip was not built." >&2
+    exit 1
+  fi
+done
 
 echo "==> Ensuring resource group $RG exists in $LOCATION"
 az group create --name "$RG" --location "$LOCATION" --output none
@@ -39,7 +76,7 @@ DEPLOY_OUT=$(az deployment group create \
   --resource-group "$RG" \
   --name "bcr-ledger-${ENV_NAME}-$(date +%Y%m%d-%H%M%S)" \
   --template-file "$ROOT/infrastructure/main.bicep" \
-  --parameters "@$ROOT/infrastructure/main.${ENV_NAME}.parameters.json" \
+  --parameters "@$PARAMS" \
   --output json)
 
 BOT_FUNC=$(echo "$DEPLOY_OUT" | jq -r '.properties.outputs.botFunctionName.value')
@@ -47,15 +84,6 @@ INGEST_FUNC=$(echo "$DEPLOY_OUT" | jq -r '.properties.outputs.ingestionFunctionN
 
 echo "==> Bot function:      $BOT_FUNC"
 echo "==> Ingestion function: $INGEST_FUNC"
-
-echo "==> Building all packages"
-(cd "$ROOT" && yarn install --immutable && yarn build)
-
-echo "==> Packaging teams-bot"
-(cd "$ROOT" && yarn workspace @bcr/teams-bot package)
-
-echo "==> Packaging document-ingestion"
-(cd "$ROOT" && yarn workspace @bcr/document-ingestion package)
 
 echo "==> Deploying teams-bot code"
 az functionapp deployment source config-zip \
