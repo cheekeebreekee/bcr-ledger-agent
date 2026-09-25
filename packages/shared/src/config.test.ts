@@ -102,7 +102,7 @@ describe('ingestionConfigSchema', () => {
     AZURE_TENANT_ID: validUuid,
     INGESTION_APP_ID: validUuid,
     EXPECTED_AUDIENCE: 'api://ingestion-app',
-    CLIENT_DIRECTORY_SITE_ID: 'contoso.sharepoint.com,site-guid,web-guid',
+    CLIENT_DIRECTORY_SITE_ID: `contoso.sharepoint.com,${validListUuid},${validUuid}`,
     CLIENT_DIRECTORY_LIST_ID: validListUuid,
     BOT_CALLER_APP_IDS: validUuid,
     QUARANTINE_SITE_HOSTNAME: 'contoso.sharepoint.com',
@@ -162,13 +162,75 @@ describe('ingestionConfigSchema', () => {
     ).toThrow(/ANTHROPIC_CONFIDENCE_THRESHOLD/);
   });
 
-  it('rejects a quarantine site path that does not start with /', () => {
+  it.each([
+    'https://contoso.sharepoint.com/sites/BCRLedgerKwarantanna',
+    '/sites/BCRLedgerKwarantanna/sub',
+    '/sites/x/../BCRLedgerKwarantanna',
+    '/sites/BCRLedgerKwarantanna.',
+    '/sites',
+  ])('rejects the quarantine site path %j', (path) => {
     expect(() =>
-      loadConfig(ingestionConfigSchema, ingestionEnvMap, {
-        ...baseEnv,
-        QUARANTINE_SITE_PATH: 'sites/BCR',
-      }),
+      loadConfig(ingestionConfigSchema, ingestionEnvMap, { ...baseEnv, QUARANTINE_SITE_PATH: path }),
     ).toThrow(/QUARANTINE_SITE_PATH/);
+  });
+
+  it('stores the quarantine site path in its canonical spelling', () => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      QUARANTINE_SITE_PATH: ' sites//BCRLedgerKwarantanna/ ',
+    });
+    expect(cfg.quarantineSitePath).toBe('/sites/BCRLedgerKwarantanna');
+  });
+
+  // A value that starts but guards nothing is worse than one that fails:
+  // these would read the Directory, then never match a resolved site.
+  it.each([
+    ['the path form', 'contoso.sharepoint.com:/sites/BCRGROUP:'],
+    ['a two-part id', `contoso.sharepoint.com,${validUuid}`],
+    ['placeholder GUIDs', 'contoso.sharepoint.com,site-guid,web-guid'],
+    ['a bare GUID', validUuid],
+  ])('rejects CLIENT_DIRECTORY_SITE_ID in %s', (_label, value) => {
+    expect(() =>
+      loadConfig(ingestionConfigSchema, ingestionEnvMap, { ...baseEnv, CLIENT_DIRECTORY_SITE_ID: value }),
+    ).toThrow(/CLIENT_DIRECTORY_SITE_ID/);
+  });
+
+  it('accepts a three-part CLIENT_DIRECTORY_SITE_ID in any case, trimmed', () => {
+    const id = `Contoso.SharePoint.com,${validListUuid.toUpperCase()},${validUuid}`;
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      CLIENT_DIRECTORY_SITE_ID: ` ${id} `,
+    });
+    expect(cfg.clientDirectorySiteId).toBe(id);
+  });
+
+  it.each([
+    '@Microsoft.KeyVault(SecretUri=https://kv.vault.azure.net/secrets/x)',
+    `"${validUuid}"`,
+    `${validUuid},not-an-app-id`,
+  ])('rejects the BOT_CALLER_APP_IDS value %j', (value) => {
+    expect(() =>
+      loadConfig(ingestionConfigSchema, ingestionEnvMap, { ...baseEnv, BOT_CALLER_APP_IDS: value }),
+    ).toThrow(/BOT_CALLER_APP_IDS/);
+  });
+
+  it('accepts several caller app ids', () => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      BOT_CALLER_APP_IDS: `${validUuid}, ${validListUuid.toUpperCase()}`,
+    });
+    expect(cfg.botCallerAppIds).toEqual([validUuid, validListUuid.toUpperCase()]);
+  });
+
+  it.each([
+    'https://contoso.sharepoint.com',
+    'contoso.sharepoint.com/sites/x',
+    'contoso.example.com',
+    'contoso',
+  ])('rejects the QUARANTINE_SITE_HOSTNAME %j', (value) => {
+    expect(() =>
+      loadConfig(ingestionConfigSchema, ingestionEnvMap, { ...baseEnv, QUARANTINE_SITE_HOSTNAME: value }),
+    ).toThrow(/QUARANTINE_SITE_HOSTNAME/);
   });
 
   it.each([
@@ -185,8 +247,11 @@ describe('ingestionConfigSchema', () => {
 
   it.each([
     'https://contoso.sharepoint.com/sites/BCRGROUP',
-    'sites/BCRGROUP',
     '/sites/BCRGROUP/Shared Documents',
+    '/sites/BCRGROUP/sub',
+    '/sites/BCRGROUP.',
+    '/sites/%42CRGROUP',
+    '/sites/./BCRGROUP',
     '/personal/someone',
   ])('rejects the FORBIDDEN_TARGET_SITE_PATHS entry %j, which would never match a row', (entry) => {
     expect(() =>
@@ -197,12 +262,16 @@ describe('ingestionConfigSchema', () => {
     ).toThrow(/FORBIDDEN_TARGET_SITE_PATHS/);
   });
 
-  it('accepts /sites and /teams paths, with or without a trailing slash', () => {
+  it('accepts /sites and /teams paths in any spelling C1 allows, stored canonical', () => {
     const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
       ...baseEnv,
-      FORBIDDEN_TARGET_SITE_PATHS: '/sites/BCRGROUP/, /teams/Other',
+      FORBIDDEN_TARGET_SITE_PATHS: '/sites/BCRGROUP/, /teams/Other, sites//BCRGROUPSp.zo.o',
     });
-    expect(cfg.forbiddenTargetSitePaths).toEqual(['/sites/BCRGROUP/', '/teams/Other']);
+    expect(cfg.forbiddenTargetSitePaths).toEqual([
+      '/sites/BCRGROUP',
+      '/teams/Other',
+      '/sites/BCRGROUPSp.zo.o',
+    ]);
   });
 
   it('uses the default for an optional setting left empty or blank in app settings', () => {

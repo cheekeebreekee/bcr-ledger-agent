@@ -1,5 +1,10 @@
 import type { Client } from '@microsoft/microsoft-graph-client';
-import { createLogger, type ClientDirectoryEntry, type SharePointTarget } from '@bcr/shared';
+import {
+  canonicalSitePath,
+  createLogger,
+  type ClientDirectoryEntry,
+  type SharePointTarget,
+} from '@bcr/shared';
 
 export interface ClientDirectoryReaderOptions {
   /** Graph site id where the Client Directory list lives. */
@@ -15,7 +20,7 @@ export interface ClientDirectoryReaderOptions {
   readonly maxStaleMs: number;
   /**
    * Site paths no row may route to (BCR GROUP, the quarantine site). Compared
-   * case-insensitively, ignoring a trailing slash.
+   * case-insensitively in their canonical spelling (`canonicalSitePath`).
    */
   readonly forbiddenSitePaths: readonly string[];
   /**
@@ -33,8 +38,17 @@ export interface ClientDirectoryReaderOptions {
  * Why a row takes no part in routing. Rows are excluded, never "fixed up":
  * a row that cannot be trusted routes nobody, and those users' uploads go to
  * quarantine where a person decides.
+ *
+ *  - `forbidden_target`: another host, a forbidden site, or a site path that
+ *    is not exactly `/sites|teams/<name>`.
+ *  - `target_conflict`: another active client row names the same site, the
+ *    same DriveId or the same TeamId.
+ *  - `unbound_target`: the row lacks RootFolder, DriveId or TeamId, so the
+ *    binding tool (`tools/directory-bindings.mjs apply`, which writes all three
+ *    together) has not bound it. Such a row would file into the library root,
+ *    or route a guest the tool never checked.
  */
-export type ExcludedRowReason = 'forbidden_target' | 'target_conflict';
+export type ExcludedRowReason = 'forbidden_target' | 'target_conflict' | 'unbound_target';
 
 /**
  * Immutable in-memory snapshot of the Client Directory.
@@ -62,6 +76,11 @@ export interface ClientDirectorySnapshot {
    * users are quarantined as `forbidden_target`.
    */
   readonly forbiddenUserIds: ReadonlySet<string>;
+  /**
+   * AAD object ids whose one row the binding tool has not bound (no RootFolder,
+   * DriveId or TeamId). These users are quarantined as `unbound_target`.
+   */
+  readonly unboundUserIds: ReadonlySet<string>;
   /** List item id → why that row routes nobody. */
   readonly excludedRows: ReadonlyMap<string, ExcludedRowReason>;
   /**
@@ -192,11 +211,16 @@ export class ClientDirectoryReader {
         this.log.warn({ event: 'directory.conflict', kind, listItemIds }, 'directory.conflict'),
     });
     this.snapshot = snapshot;
+    const excludedByReason: Partial<Record<ExcludedRowReason, number>> = {};
+    for (const reason of snapshot.excludedRows.values()) {
+      excludedByReason[reason] = (excludedByReason[reason] ?? 0) + 1;
+    }
     this.log.info(
       {
         entryCount: entries.length,
         routableUserCount: snapshot.byUserAadObjectId.size,
         excludedRowCount: snapshot.excludedRows.size,
+        excludedByReason,
       },
       'directory snapshot ready',
     );
@@ -291,22 +315,6 @@ export function normalizeAadId(input: string): string {
 }
 
 /**
- * The one canonical spelling of a SharePoint site path, or `null` when the
- * path cannot be trusted. Graph and the HTTP layer drop empty segments and
- * resolve `.`/`..`, so `/sites//X`, `/sites/./X` and `/sites/y/../X` all reach
- * site X — a check that compared spellings let such a row through to BCR
- * GROUP. Anything with a dot segment, or not under `/sites/` or `/teams/`, is
- * refused outright.
- */
-export function canonicalSitePath(p: string): string | null {
-  const segments = p.trim().split('/').filter(Boolean);
-  if (segments.length < 2) return null;
-  if (segments.some((s) => s === '.' || s === '..')) return null;
-  if (!/^(sites|teams)$/i.test(segments[0] ?? '')) return null;
-  return `/${segments.join('/')}`;
-}
-
-/**
  * The key two rows are compared on for a target conflict: the site itself.
  * One Team site belongs to one client, so two rows on the same site conflict
  * whatever drive or folder each names — a per-folder key let a second client
@@ -315,6 +323,30 @@ export function canonicalSitePath(p: string): string | null {
 export function siteKey(t: SharePointTarget): string | null {
   const path = canonicalSitePath(t.sitePath);
   return path ? `${t.siteHostname.trim().toLowerCase()}${path.toLowerCase()}` : null;
+}
+
+/**
+ * Every key a client row claims a place by: its site, and — whatever the
+ * site's spelling — the drive and the Team it was bound to. Two rows sharing
+ * any one of them are a target conflict.
+ */
+function targetKeys(e: ClientDirectoryEntry, site: string): string[] {
+  const driveId = e.target.expectedDriveId?.trim().toLowerCase();
+  const teamId = e.teamId?.trim().toLowerCase();
+  return [
+    `site|${site}`,
+    ...(driveId ? [`drive|${driveId}`] : []),
+    ...(teamId ? [`team|${teamId}`] : []),
+  ];
+}
+
+/**
+ * True when the binding tool has bound the row: it records RootFolder,
+ * DriveId and TeamId together, so a row missing any one of them was not
+ * bound by it (or was edited by hand since) and routes nobody.
+ */
+export function isBoundRow(e: ClientDirectoryEntry): boolean {
+  return Boolean(e.target.rootFolder && e.target.expectedDriveId && e.teamId);
 }
 
 export interface BuildSnapshotOptions {
@@ -332,13 +364,16 @@ export type ConflictKind = 'userAadObjectId' | 'target' | 'nip' | 'clientId';
  * Rules:
  *  - A row pointing at a forbidden site, another host, or a site path that is
  *    not canonical is excluded (`forbidden_target`).
- *  - Rows on the same site are all excluded (`target_conflict`), whatever
- *    drive or folder each names: two clients in one library is a leak by
- *    construction.
+ *  - Rows on the same site, or with the same DriveId or TeamId, are all
+ *    excluded (`target_conflict`), whatever drive or folder each names: two
+ *    clients in one library is a leak by construction, and the ids catch it
+ *    whatever the path's spelling.
+ *  - Any other client row the binding tool has not bound (no RootFolder,
+ *    DriveId or TeamId) is excluded (`unbound_target`).
  *  - A user id on exactly one row routes: to that row if it is a client row,
  *    to "staff" if it is an admin row. On two or more rows — two clients, or
  *    a client and an admin row — it routes nowhere (`conflict`). A user id on
- *    an excluded client row is a conflict too.
+ *    a row excluded for a target conflict is a conflict too.
  *  - A NIP or ClientId shared by rows only raises an alert: neither routes
  *    anything any more, and excluding a real client over a test row sharing
  *    its NIP would quarantine a live client for no safety gain.
@@ -370,7 +405,7 @@ export function buildSnapshot(
       if (host !== allowedHost || !path || !key || forbidden.has(path)) {
         excludedRows.set(e.listItemId, 'forbidden_target');
       } else {
-        push(rowsByTarget, key, e.listItemId);
+        for (const k of targetKeys(e, key)) push(rowsByTarget, k, e.listItemId);
       }
       if (e.nip) push(rowsByNip, e.nip, e.listItemId);
     }
@@ -380,10 +415,21 @@ export function buildSnapshot(
     }
   }
 
+  const reportedTargetConflicts = new Set<string>();
   for (const ids of rowsByTarget.values()) {
     if (ids.length > 1) {
       for (const id of ids) excludedRows.set(id, 'target_conflict');
-      opts.onConflict?.('target', ids);
+      // Rows sharing a site and a drive are one conflict, reported once.
+      const report = JSON.stringify(ids);
+      if (!reportedTargetConflicts.has(report)) {
+        reportedTargetConflicts.add(report);
+        opts.onConflict?.('target', ids);
+      }
+    }
+  }
+  for (const e of entries) {
+    if (!e.isAdmin && !excludedRows.has(e.listItemId) && !isBoundRow(e)) {
+      excludedRows.set(e.listItemId, 'unbound_target');
     }
   }
   for (const ids of rowsByNip.values()) {
@@ -398,6 +444,7 @@ export function buildSnapshot(
   const staffUserIds = new Set<string>();
   const conflictedUserIds = new Set<string>();
   const forbiddenUserIds = new Set<string>();
+  const unboundUserIds = new Set<string>();
 
   for (const [oid, rows] of rowsByUser) {
     if (rows.length > 1) {
@@ -410,11 +457,14 @@ export function buildSnapshot(
     }
     const [row] = rows;
     if (!row) continue;
+    const excluded = excludedRows.get(row.listItemId);
     if (row.isAdmin) {
       staffUserIds.add(oid);
-    } else if (excludedRows.get(row.listItemId) === 'forbidden_target') {
+    } else if (excluded === 'forbidden_target') {
       forbiddenUserIds.add(oid);
-    } else if (excludedRows.has(row.listItemId)) {
+    } else if (excluded === 'unbound_target') {
+      unboundUserIds.add(oid);
+    } else if (excluded) {
       conflictedUserIds.add(oid);
     } else {
       byUserAadObjectId.set(oid, row);
@@ -427,6 +477,7 @@ export function buildSnapshot(
     staffUserIds,
     conflictedUserIds,
     forbiddenUserIds,
+    unboundUserIds,
     excludedRows,
     health: 'fresh',
     fetchedAt,
@@ -440,6 +491,7 @@ function unavailableSnapshot(fetchedAt: number): ClientDirectorySnapshot {
     staffUserIds: new Set(),
     conflictedUserIds: new Set(),
     forbiddenUserIds: new Set(),
+    unboundUserIds: new Set(),
     excludedRows: new Map(),
     health: 'unavailable',
     fetchedAt,

@@ -16,15 +16,42 @@ import {
 import type { ClientResolver } from './clientResolver';
 import { SharePointTargetError, type SharePointService } from './sharePointService';
 
+/**
+ * How long a batch may run before the documents not yet started are handed
+ * back for a retry. Below the ~230 s the Functions front end allows an HTTP
+ * request, so the bot gets an answer for every document instead of a 5xx
+ * while the invocation goes on filing behind it (and a resend duplicates).
+ */
+export const BATCH_DEADLINE_MS = 150_000;
+
+/** The code of a document returned unprocessed because the batch ran out of time. */
+export const RETRY_LATER = 'RetryLater';
+
+/** Where documents are written, as a narrow interface so tests can supply fakes. */
+export interface SharePointFactoryLike {
+  forTarget(
+    target: SharePointTarget,
+  ): Pick<SharePointService, 'uploadDocument' | 'setListItemFields'>;
+}
+
 /** The collaborators, as narrow interfaces so tests can supply fakes. */
 export interface BatchIngestorDeps {
   readonly resolver: Pick<ClientResolver, 'resolve' | 'resolvePostClassification' | 'quarantine'>;
   readonly classification: { classify(ctx: ClassifierContext): Promise<Classification> };
-  readonly sharePointFactory: {
-    forTarget(target: SharePointTarget): Pick<SharePointService, 'uploadDocument' | 'setListItemFields'>;
-  };
+  /**
+   * For client targets. Refuses a target that resolves to BCR GROUP or to
+   * the quarantine site (`forbidden_site`).
+   */
+  readonly clientSharePointFactory: SharePointFactoryLike;
+  /**
+   * For the quarantine target only. It must not share the client factory's
+   * guard, which would refuse the quarantine site itself.
+   */
+  readonly quarantineSharePointFactory: SharePointFactoryLike;
   readonly now?: () => Date;
   readonly newId?: () => string;
+  /** Defaults to {@link BATCH_DEADLINE_MS}. */
+  readonly batchDeadlineMs?: number;
 }
 
 /**
@@ -39,21 +66,25 @@ export interface BatchIngestorDeps {
  *    response for them carries no link, folder or name.
  *
  * A failure on one document is captured as that document's row, so a bad file
- * never blocks the rest.
+ * never blocks the rest. A document not started within the batch deadline is
+ * returned `rejected` with {@link RETRY_LATER}, never filed late.
  */
 export class BatchIngestor {
   private readonly now: () => Date;
   private readonly newId: () => string;
+  private readonly deadlineMs: number;
 
   constructor(private readonly deps: BatchIngestorDeps) {
     this.now = deps.now ?? (() => new Date());
     this.newId = deps.newId ?? randomUUID;
+    this.deadlineMs = deps.batchDeadlineMs ?? BATCH_DEADLINE_MS;
   }
 
   async ingestBatch(
     payload: IngestionBatchRequestPayload,
     log: Logger,
   ): Promise<IngestionBatchItemResult[]> {
+    const startedAt = this.now().getTime();
     const resolved = await this.deps.resolver.resolve(payload.source);
     const batch: BatchContext = {
       batchId: this.newId(),
@@ -62,14 +93,39 @@ export class BatchIngestor {
     };
     log.info(
       resolved.source === 'directory'
-        ? { resolution: 'directory', clientId: resolved.clientId, listItemId: resolved.listItemId }
+        ? {
+            resolution: 'directory',
+            clientId: resolved.clientId,
+            listItemId: resolved.listItemId,
+            teamId: resolved.teamId,
+          }
         : { resolution: 'quarantine', quarantineReason: resolved.reason },
       'client resolved',
     );
 
     const results: IngestionBatchItemResult[] = [];
+    let notStarted = 0;
     for (const document of payload.documents) {
+      if (this.now().getTime() - startedAt >= this.deadlineMs) {
+        notStarted += 1;
+        results.push({
+          filename: document.filename,
+          status: 'rejected',
+          error: { code: RETRY_LATER, message: rejectionMessage(RETRY_LATER) },
+        });
+        continue;
+      }
       results.push(await this.ingestOne(document, resolved, batch));
+    }
+    if (notStarted > 0) {
+      log.warn(
+        {
+          event: 'batch.deadline_exceeded',
+          notStartedCount: notStarted,
+          documentCount: payload.documents.length,
+        },
+        'batch.deadline_exceeded',
+      );
     }
     return results;
   }
@@ -86,7 +142,14 @@ export class BatchIngestor {
       docLog.info({ sizeBytes: content.length }, 'document received');
 
       if (resolved.source === 'quarantine') {
-        return await this.quarantineOne(document, content, resolved.reason, documentId, batch, docLog);
+        return await this.quarantineOne(
+          document,
+          content,
+          resolved.reason,
+          documentId,
+          batch,
+          docLog,
+        );
       }
       try {
         return await this.fileForClient(document, content, resolved, documentId, docLog);
@@ -94,12 +157,16 @@ export class BatchIngestor {
         // A client whose space can't be written must not lose the document,
         // and must not have it written anywhere else. Hold it for staff.
         if (err instanceof SharePointTargetError || isSharePointFailure(err)) {
-          const reason: QuarantineReason =
-            err instanceof SharePointTargetError && err.kind === 'drive_mismatch'
-              ? 'stale_directory'
-              : 'target_unwritable';
+          const kind = err instanceof SharePointTargetError ? err.kind : undefined;
+          const reason = quarantineReasonFor(kind);
           docLog.warn(
-            { clientId: resolved.clientId, listItemId: resolved.listItemId, quarantineReason: reason },
+            {
+              clientId: resolved.clientId,
+              listItemId: resolved.listItemId,
+              teamId: resolved.teamId,
+              quarantineReason: reason,
+              ...(kind ? { targetErrorKind: kind } : {}),
+            },
             'client target unusable — holding document in quarantine',
           );
           return await this.quarantineOne(document, content, reason, documentId, batch, docLog);
@@ -137,7 +204,7 @@ export class BatchIngestor {
     const post = this.deps.resolver.resolvePostClassification(client, classified);
     const category = String(post.classification.fields.category ?? '');
 
-    const item = await this.deps.sharePointFactory.forTarget(client.target).uploadDocument({
+    const item = await this.deps.clientSharePointFactory.forTarget(client.target).uploadDocument({
       folderPath: post.classification.folderPath,
       filename: document.filename,
       contentType: document.contentType,
@@ -149,6 +216,7 @@ export class BatchIngestor {
         documentId,
         clientId: client.clientId,
         listItemId: client.listItemId,
+        teamId: client.teamId,
         category,
         driveItemId: item.id,
         ...(post.directionCorrection ? { directionCorrection: post.directionCorrection } : {}),
@@ -190,7 +258,7 @@ export class BatchIngestor {
       batch.batchId,
     ].join('/');
 
-    const sharePoint = this.deps.sharePointFactory.forTarget(target);
+    const sharePoint = this.deps.quarantineSharePointFactory.forTarget(target);
     let item;
     try {
       item = await sharePoint.uploadDocument({
@@ -236,6 +304,23 @@ interface BatchContext {
   readonly log: Logger;
 }
 
+/**
+ * Why a client document is held when its target fails. A resolved site that
+ * is BCR GROUP or the quarantine is an incident indicator, kept apart from a
+ * missing grant; a drive that no longer matches the row means the Directory
+ * is out of date.
+ */
+function quarantineReasonFor(kind: SharePointTargetError['kind'] | undefined): QuarantineReason {
+  switch (kind) {
+    case 'forbidden_site':
+      return 'forbidden_target';
+    case 'drive_mismatch':
+      return 'stale_directory';
+    default:
+      return 'target_unwritable';
+  }
+}
+
 function isSharePointFailure(err: unknown): boolean {
   return err instanceof LedgerAgentError && err.code === 'SharePointError';
 }
@@ -252,6 +337,8 @@ function rejectionMessage(code: string): string {
     case 'QuarantineFailed':
     case 'SharePointError':
       return 'The document could not be stored; try again later';
+    case RETRY_LATER:
+      return 'The document was not processed in time; send it again';
     default:
       return 'The document could not be processed';
   }

@@ -1,16 +1,25 @@
 import type { Client } from '@microsoft/microsoft-graph-client';
 import type { SharePointTarget } from '@bcr/shared';
-import { SharePointService, type SharePointServiceOptions } from './sharePointService';
+import {
+  forbiddenSiteKeys,
+  SharePointService,
+  type SharePointServiceOptions,
+} from './sharePointService';
 
 /**
  * Caches one `SharePointService` per unique target so we amortize the
  * cold-start site/drive resolution across many uploads. Necessary now
  * that a single Function App worker files documents for many clients
- * (multi-tenant routing, ARCHITECTURE.md \u00a74.2).
+ * (multi-tenant routing, ARCHITECTURE.md §4.2).
  *
  * Cache key uses hostname + path + drive + optional root folder so two
  * identical `SharePointTarget` objects (from separate Directory rows or
  * config) share the same underlying service instance.
+ *
+ * Every service a factory makes shares its options, forbidden sites
+ * included, so the runtime keeps two: one for client targets (BCR GROUP and
+ * the quarantine forbidden) and one for the quarantine itself (BCR GROUP
+ * forbidden), which would otherwise refuse its own site.
  */
 export class SharePointServiceFactory {
   private readonly cache = new Map<string, SharePointService>();
@@ -18,7 +27,11 @@ export class SharePointServiceFactory {
   constructor(
     private readonly graph: Client,
     private readonly serviceOptions: SharePointServiceOptions = {},
-  ) {}
+  ) {
+    // At cold start, not at the first upload: a forbidden site id that can't
+    // be compared would leave the guard guarding nothing.
+    forbiddenSiteKeys(serviceOptions.forbiddenSiteIds ?? []);
+  }
 
   forTarget(target: SharePointTarget): SharePointService {
     const key = cacheKey(target);

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ValidationError } from './errors';
+import { canonicalSitePath } from './sitePath';
 
 // ---------------------------------------------------------------------------
 // Custom Zod helpers
@@ -52,6 +53,29 @@ const requiredCsvList = (message: string) =>
         .filter(Boolean),
     )
     .refine((list) => list.length > 0, message);
+
+/**
+ * Site-collection paths (`/sites/<name>` or `/teams/<name>`, see
+ * {@link canonicalSitePath}), returned in their canonical spelling. Anything
+ * else would match no Directory row and silently disable the guard it feeds,
+ * so it fails at cold start.
+ */
+const toCanonicalSitePaths =
+  (message: string) =>
+  (paths: readonly string[], ctx: z.RefinementCtx): string[] => {
+    const canonical: string[] = [];
+    for (const p of paths) {
+      const c = canonicalSitePath(p);
+      if (c === null) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message });
+        return z.NEVER;
+      }
+      canonical.push(c);
+    }
+    return canonical;
+  };
+
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Optional string: missing, empty or whitespace-only all give the default. */
 const optionalStr = (defaultValue = '') =>
@@ -132,10 +156,28 @@ export const ingestionConfigSchema = z.object({
    * alone is not enough: any app that holds `Documents.Ingest` could otherwise
    * assert any user id.
    */
-  botCallerAppIds: requiredCsvList('BOT_CALLER_APP_IDS must list at least one app id'),
+  // Each entry must be an app id: a pasted Key Vault reference or a stray
+  // quote would start fine and then refuse every call.
+  botCallerAppIds: requiredCsvList('BOT_CALLER_APP_IDS must list at least one app id').refine(
+    (list) => list.every((id) => GUID.test(id)),
+    'BOT_CALLER_APP_IDS entries must be app ids (GUIDs)',
+  ),
   // --- Multi-tenant Client Directory (SharePoint list, see §4.2) ---
-  /** Graph site id (`<hostname>,<siteGuid>,<webGuid>`) where the Client Directory list lives. */
-  clientDirectorySiteId: z.string().min(1, 'CLIENT_DIRECTORY_SITE_ID is required'),
+  /**
+   * Graph site id (`<hostname>,<siteCollectionGuid>,<webGuid>`) where the
+   * Client Directory list lives — BCR GROUP. Its site-collection GUID is the
+   * resolved-site guard that keeps every client write out of BCR GROUP, so
+   * only the three-part form is accepted: Graph's path form
+   * (`host:/sites/X:`) or a two-part id would still read the Directory but
+   * would never match a resolved site, and the guard would guard nothing.
+   */
+  clientDirectorySiteId: z
+    .string({ required_error: 'CLIENT_DIRECTORY_SITE_ID is required' })
+    .trim()
+    .regex(
+      /^[a-z0-9.-]+,[0-9a-f-]{36},[0-9a-f-]{36}$/i,
+      'CLIENT_DIRECTORY_SITE_ID must be the three-part Graph site id <host>,<siteGuid>,<webGuid>',
+    ),
   /** Graph list id (GUID) of the Client Directory list. */
   clientDirectoryListId: z.string().uuid('CLIENT_DIRECTORY_LIST_ID must be a UUID'),
   /** How long the directory snapshot is cached in-process before refetching (ms). Default 5 min. */
@@ -150,11 +192,29 @@ export const ingestionConfigSchema = z.object({
   // --- Staff-only quarantine for uploads that cannot be tied to one client ---
   // A dedicated communication site with no M365 group and sharing disabled.
   // Never a client Team, never BCR GROUP.
-  quarantineSiteHostname: z.string().min(3, 'QUARANTINE_SITE_HOSTNAME is required'),
+  /**
+   * The tenant's SharePoint host, e.g. `contoso.sharepoint.com`. It is also
+   * the only host a Directory row may name: a row on any other host routes
+   * nobody. A host name only — no scheme, no path.
+   */
+  quarantineSiteHostname: z
+    .string({ required_error: 'QUARANTINE_SITE_HOSTNAME is required' })
+    .trim()
+    .regex(
+      /^[a-z0-9-]+\.sharepoint\.com$/i,
+      'QUARANTINE_SITE_HOSTNAME must be a host name like contoso.sharepoint.com, not a URL',
+    ),
   quarantineSitePath: z
-    .string()
-    .min(1, 'QUARANTINE_SITE_PATH is required')
-    .refine((p) => p.startsWith('/'), 'QUARANTINE_SITE_PATH must start with /'),
+    .string({ required_error: 'QUARANTINE_SITE_PATH is required' })
+    .transform((p, ctx) => {
+      const canonical = canonicalSitePath(p);
+      if (canonical !== null) return canonical;
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'QUARANTINE_SITE_PATH must be a site path like /sites/<name>',
+      });
+      return z.NEVER;
+    }),
   quarantineDriveName: optionalStr('Documents'),
   quarantineRootFolder: optionalStr('Kwarantanna'),
   /**
@@ -162,13 +222,15 @@ export const ingestionConfigSchema = z.object({
    * The quarantine site is added automatically. A row pointing at one of
    * these is excluded from routing as `forbidden_target`.
    */
-  // Each entry is a server-relative site path. A pasted URL would never match
-  // a row and would silently disable the guard, so it fails at cold start.
+  // Each entry is a site-collection path. A pasted URL or a sub-path would
+  // never match a row and would silently disable the guard, so it fails at
+  // cold start. Entries come back in their canonical spelling.
   forbiddenTargetSitePaths: requiredCsvList(
     'FORBIDDEN_TARGET_SITE_PATHS must list at least the BCR GROUP site path',
-  ).refine(
-    (list) => list.every((p) => /^\/(sites|teams)\/[^/]+\/?$/i.test(p)),
-    'FORBIDDEN_TARGET_SITE_PATHS entries must be site paths like /sites/BCRGROUP, not URLs',
+  ).transform(
+    toCanonicalSitePaths(
+      'FORBIDDEN_TARGET_SITE_PATHS entries must be site paths like /sites/BCRGROUP, not URLs',
+    ),
   ),
   // --- Claude (Anthropic) content classification ---
   anthropicEnabled: boolish(false),

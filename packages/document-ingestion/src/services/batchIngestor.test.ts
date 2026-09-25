@@ -1,3 +1,4 @@
+import type { Client } from '@microsoft/microsoft-graph-client';
 import {
   SharePointError,
   ValidationError,
@@ -11,8 +12,13 @@ import {
   type ResolvedClient,
   type SharePointTarget,
 } from '@bcr/shared';
-import { BatchIngestor, type BatchIngestorDeps } from './batchIngestor';
-import { SharePointTargetError, type UploadDocumentArgs } from './sharePointService';
+import { BatchIngestor, RETRY_LATER, type BatchIngestorDeps } from './batchIngestor';
+import {
+  cachedSiteIdLookup,
+  SharePointTargetError,
+  type UploadDocumentArgs,
+} from './sharePointService';
+import { SharePointServiceFactory } from './sharePointServiceFactory';
 
 const OID = 'ae3987d3-9a3a-4ff8-bcf7-713d24e79c48';
 
@@ -37,6 +43,7 @@ const clientA: DirectoryClientResolution = {
   title: '[0002] Client A',
   matchedBy: 'userAadObjectId',
   target: clientTarget,
+  teamId: 'team-0002',
   nip: '1111111111',
   companyName: 'Client A Sp. z o.o.',
 };
@@ -86,17 +93,40 @@ function recordingLogger(): { log: Logger; lines: Record<string, unknown>[] } {
   return { log: make({}), lines };
 }
 
+type FactoryName = 'client' | 'quarantine';
+
 interface FakeSharePoint {
-  uploads: { target: SharePointTarget; args: UploadDocumentArgs }[];
+  uploads: { factory: FactoryName; target: SharePointTarget; args: UploadDocumentArgs }[];
   fields: { target: SharePointTarget; itemId: string; fields: Record<string, string> }[];
   failFor: Map<SharePointTarget, unknown>;
 }
 
-function setup(resolved: ResolvedClient, opts: { classify?: jest.Mock } = {}) {
+function setup(
+  resolved: ResolvedClient,
+  opts: { classify?: jest.Mock; now?: () => Date; batchDeadlineMs?: number } = {},
+) {
   const sp: FakeSharePoint = { uploads: [], fields: [], failFor: new Map() };
   let n = 0;
   const classify =
     opts.classify ?? jest.fn(async (_ctx: ClassifierContext): Promise<Classification> => invoice);
+  const factory = (name: FactoryName) => ({
+    forTarget: (target: SharePointTarget) => ({
+      uploadDocument: jest.fn(async (args: UploadDocumentArgs): Promise<DriveItemRef> => {
+        const failure = sp.failFor.get(target);
+        if (failure) throw failure;
+        sp.uploads.push({ factory: name, target, args });
+        return {
+          id: `item-${sp.uploads.length}`,
+          name: args.filename,
+          webUrl: `https://${target.siteHostname}${target.sitePath}/${args.filename}`,
+        };
+      }),
+      setListItemFields: jest.fn(async (itemId: string, fields: Readonly<Record<string, string>>) => {
+        sp.fields.push({ target, itemId, fields: { ...fields } });
+        return true;
+      }),
+    }),
+  });
   const deps: BatchIngestorDeps = {
     resolver: {
       resolve: jest.fn().mockResolvedValue(resolved),
@@ -108,26 +138,11 @@ function setup(resolved: ResolvedClient, opts: { classify?: jest.Mock } = {}) {
       })),
     },
     classification: { classify },
-    sharePointFactory: {
-      forTarget: (target: SharePointTarget) => ({
-        uploadDocument: jest.fn(async (args: UploadDocumentArgs): Promise<DriveItemRef> => {
-          const failure = sp.failFor.get(target);
-          if (failure) throw failure;
-          sp.uploads.push({ target, args });
-          return {
-            id: `item-${sp.uploads.length}`,
-            name: args.filename,
-            webUrl: `https://${target.siteHostname}${target.sitePath}/${args.filename}`,
-          };
-        }),
-        setListItemFields: jest.fn(async (itemId: string, fields: Readonly<Record<string, string>>) => {
-          sp.fields.push({ target, itemId, fields: { ...fields } });
-          return true;
-        }),
-      }),
-    },
-    now: () => new Date('2026-09-25T10:00:00Z'),
+    clientSharePointFactory: factory('client'),
+    quarantineSharePointFactory: factory('quarantine'),
+    now: opts.now ?? (() => new Date('2026-09-25T10:00:00Z')),
     newId: () => `id-${++n}`,
+    ...(opts.batchDeadlineMs !== undefined ? { batchDeadlineMs: opts.batchDeadlineMs } : {}),
   };
   return { ingestor: new BatchIngestor(deps), deps, sp, classify };
 }
@@ -143,6 +158,7 @@ describe('BatchIngestor — bound client', () => {
     );
     expect(sp.uploads).toHaveLength(1);
     expect(sp.uploads[0]!.target).toBe(clientTarget);
+    expect(sp.uploads[0]!.factory).toBe('client');
     expect(sp.uploads[0]!.args.folderPath).toBe('01_Faktury/02_Faktury_zakupu/2026/09');
     expect(result).toEqual({
       filename: 'faktura.pdf',
@@ -173,9 +189,11 @@ describe('BatchIngestor — bound client', () => {
       documentId: 'id-2',
       clientId: '0002',
       listItemId: '11',
+      teamId: 'team-0002',
       category: 'faktury_zakupu',
       driveItemId: 'item-1',
     });
+    expect(lines.find((l) => l['msg'] === 'client resolved')).toMatchObject({ teamId: 'team-0002' });
     const serialized = JSON.stringify(lines);
     const leaks = ['8652567240', 'Client A', '1111111111', '/sites/ClientA', 'faktura'].filter((s) =>
       serialized.includes(s),
@@ -188,15 +206,28 @@ describe('BatchIngestor — bound client', () => {
     ['site gone (404)', new SharePointTargetError('site_not_found', 'x'), 'target_unwritable'],
     ['a transient failure after retries', new SharePointError('Upload failed', 502), 'target_unwritable'],
     ['a drive that no longer matches the row', new SharePointTargetError('drive_mismatch', 'x'), 'stale_directory'],
+    [
+      'a site that resolves to BCR GROUP or the quarantine',
+      new SharePointTargetError('forbidden_site', 'x'),
+      'forbidden_target',
+    ],
   ])('holds the document in quarantine when the client space fails with %s', async (_l, failure, reason) => {
     const { ingestor, sp } = setup(clientA);
     sp.failFor.set(clientTarget, failure);
-    const [result] = await ingestor.ingestBatch(payload(), recordingLogger().log);
+    const { log, lines } = recordingLogger();
+    const [result] = await ingestor.ingestBatch(payload(), log);
 
     expect(result).toEqual({ filename: 'faktura.pdf', status: 'quarantined' });
     expect(sp.uploads).toHaveLength(1);
     expect(sp.uploads[0]!.target).toBe(quarantineTarget);
+    expect(sp.uploads[0]!.factory).toBe('quarantine');
     expect(sp.fields[0]!.fields['QuarantineReason']).toBe(reason);
+    expect(lines.find((l) => l['quarantineReason'] === reason && l['clientId'])).toMatchObject({
+      clientId: '0002',
+      listItemId: '11',
+      teamId: 'team-0002',
+      ...(failure instanceof SharePointTargetError ? { targetErrorKind: failure.kind } : {}),
+    });
   });
 
   it('rejects a document whose name cannot be made safe, without quarantining it', async () => {
@@ -229,6 +260,7 @@ describe('BatchIngestor — quarantine', () => {
     expect(classify).not.toHaveBeenCalled();
     expect(sp.uploads).toHaveLength(1);
     expect(sp.uploads[0]!.target).toBe(quarantineTarget);
+    expect(sp.uploads[0]!.factory).toBe('quarantine');
     expect(sp.uploads[0]!.args.folderPath).toBe('2026/09/id-1');
     expect(sp.uploads[0]!.args.filename).toBe('skan.pdf');
     expect(result).toEqual({ filename: 'skan.pdf', status: 'quarantined' });
@@ -281,5 +313,195 @@ describe('BatchIngestor — quarantine', () => {
     expect(result).toMatchObject({ status: 'rejected', error: { code: 'QuarantineFailed' } });
     expect(sp.uploads).toHaveLength(0);
     expect(lines.some((l) => l['event'] === 'document.quarantine_failed')).toBe(true);
+  });
+});
+
+describe('BatchIngestor — batch deadline', () => {
+  /** A clock that moves forward by `stepMs` every time it is read. */
+  function steppingClock(stepMs: number): () => Date {
+    let t = Date.parse('2026-09-25T10:00:00Z');
+    return () => {
+      const d = new Date(t);
+      t += stepMs;
+      return d;
+    };
+  }
+
+  it('hands back the documents not started by the deadline for a retry, never filing them late', async () => {
+    // The clock is read at the start and once before each document: 0, 60, 120, 180, 240 s.
+    const { ingestor, sp, classify } = setup(clientA, {
+      now: steppingClock(60_000),
+      batchDeadlineMs: 150_000,
+    });
+    const { log, lines } = recordingLogger();
+    const results = await ingestor.ingestBatch(payload(['a.pdf', 'b.pdf', 'c.pdf', 'd.pdf']), log);
+
+    expect(results.map((r) => r.status)).toEqual(['uploaded', 'uploaded', 'rejected', 'rejected']);
+    expect(results[2]).toEqual({
+      filename: 'c.pdf',
+      status: 'rejected',
+      error: { code: RETRY_LATER, message: 'The document was not processed in time; send it again' },
+    });
+    expect(sp.uploads.map((u) => u.args.filename)).toEqual(['a.pdf', 'b.pdf']);
+    expect(classify).toHaveBeenCalledTimes(2);
+    expect(lines.find((l) => l['event'] === 'batch.deadline_exceeded')).toMatchObject({
+      notStartedCount: 2,
+      documentCount: 4,
+    });
+  });
+
+  it('finishes a document it started before the deadline, even past it', async () => {
+    let t = Date.parse('2026-09-25T10:00:00Z');
+    const classify = jest.fn(async (): Promise<Classification> => {
+      t += 200_000; // a slow model call
+      return invoice;
+    });
+    const { ingestor, sp } = setup(clientA, { classify, now: () => new Date(t) });
+    const results = await ingestor.ingestBatch(payload(['a.pdf', 'b.pdf']), recordingLogger().log);
+    expect(results.map((r) => r.status)).toEqual(['uploaded', 'rejected']);
+    expect(sp.uploads).toHaveLength(1);
+  });
+
+  it('applies to quarantined batches too, and defaults to 150 s', async () => {
+    const unmapped: ResolvedClient = { source: 'quarantine', reason: 'unmapped', target: quarantineTarget };
+    let t = Date.parse('2026-09-25T10:00:00Z');
+    const { ingestor, sp, deps } = setup(unmapped, { now: () => new Date(t) });
+    (deps.resolver.resolve as jest.Mock).mockImplementation(async () => {
+      t += 149_999;
+      return unmapped;
+    });
+    const first = await ingestor.ingestBatch(payload(['a.pdf']), recordingLogger().log);
+    expect(first.map((r) => r.status)).toEqual(['quarantined']);
+
+    (deps.resolver.resolve as jest.Mock).mockImplementation(async () => {
+      t += 150_000;
+      return unmapped;
+    });
+    const second = await ingestor.ingestBatch(payload(['b.pdf']), recordingLogger().log);
+    expect(second.map((r) => r.error?.code)).toEqual([RETRY_LATER]);
+    expect(sp.uploads.map((u) => u.args.filename)).toEqual(['a.pdf']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// With the real SharePoint services: the client guard and the quarantine
+// guard are separate, so a client row that resolves to the quarantine is
+// refused while the quarantine itself still works.
+// ---------------------------------------------------------------------------
+
+describe('BatchIngestor — real SharePoint services and forbidden sites', () => {
+  const BCR_GROUP = '11111111-1111-1111-1111-111111111111';
+  const QUARANTINE = '22222222-2222-2222-2222-222222222222';
+  const siteId = (collection: string, web: string) => `contoso.sharepoint.com,${collection},${web}`;
+  const WEB_1 = '33333333-3333-3333-3333-333333333333';
+  const WEB_2 = '44444444-4444-4444-4444-444444444444';
+
+  interface Call {
+    method: string;
+    path: string;
+    body: unknown;
+  }
+
+  /** Graph double: the client's path resolves to `clientSiteId`; the quarantine to its own site. */
+  function fakeGraph(clientSiteId: string): { client: Client; calls: Call[] } {
+    const calls: Call[] = [];
+    const drives: Record<string, string> = {
+      [siteId(QUARANTINE, WEB_1)]: 'drive-quarantine',
+      [siteId(BCR_GROUP, WEB_1)]: 'drive-bcrgroup',
+      [siteId(QUARANTINE, WEB_2)]: 'drive-quarantine-subweb',
+    };
+    const api = (path: string) => {
+      const request = {
+        query: () => request,
+        header: () => request,
+        get: () => respond('get'),
+        post: (body: unknown) => respond('post', body),
+        put: (body: unknown) => respond('put', body),
+        patch: (body: unknown) => respond('patch', body),
+      };
+      const respond = async (method: string, body?: unknown): Promise<unknown> => {
+        calls.push({ method, path, body });
+        if (method === 'get' && path === '/sites/contoso.sharepoint.com:/sites/ClientA') {
+          return { id: clientSiteId };
+        }
+        if (method === 'get' && path === '/sites/contoso.sharepoint.com:/sites/BCRLedgerKwarantanna') {
+          return { id: siteId(QUARANTINE, WEB_1) };
+        }
+        const drivesOf = /^\/sites\/(.+)\/drives$/.exec(path);
+        if (method === 'get' && drivesOf) {
+          return { value: [{ id: drives[drivesOf[1]!] ?? 'drive-unknown', name: 'Dokumenty' }] };
+        }
+        if (method === 'post' && path.endsWith('/children')) return {};
+        if (method === 'get' && path.startsWith('/drives/')) return { id: 'folder' };
+        if (method === 'put') return { id: 'item-q', name: 'faktura.pdf', webUrl: 'u' };
+        if (method === 'patch') return {};
+        throw Object.assign(new Error(`unhandled ${method} ${path}`), { statusCode: 400 });
+      };
+      return request;
+    };
+    return { client: { api } as unknown as Client, calls };
+  }
+
+  function realIngestor(clientSiteId: string) {
+    const { client, calls } = fakeGraph(clientSiteId);
+    const { log, lines } = recordingLogger();
+    const retry = { retries: 0, minTimeoutMs: 0 };
+    const bcrGroup = [siteId(BCR_GROUP, WEB_1)];
+    const deps: BatchIngestorDeps = {
+      resolver: {
+        resolve: jest.fn().mockResolvedValue(clientA),
+        resolvePostClassification: jest.fn((client, classification) => ({ client, classification })),
+        quarantine: jest.fn((reason: QuarantineReason) => ({
+          source: 'quarantine' as const,
+          reason,
+          target: quarantineTarget,
+        })),
+      },
+      classification: { classify: jest.fn(async () => invoice) },
+      clientSharePointFactory: new SharePointServiceFactory(client, {
+        retry,
+        log,
+        forbiddenSiteIds: bcrGroup,
+        forbiddenSiteLookups: [cachedSiteIdLookup(client, quarantineTarget, { retry })],
+      }),
+      quarantineSharePointFactory: new SharePointServiceFactory(client, {
+        retry,
+        log,
+        forbiddenSiteIds: bcrGroup,
+      }),
+      now: () => new Date('2026-09-25T10:00:00Z'),
+      newId: () => 'id-1',
+    };
+    return { ingestor: new BatchIngestor(deps), calls, lines, log };
+  }
+
+  it.each([
+    ['the quarantine site', siteId(QUARANTINE, WEB_1)],
+    ['a subweb of the quarantine site', siteId(QUARANTINE, WEB_2)],
+    ['BCR GROUP', siteId(BCR_GROUP, WEB_1)],
+  ])('quarantines a client target resolving to %s as forbidden_target', async (_l, resolvedTo) => {
+    const { ingestor, calls, lines, log } = realIngestor(resolvedTo);
+    const [result] = await ingestor.ingestBatch(payload(), log);
+
+    expect(result).toEqual({ filename: 'faktura.pdf', status: 'quarantined' });
+    const writes = calls.filter((c) => c.method !== 'get');
+    // Nothing under the client's folder; the one file is the quarantine copy.
+    expect(writes.filter((c) => c.method === 'put').map((c) => c.path)).toEqual([
+      '/drives/drive-quarantine/root:/Kwarantanna/2026/09/id-1/faktura.pdf:/content',
+    ]);
+    expect(writes.some((c) => c.path.includes('drive-bcrgroup') || c.path.includes('subweb'))).toBe(false);
+    expect(writes.find((c) => c.method === 'patch')?.body).toMatchObject({
+      QuarantineReason: 'forbidden_target',
+    });
+    expect(lines.some((l) => l['event'] === 'sharepoint.forbidden_site')).toBe(true);
+  });
+
+  it('files a client target on its own site into that site', async () => {
+    const { ingestor, calls, log } = realIngestor(siteId('55555555-5555-5555-5555-555555555555', WEB_1));
+    const [result] = await ingestor.ingestBatch(payload(), log);
+    expect(result?.status).toBe('uploaded');
+    expect(calls.filter((c) => c.method === 'put').map((c) => c.path)).toEqual([
+      '/drives/drive-unknown/root:/Dokumenty%20ksi%C4%99gowe/01_Faktury/02_Faktury_zakupu/2026/09/faktura.pdf:/content',
+    ]);
   });
 });

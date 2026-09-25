@@ -5,6 +5,7 @@ import type {
   ClientDirectoryEntry,
   DocumentParty,
   IngestionSource,
+  Logger,
   SharePointTarget,
 } from '@bcr/shared';
 import {
@@ -27,6 +28,7 @@ const OID_A = 'ae3987d3-9a3a-4ff8-bcf7-713d24e79c48';
 const OID_B = '0b8c7a2e-51f4-4a7e-9d3e-2f1c6a9b8d70';
 const OID_STAFF = '5f0d2c11-7c3e-4b2a-8e61-9a4d3b2c1e0f';
 
+/** A client row as the binding tool leaves it: RootFolder, DriveId and TeamId all set. */
 function makeEntry(overrides: Partial<ClientDirectoryEntry>): ClientDirectoryEntry {
   return {
     listItemId: '1',
@@ -39,11 +41,34 @@ function makeEntry(overrides: Partial<ClientDirectoryEntry>): ClientDirectoryEnt
       siteHostname: HOST,
       sitePath: '/sites/Client-0001',
       driveName: 'Dokumenty',
+      rootFolder: 'Dokumenty księgowe',
+      expectedDriveId: 'b!drive-0001',
     },
+    teamId: 'team-0001',
     isAdmin: false,
     active: true,
     ...overrides,
   };
+}
+
+/** A target as the binding tool leaves it. */
+function boundTarget(sitePath: string, id: string): SharePointTarget {
+  return {
+    siteHostname: HOST,
+    sitePath,
+    driveName: 'Dokumenty',
+    rootFolder: 'Dokumenty księgowe',
+    expectedDriveId: `b!drive-${id}`,
+  };
+}
+
+/** A logger that records every call, so tests can assert what reaches the logs. */
+function recordingLogger(): { log: Logger; lines: Record<string, unknown>[] } {
+  const lines: Record<string, unknown>[] = [];
+  const write = (obj: unknown, msg?: string) =>
+    lines.push({ ...(typeof obj === 'object' && obj ? obj : { msg: obj }), msg });
+  const log = { info: write, warn: write, error: write, debug: write } as unknown as Logger;
+  return { log, lines };
 }
 
 /** Uses the real snapshot builder, so resolver tests exercise real routing rules. */
@@ -66,7 +91,8 @@ const clientA = makeEntry({
   nip: '1111111111',
   companyNameAliases: ['Client A Sp. z o.o.'],
   userAadObjectIds: [OID_A],
-  target: { siteHostname: HOST, sitePath: '/sites/ClientA', driveName: 'Dokumenty' },
+  target: boundTarget('/sites/ClientA', '0002'),
+  teamId: 'team-0002',
 });
 
 const clientB = makeEntry({
@@ -76,7 +102,8 @@ const clientB = makeEntry({
   nip: '2222222222',
   companyNameAliases: ['Client B Sp. z o.o.'],
   userAadObjectIds: [OID_B],
-  target: { siteHostname: HOST, sitePath: '/sites/ClientB', driveName: 'Dokumenty' },
+  target: boundTarget('/sites/ClientB', '0003'),
+  teamId: 'team-0003',
 });
 
 const staffRow = makeEntry({
@@ -113,9 +140,19 @@ describe('ClientResolver.resolve', () => {
       title: '[0002] Client A',
       matchedBy: 'userAadObjectId',
       target: clientA.target,
+      teamId: 'team-0002',
       nip: '1111111111',
       companyName: 'Client A Sp. z o.o.',
     });
+  });
+
+  it('logs the routing decision with ids only — the Team id included', async () => {
+    const { log, lines } = recordingLogger();
+    const r = new ClientResolver(makeReader([clientA]), { quarantineTarget, log });
+    await r.resolve({ ...baseSource, userAadObjectId: OID_A });
+    expect(lines).toEqual([
+      { clientId: '0002', listItemId: '11', teamId: 'team-0002', msg: 'routed to client via userAadObjectId' },
+    ]);
   });
 
   it('matches the user id case-insensitively', async () => {
@@ -164,6 +201,7 @@ describe('ClientResolver.resolve', () => {
       staffUserIds: new Set(),
       conflictedUserIds: new Set(),
       forbiddenUserIds: new Set(),
+      unboundUserIds: new Set(),
       excludedRows: new Map(),
       health: 'unavailable',
       fetchedAt: 0,
@@ -171,6 +209,59 @@ describe('ClientResolver.resolve', () => {
     const r = new ClientResolver(readerFor(unavailable), { quarantineTarget });
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toMatchObject({ source: 'quarantine', reason: 'stale_directory' });
+  });
+
+  // Contract C3: a row the binding tool has not bound routes nobody — it
+  // would file into the library root, for a guest nobody checked is in this
+  // client's Team only.
+  it.each([
+    ['RootFolder', { target: { ...clientA.target, rootFolder: '' } }],
+    ['DriveId', { target: { ...clientA.target, expectedDriveId: '' } }],
+    ['TeamId', { teamId: '' }],
+  ])('quarantines a user whose only row lacks %s as unbound_target', async (_missing, override) => {
+    const r = new ClientResolver(makeReader([{ ...clientA, ...override }, clientB]), { quarantineTarget });
+    const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
+    expect(resolved).toEqual({ source: 'quarantine', reason: 'unbound_target', target: quarantineTarget });
+    const other = await r.resolve({ ...baseSource, userAadObjectId: OID_B });
+    expect(other).toMatchObject({ source: 'directory', clientId: '0003' });
+  });
+
+  it('refuses an unbound row even if a snapshot were to route it', async () => {
+    const unbound = (({ teamId: _teamId, ...rest }) => rest)(clientA);
+    const snapshot: ClientDirectorySnapshot = {
+      entries: [unbound],
+      byUserAadObjectId: new Map([[OID_A, unbound]]),
+      staffUserIds: new Set(),
+      conflictedUserIds: new Set(),
+      forbiddenUserIds: new Set(),
+      unboundUserIds: new Set(),
+      excludedRows: new Map(),
+      health: 'fresh',
+      fetchedAt: 0,
+    };
+    const r = new ClientResolver(readerFor(snapshot), { quarantineTarget });
+    const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
+    expect(resolved).toMatchObject({ source: 'quarantine', reason: 'unbound_target' });
+  });
+
+  it('quarantines both users of rows that share a DriveId as conflict', async () => {
+    const r = new ClientResolver(
+      makeReader([clientA, { ...clientB, target: { ...clientB.target, expectedDriveId: 'b!drive-0002' } }]),
+      { quarantineTarget },
+    );
+    for (const oid of [OID_A, OID_B]) {
+      const resolved = await r.resolve({ ...baseSource, userAadObjectId: oid });
+      expect(resolved).toMatchObject({ source: 'quarantine', reason: 'conflict' });
+    }
+  });
+
+  it('quarantines a user whose row names a sub-site as forbidden_target', async () => {
+    const r = new ClientResolver(
+      makeReader([{ ...clientA, target: { ...clientA.target, sitePath: '/sites/ClientB/sub' } }, clientB]),
+      { quarantineTarget },
+    );
+    const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
+    expect(resolved).toMatchObject({ source: 'quarantine', reason: 'forbidden_target' });
   });
 
   it('falls back to the title as companyName when no aliases are set', async () => {
