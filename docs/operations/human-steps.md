@@ -660,7 +660,8 @@ For every row, `check` reports:
   Directory's own site collection (BCR GROUP) however the path is spelled. A `SitePath` that is
   not exactly `/sites/<name>` or `/teams/<name>` is skipped as `site_path_not_canonical`.
   Ingestion excludes the same rows;
-- staff ids on client rows;
+- staff ids on client rows. On a row that is not bound yet (see the exit codes below) they are
+  reported as `not routing (unbound)`: ingestion quarantines those uploads as `unbound_target`;
 - duplicate ClientIds and NIPs, and rows sharing a site, a `DriveId` or a `TeamId` (ingestion
   excludes every such row as a conflict);
 - whether the client's Team is Private and its channel is standard;
@@ -671,6 +672,25 @@ For every row, `check` reports:
 - whether each guest is in this client's Team and **in no other Team**. A guest who is also in
   any other Team, marked or not, is excluded (`guest_in_other_team`) and is never bound; their
   uploads go to quarantine.
+
+**Its exit code.** A row is *bound* when it is Active, not `IsAdmin`, and has `RootFolder`,
+`DriveId` and `TeamId` all set: the only rows ingestion routes to.
+
+- `0`: every bound row was assessed, and nothing routes where it should not.
+- `3`: **routing drift on a bound row.** It holds a staff id, or a guest who is no longer a guest
+  of that row's Team alone. An `ACTION` line says to run `propose` and apply the whole plan.
+- `4`: **incomplete.** No drift was found, but at least one bound row that holds user ids could
+  not be fully assessed (`site_unresolved`, `no_team`, `team_lookup_failed`,
+  `membership_lookup_failed` or `guest_memberships_unreadable`). Those rows are listed as
+  `incomplete`, in the report and on an `ACTION` line. Act on each: usually a 403 (H-4a) or a
+  site the signed-in person cannot read. Then run `check` again.
+- `1`: refused (a missing or malformed input, an expired token).
+
+3 wins over 4. **At H-7, expect `0`**, or `4` with the `incomplete` rows listed, to act on as
+above. Nothing is bound yet (`DriveId` and `TeamId` stay empty until H-12), so Yahor's staff id
+on PESKOVOI's row, and any staff id on TEST's, is `not routing (unbound)` and does not make it
+exit 3. It is still a finding to decide on below; H-12 step 5 removes it. An exit 3 at H-7
+would mean a row is already bound and routes someone it should not: stop and tell Roman.
 
 **Write grants read "unknown" with this token,** because reading site permissions needs
 `Sites.FullControl.All`. Verify each one **read-only**: in Graph Explorer, with
@@ -1170,8 +1190,8 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
     more with the same flags as step 5 and apply that plan **without `--only`** (a dry run, then
     `--apply`). Every PATCH in it is applied, including one that takes an id off another row. The
     dry run should show no PATCH at all; any it shows is reviewed as in step 5 before it is
-    applied, never skipped. Then run `check`. From now on the
-    [standing checks](#standing-checks) apply.
+    applied, never skipped. Then run `check`: it must exit `0` (a `3` or `4` is acted on as in
+    the [standing checks](#standing-checks)). From now on the standing checks apply.
 13. **Watch for an hour:**
 
 ```bash
@@ -1319,17 +1339,21 @@ Bicep drift fix (gate G1), not here.
 Phase 0 checks a guest's Team membership only when `propose` and `apply` bind a row, and it has
 no alert rule. Ingestion routes on the Directory row alone. So a bound guest who is later added
 to a second client's Team keeps routing everything, the second company's documents included,
-into the first client's channel, and nothing notices. That is an ordinary business event: one
-person running two companies. Onboarding invites the same email, gets the same guest back, adds
-it to the new Team, and writes the new row with no user ids, so no conflict is raised either.
-These checks close that gap by schedule until the robust fix, a runtime `memberOf` check (or a
-membership registry kept in sync), lands in Phase 2. Onboarding writing the guest's id into the
-new row itself (R1) waits on Roman's re-ruling of Q21.
+into the first client's channel, until the next `check` and apply of the whole plan take the id
+off. That is an ordinary business event: one person running two companies. Onboarding invites
+the same email, gets the same guest back, adds it to the new Team, and writes the new row with
+no user ids, so no conflict is raised either.
+
+**This is an accepted residual risk of Phase 0.** The mitigation is the schedule below: `check`
+and an apply of the **whole** plan after **every** onboarding, a `check` at least weekly, and
+action the same day whenever `check` exits `3` or `4`. The robust fix, a runtime `memberOf` check
+at upload time (or a membership registry kept in sync), is Phase 2. Onboarding writing the
+guest's id into the new row itself (R1) waits on Roman's re-ruling of Q21.
 
 | When | What | Why |
 |---|---|---|
-| After **any** onboarding | `propose` with H-12 step 5's flags, reviewed, then `apply` of the **whole** plan (a dry run, then `--apply`): never `--only <new row>` | The whole plan carries the PATCH that takes a reused guest's id off the first client's row. A guest in two Teams is then bound to neither, and their uploads go to quarantine until a person decides |
-| **Weekly**, and after any onboarding that reuses an existing guest | `check`. A row id marked *not eligible* (now in another Team, or no longer in the row's Team), or a guest reported as `guest_in_other_team`, means: `propose` and apply the whole plan the same day | Catches Team changes made outside onboarding, and a guest who left their client's Team but can still file into its channel |
+| After **any** onboarding | `propose` with H-12 step 5's flags, reviewed, then `apply` of the **whole** plan (a dry run, then `--apply`): never `--only <new row>`. Then `check`, acted on as in the next row | The whole plan carries the PATCH that takes a reused guest's id off the first client's row. A guest in two Teams is then bound to neither, and their uploads go to quarantine until a person decides |
+| **Weekly**, and after any onboarding that reuses an existing guest | `check`. **Exit `3` and exit `4` both need action, the same day.** `3` is drift on a bound row: a row id marked *not eligible* (now in another Team, or no longer in the row's Team) or a staff id; `propose` and apply the whole plan. `4` is incomplete: a bound row could not be fully assessed, and the `incomplete` rows are listed; fix what stopped the read (a 403 is a missing permission, H-4a; or a site the signed-in person cannot read) and run `check` again until it exits `0`, or `3` and is acted on. A guest reported as `guest_in_other_team` also means: `propose` and apply the whole plan the same day | Catches Team changes made outside onboarding, and a guest who left their client's Team but can still file into its channel. An exit `4` hides whether that happened on the rows it lists |
 | Before any negative canary | H-12 step 4's `check \| grep -ci <canary id>` prints `0` | A canary guest left on a row files into that client's channel |
 | Every working day | The query below. A `document.quarantine_failed` row means: check H-6's grant and the quarantine library name first. A `sharepoint.forbidden_site` row is an incident indicator (H-12 step 13) | A failed quarantine write is fail-closed (the user gets "spróbuj ponownie", nothing is written anywhere else), but if the quarantine grant or `QUARANTINE_DRIVE_NAME` breaks, every unbound, staff and stale upload is refused and nobody is told |
 
