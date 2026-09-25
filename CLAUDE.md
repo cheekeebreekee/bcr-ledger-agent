@@ -31,6 +31,7 @@ yarn install                 # or: yarn install --immutable (what CI runs)
 yarn build                   # topological build of every workspace (tsc -b)
 yarn test                    # Jest in every workspace
 yarn test:coverage           # Jest + per-package coverage thresholds (what CI runs)
+yarn test:tools              # node:test suites for the operator tools in tools/ (offline)
 yarn lint                    # ESLint over packages/**/src/**/*.ts
 yarn type-check              # tsc --noEmit per workspace
 yarn format                  # Prettier over sources + infrastructure/**/*.bicep
@@ -247,3 +248,8 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
 | `docs/client-directory-admin-guide.md` | The Client Directory list — columns and admin workflow |
 | `docs/admin-sharepoint-grant.md` | `Sites.Selected` via Graph Explorer |
 | `docs/security.md` | Threat model + secrets inventory |
+| `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback |
+| `docs/operations/incident-2026-09.md` | The cross-client routing incident: causes, IR-0..IR-3, status |
+| `docs/operations/tenant-hardening.md` | Tenant settings that keep clients apart (BCR GROUP stays Private, read-only check) |
+| `docs/diagrams/` | Mermaid: as-is, Phase-0 routing, target business logic/architecture/data flow, sequences, data model |
+| `tools/README.md` | Operator tools (directory bindings, IR-0/IR-1): dry-run by default, `--apply` to write |

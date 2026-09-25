@@ -127,17 +127,27 @@ day of delay deletes a day of evidence. This must also happen **before H-9 and H
 Phase-0 code changes what is logged.
 
 What to export, and why each join works, is in
-[incident → IR-0](incident-2026-09.md#ir-0-preserve-the-evidence-first). The scripts are in
-`tools/ir0/`; its README gives the exact invocation.
+[incident → IR-0](incident-2026-09.md#ir-0-preserve-the-evidence-first). Every script is
+described, with all its flags, in [`tools/README.md`](../../tools/README.md).
 
 ```bash
-# 1. The store: an immutable container outside BCR GROUP. Readable by Roman, the IOD and
-#    yahor.simak@bcr-group.pl only. The script prints its plan and changes nothing without --apply.
-./infrastructure/ir/evidence-store.sh
-./infrastructure/ir/evidence-store.sh --apply
+# 1. The trace export (Yahor). 24-hour chunks over the last 30 days; writes the files,
+#    the query, export-meta.txt and SHA256SUMS under tools/out/ (git-ignored).
+tools/ir0/export-appinsights.sh --app <App Insights component> --resource-group rg-bcr-ledger-dev
 
-# 2. The exports (traces, Directory list, Purview), each hashed into SHA256SUMS,
-#    then uploaded to the store. See tools/ir0/README.
+# 2. The Purview export (Global Admin, PowerShell 7, "View-Only Audit Logs" role).
+#    Sites: BCR GROUP, PESKOVOI, TEST.
+Connect-ExchangeOnline -UserPrincipalName <auditor>
+./tools/ir0/export-purview.ps1 -SiteUrl <BCR GROUP url>, <PESKOVOI url>, <TEST url> -StartDate <UTC>
+
+# 3. The store (Roman): an immutable container outside BCR GROUP, readable by Roman, the IOD
+#    and yahor.simak@bcr-group.pl only. A dry run first; --apply refuses until both UPNs are set.
+ROMAN_UPN=<roman> IOD_UPN=<iod> infrastructure/ir/evidence-store.sh \
+  --resource-group rg-bcr-ir-evidence --account <storage account> \
+  --upload-dir tools/out/<export folder> --grant-uploader
+ROMAN_UPN=<roman> IOD_UPN=<iod> infrastructure/ir/evidence-store.sh \
+  --resource-group rg-bcr-ir-evidence --account <storage account> \
+  --upload-dir tools/out/<export folder> --grant-uploader --apply
 ```
 
 **Verify.**
@@ -196,6 +206,20 @@ The quarantine replaces the fallback bucket. Uploads that cannot be tied to exac
 go there, and it is readable only by the people who triage it. It is a communication site: no
 Microsoft 365 group, so no Team and no way to join it; unique permissions; and sharing Disabled.
 
+**Use the script.** [`infrastructure/quarantine/New-QuarantineSite.ps1`](../../infrastructure/quarantine/README.md)
+does everything in this step — site, sharing, reviewers group, broken inheritance, no Everyone
+claims, and the four columns — prints its plan, and changes nothing without `-Apply`. It refuses
+an existing site that is a Team site or not a communication site, so a mistyped URL cannot touch
+a client Team or BCR GROUP.
+
+```powershell
+./infrastructure/quarantine/New-QuarantineSite.ps1 -SiteUrl https://<tenant>.sharepoint.com/sites/BCRLedgerKwarantanna `
+  -Owner <admin-upn> -ReviewerUpn <roman-upn>, <yahor-upn> -ClientId <PnP app client id>
+# review the plan, then the same command with -Apply
+```
+
+The manual commands below are the equivalent, kept for reference.
+
 ```powershell
 Connect-SPOService -Url https://<tenant>-admin.sharepoint.com
 New-SPOSite -Url https://<tenant>.sharepoint.com/sites/BCRLedgerKwarantanna `
@@ -225,8 +249,7 @@ for C in UploaderOid QuarantineReason OriginalFilename DocumentId; do
 done
 ```
 
-If the tools branch ships a quarantine-site script, it replaces these commands; the result must
-be the same.
+The script above creates these columns; the commands are the manual equivalent.
 
 **Verify.**
 
@@ -273,8 +296,9 @@ H-12.
 new columns.
 
 `tools/directory-bindings.mjs` runs with a delegated Graph token. By default it reads and
-changes nothing. The flags below are as planned; `node tools/directory-bindings.mjs --help` is
-authoritative.
+changes nothing. The flags below match [`tools/README.md`](../../tools/README.md);
+`node tools/directory-bindings.mjs --help` is authoritative. For the token, see that README's
+"Authentication" section: the `az` token has no SharePoint scopes.
 
 ```bash
 export GRAPH_TOKEN=$(node ../bcr-onboarding-agent/tools/graph-login.mjs)
@@ -307,7 +331,8 @@ Then add the two new columns, `DriveId` and `TeamId`. The code running today doe
 them.
 
 ```bash
-node tools/directory-bindings.mjs --add-columns
+node tools/directory-bindings.mjs --add-columns           # dry run: says what it would create
+node tools/directory-bindings.mjs --add-columns --apply
 ```
 
 **Verify.** The list has `DriveId` and `TeamId`, and `check` has no unresolved finding without a
@@ -461,7 +486,9 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
 
 1. **Deploy ingestion,** code only, as in H-9, with the `document-ingestion` package.
 2. **Check that it is the Phase-0 build.**
-   `curl -s https://$INGEST.azurewebsites.net/api/health` reports the Phase-0 build.
+   `curl -s https://$INGEST.azurewebsites.net/api/health` reports the Phase-0 build:
+   `"build":{"phase":"p0","routing":"identity-only"}`. The tool enforces this itself when you
+   pass `--health-url https://$INGEST.azurewebsites.net/api/health --expect-health build.routing=identity-only`.
    `directory-bindings.mjs` refuses to apply until it does.
 3. **Negative canary: quarantine.** A canary guest bound to no row uploads a synthetic PDF. The
    canary guest is a BCR-controlled outside account, invited as a guest and in no client Team.
@@ -477,8 +504,16 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    - `RootFolder` is the channel folder's name as Graph returns it;
    - `DriveId` and `TeamId` are set;
    - host, path and drive are unchanged.
-5. **Apply TEST first.** `node tools/directory-bindings.mjs apply --plan tools/out/<plan>.json --only <TEST row>`
-   (flags per `--help`). The tool prints each row before and after, and writes a rollback log.
+5. **Apply TEST first.** A dry run, then the same with `--apply`:
+
+   ```bash
+   node tools/directory-bindings.mjs apply --plan tools/out/<plan>.json --only <TEST listItemId> \
+     --health-url https://$INGEST.azurewebsites.net/api/health \
+     --expect-health build.routing=identity-only            # then again with --apply
+   ```
+
+   The tool prints each row before and after, and writes a rollback log. It refuses a plan older
+   than 24 hours, a row changed since `propose`, and a health endpoint that is not the P0 build.
 6. **Canary on TEST.** The TEST guest uploads a synthetic PDF. Expect:
    - it lands in TEST's `Dokumenty księgowe/…`, visible in the channel's files tab;
    - the card's link opens it there;
@@ -513,8 +548,8 @@ aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
 
 **Rollback.**
 
-- A binding: `node tools/directory-bindings.mjs rollback --log tools/out/<apply-log>.json`
-  restores the before-state it printed. That row's guests then go to quarantine, which is safe.
+- A binding: `node tools/directory-bindings.mjs rollback --log tools/out/<apply-log>.json --apply`
+  (a dry run without `--apply`) restores the before-state it printed. That row's guests then go to quarantine, which is safe.
 - The ingestion build: stop the app, revert the offending commit, rebuild and deploy. **Never
   redeploy a pre-Phase-0 ingestion zip.**
 - The bot keeps running either way.

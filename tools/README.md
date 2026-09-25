@@ -119,7 +119,7 @@ Before it writes anything, `apply` refuses a plan in any of these cases:
 - the plan's digest no longer matches: it was **edited** after `propose`;
 - the plan is **older** than `--max-plan-age-hours` (default 24), because Team membership may have changed;
 - `--only` asks for a **SKIP** row;
-- the **ingestion health** check fails: `--health-url` must answer 200, and its JSON must satisfy every `--expect-health key=value`. Dotted keys reach into nested objects, so pass values that only the P0 build reports;
+- the **ingestion health** check fails: `--health-url` must answer 200, and its JSON must satisfy every `--expect-health key=value`. Dotted keys reach into nested objects, so pass values that only the P0 build reports — the Phase-0 ingestion build answers `"build":{"phase":"p0","routing":"identity-only"}`, so use `--expect-health build.routing=identity-only`;
 - the plan patches `DriveId` or `TeamId` and those **columns are missing**. Run `--add-columns --apply` first.
 
 For each PATCH row, `apply`:
