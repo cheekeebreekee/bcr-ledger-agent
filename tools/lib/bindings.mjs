@@ -495,7 +495,8 @@ export function classifyTeamPeople({ teamId, members, owners, memberOfByUser, kn
 }
 
 /**
- * Whether the ingestion identity may write to a site, from
+ * Whether the ingestion's managed identity (its app id, INGEST_MI_APPID) may
+ * write to a site, from
  * `GET /sites/{id}/permissions`. `null` means the caller could not read the
  * permissions, which is common: it needs Sites.FullControl.All.
  *
@@ -908,7 +909,11 @@ export function assessRow(row, facts = {}, ctx = {}) {
       : evaluateWriteGrant(facts.permissions, ctx.ingestAppIds);
   evidence.writeGrant = grant;
   if (grant === 'missing') {
-    add('write_grant_missing', 'skip', 'the ingestion identity has no write permission on this site');
+    add(
+      'write_grant_missing',
+      'skip',
+      "the ingestion Function App's managed identity (--ingest-app-ids) has no write permission on this site",
+    );
   } else if (grant === 'unknown') {
     const verified = ctx.writeVerified?.has(canonicalPath) || ctx.writeVerified?.has(row.listItemId);
     if (verified) {
