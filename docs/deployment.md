@@ -57,45 +57,19 @@ az ad app create --display-name "BCR Ledger Ingestion API" \
 
 - Under *Expose an API*, add an **App role** called `Documents.Ingest`
   (Allowed member types: *Applications*).
-- Under *API permissions* → *Add a permission* → *Microsoft Graph* → *Application*:
-  - `Sites.Selected`
-- Click *Grant admin consent for <tenant>*.
+- Add **no** Microsoft Graph permission here. Ingestion calls Graph as its Function App's
+  managed identity, which does not exist until the deploy in §3; it gets its grants in §5.
 
 ### 1c. Allow the bot to call the ingestion API
 
-In the *Ingestion API* app → *Expose an API* → *Authorized client
-applications*, add the **Bot app's client id** and check `Documents.Ingest`.
+Assign the `Documents.Ingest` **application** permission to the bot's service principal and
+grant admin consent, as in [`setup-guide.md` §2c](setup-guide.md#2c-grant-the-bot-app-permission-to-call-the-ingestion-api).
+*Authorized client applications* does not apply: it is for delegated scopes, and this flow is
+app-only.
 
 ---
 
-## 2. Grant SharePoint site permission
-
-`Sites.Selected` lets the ingestion identity write only to the sites you explicitly
-authorise, one grant per site. In a multi-client deployment that means **every** client site
-plus the quarantine site, so it is not a single-site scope (see `security.md`, T3). Run this
-from a context with `Sites.FullControl.All` (usually a Global Admin token):
-
-```bash
-SITE_ID=$(az rest --method get \
-  --uri "https://graph.microsoft.com/v1.0/sites/contoso.sharepoint.com:/sites/BCR-Ledger" \
-  --query id -o tsv)
-
-az rest --method post \
-  --uri "https://graph.microsoft.com/v1.0/sites/$SITE_ID/permissions" \
-  --body '{
-    "roles": ["write"],
-    "grantedToIdentities": [{
-      "application": {
-        "id": "<INGESTION_APP_ID>",
-        "displayName": "BCR Ledger Ingestion API"
-      }
-    }]
-  }'
-```
-
----
-
-## 3. Fill in parameter files
+## 2. Fill in parameter files
 
 Edit `infrastructure/main.dev.parameters.json` (and the prod copy) with:
 
@@ -106,7 +80,7 @@ Edit `infrastructure/main.dev.parameters.json` (and the prod copy) with:
 
 ---
 
-## 4. Deploy
+## 3. Deploy
 
 ```bash
 az login
@@ -126,7 +100,7 @@ The script will:
 
 ---
 
-## 5. Seed secrets in Key Vault
+## 4. Seed secrets in Key Vault
 
 ```bash
 KV=$(az deployment group show -g rg-bcr-ledger-dev -n bcr-ledger-dev-... \
@@ -146,6 +120,21 @@ Then restart both Function Apps so the new Key Vault references are picked up:
 az functionapp restart -g rg-bcr-ledger-dev -n func-bcr-bot-dev-...
 az functionapp restart -g rg-bcr-ledger-dev -n func-bcr-ingest-dev-...
 ```
+
+---
+
+## 5. Grant SharePoint permissions to the ingestion managed identity
+
+Ingestion reads and writes SharePoint as the ingestion Function App's **system-assigned managed
+identity**, which the deploy in §3 created. Every grant goes to that identity's app id
+(`INGEST_MI_APPID`), **never** to the Ingestion API app registration: ingestion never
+authenticates as the registration, so a grant to it does nothing.
+
+The procedure is in [`setup-guide.md` §5](setup-guide.md#5-grant-sharepoint-site-permission-sitesselected):
+derive `INGEST_MI_APPID` from the Function App, give the identity the Graph app role
+`Sites.Selected`, then `write` on the quarantine site, `read` on the site that holds the Client
+Directory, and `write` on each client site as it is bound. `Sites.Selected` is an allow-list of
+per-site grants, not a single-site scope (see `security.md`, T3).
 
 ---
 

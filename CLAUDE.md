@@ -242,7 +242,9 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
   column, the quarantine site's from `QUARANTINE_DRIVE_NAME`.
 - **Graph calls use the Function App's system-assigned managed identity**, not the API app
   registration, and `Sites.Selected` needs *two* grants (Graph app role + per-site permission);
-  per-site grants take ~5 min to propagate. See `docs/admin-sharepoint-grant.md`.
+  per-site grants take ~5 min to propagate. Every grant names the MI's app id (`INGEST_MI_APPID`);
+  a grant to the API app registration does nothing. See `docs/setup-guide.md` §5 and
+  `infrastructure/quarantine/README.md` (the old `grant-sharepoint-permission.sh` is deleted).
 - `MICROSOFT_APP_TYPE` must be `SingleTenant` (the app registration is `AzureADMyOrg`); the wrong
   value is a 401 at Bot Framework auth.
 - `@anthropic-ai/sdk` must stay ≥ 0.40 for typed PDF `document` content blocks

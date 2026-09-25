@@ -44,7 +44,7 @@ Two rules follow from that, and they are the ones that were broken:
 | `conflict` | The id is on two rows (a client row and an `IsAdmin` row count too), or its only row was excluded because its target is shared with another row (see [Duplicates and conflicts](#duplicates-and-conflicts)). |
 | `stale_directory` | The list could not be refreshed for longer than the stale cap, or the row's `DriveId` does not match. |
 | `forbidden_target` | The id's only row was excluded because it points at a forbidden site: BCR GROUP, the quarantine site, or a SharePoint host other than the tenant's. |
-| `target_unwritable` | The client's site refused the write after retries, usually because the ingestion identity has no grant there. |
+| `target_unwritable` | The client's site refused the write after retries, usually because the ingestion managed identity has no `write` grant there (or the grant went to the Ingestion API app registration instead). |
 
 5. **Content never changes the client.** After classification, the only thing content can change
    is the direction of an invoice (sales ⇄ purchase), and only inside the client the uploader is
@@ -147,13 +147,18 @@ Onboarding step 13 writes the row with an empty `RootFolder` and no user ids. Un
 bound, the client's uploads go to quarantine as `unmapped`. That is safe but slow, so bind soon
 after onboarding:
 
-1. **Grant the ingestion identity write on the client's site.** Use the onboarding repo's
-   `Grant-TeamSiteAccess.ps1` runbook with the ingestion identity's app id. The runbook call is
-   in [human-steps H-6](operations/human-steps.md#h-6-grant-the-ingestion-identity-write-on-the-quarantine-site).
+1. **Grant the ingestion managed identity write on the client's site.** Use the onboarding
+   repo's `Grant-TeamSiteAccess.ps1` runbook with `AppId` set to the **ingestion Function App's
+   managed identity app id** (`INGEST_MI_APPID`, derived as in
+   [human-steps → Variables](operations/human-steps.md#variables-used-below)). Never use the
+   Ingestion API app registration's id: ingestion never authenticates as it, so a grant to it
+   does nothing. The runbook call is in
+   [human-steps H-6](operations/human-steps.md#h-6-grant-the-ingestion-identity-write-on-the-quarantine-site).
    Without this grant the tool skips the row. Only once the Phase-0 ingestion is live: under the
    old build, every new grant was one more site content promotion could write into. Confirm the
-   grant **read-only** afterwards (`GET /sites/{site-id}/permissions` in Graph Explorer shows
-   `write` for the ingestion app id). The runbook is not a check: when it finds no grant it
+   grant **read-only** afterwards: `GET /sites/{site-id}/permissions` in Graph Explorer must
+   show `write` for `INGEST_MI_APPID`. A `write` entry for the Ingestion API app registration
+   does not count; record it for deletion. The runbook is not a check: when it finds no grant it
    creates one, so never run it against BCR GROUP or any other forbidden site.
 2. `node tools/directory-bindings.mjs check`, with the variables from
    [human-steps H-7](operations/human-steps.md#h-7-check-the-directory-before-the-deploy-and-add-the-new-columns):

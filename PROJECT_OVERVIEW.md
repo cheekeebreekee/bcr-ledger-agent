@@ -213,8 +213,9 @@ bcr-ledger-agent/
 ├── infrastructure/
 │   ├── main.bicep                       # Azure resources (drifted from dev; see lesson 20)
 │   ├── main.dev.parameters.json
-│   ├── deploy.sh                        # Bicep + zip-deploy wrapper. Not for Phase 0.
-│   └── grant-sharepoint-permission.sh   # (legacy) only works in tenants without strict pre-auth
+│   ├── deploy.sh                        # Bicep + zip-deploy wrapper. New environments only; refuses dev.
+│   ├── quarantine/                      # quarantine site script, and the managed identity's site grant
+│   └── ir/                              # IR evidence store
 ├── tools/                               # operator tools: directory-bindings, inventory-misfiled, ir0/
 ├── teams-app/
 │   ├── manifest.json                    # Teams app manifest 0.2.0 (personal scope only, no tab)
@@ -421,7 +422,10 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
 
 1. **Function MI ≠ API app registration.** The ingestion function calls Graph as its
    system-assigned **managed identity** (app id `d5226274-…`), not as the API app registration
-   (`b8b90018-…`). Grant `Sites.Selected` to the MI.
+   (`b8b90018-…`). Grant `Sites.Selected` and every per-site permission to the MI. The legacy
+   `infrastructure/grant-sharepoint-permission.sh` granted to the app registration by default,
+   wrote without a dry run and hard-coded this tenant's ids; it is deleted. Grants follow
+   [`docs/setup-guide.md` §5](docs/setup-guide.md#5-grant-sharepoint-site-permission-sitesselected).
 
 2. **Sites.Selected needs TWO grants** to work:
    - an app role assignment on Microsoft Graph (tenant-wide):

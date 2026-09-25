@@ -45,6 +45,7 @@ into multiple places. Keep a scratchpad open:
 | **Bot App Password** | long string | Client secret on the Bot app reg |
 | **Ingestion App ID** | UUID | App registration (the “API identity”) |
 | **Ingestion App ID URI** | `api://<uuid>` | *Expose an API* blade on Ingestion app |
+| **Ingestion managed identity app id** (`INGEST_MI_APPID`) | UUID | The ingestion Function App's system-assigned managed identity, after §3b. The identity that calls Microsoft Graph, and the only one that gets SharePoint grants (§5). |
 | **SharePoint Site ID** | comma-tuple | `GET /sites/{hostname}:/sites/{path}` |
 | **App Insights Connection String** | `InstrumentationKey=…;IngestionEndpoint=…;` | App Insights → *Configure → Properties* |
 | **Anthropic API Key** | `sk-ant-…` | [Anthropic Console](https://console.anthropic.com/) → *API Keys* |
@@ -60,6 +61,12 @@ The architecture uses **two** app registrations:
    ingestion HTTP API. The bot acquires a token for this app and presents
    it on every `POST /api/ingest/batch` call. Since Phase 0, ingestion also checks that the
    token's app id is the bot's (`BOT_CALLER_APP_IDS`), so no other app can call it.
+
+Neither registration calls Microsoft Graph. Ingestion calls Graph as its Function App's
+**system-assigned managed identity**, which the Bicep deploy in §3 creates. That identity, and
+only that identity, gets `Sites.Selected` and the per-site grants in §5. A SharePoint grant to
+the Ingestion API app registration gives ingestion nothing, because ingestion never
+authenticates as it.
 
 ### 2a. Bot app registration
 
@@ -110,11 +117,9 @@ On the new registration:
    - **Allowed member types:** *Applications*
    - **Value:** `Documents.Ingest`
    - **Description:** *Allows the caller to ingest documents into SharePoint.*
-3. **API permissions → + Add a permission → Microsoft Graph → Application
-   permissions:**
-   - `Sites.Selected` (we’ll scope this to a single SharePoint site in
-     step 5)
-4. Click **Grant admin consent for <your tenant>**.
+
+Add **no** Microsoft Graph permission to this registration. `Sites.Selected` goes to the
+ingestion Function App's managed identity in §5, never to this app registration.
 
 | Copy this value | Use as |
 |---|---|
@@ -146,7 +151,7 @@ az ad app show --id "$INGESTION_APP_ID" \
 ```json
 {
   "roles": ["Documents.Ingest"],
-  "uris": ["api://b8b90018-9af0-4d7a-ada2-71559952ebbe"]
+  "uris": ["api://<INGESTION_APP_ID>"]
 }
 ```
 
@@ -348,33 +353,56 @@ az functionapp restart -g rg-bcr-ledger-dev -n func-bcr-ingest-dev-XXXX
 
 ## 5. Grant SharePoint site permission (`Sites.Selected`)
 
-`Sites.Selected` is the modern, **least-privilege** alternative to
-`Sites.ReadWrite.All`. The ingestion app is allowed to write only to the
-single site you grant it.
+Ingestion reads and writes SharePoint as the ingestion Function App's **system-assigned managed
+identity**. Every grant below goes to that identity. **Never grant to the Ingestion API app
+registration** (`INGESTION_APP_ID`): ingestion never authenticates as it, so the grant does
+nothing, yet a permissions list then shows `write` for an id that looks right. In June 2026 that
+mistake was the 401 at the first smoke test
+([`admin-sharepoint-grant.md`](admin-sharepoint-grant.md)).
+
+`Sites.Selected` is not a single-site scope. It is an allow-list of per-site grants, and the
+identity ends up with `write` on every client site it files into (see
+[`security.md`](security.md), T3).
+
+Derive the identity's ids from the Function App, so nobody types a GUID:
 
 ```bash
-# 1. Look up the site ID
-SITE_ID=$(az rest --method get \
-  --uri "https://graph.microsoft.com/v1.0/sites/contoso.sharepoint.com:/sites/BCR-Ledger" \
-  --query id -o tsv)
-
-# 2. Grant the Ingestion app reg the "write" role on that site
-az rest --method post \
-  --uri "https://graph.microsoft.com/v1.0/sites/$SITE_ID/permissions" \
-  --body '{
-    "roles": ["write"],
-    "grantedToIdentities": [{
-      "application": {
-        "id": "<INGESTION_APP_ID>",
-        "displayName": "BCR Ledger Ingestion API"
-      }
-    }]
-  }'
+RG=rg-bcr-ledger-<env>
+INGEST=func-bcr-ingest-<env>-XXXX            # from §3b
+INGEST_MI_OID=$(az functionapp identity show -g $RG -n $INGEST --query principalId -o tsv)
+INGEST_MI_APPID=$(az ad sp show --id "$INGEST_MI_OID" --query appId -o tsv)
 ```
 
-> ⚠️ The user running this command needs `Sites.FullControl.All` (typically
-> a Global / SharePoint admin). Once granted, you’re done — no per-folder
-> ACLs needed.
+The object id is for the app-role assignment, the app id for the site grants. Swapping them
+creates a grant that silently protects nothing.
+
+1. **The Graph app role `Sites.Selected`**, once for this identity. It needs Global
+   Administrator or Privileged Role Administrator, and the Azure CLI cannot make it in this
+   tenant (`AADSTS65002`). Use Graph Explorer, as in
+   [`admin-sharepoint-grant.md`](admin-sharepoint-grant.md), Step 1, with `$INGEST_MI_OID` as the
+   principal.
+2. **A per-site permission** for `$INGEST_MI_APPID`, on each site the identity touches:
+
+   | Site | Role | When |
+   |---|---|---|
+   | The quarantine site | `write` | Before ingestion takes traffic. See [`infrastructure/quarantine/README.md`](../infrastructure/quarantine/README.md#write-grant-for-the-ingestion-managed-identity). |
+   | The site that holds the Client Directory list (BCR GROUP) | `read` | Before ingestion takes traffic. **Never `write`**: nothing is ever filed there. |
+   | Each client's Team site | `write` | When that client is bound, as step 1 of [Onboarding a client](client-directory-admin-guide.md#onboarding-a-client-phase-0). |
+
+   Make a `write` grant with the onboarding repo's `Grant-TeamSiteAccess.ps1` runbook
+   (`AppId="$INGEST_MI_APPID"`), or with a Graph `POST /sites/{site-id}/permissions` by a
+   SharePoint administrator. Both are in
+   [`infrastructure/quarantine/README.md`](../infrastructure/quarantine/README.md#write-grant-for-the-ingestion-managed-identity).
+   The `read` grant is the same Graph call with `"roles": ["read"]`. The runbook only ever
+   grants `write`, and it is not a check: when it finds no grant it creates one. So never run it
+   to verify a grant, and never against BCR GROUP or any other site in
+   `FORBIDDEN_TARGET_SITE_PATHS`.
+
+**Verify, read-only.** `GET https://graph.microsoft.com/v1.0/sites/{site-id}/permissions`, with
+`Sites.FullControl.All` consented, lists one entry whose `grantedToIdentities[0].application.id`
+equals `$INGEST_MI_APPID`, with the role from the table. An entry for the Ingestion API app
+registration does not count: record it for deletion. Per-site grants take about 5 minutes to
+apply.
 
 ---
 
@@ -597,7 +625,7 @@ union requests, exceptions, traces
 | `+ Add a permission → My APIs` shows **No results** | Ingestion API has no *Application ID URI* and/or no *app role*, **or** you're signed in to a different tenant | Run the preflight in §2b (`az ad app show --id …`); fix whichever array is empty, then **Refresh** the *My APIs* tab |
 | `401 Unauthorized` from ingestion | Bot’s token has no `Documents.Ingest` role | Re-check §2c (Bot app reg → *API permissions* → application permission + admin consent) |
 | Ingestion logs `Token missing required role` but portal shows *✅ Granted* | CLI script used `az ad app permission admin-consent` (creates only delegated grants, **not** app-role assignments) | Run the `az rest --method POST … /appRoleAssignments` from §2c, then verify the GET returns one entry |
-| `403 Forbidden` on Graph upload | `Sites.Selected` not granted on the target site | Re-run §5 |
+| A client's uploads land in quarantine as `target_unwritable`, or Graph answers `401`/`403` | The ingestion **managed identity** lacks the `Sites.Selected` app role or the site's `write` grant. Often the grant went to the Ingestion API app registration instead. | Check read-only as in §5 (**Verify**): the entry must name `INGEST_MI_APPID`. Then make the missing grant to the managed identity, never to the app registration |
 | Bot replies “⚠️ Could not file …” with `Folder traversal not allowed` | Tenant filename contains `..` or path separator | Rename the file or extend `pathBuilder.ts` rules |
 | Cards never render in Teams | The bot identity is wrong | Confirm `MICROSOFT_APP_ID` matches the Bot app reg, *and* the Teams `manifest.json` `id` + `bots[0].botId` use the same value |
 | `func: command not found` running `yarn start:bot` | Dependencies not installed from repo root | `cd bcr-ledger-agent && corepack yarn install` |

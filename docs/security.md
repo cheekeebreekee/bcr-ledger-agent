@@ -28,7 +28,10 @@ one SharePoint site. Each threat now has a status:
 **The ingestion identity's site grants.** Before Phase 0, it had `write` on TEST, PESKOVOI and
 BCR GROUP. Phase 0 adds `write` on the quarantine site, and on each client site bound in the
 Phase-0 change window. It downgrades BCR GROUP to `read`, because the Client Directory is read
-there and nothing may be written there.
+there and nothing may be written there. Every grant names the managed identity's app id. A grant
+to the Ingestion API app registration gives ingestion nothing, because ingestion never
+authenticates as it, but it makes a permissions list look as if ingestion can write. Such
+entries are recorded for deletion.
 
 ## 2. Secrets inventory
 

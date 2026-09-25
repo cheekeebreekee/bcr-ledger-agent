@@ -398,9 +398,15 @@ site the identity files into:
 
 So the identity can write to every client site: that is by design, not a single-site scope (see
 T3 in [`docs/security.md`](./docs/security.md)). Never grant `Files.ReadWrite.All` or
-`Sites.ReadWrite.All` instead. The grant procedure is in
-[`docs/admin-sharepoint-grant.md`](./docs/admin-sharepoint-grant.md) and, for client sites, the
-onboarding repo's `Grant-TeamSiteAccess.ps1` runbook.
+`Sites.ReadWrite.All` instead.
+
+Every grant names the **managed identity's app id** (`INGEST_MI_APPID`), never the Ingestion
+API app registration's. The registration is only the token audience of §5.2; ingestion never
+authenticates to Graph as it, so a site grant to it does nothing. The procedure is in
+[`docs/setup-guide.md` §5](./docs/setup-guide.md#5-grant-sharepoint-site-permission-sitesselected):
+the Graph app role as in [`docs/admin-sharepoint-grant.md`](./docs/admin-sharepoint-grant.md),
+and site grants through the onboarding repo's `Grant-TeamSiteAccess.ps1` runbook or Graph, as in
+[`infrastructure/quarantine/README.md`](./infrastructure/quarantine/README.md#write-grant-for-the-ingestion-managed-identity).
 
 ---
 
