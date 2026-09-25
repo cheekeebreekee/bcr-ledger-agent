@@ -623,6 +623,9 @@ app. The build works on a copy, so the tracked manifest keeps its placeholders.
 # RG and BOT as in human-steps.md → Variables
 BOT_APP_ID=$(az functionapp config appsettings list -g $RG -n $BOT \
   --query "[?name=='MICROSOFT_APP_ID'].value | [0]" -o tsv)
+# Must print nothing.
+[[ $BOT_APP_ID =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+  || echo 'STOP: BOT_APP_ID is not a GUID. Check RG and BOT, and do not upload what follows.'
 T=$(mktemp -d)
 sed "s/REPLACE-WITH-BOT-APP-ID/$BOT_APP_ID/g" teams-app/manifest.json > "$T/manifest.json"
 cp teams-app/color.png teams-app/outline.png "$T/"
@@ -631,11 +634,12 @@ grep -c REPLACE-WITH "$T/manifest.json"
 OUT="$PWD/artifacts/teams-app.zip"; mkdir -p artifacts; rm -f "$OUT"
 (cd "$T" && zip -X "$OUT" manifest.json color.png outline.png)
 unzip -p "$OUT" manifest.json | jq -r \
-  '.version, (.bots[0].scopes | join(",")), (.staticTabs // [] | length), (.id == .bots[0].botId)'
+  '.version, (.bots[0].scopes | join(",")), (.staticTabs // [] | length),
+   (.id == .bots[0].botId and (.id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"; "i")))'
 ```
 
-The last command must print `0.2.0`, `personal`, `0` and `true`, one per line. Anything else:
-do not upload it.
+The last command must print `0.2.0`, `personal`, `0` and `true`, one per line: `true` only when
+`id` and `botId` are the same GUID. Anything else: do not upload it.
 
 **Change.** In the Teams admin centre:
 

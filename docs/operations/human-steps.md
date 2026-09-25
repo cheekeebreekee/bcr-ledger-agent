@@ -74,6 +74,18 @@ aiq() { az monitor app-insights query -g $RG --app $APPI --analytics-query "$1" 
   --start-time "$2" --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o table; }
 ```
 
+**Check the two ids, in every new shell, right after the variables.** An empty or malformed value
+means `RG`, `BOT` or `INGEST` is wrong (or a comment was pasted into zsh), and the steps below
+would write it into a setting or a grant: an empty `BOT_CALLER_APP_IDS` stops the Phase-0
+ingestion at cold start. This must print nothing:
+
+```bash
+[[ $BOT_APP_ID =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+  || echo 'STOP: BOT_APP_ID is not a GUID. Check RG and BOT, then set the variables again.'
+[[ $INGEST_MI_APPID =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+  || echo 'STOP: INGEST_MI_APPID is not a GUID. Check RG and INGEST, then set the variables again.'
+```
+
 Graph and SharePoint tokens are set up as described in
 [`tenant-hardening.md` → Tokens](tenant-hardening.md#tokens).
 
@@ -641,19 +653,25 @@ the set below a live change to the running bot's Bot Framework authentication: r
 the TEST guest sends `pomoc` and the help card must come back. If it does not, restore the noted
 value (or delete the setting, if it was not set) and stop.
 
-```bash
-az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
-  "BOT_CALLER_APP_IDS=$BOT_APP_ID" \
-  "QUARANTINE_SITE_HOSTNAME=$SP_HOST" \
-  "QUARANTINE_SITE_PATH=/sites/BCRLedgerKwarantanna" \
-  "QUARANTINE_DRIVE_NAME=Dokumenty" \
-  "QUARANTINE_ROOT_FOLDER=Kwarantanna" \
-  "FORBIDDEN_TARGET_SITE_PATHS=/sites/BCRGROUPSp.zo.o" \
-  "CLIENT_DIRECTORY_MAX_STALE_MS=900000"
+The set runs only if `BOT_APP_ID` is a GUID (the guard after the Variables), so a lost variable
+cannot write an empty `BOT_CALLER_APP_IDS`:
 
-az functionapp config appsettings set -g $RG -n $BOT -o none --settings \
-  "BOT_GATE_MODE=log" \
-  "MICROSOFT_APP_TYPE=SingleTenant"
+```bash
+if [[ $BOT_APP_ID =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+  az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
+    "BOT_CALLER_APP_IDS=$BOT_APP_ID" \
+    "QUARANTINE_SITE_HOSTNAME=$SP_HOST" \
+    "QUARANTINE_SITE_PATH=/sites/BCRLedgerKwarantanna" \
+    "QUARANTINE_DRIVE_NAME=Dokumenty" \
+    "QUARANTINE_ROOT_FOLDER=Kwarantanna" \
+    "FORBIDDEN_TARGET_SITE_PATHS=/sites/BCRGROUPSp.zo.o" \
+    "CLIENT_DIRECTORY_MAX_STALE_MS=900000"
+  az functionapp config appsettings set -g $RG -n $BOT -o none --settings \
+    "BOT_GATE_MODE=log" \
+    "MICROSOFT_APP_TYPE=SingleTenant"
+else
+  echo 'STOP: BOT_APP_ID is not a GUID, so nothing was set. Set the variables again.'
+fi
 ```
 
 | Setting | Why this value |
@@ -676,22 +694,40 @@ az functionapp config appsettings list -g $RG -n $BOT -o table --query \
   "[?name=='BOT_GATE_MODE' || name=='MICROSOFT_APP_TYPE'].{name:name,value:value}"
 ```
 
-The shapes the Phase-0 build checks at cold start, checked now, while a wrong value costs
-nothing. This must print nothing:
+The settings the Phase-0 build requires at cold start, checked now, while a wrong value costs
+nothing. Each must be present, not empty, and in the shape the table gives: the two paths exactly
+`/sites/<name>` or `/teams/<name>`, every `BOT_CALLER_APP_IDS` entry a GUID. A setting that is
+missing prints `missing or empty`, one in the wrong shape `wrong shape`. This must print nothing:
 
 ```bash
 az functionapp config appsettings list -g $RG -n $INGEST -o json --query \
-  "[?name=='CLIENT_DIRECTORY_SITE_ID' || name=='QUARANTINE_SITE_HOSTNAME' || name=='BOT_CALLER_APP_IDS'].{name:name,value:value}" \
-  | jq -r '.[] | select(
-      (.name == "CLIENT_DIRECTORY_SITE_ID"
-        and (.value | test("^[a-z0-9.-]+,[0-9a-f-]{36},[0-9a-f-]{36}$"; "i") | not))
-      or (.name == "QUARANTINE_SITE_HOSTNAME"
-        and (.value | test("^[a-z0-9-]+\\.sharepoint\\.com$"; "i") | not))
-      or (.name == "BOT_CALLER_APP_IDS"
-        and (.value | split(",") | map(gsub("^\\s+|\\s+$"; ""))
-             | all(test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"; "i")) | not))
-    ) | "wrong shape: \(.name)"'
+  "[?name=='CLIENT_DIRECTORY_SITE_ID' || name=='QUARANTINE_SITE_HOSTNAME' || name=='QUARANTINE_SITE_PATH' || name=='BOT_CALLER_APP_IDS' || name=='FORBIDDEN_TARGET_SITE_PATHS'].{name:name,value:value}" \
+  | jq -r '
+    def t: sub("^\\s+"; "") | sub("\\s+$"; "");
+    def list: split(",") | map(t) | map(select(. != ""));
+    def guid: test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"; "i");
+    def site_path: test("^/(sites|teams)/[A-Za-z0-9_-]([A-Za-z0-9._-]*[A-Za-z0-9_-])?$");
+    def ok($n):
+      if   $n == "CLIENT_DIRECTORY_SITE_ID" then test("^[a-z0-9.-]+,[0-9a-f-]{36},[0-9a-f-]{36}$"; "i")
+      elif $n == "QUARANTINE_SITE_HOSTNAME" then test("^[a-z0-9-]+\\.sharepoint\\.com$"; "i")
+      elif $n == "QUARANTINE_SITE_PATH"     then site_path
+      elif $n == "BOT_CALLER_APP_IDS"       then list | length > 0 and all(guid)
+      else                                       list | length > 0 and all(site_path) end;
+    (map({(.name): (.value // "" | t)}) | add // {}) as $s
+    | ("CLIENT_DIRECTORY_SITE_ID", "QUARANTINE_SITE_HOSTNAME", "QUARANTINE_SITE_PATH",
+       "BOT_CALLER_APP_IDS", "FORBIDDEN_TARGET_SITE_PATHS") as $n
+    | ($s[$n] // "") as $v
+    | if $v == "" then "missing or empty: \($n)"
+      elif ($v | ok($n)) then empty
+      else "wrong shape: \($n)" end'
 ```
+
+If it prints anything, correct that setting now with a merge-only
+`az functionapp config appsettings set … -o none`, and run the check again. At H-12 the same
+mistake would stop the new build at cold start. The running ingestion ignores the new settings,
+so correcting them is harmless. It does read `CLIENT_DIRECTORY_SITE_ID`: if that one is reported,
+set it to the same site's three-part id,
+`g "$G/sites/$SP_HOST:/sites/BCRGROUPSp.zo.o?\$select=id" | jq -r .id`, and run T-5's `directory refresh failed` query for the next 15 minutes.
 
 If you changed `MICROSOFT_APP_TYPE`, the TEST guest's `pomoc` came back.
 
@@ -881,7 +917,7 @@ These steps go in **one** window because each fixes a failure the others would c
 - IR-0 is stored (H-2). This deploy changes the logs.
 - `ANTHROPIC_ENABLED=false` (H-3) and the fallback points at the quarantine (H-6b).
 - H-6's grant is in place.
-- H-8's settings are present.
+- H-8's settings are present, and H-8's check of them, run again now, prints nothing.
 - The gate is in `enforce` (H-11).
 - T-4 (and its check after H-6b), T-4b and T-5 are done.
 - Every H-7 finding has a decision.
@@ -911,6 +947,23 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    `"build":{"phase":"p0","routing":"identity-only"}`. `directory-bindings.mjs apply` checks
    this itself: it refuses to write unless the `--health-url` it is given reports
    `build.routing=identity-only`. `--expect-health` only adds further checks.
+
+   **If `/api/health` does not answer within a few minutes** of the deploy, the new build did not
+   start. It checks its settings when it loads, and one missing or malformed setting stops every
+   function, `/api/health` included. Never answer this with the pre-Phase-0 zip. Instead:
+   1. run the emergency stop, `az functionapp stop -g $RG -n $INGEST`;
+   2. find the setting it names. The message lists each failing setting by name, never its value:
+
+      ```bash
+      aiq 'union exceptions, traces | where cloud_RoleName startswith "func-bcr-ingest"
+        | where outerMessage has "Invalid configuration" or message has "Invalid configuration"
+        | project timestamp, text = coalesce(outerMessage, message)' <time of the deploy>
+      ```
+
+   3. fix that setting with a merge-only
+      `az functionapp config appsettings set -g $RG -n $INGEST -o none --settings "<NAME>=<value>"`,
+      and run H-8's check again until it prints nothing;
+   4. `az functionapp start -g $RG -n $INGEST`, and check `/api/health` again.
 
    **The window, from here until each row's apply.** A client row routes nobody until it holds
    `RootFolder`, `DriveId` and `TeamId`, and only `apply` writes those, all three together. So
