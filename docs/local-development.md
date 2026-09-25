@@ -30,42 +30,55 @@ yarn ts-node scripts/mockIngestion.ts
 
 ## Triggering ingestion without the bot
 
-`curl` straight into the ingestion API for tight iteration on classification:
+⚠️ **A local ingestion writes to whatever the Directory it reads points at.** Point
+`CLIENT_DIRECTORY_*` at a test list, and `QUARANTINE_*` at a test site, in your
+`local.settings.json`. Never point them at the live Client Directory, and never upload a real
+client document from a laptop.
+
+Since Phase 0, ingestion has a single route, `POST /api/ingest/batch`. It accepts a token only
+from an app id in `BOT_CALLER_APP_IDS`. It also requires a 1:1-chat source from the configured
+tenant with a UUID user id. For local iteration, put the app id your token carries in your
+**local** `BOT_CALLER_APP_IDS`. Never add it to a deployed app.
 
 ```bash
-ACCESS_TOKEN=$(az account get-access-token \
-  --resource api://<ingestion-app-id> \
-  --query accessToken -o tsv)
+ACCESS_TOKEN=<a token for api://<ingestion-app-id> whose appid is in your local BOT_CALLER_APP_IDS>
 
 cat > /tmp/payload.json <<JSON
 {
-  "filename": "Invoice_03_2026.pdf",
-  "contentType": "application/pdf",
-  "contentBase64": "$(base64 -i ~/Downloads/sample.pdf)",
+  "documents": [{
+    "filename": "Invoice_03_2026.pdf",
+    "contentType": "application/pdf",
+    "contentBase64": "$(base64 -i ~/Downloads/synthetic-sample.pdf)"
+  }],
   "source": {
-    "tenantId": "<tenant-id>",
+    "tenantId": "<AZURE_TENANT_ID>",
     "channelId": "msteams",
     "conversationId": "local-test",
-    "activityId": "local-$(date +%s)"
+    "activityId": "local-$(date +%s)",
+    "conversationType": "personal",
+    "userAadObjectId": "<object id of a test user>"
   }
 }
 JSON
 
-curl -X POST http://localhost:7071/api/ingest \
+curl -X POST http://localhost:7071/api/ingest/batch \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d @/tmp/payload.json | jq .
 ```
 
+A user id that is on no row of your test Directory comes back as `quarantined`, with no result.
+That is the expected answer for an unbound uploader.
+
 ## Useful Kusto
 
 ```kusto
-// All ingestion attempts in the last hour, grouped by outcome
-requests
-| where timestamp > ago(1h)
-| where name == "POST /api/ingest"
-| summarize count() by tostring(customDimensions["resultCode"]), success
-| order by count_ desc
+// Routing outcomes in the last hour (Phase-0 events: ids and codes only)
+traces
+| where timestamp > ago(1h) and cloud_RoleName startswith "func-bcr-ingest"
+| extend m = parse_json(message), msg = tostring(parse_json(message).msg)
+| where msg in ("document.filed", "document.quarantined", "directory.conflict", "ingestion.caller.rejected")
+| summarize count() by msg, reason = tostring(m.quarantineReason)
 ```
 
 ```kusto

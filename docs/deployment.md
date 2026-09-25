@@ -6,6 +6,12 @@ subscription and Microsoft 365 tenant.
 > Total time budget: ~45 minutes the first time, ~3 minutes for subsequent
 > code-only deploys via `yarn deploy:dev`.
 
+> ⚠️ **This guide is for a brand-new environment. Do not run it against "dev" today.** "dev"
+> serves a real client, and `main.bicep` has drifted from the app settings running there.
+> `yarn deploy:dev` deploys Bicep first, which replaces every setting and takes ingestion down.
+> Until the Bicep drift fix, deploy code only, in the order given in
+> [`operations/human-steps.md`](operations/human-steps.md#phase-0).
+
 ---
 
 ## 0. Prerequisites
@@ -63,9 +69,10 @@ applications*, add the **Bot app's client id** and check `Documents.Ingest`.
 
 ## 2. Grant SharePoint site permission
 
-`Sites.Selected` lets the ingestion API write only to the **one** site you
-explicitly authorise. Run this from a context with `Sites.FullControl.All`
-(usually a Global Admin token):
+`Sites.Selected` lets the ingestion identity write only to the sites you explicitly
+authorise, one grant per site. In a multi-client deployment that means **every** client site
+plus the quarantine site, so it is not a single-site scope (see `security.md`, T3). Run this
+from a context with `Sites.FullControl.All` (usually a Global Admin token):
 
 ```bash
 SITE_ID=$(az rest --method get \
@@ -157,8 +164,8 @@ curl https://func-bcr-ingest-dev-XXXX.azurewebsites.net/api/health
 curl -i https://func-bcr-bot-dev-XXXX.azurewebsites.net/api/messages
 ```
 
-Then drag `Invoice_03_2026.pdf` into the chat. You should see:
-
-> ✅ Filed **Invoice_03_2026.pdf**  
-> Type: Invoice — Confidence: 95% — Folder: Invoices/2026/03  
-> [Open in SharePoint]
+Then, as a test guest bound to a test client, send a synthetic PDF to the bot in a 1:1 chat.
+The card shows the document, its category (**Kategoria**) and the folder, with an "Otwórz"
+link into that client's space. An uploader who is not bound to a client instead gets "Dokument
+przekazano do weryfikacji przez zespół BCR.", with no link. Never smoke-test with a real client
+document.

@@ -1,26 +1,32 @@
 # Architecture
 
-## 1. Goals & non-goals
+> **Phase 0 of v2 (September 2026).** This page describes the routing after the Phase-0
+> containment: the client comes from the uploader's identity only, and anything that cannot be
+> tied to exactly one client goes to a staff-only quarantine. Sections that describe behaviour
+> Phase 0 removed are kept, collapsed and marked **as-is before v2 (Sep 2026)**, because
+> incident [`IR-2026-09`](docs/operations/incident-2026-09.md) needs a record of how the system
+> used to behave. Do not build on them.
+
+## 1. Goals and non-goals
 
 **Goals**
 
-- Conversational document-ingestion experience in Microsoft Teams.
-- Content-based folder routing in SharePoint Online: each document is
-  classified by **Claude** (Anthropic API), with a deterministic fallback to
-  a manual-review folder when confidence is low.
-- Fully managed, serverless Azure footprint — no VMs, no Kubernetes.
-- Strict separation of concerns: the **bot** never touches SharePoint or
-  the classifier directly; it only forwards work to an authenticated
-  internal API.
-- Zero secrets in source. Everything is in Key Vault and referenced through
-  Function App settings.
+- Conversational document intake in Microsoft Teams, in a 1:1 chat with the bot.
+- **The document's content chooses the folder; the uploader's identity chooses the client.**
+  Each document is classified by **Claude** (Anthropic API), with a deterministic fallback to a
+  manual-review folder when confidence is low. Content never chooses whose space a document goes
+  to.
+- A client never reaches another client's documents. Anything ambiguous goes to quarantine,
+  never to a guess.
+- Fully managed, serverless Azure footprint: no VMs, no Kubernetes.
+- Strict separation of concerns. The **bot** never touches SharePoint or the classifier directly;
+  it only forwards work to an authenticated internal API.
+- Zero secrets in source. Secrets are in Key Vault and referenced from Function App settings.
 
 **Non-goals**
 
-- Building a generic chatbot framework. This agent has exactly one skill:
-  *“take this file and file it”*.
-- Long-running workflows. If an upload takes > ~30s the bot will respond
-  with a *“still working”* message and move the work to a queue (future).
+- A generic chatbot framework. This agent has exactly one skill: *"take this file and file it"*.
+- Long-running workflows. Moving uploads to a queue is planned (v2 Phase 3).
 
 ---
 
@@ -30,272 +36,325 @@
 |---|---|---|
 | Teams Bot | Bot Framework SDK v4 (JS) | Azure Functions (Node 22, HTTP trigger) |
 | Document Ingestion API | TypeScript + Azure Functions v4 programming model | Azure Functions (Node 22, HTTP trigger) |
-| Shared library | TypeScript | Published intra-repo via Yarn workspaces |
+| Shared library | TypeScript | Yarn workspace |
 | Channel registration | Azure Bot Service | Microsoft.BotService |
 | Secrets | Azure Key Vault | Microsoft.KeyVault |
 | Document classification | Claude (Anthropic Messages API) | api.anthropic.com (external) |
-| File store | SharePoint Online (Microsoft Graph) | Microsoft 365 tenant |
+| Routing directory | "Client Directory" SharePoint list on the BCR GROUP site | Microsoft 365 tenant |
+| File store | Each client's Team site, channel "Dokumenty księgowe" (Microsoft Graph) | Microsoft 365 tenant |
+| Quarantine | "BCR Ledger – Kwarantanna" communication site, staff only | Microsoft 365 tenant |
 | Telemetry | Application Insights | Microsoft.Insights |
 | Infrastructure as code | Bicep | `infrastructure/` |
 
 ---
 
-## 3. Sequence — happy path
+## 3. Sequence: happy path (Phase 0)
 
 ```mermaid
 sequenceDiagram
-  actor U as User (Teams)
-  participant TC as Teams client
+  actor U as Client guest (Teams)
   participant BS as Azure Bot Service
   participant FB as Bot Function App
   participant FI as Ingestion Function App
   participant CD as Client Directory (SharePoint list)
   participant CL as Claude (Anthropic API)
-  participant GR as Microsoft Graph
-  participant SP as SharePoint Online
+  participant SP as SharePoint (via Graph, ingestion MI)
 
-  U->>TC: DMs bot with Invoice_03_2026.pdf + Receipt_2026-03.png
-  TC->>BS: POST activity (message + attachments)
-  BS->>FB: POST /api/messages (JWT signed by BF)
-  FB->>FB: ActivityHandler validates JWT
-  FB->>BS: GET each attachment via attachment service (in parallel)
-  BS-->>FB: file bytes
-  FB->>FI: POST /api/ingest/batch (Bearer token, { documents[], source })
-  FI->>FI: Validate AAD token (audience = ingestion app)
-  FI->>CD: getSnapshot() — 5min cached, byNip / byUserAadObjectId maps
-  CD-->>FI: entries + lookup maps
-  FI->>FI: resolve(source.userAadObjectId) → pre-resolved client (or fallback)
-  loop for each document
-    FI->>CL: messages.create(content + tool schema, primed with resolved client identity)
-    CL-->>FI: category + year/month + confidence + reasoning + parties[]
-    FI->>FI: resolvePostClassification(preResolved, classified)
-    Note over FI: promotes fallback to Directory client on party NIP match;<br/>flips faktury_sprzedazy ⇄ faktury_zakupu on client role
-    alt final client + folder path known
-      FI->>GR: ensureFolder + PUT /content (via per-client SharePointService)
-      GR->>SP: write file into resolved client's site
-      SP-->>GR: 201 Created (driveItem)
-      GR-->>FI: driveItem JSON
-    else confidence too low or category unknown
-      FI->>GR: PUT into 98_Nieposortowane/<YYYY>/<MM>/ on the resolved (or fallback) site
+  U->>BS: 1:1 chat: Faktura_03_2026.pdf
+  BS->>FB: POST /api/messages (JWT signed by Bot Framework)
+  FB->>FB: gate: personal chat? BCR tenant? GUID aadObjectId?
+  Note over FB: refused → no download, no ingestion call
+  FB->>BS: GET each attachment (in parallel)
+  FB->>FI: POST /api/ingest/batch (Bearer token; source.conversationType = personal)
+  FI->>FI: JWT: issuer, audience, role, caller app id ∈ BOT_CALLER_APP_IDS
+  FI->>FI: strict source: personal, UUID user id, BCR tenant
+  FI->>CD: snapshot (5 min cache; empty if older than 15 min)
+  FI->>FI: resolve(userAadObjectId) → directory client, or quarantine + reason
+  loop each document
+    FI->>CL: classify (primed with the bound client's NIP and name, if any)
+    CL-->>FI: category, year/month, confidence, parties[]
+    FI->>FI: bound client only: flip sprzedaż ⇄ zakup from the parties
+    alt bound to exactly one client
+      FI->>SP: PUT <RootFolder>/<category path>/<name> (conflictBehavior=fail)
+    else quarantine, or the client's site refuses the write
+      FI->>SP: PUT Kwarantanna/YYYY/MM/<batchId>/<name> on the quarantine site
+      FI->>SP: PATCH item fields: UploaderOid, QuarantineReason, OriginalFilename, DocumentId
     end
-    Note over FI: per-document failure → `rejected` row, batch continues
   end
-  FI-->>FB: 200 { status: 'completed', results[] }
-  FB-->>BS: Activity (one adaptive card with a summary Table)
-  BS-->>TC: Card
-  TC-->>U: 📊 Summary table (per doc: folder, confidence, reasoning)
+  FI-->>FB: 200 { results[]: uploaded | quarantined | rejected }
+  FB-->>U: one card: Dokument · Kategoria · Folder; quarantined rows carry no link
 ```
 
-> **Single-document route.** The original one-file-at-a-time endpoint
-> `POST /api/ingest` (returning `{ status: 'uploaded', result }`) is retained
-> for backwards compatibility and programmatic callers. The Teams bot always
-> uses the batch route so the user gets one consolidated response.
+**Bot delivery model.** Only 1:1 chats deliver file attachments to a bot. Files posted in a
+channel bypass the bot (drag-drop), or arrive as mention HTML with no file. Manifest 0.2.0 has
+`"scopes": ["personal"]` only, and the gate refuses any other conversation type from older
+installs.
 
-> **Bot delivery model.** Only 1:1 DMs with the bot reliably deliver file
-> attachments through Bot Framework. Files posted into Teams channels
-> either bypass the bot entirely (drag-drop) or arrive without their
-> content (`@mention` messages carry only the mention HTML). The bot's
-> app manifest keeps `"scopes": ["personal", "team", "groupchat"]` for
-> completeness but only the `personal` scope is functional today.
+<details>
+<summary>As-is before v2 (Sep 2026): the pre-Phase-0 sequence</summary>
 
+```mermaid
+sequenceDiagram
+  actor U as User (Teams)
+  participant FB as Bot Function App
+  participant FI as Ingestion Function App
+  participant CD as Client Directory
+  participant CL as Claude
+  participant SP as SharePoint
+
+  U->>FB: DM with attachments (any conversation type, any tenant)
+  FB->>FI: POST /api/ingest/batch
+  FI->>CD: getSnapshot(): byNip / byUserAadObjectId maps
+  FI->>FI: resolve(userAadObjectId) → client, or the fallback bucket (BCR GROUP library root)
+  loop each document
+    FI->>CL: classify
+    CL-->>FI: category + confidence + reasoning + parties[]
+    FI->>FI: resolvePostClassification: promote fallback → client on party NIP match; flip direction
+    FI->>SP: probe for a free name, then PUT into the resolved (or promoted) client's site
+  end
+  FB-->>U: card with folder, confidence and the model's reasoning, plus a link per file
+```
+
+A single-document route, `POST /api/ingest`, also existed. Phase 0 deleted it.
+
+</details>
 
 ---
 
 ## 4. Classification pipeline
 
-The ingestion function pipes every file through an ordered list of
-`Classifier` strategies. The first one that returns a `match` wins; the
-fallback always succeeds last.
+Ingestion passes every file through an ordered list of `Classifier` strategies. The first one
+that returns a match wins, and the fallback always succeeds last.
 
-1. **`ClaudeClassifier`** — see
-   [`packages/document-ingestion/src/services/claudeClassifier.ts`](./packages/document-ingestion/src/services/claudeClassifier.ts).  
-   Sends the document **content** (PDF → `document` block, images → `image`
-   block, text → `text` block) to the Anthropic Messages API together with a
-   forced tool whose `input_schema` is generated from the folder taxonomy
-   ([`folderTaxonomy.ts`](./packages/shared/src/parsers/folderTaxonomy.ts)).
-   The model returns a `category`, optional `year`/`month`, a `confidence`
-   score, and an optional `parties[]` array (seller/buyer/issuer/recipient/
-   unknown, each with NIP + company name + person name). The category maps
-   to a literal SharePoint path via `buildFolderPath`; `dated` categories get
-   a nested `YYYY/MM` leaf.
+1. **`ClaudeClassifier`** ([`claudeClassifier.ts`](./packages/document-ingestion/src/services/claudeClassifier.ts)).
+   It sends the document **content** to the Anthropic Messages API: PDF as a `document` block,
+   images as `image`, text as `text`. It comes with a tool whose `input_schema` is generated from
+   the folder taxonomy ([`folderTaxonomy.ts`](./packages/shared/src/parsers/folderTaxonomy.ts)).
+   The model returns a `category`, optional `year`/`month`, a `confidence`, and optional
+   `parties[]` (seller, buyer, issuer, recipient, each with NIP and name). The category maps to a
+   literal path through `buildFolderPath`; `dated` categories get a `YYYY/MM` leaf.
 
-   Client identity is passed **per call** via `ClassifierContext.client`
-   (populated from the pre-resolved routing decision). When present, the
-   model is primed with the client's NIP + name and can decide invoice
-   direction (sales vs purchase) directly. When absent (fallback routing),
-   the model extracts parties without deciding direction and the
-   `ClientResolver` derives direction post-classification (see §4.2).
+   When the uploader is bound to a client, that client's NIP and name are passed per call through
+   `ClassifierContext.client`. The model can then decide invoice direction (sales or purchase)
+   directly. When the upload is going to quarantine, no client identity is passed, and nothing is
+   flipped.
 
-   The classifier **never throws** — unsupported content type, oversized
-   files (`ANTHROPIC_MAX_CONTENT_BYTES`), confidence below
-   `ANTHROPIC_CONFIDENCE_THRESHOLD`, unknown categories, and API errors all
-   return `null` so the fallback runs. Disabled when `ANTHROPIC_ENABLED=false`
-   or no API key is configured.
-2. **`FallbackClassifier`** — `98_Nieposortowane/<YYYY>/<MM>/`. Always
-   succeeds so the user never sees a *“nowhere to put this”* error; the file
-   is routed to manual review.
+   The classifier **never throws**. An unsupported type, an oversized file
+   (`ANTHROPIC_MAX_CONTENT_BYTES`), confidence below `ANTHROPIC_CONFIDENCE_THRESHOLD`, an unknown
+   category or an API error all return `null`, and the fallback runs. The classifier is off when
+   `ANTHROPIC_ENABLED=false` or when there is no key.
+2. **`FallbackClassifier`**: `98_Nieposortowane/<YYYY>/<MM>/`. It always succeeds, so the user
+   never gets a *"nowhere to put this"* error, and the file goes to manual review **inside the
+   client's own space**.
 
-Adding or changing a category means editing the single `categoryCatalog` in
-[`folderTaxonomy.ts`](./packages/shared/src/parsers/folderTaxonomy.ts) plus a
-unit test — the Claude prompt/tool schema and the fallback both derive from it.
+To add or change a category, edit the single `categoryCatalog` in
+[`folderTaxonomy.ts`](./packages/shared/src/parsers/folderTaxonomy.ts) and add a unit test. The
+Claude prompt, the tool schema and the fallback all derive from it.
 
 ### 4.1 Batch ingestion
 
-When a Teams message carries **more than one** attachment, the bot does **not**
-file them one-by-one. Instead
-[`LedgerBot.handleMessage`](./packages/teams-bot/src/bot/ledgerBot.ts)
-downloads every attachment (in parallel) and forwards the whole set in a single
-call to `POST /api/ingest/batch`
-([`handleIngestBatch`](./packages/document-ingestion/src/functions/ingestDocument.ts)).
+When one Teams message carries several attachments,
+[`LedgerBot`](./packages/teams-bot/src/bot/ledgerBot.ts) downloads them all in parallel and
+sends them in **one** call to `POST /api/ingest/batch`
+([`ingestDocument.ts`](./packages/document-ingestion/src/functions/ingestDocument.ts)).
 
-- **Request:** `{ documents: IngestionDocument[], source }` — one shared
-  `source` block for the whole activity. Validated by
-  `validateBatchIngestionPayload` (max **25** documents, aggregate decoded
-  size ≤ **100 MiB**).
-- **Processing:** the ingestion function classifies and uploads each document
-  through the exact same pipeline as the single-file route. A failure on one
-  document (download error, oversized file, Graph/SharePoint error, …) is
-  captured as a `rejected` item **without aborting the batch** — every other
-  document is still filed.
-- **Response:** `{ status: 'completed', results: IngestionBatchItemResult[] }`,
-  where each item is either `uploaded` (with the drive item, folder path, and
-  the classifier's Polish `reasoning`) or `rejected` (with an error message).
-- **Presentation:** the bot renders **one** adaptive card containing a single
-  `Table` (`buildBatchResultCard` in
-  [`responseBuilder.ts`](./packages/teams-bot/src/bot/responseBuilder.ts)) with
-  a row per document — **Dokument · Folder · Pewność · Uzasadnienie** — plus an
-  `Action.OpenUrl` for each successfully uploaded file. This is the *“one table
-  that explains why each document was classified where”* deliverable.
+- **Request:** `{ documents: IngestionDocument[], source }`, with one `source` for the whole
+  activity. It is validated by `validateBatchIngestionPayload`:
+  - at most **25** documents and **100 MiB** decoded;
+  - `source.conversationType` must be `personal`;
+  - `source.userAadObjectId` must be a UUID;
+  - `source.tenantId` must equal `AZURE_TENANT_ID`.
+- **Processing:** each document goes through the pipeline on its own. A failure on one document
+  becomes a `rejected` item **without aborting the batch**.
+- **Response:** `{ status: 'completed', results: IngestionBatchItemResult[] }`. Each item is one
+  of three kinds:
+  - `uploaded`: with the drive item, the folder, and `classification` (`documentType`,
+    `categoryId`, `confidence`, `classifier`). There is no free-text reasoning;
+  - `quarantined`: with **no** result at all. No URL, folder, stored name or client name;
+  - `rejected`: with an error code.
+- **Presentation:** one Adaptive Card, built in
+  [`responseBuilder.ts`](./packages/teams-bot/src/bot/responseBuilder.ts).
+  - **Uploaded** rows show **Dokument · Kategoria · Folder**, with an "Otwórz" action into the
+    client's own space.
+  - **Quarantined** rows show "📨 {file name}" and "Dokument przekazano do weryfikacji przez
+    zespół BCR.", with no link.
+  - **Rejected** rows show a fixed Polish message chosen by error code, never the error's text.
 
-The relevant shared contracts live in
-[`packages/shared/src/types/bot.ts`](./packages/shared/src/types/bot.ts):
-`IngestionSource`, `IngestionDocument`, `IngestionUploadResult`,
-`IngestionBatchRequestPayload`, `IngestionBatchItemResult`, and
-`IngestionBatchResponsePayload`.
+  Every inserted value goes through `escapeMarkdown()`
+  ([`cardText.ts`](./packages/teams-bot/src/bot/cardText.ts)). The model's reasoning is never
+  shown, because document content could steer it.
 
-### 4.2 Multi-tenant client routing (implemented)
+The shared contracts are in [`packages/shared/src/types/bot.ts`](./packages/shared/src/types/bot.ts).
 
-A single deployment routes documents to many clients' SharePoint spaces.
-The resolver runs in **two phases** — once before classification (envelope
-signals only) and once after (content signals from Claude's `parties[]`).
+### 4.2 Client routing (Phase 0: identity only)
 
-#### Client Directory
+One deployment files documents for many clients. Which client a document belongs to is decided
+**once, from the uploader's identity, before classification**, and nothing after that can change
+it.
 
-A SharePoint list on the BCR Group site is the single source of truth.
-One row per client, columns: `Title`, `ClientId`, `NIP`,
-`CompanyNameAliases` (one alias per line), `PersonNames` (one name per
-line), `UserAadObjectIds` (one AAD id per line), `SiteHostname`,
-`SitePath`, `DriveName`, `RootFolder`, `IsAdmin`, `Status`. The list id
-and site id are configured on the ingest function via
-`CLIENT_DIRECTORY_LIST_ID` and `CLIENT_DIRECTORY_SITE_ID`. See
-[`docs/client-directory-admin-guide.md`](./docs/client-directory-admin-guide.md)
-for onboarding runbooks.
+```mermaid
+flowchart TD
+  A[uploader's AAD object id] --> B{snapshot older than<br/>CLIENT_DIRECTORY_MAX_STALE_MS?}
+  B -- yes --> Q1[quarantine: stale_directory]
+  B -- no --> C{id on an Active row<br/>after the two-pass checks?}
+  C -- no --> Q2[quarantine: unmapped / conflict]
+  C -- IsAdmin row --> Q3[quarantine: staff]
+  C -- one client row --> D{row's site is a<br/>forbidden target?}
+  D -- yes --> Q4[quarantine: forbidden_target]
+  D -- no --> E{path resolves to the<br/>row's DriveId, write succeeds?}
+  E -- drive differs --> Q1
+  E -- write refused after retries --> Q5[quarantine: target_unwritable]
+  E -- yes --> F[filed in the client's<br/>Dokumenty księgowe folder]
+```
+
+#### The Client Directory
+
+This is a SharePoint list on the BCR GROUP site, with one row per client. The admin guide,
+[`docs/client-directory-admin-guide.md`](./docs/client-directory-admin-guide.md), describes the
+columns and the rules for maintaining them. What matters for routing:
+
+- **`UserAadObjectIds`** holds the client's own guests only, and never staff.
+- The target is **`SiteHostname`**, **`SitePath`**, **`DriveName`** and **`RootFolder`**.
+  `RootFolder` is the "Dokumenty księgowe" channel folder, as Graph's `filesFolder` names it.
+- **`DriveId`** is optional. If it is set, the resolved drive must have this id.
+- **`TeamId`** is logged only.
+- **`IsAdmin`** marks the staff row, and **`Status`** must be `Active` for a row to route.
+
+The routing fields are written by `tools/directory-bindings.mjs` from Graph, not typed by hand.
+`NIP` is used only to decide invoice direction inside the bound client.
 
 [`ClientDirectoryReader`](./packages/document-ingestion/src/services/clientDirectoryReader.ts)
-fetches the list at cold start (following `@odata.nextLink` pagination),
-caches the parsed snapshot in memory for `CLIENT_DIRECTORY_CACHE_TTL_MS`
-(default 5 min), and rebuilds lookup maps (`byNip`, `byCompanyAlias`,
-`byPersonName`, `byUserAadObjectId`) on every refresh. Duplicate keys
-across clients are fail-closed: if the same NIP or AAD id shows up on
-two rows, the reader drops the ambiguous key from the map and logs a
-warning so an unresolved document falls back rather than mis-routes.
+reads the list, follows pagination, and caches the snapshot for `CLIENT_DIRECTORY_CACHE_TTL_MS`
+(default 5 minutes). It builds the snapshot in **two passes**, so the result does not depend on
+row order:
 
-#### Phase 1 — pre-classification resolution
+- **Pass 1** collects, for each key, every row that has it. The keys are the user id, the
+  normalised target (`host|path|drive|rootFolder`), the ClientId and the NIP.
+- **Pass 2** applies these rules:
+  - a user id on two rows is dropped from routing. The rows stay usable for everyone else;
+  - a target on two rows excludes **every** row that shares it;
+  - a ClientId or NIP on two rows only raises `directory.conflict`, because neither routes
+    anything;
+  - a row whose `SitePath` is in `FORBIDDEN_TARGET_SITE_PATHS` (BCR GROUP, plus the quarantine
+    site, added automatically) is excluded.
+- **Stale cap.** If refreshes keep failing, a snapshot older than `CLIENT_DIRECTORY_MAX_STALE_MS`
+  (default 15 minutes) counts as empty, so every upload goes to quarantine.
+
+There are no name maps. The alias and person-name lookups were only ever used for content
+matching, and are deleted.
+
+#### Resolution
 
 [`ClientResolver.resolve(source)`](./packages/document-ingestion/src/services/clientResolver.ts)
-reads `source.userAadObjectId` (from `activity.from.aadObjectId`, captured
-by the bot on every turn) and looks it up in `byUserAadObjectId`. If the
-row is a non-admin client, that's the destination. If it's an admin row
-(or no match), the resolver returns the configured fallback bucket — but
-doesn't yet commit; content-based routing may still promote it in phase 2.
+returns `source: 'directory'` for exactly one bound client row. Otherwise it returns
+`source: 'quarantine'` with a `quarantineReason`: `unmapped`, `staff`, `conflict`,
+`stale_directory` or `forbidden_target`. The upload step can add `target_unwritable`.
 
-Channel-based routing was designed and briefly deployed but was removed
-after live testing. Teams doesn't reliably deliver channel file uploads
-to bots — drag-drop bypasses Bot Framework entirely, and `@mention`
-messages only carry the mention HTML in `activity.attachments`. The bot
-is DM-only in practice, so user-identity routing is the sole primary
-path. `source.teamsChannelId` is still captured for observability but
-nothing keys on it.
+After classification, `resolvePostClassification` does exactly one thing, and only for a
+`directory` client. If that client's NIP is on the invoice as seller or buyer, it sets the
+direction (`faktury_sprzedazy` ⇄ `faktury_zakupu`) and rebuilds the folder path. It never
+changes the client. A source-scan test fails the build if a path from a NIP to a client comes
+back.
 
-#### Phase 2 — post-classification refinement
+#### Quarantine
 
-Once Claude has returned a `Classification` (with `parties[]` populated
-when the document is an invoice/contract),
-[`ClientResolver.resolvePostClassification(preResolved, classification)`](./packages/document-ingestion/src/services/clientResolver.ts)
-does two things:
+The quarantine site is a SharePoint communication site. It has no Microsoft 365 group, unique
+permissions for the triage staff, and sharing disabled. It is configured by
+`QUARANTINE_SITE_HOSTNAME`, `QUARANTINE_SITE_PATH`, `QUARANTINE_DRIVE_NAME` (`Dokumenty` on this
+tenant) and `QUARANTINE_ROOT_FOLDER` (default `Kwarantanna`).
 
-1. **Fallback → client promotion.** If pre-resolution was `fallback` and
-   exactly one `parties[].nip` matches a Directory client (via
-   `snapshot.byNip`), the routing is retroactively promoted to that
-   client. Ambiguous cases (multiple Directory clients present in the
-   same document, e.g. an inter-client invoice) keep the fallback —
-   fail-closed to avoid mis-filing.
-2. **Invoice direction override.** If the resolved client's NIP appears
-   in `parties[]` with `role: 'seller'` or `role: 'buyer'`, and the
-   current category is `faktury_sprzedazy`, `faktury_zakupu`, or
-   `nieposortowane`, `applyInvoiceDirection` rebuilds the folder path
-   with the correct direction. This is the safety net for cases where
-   pre-resolution routed to fallback (no client identity was primed
-   into Claude), and it corrects Claude when it guesses direction wrong.
+- A file goes to `Kwarantanna/YYYY/MM/<batchId>/<sanitised original name>`.
+- Ingestion then PATCHes the list item's `UploaderOid`, `QuarantineReason`, `OriginalFilename`
+  and `DocumentId`. Staff decide the owner from those fields, not from the content.
+- If the bound client's site refuses the write after retries, the file goes to quarantine as
+  `target_unwritable`. If the quarantine write fails too, the item is `rejected`, the user is
+  asked to try again, and an error is logged.
 
-#### Per-client SharePoint clients
+**A document is never written anywhere else.**
+
+#### Per-client SharePoint services
 
 [`SharePointServiceFactory`](./packages/document-ingestion/src/services/sharePointServiceFactory.ts)
-memoises one `SharePointService` per unique target
-(`{hostname, sitePath, driveName, rootFolder}`) so cold-start site/drive
-resolution is amortised across many uploads. New client rows automatically
-spin up a new service on first use.
+keeps one `SharePointService` per target, so site and drive resolution happens once per target.
+Uploads use `@microsoft.graph.conflictBehavior=fail`. If the name is taken, they retry with
+`_1` to `_10`, without probing first. Every path segment is sanitised and then
+`encodeURIComponent`-ed.
 
-#### Fallback bucket
+<details>
+<summary>As-is before v2 (Sep 2026): two-phase resolution, promotion and the fallback bucket</summary>
 
-When no user or content routing resolves, uploads land in the fallback
-target defined by `FALLBACK_SITE_HOSTNAME`, `FALLBACK_SITE_PATH`,
-`FALLBACK_DRIVE_NAME`, `FALLBACK_ROOT_FOLDER`, `FALLBACK_CLIENT_ID`. Dev
-fallback is the BCR Group site's default `Dokumenty` library.
+This behaviour caused incident IR-2026-09 and is **deleted**. It is recorded here only so that
+the incident's evidence can be read.
 
-### 4.3 Personal Tab — “Moje dokumenty”
+- **Phase 1, before classification:** `resolve(source)` looked the uploader up in
+  `byUserAadObjectId`. A non-admin match was the destination. An admin match, or no match,
+  returned the **fallback bucket**: the BCR GROUP site's `Dokumenty` library root, configured by
+  `FALLBACK_SITE_HOSTNAME`, `FALLBACK_SITE_PATH`, `FALLBACK_DRIVE_NAME`, `FALLBACK_ROOT_FOLDER`
+  and `FALLBACK_CLIENT_ID`. Every member of BCR GROUP could read it.
+- **Phase 2, after classification:** `resolvePostClassification` **promoted** a fallback upload
+  to a Directory client when exactly one `parties[].nip` matched that client's NIP, in any role,
+  whoever had uploaded it. It then flipped invoice direction.
+- **The reader** built `byNip`, `byCompanyAlias`, `byPersonName` and `byUserAadObjectId` in one
+  pass. Its duplicate check deleted a key on the second row and re-added it on the third, and a
+  failed refresh kept the last snapshot forever.
+- **Uploads** probed for a free `_n` name with a GET and then PUT. Two uploads could race, and
+  the second overwrote the first.
+- **Onboarding** wrote rows with `RootFolder = ''` and no user ids. So onboarded clients' uploads
+  were all unmapped, went to the fallback bucket, and were then promoted by content.
 
-A Teams personal tab that gives every user a one-click deep-link to their
-client's SharePoint document library from inside Teams.
+</details>
 
-- **Manifest** — `teams-app/manifest.json` adds a `staticTabs` entry with
-  `contentUrl` templated on `{userObjectId}` and `{theme}` (both
-  substituted by Teams at tab-load time).
-- **Content endpoint** — `GET /api/mydocs?userObjectId={id}&theme={theme}`
-  on the bot function
-  ([`packages/teams-bot/src/functions/mydocs.ts`](./packages/teams-bot/src/functions/mydocs.ts)).
-  Anonymous auth (called by the Teams iframe); serves a small themed HTML
-  page with the resolved client's name and an "Otwórz w SharePoint"
-  button. The button uses the Teams JS SDK's `microsoftTeams.app.openLink`
-  (falls back to `window.open`). SharePoint refuses to be iframed
-  cross-origin, so the tab deep-links out instead of embedding.
-- **Lookup endpoint** — `GET /api/user-target?userAadObjectId={id}` on the
-  ingest function
-  ([`packages/document-ingestion/src/functions/userTarget.ts`](./packages/document-ingestion/src/functions/userTarget.ts)).
-  Same JWT auth as `/api/ingest` (`Documents.Ingest` role). Reuses the
-  same `ClientResolver` as the ingest pipeline so “where the tab sends
-  the user” always matches “where the bot files their documents”. Returns
-  `{clientId, title, source, siteHostname, sitePath, driveName,
-  sharepointWebUrl}`. The web URL is constructed heuristically
-  (`Dokumenty` for Polish tenants, `Shared Documents` for English).
-- **Auth trail** — Teams tab → anonymous GET to bot's `/api/mydocs` →
-  bot calls ingest's `/api/user-target` with its existing MSAL
-  client-credentials JWT (same one used for `/api/ingest`).
+### 4.3 Personal Tab "Moje dokumenty" (removed)
+
+Phase 0 removed the tab. Manifest 0.2.0 has no `staticTabs`. `/api/mydocs` returns a static page
+that tells the user where their documents are (their team → "Dokumenty księgowe"), and
+`/api/user-target` is deleted. Clients find their files in their own Team.
+
+<details>
+<summary>As-is before v2 (Sep 2026): the tab and its IDOR</summary>
+
+- The manifest's `staticTabs` loaded `GET /api/mydocs?userObjectId={userObjectId}&theme={theme}`
+  on the bot, **anonymously**.
+- The bot passed the `userObjectId` from the URL to ingestion's `GET /api/user-target`, which
+  returned the resolved client's `{clientId, title, siteHostname, sitePath, driveName,
+  sharepointWebUrl}`.
+- The page showed the client's name and a link to its library.
+
+Because the id came from the query string and nothing checked who was asking, anyone on the
+internet could map any user id to that user's client and SharePoint location. This is threat
+T7 in [`docs/security.md`](./docs/security.md).
+
+</details>
 
 ---
 
 ## 5. Auth model
 
-### 5.1 Teams → Bot
+### 5.1 Teams → bot
 
-Standard Bot Framework JWT. The SDK middleware in
-`@bcr/teams-bot` validates it using `MicrosoftAppCredentials` configured
-with the Bot’s `MicrosoftAppId`, `MicrosoftAppPassword` (or, preferred,
-a managed-identity federated credential), and `MicrosoftAppTenantId`.
+Standard Bot Framework JWT, validated by `CloudAdapter` with the bot's `MicrosoftAppId`,
+`MicrosoftAppPassword` and `MicrosoftAppTenantId`. `MICROSOFT_APP_TYPE` is required and is
+`SingleTenant`.
 
-### 5.2 Bot → Ingestion API
+After authentication, a **gate middleware** runs on every activity type: messages, invokes
+(Adaptive Card actions, file consent), conversation and installation updates, edits and
+reactions. An activity passes only if all three hold:
 
-Client credentials via MSAL Node:
+- `conversation.conversationType` is `personal`;
+- the tenant (`channelData.tenant.id`, else `conversation.tenantId`) equals
+  `MICROSOFT_APP_TENANT_ID`;
+- `from.aadObjectId` is a GUID.
+
+Every refusal is logged as `bot.gate.rejected {reason, mode}`.
+
+- `BOT_GATE_MODE=log` records refusals and lets the turn through. It exists for the first 24
+  hours of the rollout, to prove that real guests pass.
+- `enforce`, the default, ends the turn with no download and no ingestion call. It replies with
+  one fixed line in a 1:1 chat, and stays silent anywhere else.
+
+### 5.2 Bot → ingestion API
+
+Client credentials through MSAL Node:
 
 ```
 POST https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token
@@ -305,21 +364,43 @@ POST https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token
   grant_type    = client_credentials
 ```
 
-The ingestion function validates the JWT using `jose` and checks:
-- `iss` matches the expected tenant authority
-- `aud` matches its own App ID URI
-- `roles` contains `Documents.Ingest`
+`AuthMiddleware.verify(header, { roles, appIds })` validates the JWT with `jose` against the
+tenant's JWKS, and checks:
+
+- `iss` is the tenant's authority;
+- `aud` is ingestion's App ID URI;
+- `roles` contains `Documents.Ingest`;
+- **the caller's app id** (`appid`, else `azp`) is in `BOT_CALLER_APP_IDS`. The role alone was
+  not enough, because any app granted `Documents.Ingest` could have called with any user id.
+  Refusals are logged as `ingestion.caller.rejected {appId}`.
+
+Ingestion's only routes are `POST /api/ingest/batch` and `GET /api/health`.
+
+**What pinning does not cover.** The user id still travels in the request body. Anyone holding
+the bot's secret *is* the bot, and can name any guest. That is threat T15 in
+[`docs/security.md`](./docs/security.md). Phase 3 removes it, with a federated credential and a
+queue transport that carries no user identity across the network.
 
 ### 5.3 Ingestion → Microsoft Graph
 
-The Function App uses its **system-assigned managed identity**. A
-federated credential on the Graph App Registration trusts the managed
-identity, so we never store a Graph client secret.
+The Function App calls Graph as its **system-assigned managed identity**, with the Graph
+application permission `Sites.Selected`. There is no Graph secret and no federated credential
+involved. The identity simply gets its own token.
 
-Required Graph permissions (application):
-- `Sites.Selected` — granted only on the target SharePoint site via
-  `POST /sites/{id}/permissions` during deployment.
-- `Files.ReadWrite.All` — only if you cannot use `Sites.Selected`.
+`Sites.Selected` grants nothing until a site is named, and a per-site grant is made for **every**
+site the identity files into:
+
+| Site | Grant |
+|---|---|
+| Each bound client's site | `write` |
+| The quarantine site | `write` |
+| BCR GROUP | `read`, to read the Client Directory, after the Phase-0 change window |
+
+So the identity can write to every client site: that is by design, not a single-site scope (see
+T3 in [`docs/security.md`](./docs/security.md)). Never grant `Files.ReadWrite.All` or
+`Sites.ReadWrite.All` instead. The grant procedure is in
+[`docs/admin-sharepoint-grant.md`](./docs/admin-sharepoint-grant.md) and, for client sites, the
+onboarding repo's `Grant-TeamSiteAccess.ps1` runbook.
 
 ---
 
@@ -327,21 +408,27 @@ Required Graph permissions (application):
 
 | Failure | Behaviour |
 |---|---|
-| Claude is off, low confidence, or API error | Upload to `98_Nieposortowane/<YYYY>/<MM>/` for manual review. |
-| SharePoint 409 (file exists) | Append `_n` suffix and retry once; report the final filename. |
-| Graph 5xx | Exponential back-off with jitter via `p-retry` (max 3 attempts), then surface error card. |
-| Token expired | MSAL token cache auto-refreshes; ingestion uses `getToken` lazily per request. |
-| File > 4 MB | Switch to Graph **upload session** (`createUploadSession`) and chunk at 320 KiB × N. |
-| Antivirus block (Graph 423) | Surface explicit message; do not retry. |
+| Claude is off, low confidence, or an API error | Filed in `98_Nieposortowane/<YYYY>/<MM>/` in the client's own space, for manual review. |
+| Uploader not bound to exactly one client | Quarantine, with the reason. |
+| Directory cannot be refreshed for over 15 min | Everything goes to quarantine (`stale_directory`). |
+| Name already taken (Graph 409 with `conflictBehavior=fail`) | Retry as `name_1` … `name_10`. |
+| The client's site refuses the write after retries | Quarantine (`target_unwritable`). |
+| The quarantine write fails too | The item is `rejected` with a generic Polish "try again" message. It is never written elsewhere. |
+| Graph 5xx | Exponential back-off with jitter (`p-retry`, 3 attempts). |
+| Token expired | MSAL's token cache refreshes it; ingestion gets tokens lazily per request. |
+| File > 4 MB | Graph upload session (`createUploadSession`), 320 KiB chunks, also with `conflictBehavior=fail`. |
+| Antivirus block (Graph 423) | Generic Polish message; no retry. |
+| Activity fails the bot gate | In `enforce` mode: no download and no ingestion call; one fixed line in a 1:1 chat, silence elsewhere. |
 
-Every error is logged with the Teams `activityId` and `conversationId`
-as custom dimensions on the Application Insights `requests` table,
-so triage is one Kusto query away:
+Every request is logged with the Teams `activityId` and `conversationId`, and from Phase 0 with a
+server-minted `documentId` per document. Routing outcomes are the events `document.filed` and
+`document.quarantined`, which carry ids and codes only. So triage is one query:
 
 ```kusto
-requests
-| where customDimensions["activityId"] == "<id>"
-| project timestamp, name, resultCode, customDimensions
+traces
+| extend m = parse_json(message)
+| where tostring(m.documentId) == "<id>" or tostring(m.activityId) == "<id>"
+| project timestamp, msg = tostring(m.msg), m
 ```
 
 ---
@@ -352,15 +439,19 @@ A single Azure resource group per environment:
 
 ```
 rg-bcr-ledger-<env>
-├── stbcrledger<env>          (Storage – Functions runtime + uploads queue)
+├── stbcrledger<env>          (Storage – Functions runtime)
 ├── plan-bcr-ledger-<env>     (Linux consumption plan, Node 22)
 ├── func-bcr-bot-<env>
 ├── func-bcr-ingest-<env>
 ├── bot-bcr-ledger-<env>      (Azure Bot, Teams channel enabled)
 ├── kv-bcr-ledger-<env>       (Key Vault, RBAC mode)
-├── ai-bcr-ledger-<env>       (Document Intelligence – S0)
 ├── appi-bcr-ledger-<env>     (Application Insights)
 └── log-bcr-ledger-<env>      (Log Analytics workspace)
 ```
 
-All wired up declaratively in [`infrastructure/main.bicep`](./infrastructure/main.bicep).
+All of it is declared in [`infrastructure/main.bicep`](./infrastructure/main.bicep).
+
+⚠️ **The template has drifted from what runs in "dev"**, which is production: it serves
+PESKOVOI. The routing settings were set by hand and are missing from the template. Until the
+drift fix (v2 gate G1) there is no deploy on push, and deploys are code-only with settings added
+by merge. See [`docs/operations/human-steps.md`](./docs/operations/human-steps.md#phase-0).

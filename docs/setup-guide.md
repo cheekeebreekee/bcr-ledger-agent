@@ -58,7 +58,8 @@ The architecture uses **two** app registrations:
 1. **Bot app reg** — identity of the bot to Microsoft Teams / Bot Framework.
 2. **Ingestion API app reg** — identity that protects the document
    ingestion HTTP API. The bot acquires a token for this app and presents
-   it on every `POST /api/ingest` call.
+   it on every `POST /api/ingest/batch` call. Since Phase 0, ingestion also checks that the
+   token's app id is the bot's (`BOT_CALLER_APP_IDS`), so no other app can call it.
 
 ### 2a. Bot app registration
 
@@ -398,17 +399,19 @@ references for secrets).
 | `MICROSOFT_APP_ID` | teams-bot | Bot app reg → **Overview → Application (client) ID** *(§2a)* |
 | `MICROSOFT_APP_PASSWORD` | teams-bot | Bot app reg → **Certificates & secrets → New client secret → Value** *(§2a)*. After deployment, paste into Key Vault as `bot-app-password` *(§4)*. |
 | `MICROSOFT_APP_TENANT_ID` | teams-bot | Same as `AZURE_TENANT_ID` |
-| `MICROSOFT_APP_TYPE` | teams-bot | Almost always `SingleTenant`. The other options are `MultiTenant` and `UserAssignedMSI`. |
+| `MICROSOFT_APP_TYPE` | teams-bot | **Required.** `SingleTenant` for the BCR bot, whose app registration is single-tenant. The other options are `MultiTenant` and `UserAssignedMSI`. |
+| `BOT_GATE_MODE` | teams-bot | `enforce` (default) or `log`. The gate refuses anything but a 1:1 chat from the BCR tenant with a valid user id. Use `log` only for the first 24 hours of a rollout, to prove real guests pass. |
 | `INGESTION_BASE_URL` | teams-bot | `http://localhost:7071` locally, `https://func-bcr-ingest-<env>-XXXX.azurewebsites.net` in Azure. |
 | `INGESTION_SCOPE` | teams-bot | `api://<INGESTION_APP_ID>/.default` — see §2b |
 
 ### 6c. Ingestion API auth & multi-tenant routing (`packages/document-ingestion/local.settings.json`)
 
-The ingest function is multi-tenant — it decides per-upload which client's
-SharePoint site to use, based on the uploader's AAD id (via the Client
-Directory list) or the document's extracted NIP. See
+The ingest function serves many clients. It decides per upload which client's
+SharePoint site to use, **from the uploader's AAD id only**, looked up in the Client
+Directory list. The document's content never chooses the client. An uploader who
+cannot be tied to exactly one client goes to the staff-only quarantine site. See
 [`docs/client-directory-admin-guide.md`](./client-directory-admin-guide.md)
-for the routing model, and [`ARCHITECTURE.md §4.2`](../ARCHITECTURE.md#42-multi-tenant-client-routing-implemented)
+for the routing model, and [`ARCHITECTURE.md §4.2`](../ARCHITECTURE.md#42-client-routing-phase-0-identity-only)
 for the design.
 
 | Variable | How to find it |
@@ -419,11 +422,16 @@ for the design.
 | `CLIENT_DIRECTORY_SITE_ID` | Microsoft Graph site id (`<hostname>,<siteGuid>,<webGuid>`) of the SharePoint site that hosts the Client Directory list. `GET https://graph.microsoft.com/v1.0/sites/{hostname}:/{sitePath}` returns it. |
 | `CLIENT_DIRECTORY_LIST_ID` | GUID of the Client Directory list itself. Returned by `GET /sites/{id}/lists?$filter=displayName eq 'Client Directory'`. |
 | `CLIENT_DIRECTORY_CACHE_TTL_MS` | *(optional)* Directory snapshot cache TTL in milliseconds. Default `300000` (5 min). |
-| `FALLBACK_CLIENT_ID` | *(optional)* Short business key logged when routing falls back. Default `bcr-group`. |
-| `FALLBACK_SITE_HOSTNAME` | SharePoint hostname of the fallback bucket (BCR Group), e.g. `bcrgroupeu.sharepoint.com`. |
-| `FALLBACK_SITE_PATH` | Site path (must start with `/`), e.g. `/sites/BCRGROUPSp.zo.o`. |
-| `FALLBACK_DRIVE_NAME` | Fallback library display name. `Dokumenty` on Polish tenants, `Documents` elsewhere. |
-| `FALLBACK_ROOT_FOLDER` | *(optional)* Sub-folder prefix under the fallback drive root. |
+| `CLIENT_DIRECTORY_MAX_STALE_MS` | *(optional)* Oldest snapshot still used when refreshes fail. Default `900000` (15 min). Past it, every upload goes to quarantine. |
+| `BOT_CALLER_APP_IDS` | **Required.** Comma-separated app ids allowed to call ingestion: the bot app reg's client id *(§2a)*. |
+| `QUARANTINE_SITE_HOSTNAME` | **Required.** SharePoint hostname of the quarantine site. |
+| `QUARANTINE_SITE_PATH` | **Required.** e.g. `/sites/BCRLedgerKwarantanna`. Must start with `/`. A communication site with no group and sharing disabled; see `docs/operations/human-steps.md` H-5. |
+| `QUARANTINE_DRIVE_NAME` | *(optional)* Default `Documents`. `Dokumenty` on Polish tenants. |
+| `QUARANTINE_ROOT_FOLDER` | *(optional)* Default `Kwarantanna`. |
+| `FORBIDDEN_TARGET_SITE_PATHS` | **Required.** Comma-separated site paths no Directory row may route to: at least the BCR GROUP site, e.g. `/sites/BCRGROUPSp.zo.o`. The quarantine path is added automatically. |
+
+The `FALLBACK_*` settings were removed in Phase 0. The fallback bucket they described (the BCR
+GROUP library root, readable by the whole team) is replaced by the quarantine.
 
 ### 6d. Claude document classification
 
@@ -520,29 +528,14 @@ curl https://func-bcr-ingest-dev-XXXX.azurewebsites.net/api/health
 # 2. Bot endpoint exists (returns 405 to a GET — that's expected)
 curl -i https://func-bcr-bot-dev-XXXX.azurewebsites.net/api/messages
 
-# 3. Direct ingestion call (no bot involved)
-ACCESS_TOKEN=$(az account get-access-token \
-  --resource api://<INGESTION_APP_ID> --query accessToken -o tsv)
-
-cat > /tmp/payload.json <<JSON
-{
-  "filename": "Invoice_03_2026.pdf",
-  "contentType": "application/pdf",
-  "contentBase64": "$(base64 -i ~/Downloads/sample.pdf)",
-  "source": {
-    "tenantId": "<AZURE_TENANT_ID>",
-    "channelId": "msteams",
-    "conversationId": "smoke-test",
-    "activityId": "smoke-$(date +%s)"
-  }
-}
-JSON
-
-curl -X POST https://func-bcr-ingest-dev-XXXX.azurewebsites.net/api/ingest \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d @/tmp/payload.json | jq .
+# 3. End to end: the TEST guest sends a synthetic document to the bot in a 1:1 chat.
 ```
+
+A direct call to ingestion with your own token is **refused by design** since Phase 0: only the
+bot's app id may call it (`BOT_CALLER_APP_IDS`), and the request must come from a 1:1 chat in the
+BCR tenant. Smoke-test through Teams, as the TEST guest, with a synthetic document. Never use a
+real client document, and never a staff account, because staff uploads go to quarantine by
+design. The canary procedure is in `docs/operations/human-steps.md`, H-12.
 
 If the bot does **not** respond in Teams, query Application Insights:
 
@@ -572,11 +565,12 @@ union requests, exceptions, traces
 | `CLIENT_DIRECTORY_SITE_ID` | Graph site id of Client Directory list host | Ingestion Function App setting |
 | `CLIENT_DIRECTORY_LIST_ID` | Client Directory list GUID | Ingestion Function App setting |
 | `CLIENT_DIRECTORY_CACHE_TTL_MS` | *(optional)* cache TTL, default 300000 | Ingestion Function App setting |
-| `FALLBACK_CLIENT_ID` | short key for fallback bucket logs | Ingestion Function App setting |
-| `FALLBACK_SITE_HOSTNAME` | SharePoint URL of fallback (BCR Group) | Ingestion Function App setting |
-| `FALLBACK_SITE_PATH` | Fallback site path | Ingestion Function App setting |
-| `FALLBACK_DRIVE_NAME` | Fallback library display name | Ingestion Function App setting |
-| `FALLBACK_ROOT_FOLDER` | *(optional)* fallback sub-folder | Ingestion Function App setting |
+| `CLIENT_DIRECTORY_MAX_STALE_MS` | *(optional)* stale cap, default 900000 | Ingestion Function App setting |
+| `BOT_CALLER_APP_IDS` | = `MICROSOFT_APP_ID` (the bot's app id) | Ingestion Function App setting |
+| `QUARANTINE_SITE_HOSTNAME` / `_SITE_PATH` | the quarantine communication site | Ingestion Function App setting |
+| `QUARANTINE_DRIVE_NAME` / `_ROOT_FOLDER` | *(optional)* `Dokumenty` on Polish tenants / `Kwarantanna` | Ingestion Function App setting |
+| `FORBIDDEN_TARGET_SITE_PATHS` | BCR GROUP site path | Ingestion Function App setting |
+| `BOT_GATE_MODE` | `enforce` (or `log` for the first 24 h) | Bot Function App setting |
 | `ANTHROPIC_ENABLED` | feature flag | Ingestion Function App setting |
 | `ANTHROPIC_API_KEY` | Anthropic Console | **Key Vault** secret `anthropic-api-key` |
 | `ANTHROPIC_MODEL` | constant (model id) | Ingestion Function App setting |

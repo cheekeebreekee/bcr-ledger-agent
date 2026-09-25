@@ -1,162 +1,207 @@
 # Admin guide: the "Client Directory" SharePoint list
 
-> **Status: implemented and live in dev** (Phases 2 + 2.5 + 3, verified end-to-end).
-> Keep this guide up to date as onboarding conventions evolve.
+Written for whoever maintains the list, and for the next person who changes how documents are
+routed.
+
+> **Status: Phase 0 routing, September 2026.** Routing uses the uploader's identity only. The
+> document's content never chooses the client. This guide replaces the earlier one, which
+> described content-based promotion; that path was the cross-client write in incident
+> [`IR-2026-09`](operations/incident-2026-09.md) and has been deleted. The list is an interim
+> routing source. The database-backed registry replaces it in Phase 2 of the v2 plan.
 
 ## What it's for
 
-The Client Directory is the single source of truth the ingestion function
-uses to decide **whose** SharePoint space a document belongs in. Every
-client the agent files documents for needs exactly one row here, and every
-BCR staff user who should be able to upload documents needs their AAD id
-registered against that client's row.
+The ingestion function uses the list to answer one question: **which one client is this
+uploader bound to?** If the answer is exactly one client, the document is filed in that
+client's space. In every other case it goes to the staff-only quarantine, and an accountant
+decides.
 
-Routing priority (see [`ClientResolver`](../packages/document-ingestion/src/services/clientResolver.ts)):
+Two rules follow from that, and they are the ones that were broken:
 
-1. **User identity** (`UserAadObjectIds`) — the primary path. If the
-   uploader's AAD object id appears on a client row, the upload files into
-   that client's SharePoint site.
-2. **Content-based promotion** — if user routing falls through to the
-   fallback bucket **and** the document's extracted NIP matches exactly
-   one Directory client (via Claude's `parties[]` extraction), the upload
-   is retroactively promoted to that client. This covers admin/agency
-   users who don't have a fixed home client.
-3. **Fallback bucket** — everything else lands in the configured fallback
-   site (BCR Group), under the same folder taxonomy.
+- **A client row names only that client's own guests.** Anyone whose id is on a client's row
+  has every upload filed into that client's space, whatever the document is. A staff id on a
+  client row therefore files other clients' papers into that client's folder. That happened:
+  Yahor's id was on PESKOVOI's row.
+- **Nothing is typed by hand that a tool can read from Graph.** Guest ids, the channel folder
+  name, the drive id and the team id all come from `tools/directory-bindings.mjs`. A typo in a
+  folder name creates a look-alike folder the client never sees. A wrong id sends documents to
+  the wrong client.
 
-**Note on Teams channels.** Earlier designs used a `TeamsChannelId` column
-for channel-based routing. That was removed after live testing found that
-Teams channel messages don't reliably deliver file attachments to bots
-(channel drag-drop bypasses Bot Framework entirely, and `@mention` messages
-carry only the mention HTML). **The bot is DM-only** — the Client
-Directory keys on `UserAadObjectIds`, not channels.
+## How an upload is routed (Phase 0)
+
+1. **The bot's gate.** Only a 1:1 chat, from the BCR tenant, with a valid user object id,
+   reaches ingestion at all. Ingestion checks the same three things again.
+2. **The uploader's id** is looked up in `UserAadObjectIds` across the `Active` rows.
+3. **Exactly one client row matches.** The document goes to that row's target:
+   `SiteHostname`, `SitePath`, `DriveName` and `RootFolder`. If the row has a `DriveId`, the
+   drive the path resolves to must have that id.
+4. **Anything else goes to quarantine**, with a reason:
+
+| Reason | When |
+|---|---|
+| `unmapped` | The id is on no row, or only on a row that was excluded. |
+| `staff` | The id is on an `IsAdmin` row. Staff are never routed to a client. |
+| `conflict` | The id is on two rows, or the row's target is shared with another row (see [Duplicates and conflicts](#duplicates-and-conflicts)). |
+| `stale_directory` | The list could not be refreshed for longer than the stale cap, or the row's `DriveId` does not match. |
+| `forbidden_target` | The row points at BCR GROUP or at the quarantine site. |
+| `target_unwritable` | The client's site refused the write after retries, usually because the ingestion identity has no grant there. |
+
+5. **Content never changes the client.** After classification, the only thing content can change
+   is the direction of an invoice (sales ⇄ purchase), and only inside the client the uploader is
+   bound to. It is decided by comparing the parties on the invoice with that client's `NIP`.
+
+## What quarantine means
+
+Quarantine is a SharePoint communication site, "BCR Ledger – Kwarantanna". It has no Team and no
+Microsoft 365 group, so nobody can join it. It has unique permissions (triage staff only) and
+sharing is disabled. No client can reach it.
+
+- **Where a file goes:** `Kwarantanna/YYYY/MM/<batchId>/<original file name>`.
+- **What is recorded on it:** four columns, so triage can decide from identity rather than from
+  content: `UploaderOid`, `QuarantineReason`, `OriginalFilename` and `DocumentId`.
+- **What the uploader sees:** "📨 {file name}" and "Dokument przekazano do weryfikacji przez
+  zespół BCR." No link, no folder and no client name, because the uploader may not be who they
+  claim, and a link would say where documents are kept.
+
+**Triage rule.** Decide the owner from the uploader: take `UploaderOid`, then the client Teams
+that person is a guest of (`GET /users/{id}/memberOf`, groups whose description starts
+`BCR Group —`).
+
+- If they belong to several clients, ask them.
+- The content may break a tie between clients the identity already produced. It never decides on
+  its own.
+- A second person checks before anything is moved into a client's folder.
 
 ## Where it lives
 
-A SharePoint list named **`Client Directory`** on the **BCR Group** site
-(`https://bcrgroupeu.sharepoint.com/sites/BCRGROUPSp.zo.o`). The ingestion
-function's managed identity has `Sites.Selected` + per-site `write` on
-this site, so it can read the list without any additional grant.
+A SharePoint list named **`Client Directory`** on the BCR GROUP site
+(`https://bcrgroupeu.sharepoint.com/sites/BCRGROUPSp.zo.o`).
 
-- **Dev list id:** `2a5613f1-6193-4c04-8a3d-d606617fb411`
-- **Dev site id:** `bcrgroupeu.sharepoint.com,c2b2fedb-12e3-47f1-93f4-c22b2e361a68,fa306584-d50a-4e44-89c0-baa5bf265c69`
+- **List id:** `2a5613f1-6193-4c04-8a3d-d606617fb411`
+- **Site id:** `bcrgroupeu.sharepoint.com,c2b2fedb-12e3-47f1-93f4-c22b2e361a68,fa306584-d50a-4e44-89c0-baa5bf265c69`
 
-Both ids are wired into the ingest function via `CLIENT_DIRECTORY_SITE_ID`
-and `CLIENT_DIRECTORY_LIST_ID` app settings.
+Both ids reach the ingestion function as `CLIENT_DIRECTORY_SITE_ID` and
+`CLIENT_DIRECTORY_LIST_ID`.
 
-## List schema
+**Who can edit it.** Since the Phase-0 hardening the list has unique permissions: only the
+site's Owners can edit it, and versioning records every change
+([tenant-hardening T-5](operations/tenant-hardening.md#t-5-lock-and-version-the-client-directory-list)).
+The ingestion identity reads it through its site grant. After the Phase-0 change window that
+grant is read-only, and ingestion can never write to BCR GROUP again.
 
-| Column | Type | Purpose |
+## Columns
+
+| Column | Type | Set by | What it does |
+|---|---|---|---|
+| `Title` | Single line | Onboarding | Display name, e.g. `[0002] PESKOVOI Sp. z o. o. - Księgowość`. Redacted from logs, and never shown on a card. |
+| `ClientId` | Single line | Onboarding | BCR record number, e.g. `0002`. Never reused, even after offboarding. |
+| `NIP` | Single line | Onboarding | Digits only. Used **only** to decide invoice direction inside this client. It never picks a client. |
+| `CompanyNameAliases` | Multi-line, plain | Onboarding | The first line is the name given to the classifier for this client. Nothing routes on it. |
+| `PersonNames` | Multi-line, plain | — | Not read any more. Leave it empty. |
+| `UserAadObjectIds` | Multi-line, plain | **The tool** | One id per line. **The client's guests only**, each a guest in this client's Team and in no other client Team. **Never staff.** This is what routes uploads. |
+| `SiteHostname` | Single line | Onboarding | The tenant's SharePoint host. |
+| `SitePath` | Single line | Onboarding | e.g. `/sites/0002PESKOVOISp.zo.o.-Ksigowo`. Must start with `/`. Must not be BCR GROUP or the quarantine site. |
+| `DriveName` | Single line | Onboarding | The library name. `Dokumenty` on this Polish tenant. |
+| `RootFolder` | Single line | **The tool** | The channel folder's name, exactly as Graph returns it for the "Dokumenty księgowe" channel (`GET /teams/{id}/channels/{id}/filesFolder`). Documents then appear in the channel's files tab. Empty means the library root, which is where the incident's documents went and where clients never look. |
+| `DriveId` | Single line | **The tool** | New. The id of the drive holding the channel folder. If set, ingestion checks that the path still resolves to this drive; if not, the upload goes to quarantine as `stale_directory`. This protects against a deleted Team whose site URL is later reused by a new Team. |
+| `TeamId` | Single line | **The tool** | New. The client's Team id. Logged and used by the tools and audits; routing does not read it. |
+| `IsAdmin` | Yes/No | By hand | `Yes` only on the staff row. See [Staff](#staff). |
+| `Status` | `Active` / `Inactive` | By hand | Only `Active` rows route. |
+| `TeamsChannelId` | Single line | Onboarding | Written by onboarding, read by nothing. Channel uploads never reach a bot, so channels do not route. |
+
+## Duplicates and conflicts
+
+The list is read in two passes, so the result does not depend on row order. The rules are
+fail-closed: when in doubt, the upload goes to quarantine, never to a guess.
+
+| What is duplicated | Effect | Why |
 |---|---|---|
-| `Title` | Single line of text | Canonical display name, e.g. `[0002] PESKOVOI Sp. z o. o. - Księgowość`. Shown on the Personal Tab. |
-| `ClientId` | Single line of text | Short stable business key, e.g. `0002`. Appears in logs and result cards. Never reuse a retired id. |
-| `NIP` | Single line of text | Digits-only tax id. Used for content-based promotion + invoice direction detection. |
-| `CompanyNameAliases` | Multiple lines of text (plain) | One alias per line — legal name, trading name, common abbreviations, previous names. Used by Claude for identity priming and (in future) alias-based content matching. |
-| `PersonNames` | Multiple lines of text (plain) | One full name per line (e.g. company owner/signatory). Reserved for last-resort content matching. |
-| `UserAadObjectIds` | Multiple lines of text (plain) | One AAD object id (GUID) per line. **This is what routes uploads.** Every user who should be able to upload on this client's behalf must have their AAD id here. |
-| `SiteHostname` | Single line of text | e.g. `bcrgroupeu.sharepoint.com`. |
-| `SitePath` | Single line of text | e.g. `/sites/0002PESKOVOISp.zo.o.-Ksigowo` (must start with `/`). |
-| `DriveName` | Single line of text | Usually `Dokumenty` on Polish-locale tenants — verify per site, don't assume `Documents`. |
-| `RootFolder` | Single line of text | Optional sub-folder prefix under the drive root. Leave blank for uploads at drive root. |
-| `IsAdmin` | Yes/No | Set `Yes` for BCR staff / admin rows. Admin rows are matched on user id but their upload then falls through to content-based routing (they don't have a fixed home client). |
-| `Status` | Choice: `Active` / `Inactive` | Set `Inactive` to offboard a client without deleting the row (keeps audit history). |
+| A user id on two rows (including an `IsAdmin` row and a client row) | That id is dropped from routing. The rows stay usable for everyone else. | One person cannot be bound to two clients by accident. |
+| A target (`SiteHostname`, `SitePath`, `DriveName` and `RootFolder` together) on two rows | **Both rows** are excluded. Their uploads go to quarantine as `conflict`. | Two rows claiming one folder means one of them is wrong, and nothing says which. |
+| A `ClientId` or a `NIP` on two rows | An alert only (`directory.conflict`). Routing is not affected. `directory-bindings.mjs` refuses to change those rows until a person fixes them. | Neither routes anything any more, so excluding the rows would only quarantine a real client for no gain. |
 
-Indexing the `NIP` and (once populated) `UserAadObjectIds` columns via
-list settings → Indexed columns is worth doing once the list grows past a
-few hundred rows.
+A `directory.conflict` log line names the kind of conflict and the list item ids. It never logs
+the duplicated value itself. Look the items up in the list.
 
-## Onboarding a new client
+**The live duplicate.** Two rows carry `0002`. Before PESKOVOI is bound, Roman decides which is
+the real one (the row whose `SitePath` is PESKOVOI's site), and the other is set to `Inactive`
+([human-steps H-7](operations/human-steps.md#h-7-check-the-directory-before-the-deploy-and-add-the-new-columns)).
 
-1. **Gather the client's SharePoint site details.** Note the site
-   hostname, site path (starts with `/sites/…`), and drive display name.
-   Polish tenants use `Dokumenty`; other locales use `Documents`.
-2. **Collect the AAD object ids** of every user at the client's
-   organisation who should be able to upload documents. Get these from
-   Entra ID → *Users* → click each user → *Object ID*, or run
-   `Get-MgUser -Filter "userPrincipalName eq 'user@example.com'"` in
-   PowerShell.
-3. **Add a row** to the Client Directory list with:
-   - `Title`, `ClientId`, `NIP`, `CompanyNameAliases` for the client.
-   - `UserAadObjectIds` — one AAD id per line for each authorised user.
-   - `SiteHostname`, `SitePath`, `DriveName`, and (optionally) `RootFolder`.
-   - `Status = Active`.
-4. **Grant the ingest function's managed identity `write` on the client's
-   SharePoint site.** This is a separate step from adding the row — the
-   MI needs Graph-side permission to actually write into that site.
-   Follow [`admin-sharepoint-grant.md`](./admin-sharepoint-grant.md)
-   (step 2 only; the tenant-wide `Sites.Selected` app role in step 1 is a
-   one-time grant across all clients).
-5. Changes take effect within the ingest function's directory cache TTL
-   (default 5 min, configurable via `CLIENT_DIRECTORY_CACHE_TTL_MS`). No
-   redeploy needed.
-6. **Tell the client to use the bot via DM** — Teams left rail → chat →
-   search *"Asystent BCR"* → drop files. They can also add the
-   *"Moje dokumenty"* Personal Tab from the bot's app page to get a
-   deep link to their SharePoint document library.
+## The stale cap and the forbidden targets
 
-## Registering an admin
+- **Refresh.** The list is re-read every `CLIENT_DIRECTORY_CACHE_TTL_MS` (default 5 minutes).
+  An edit takes effect within that time, without a redeploy.
+- **Stale cap.** If refreshes keep failing, the last good snapshot is used for at most
+  `CLIENT_DIRECTORY_MAX_STALE_MS` (default 15 minutes). After that the snapshot counts as empty,
+  and every upload goes to quarantine as `stale_directory`. Before Phase 0, a failed refresh kept
+  an old snapshot forever, so a corrected row (a wrong id removed, say) might never take effect.
+- **Forbidden targets.** `FORBIDDEN_TARGET_SITE_PATHS` lists sites no row may ever route to: at
+  least BCR GROUP. The quarantine site is added automatically. A row pointing at one is excluded
+  as `forbidden_target`.
 
-Admins are BCR staff who file documents on behalf of many clients (a
-bookkeeper, agency owner, etc.) — they don't have a fixed home client.
+## Onboarding a client (Phase 0)
 
-1. Add a row with `IsAdmin = Yes` and the admin's AAD object id in
-   `UserAadObjectIds`. `Title` and `ClientId` are still required for
-   logging; `SiteHostname`/`SitePath` can be blank (admin rows never
-   themselves become a file target).
-2. When the admin uploads via DM:
-   - User-based routing matches their AAD id → the resolver sees
-     `IsAdmin=true` and defers.
-   - Post-classification routing kicks in: the document's NIP is looked
-     up against Directory clients. If exactly one matches, the file goes
-     to that client's site. If none match (or multiple match), it lands
-     in the fallback bucket for manual review.
+Onboarding step 13 writes the row with an empty `RootFolder` and no user ids. Until the row is
+bound, the client's uploads go to quarantine as `unmapped`. That is safe but slow, so bind soon
+after onboarding:
 
-## Updating or correcting a client
+1. **Grant the ingestion identity write on the client's site.** Use the onboarding repo's
+   `Grant-TeamSiteAccess.ps1` runbook with the ingestion identity's app id. The runbook call is
+   in [human-steps H-6](operations/human-steps.md#h-6-grant-the-ingestion-identity-write-on-the-quarantine-site).
+   Without this grant the tool skips the row.
+2. `node tools/directory-bindings.mjs check`: review what it reports for the row.
+3. `node tools/directory-bindings.mjs propose`: read the proposed `UserAadObjectIds`,
+   `RootFolder`, `DriveId` and `TeamId`.
+4. A second person reviews the proposal. Then apply it (`--help` gives the command). The tool
+   prints the row before and after, and writes a rollback log.
+5. **Canary:** a synthetic document, never a real one, uploaded by an identity bound to that
+   client, lands in the client's `Dokumenty księgowe` channel folder. Then delete the canary
+   file.
+6. Tell the client to use the bot in a 1:1 chat. In Teams, they switch to the BCR organisation,
+   open chat and search for "Asystent BCR". Their files are in their team → "Dokumenty
+   księgowe" → Files.
 
-- **Renamed company / new trading name** → add a new line to
-  `CompanyNameAliases` rather than replacing the existing ones (old
-  documents may still reference the old name).
-- **New employee joins** → add their AAD id to `UserAadObjectIds`. Effect
-  is picked up within the cache TTL.
-- **Employee leaves** → remove their AAD id. Their next upload will fall
-  through to fallback / content-based routing.
-- **Changed NIP** → update `NIP` directly. Affects future direction
-  detection and content-based promotion; already-uploaded files are
-  untouched.
-- **Client moved to a different SharePoint site** → update
-  `SiteHostname`/`SitePath`/`DriveName` and re-grant the managed identity
-  `write` on the new site (the old grant is not automatically transferred
-  — clean it up separately if the client is fully offboarding).
+## Staff
+
+Staff never go on a client row. Staff ids go on one row with `IsAdmin = Yes`, no target, and a
+`Title`/`ClientId` for the logs. A staff upload goes to quarantine as `staff`, and staff file
+documents into client folders by hand in SharePoint. There is no staff routing in Phase 0: the
+old "admin → route by the document's NIP" path is what the incident was.
+
+Until the full implementation is done, staff do not upload through the bot at all.
+
+## Changing a client
+
+- **A guest joins or leaves the client's Team:** run the tool again (`check`, `propose`, apply).
+  Do not edit `UserAadObjectIds` by hand.
+- **The company is renamed:** add a line to `CompanyNameAliases`, keeping the old ones.
+- **The NIP changes:** update `NIP`. It only affects invoice direction for future uploads.
+- **The client's Team, site or drive changes:** this is a rebind, not an edit. Two people agree
+  it, the tool writes the new values, and a canary proves them. Never edit `SitePath` or
+  `DriveName` by hand on an active row.
 
 ## Offboarding a client
 
-Set `Status = Inactive` rather than deleting the row. Inactive rows are
-excluded from lookups but preserve the audit trail. Deleting a row would
-also work but breaks any retry that references the old `ClientId`.
+1. Set `Status = Inactive`. Do not delete the row: it keeps the history, and retries and audits
+   refer to the `ClientId`.
+2. Remove the guests from the Team. On the next run, the tool clears `UserAadObjectIds`.
+3. Never reuse the `ClientId`.
+
+If the Team is later deleted and a new Team takes the same site URL, the old row's `DriveId` no
+longer matches. Uploads then go to quarantine instead of into the new Team.
 
 ## Data-handling notes
 
-- Only store identifiers needed for routing/matching (NIP, name aliases,
-  person names, AAD ids, SharePoint target). Don't use this list to store
-  other client-sensitive business data.
-- `CompanyNameAliases`/`PersonNames` matching is **exact, normalized**
-  (case/diacritics/whitespace-insensitive) — deliberately **not** fuzzy —
-  to avoid ever mis-filing a document into the wrong client's SharePoint
-  space. When adding aliases, include every real variant you expect to
-  see on documents rather than relying on partial matching to catch typos.
-- `UserAadObjectIds` matching is exact after case/whitespace
-  normalisation, and only accepts inputs that look like AAD GUIDs — junk
-  entries (e.g. UPNs, employee ids) are silently dropped by the reader.
-- **Duplicate keys across rows are fail-closed:** if the same NIP or the
-  same AAD id appears on two different clients, the reader removes it
-  from both lookup maps and logs a warning. Uploads matched only by the
-  ambiguous key then fall back rather than risk mis-routing.
+- Store only what routing and direction need: ids, NIP, a name for the classifier, and the
+  SharePoint target. No other client business data.
+- User ids are matched exactly, after lower-casing. Anything that is not a GUID (a UPN, an
+  employee number) is ignored.
+- Log lines about the list carry list item ids and ClientIds, never NIPs, names or user ids.
 
 ## Creating the list from scratch
 
-The list itself was created via Microsoft Graph Explorer (Azure CLI
-cannot POST to `/sites/{id}/lists` in this tenant due to strict
-pre-authorisation). To recreate it on a new site, use:
+The list was created with Microsoft Graph Explorer. The Azure CLI cannot `POST /sites/{id}/lists`
+in this tenant because of pre-authorisation. To recreate it:
 
 ```
 POST https://graph.microsoft.com/v1.0/sites/<siteId>/lists
@@ -165,7 +210,7 @@ POST https://graph.microsoft.com/v1.0/sites/<siteId>/lists
 ```json
 {
   "displayName": "Client Directory",
-  "description": "Multi-tenant routing directory for the BCR Ledger ingestion agent.",
+  "description": "Routing directory for the BCR Ledger ingestion agent (Phase 0).",
   "list": { "template": "genericList" },
   "columns": [
     { "name": "ClientId",           "text": {} },
@@ -177,11 +222,16 @@ POST https://graph.microsoft.com/v1.0/sites/<siteId>/lists
     { "name": "SitePath",           "text": {} },
     { "name": "DriveName",          "text": {} },
     { "name": "RootFolder",         "text": {} },
+    { "name": "DriveId",            "text": {} },
+    { "name": "TeamId",             "text": {} },
+    { "name": "TeamsChannelId",     "text": {} },
     { "name": "IsAdmin",            "boolean": {} },
     { "name": "Status",             "choice":  { "choices": ["Active", "Inactive"], "displayAs": "dropDown" } }
   ]
 }
 ```
 
-Then update `CLIENT_DIRECTORY_SITE_ID` and `CLIENT_DIRECTORY_LIST_ID` on
-the ingest function app settings and restart it.
+Then give it unique permissions (Owners only) and turn on versioning
+([T-5](operations/tenant-hardening.md#t-5-lock-and-version-the-client-directory-list)). Finally,
+set `CLIENT_DIRECTORY_SITE_ID` and `CLIENT_DIRECTORY_LIST_ID` on the ingestion app with
+`az functionapp config appsettings set … -o none`, which restarts it.
