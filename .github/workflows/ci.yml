@@ -49,6 +49,36 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: yarn test:tools
 
+  # The deploy packages, built exactly as a deploy builds them, so a broken
+  # package (orphan dist file, lockfile drift, a dependency the code requires
+  # but does not declare) fails the PR instead of the deploy. Nothing is
+  # uploaded: artifacts/*.zip is git-ignored build output.
+  package:
+    name: Package Function Apps
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Package teams-bot
+        shell: bash
+        run: yarn workspace @bcr/teams-bot package
+
+      - name: Package document-ingestion
+        shell: bash
+        run: yarn workspace @bcr/document-ingestion package
+
   bicep-validate:
     name: Validate Bicep
     runs-on: ubuntu-latest
