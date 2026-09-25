@@ -47,12 +47,22 @@ export GRAPH_TOKEN=$(node ../bcr-onboarding-agent/tools/graph-login.mjs)
 export SHAREPOINT_TOKEN=$(node ../bcr-onboarding-agent/tools/graph-login.mjs --sharepoint <tenant>.sharepoint.com)
 
 g()  { curl -sS -H "Authorization: Bearer $GRAPH_TOKEN" -H 'Content-Type: application/json' "$@"; }
-sp() { curl -sS -H "Authorization: Bearer $SHAREPOINT_TOKEN" -H 'Accept: application/json;odata=nometadata' "$@"; }
+# With -f an HTTP error fails the call and names its status, instead of printing an error body.
+sp() { curl -sSf -H "Authorization: Bearer $SHAREPOINT_TOKEN" -H 'Accept: application/json;odata=nometadata' "$@"; }
 G=https://graph.microsoft.com/v1.0
 ```
 
 `<tenant>` is the SharePoint tenant name and `<tenant-id>` the Entra tenant id. Both are in
 `PROJECT_OVERVIEW.md`. Tokens expire after about an hour, and they never go in a file.
+
+**Permissions.** The Graph permissions this page and the tools need are added and consented once
+on that app registration, by the Global Admin, in
+[`human-steps.md` H-4a](human-steps.md#h-4a-consent-the-permissions-the-operator-tools-need). Its
+SharePoint token carries `AllSites.Read`, enough for every SharePoint **read** on this page.
+The **scripted** SharePoint changes (in T-4, T-4b and T-5) need `AllSites.FullControl`, which
+H-4a deliberately does not add: use the browser path those steps give. A `403` from `g`, `sp` or
+a tool means a missing permission on the registration, or a right the signed-in person lacks;
+`sp` stops on it (`curl: (22) … 403`) rather than printing an error that reads like a result.
 
 ---
 
@@ -79,6 +89,7 @@ GRAPH_TOKEN=$(az account get-access-token --resource https://graph.microsoft.com
   node tools/audit-client-access.mjs > t1-before.txt
 
 # Apply: blocks sign-in on the accounts it marked RESTRICT, and nothing else.
+# Needs User.ReadWrite.All on the sign-in app, see human-steps H-4a. A 403 means it is missing.
 GRAPH_TOKEN=$(node tools/graph-login.mjs) node tools/audit-client-access.mjs --apply
 ```
 
@@ -215,13 +226,15 @@ Save the list of root folders, and mark which are taxonomy folders and which are
 The taxonomy folders on it, plus `98_Nieposortowane` if you create it (see **When**), are IR-1's
 `--expect-root-folders` for this site.
 
-**Change: in the browser.** This is the clearest way, and there are at most 14 folders. On the
-BCR GROUP site, open the document library. For each taxonomy folder: **⋯ → Manage access →
-Advanced settings → Stop Inheriting Permissions**. Then tick the site's **Members** and
-**Visitors** groups and click **Remove User Permissions**. The site's **Owners** group stays.
+**Change: in the browser.** This is the clearest way, there are at most 14 folders, and it needs
+no extra permission, so it is the path to use. On the BCR GROUP site, open the document library.
+For each taxonomy folder: **⋯ → Manage access → Advanced settings → Stop Inheriting
+Permissions**. Then tick the site's **Members** and **Visitors** groups and click **Remove User
+Permissions**. The site's **Owners** group stays.
 
-**Change: scripted,** with the same effect. `LIB` is the library path from `webUrl` above,
-decoded, for example `/sites/BCRGROUPSp.zo.o/Shared Documents`.
+**Helpers, for Verify and for the scripted change.** These only read, so set them whichever path
+made the change. `LIB` is the library path from `webUrl` above, decoded, for example
+`/sites/BCRGROUPSp.zo.o/Shared Documents`.
 
 ```bash
 WEB=https://<tenant>.sharepoint.com/sites/BCRGROUPSp.zo.o
@@ -234,7 +247,14 @@ item() {
   local p; p=$(jq -rn --arg p "$LIB/$1" '$p|@uri')
   echo "$WEB/_api/web/GetFolderByServerRelativePath(decodedurl='$p')/ListItemAllFields"
 }
+```
 
+**Change: scripted,** with the same effect. ⚠️ **It needs SharePoint `AllSites.FullControl`** on
+the sign-in app, which [H-4a](human-steps.md#h-4a-consent-the-permissions-the-operator-tools-need)
+deliberately leaves out. With only `AllSites.Read`, every POST below fails with 403 and nothing
+changes. Prefer the browser.
+
+```bash
 # Name only the taxonomy folders that exist on this site.
 for F in 01_Faktury 02_Wyciągi_bankowe 98_Nieposortowane; do
   I=$(item "$F")
@@ -267,8 +287,10 @@ item's sharing links and direct grants. The live permissions of an item therefor
 show a link that existed before the lock; IR-2 takes that history from the IR-0 Purview export
 (`purview-sharing-events.csv`) instead.
 
-**Rollback.** `sp -X POST "$(item <folder>)/resetroleinheritance()"`. This exposes the folder to
-every member again, so only do it if the lock broke something essential, and record why.
+**Rollback.** In the browser, the folder's **⋯ → Manage access → Advanced settings → Delete
+unique permissions**; scripted (needs `AllSites.FullControl`),
+`sp -X POST "$(item <folder>)/resetroleinheritance()"`. This exposes the folder to every member
+again, so only do it if the lock broke something essential, and record why.
 
 **Before anyone joins BCR GROUP.** No accountant is added to BCR GROUP, and the planned
 "Weryfikacja dokumentów" channel is not created, until this step and
@@ -334,11 +356,13 @@ The taxonomy folders are IR-1's `--expect-root-folders` for this site. The Team'
 the site's Owners group, which keeps access: every owner must read `Member`. **If a guest is an
 owner, stop and tell Roman**; locking would leave that guest with access.
 
-**Change.** Exactly as in T-4, in the browser or scripted, with `WEB` and `LIB` pointing at this
-client site, for example `WEB=https://<tenant>.sharepoint.com/sites/<client-site>` and
+**Change.** Exactly as in T-4: in the browser (the path to use), or scripted only if
+`AllSites.FullControl` is consented (H-4a leaves it out). Either way, set T-4's helpers again for
+this client site, because Verify reads through them: `WEB` and `LIB` pointing at it, for example
+`WEB=https://<tenant>.sharepoint.com/sites/<client-site>` and
 `LIB='/sites/<client-site>/Shared Documents'`, and `MEMBERS` and `VISITORS` read again from that
-`WEB` (they are this site's groups, not BCR GROUP's). Pass only the taxonomy folders that exist
-on this site to the `for` loop: `breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)`,
+`WEB` (they are this site's groups, not BCR GROUP's). Scripted, pass only the taxonomy folders
+that exist on this site to the `for` loop: `breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)`,
 then remove the site's Members and Visitors groups. The Owners group stays. Nothing is created
 on a client site.
 
@@ -365,7 +389,10 @@ register and the IR-0 Purview export (`purview-file-operations.csv`, or the manu
 
 Lock each of them on its own: save its `GET /drives/{driveId}/items/{itemId}/permissions` to the
 evidence store first, then stop inheritance and leave only the site's Owners group. A file
-inside a channel folder is locked this way too; the channel folder itself never is.
+inside a channel folder is locked this way too; the channel folder itself never is. In the
+browser, as for a folder: the file's **⋯ → Manage access → Advanced settings → Stop Inheriting
+Permissions**, then remove **Members** and **Visitors**. The helper and the check below only
+read; the three POSTs are the scripted change, and need `AllSites.FullControl` (see T-4).
 
 ```bash
 # The list item of a file, with the path percent-encoded.
@@ -374,9 +401,11 @@ file_item() {
   echo "$WEB/_api/web/GetFileByServerRelativePath(decodedurl='$p')/ListItemAllFields"
 }
 I=$(file_item '<path under the library>')
+# The scripted change only. Skip these three when the browser made it.
 sp -X POST "$I/breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)"
 sp -X POST "$I/roleassignments/getbyprincipalid($MEMBERS)/deleteobject()"
 sp -X POST "$I/roleassignments/getbyprincipalid($VISITORS)/deleteobject()"
+# The check.
 sp "$I/roleassignments?\$expand=Member&\$select=Member/Title" | jq -r '.value[].Member.Title'
 ```
 
@@ -387,8 +416,10 @@ evidence store, not here: for that item, W4 ends at that time. The processor not
 breach register say that the receiving team's members can no longer open the moved documents
 only once this check is done for the site and leaves nothing unlocked.
 
-**Rollback.** `sp -X POST "$(item <folder>)/resetroleinheritance()"`. This gives the client's
-guest access to another client's documents again, so only with Roman's decision, and recorded.
+**Rollback.** As in T-4: **Delete unique permissions** in the browser, or scripted (needs
+`AllSites.FullControl`) `sp -X POST "$(item <folder>)/resetroleinheritance()"`. This gives the
+client's guest access to another client's documents again, so only with Roman's decision, and
+recorded.
 
 ## T-5: Lock and version the Client Directory list
 
@@ -415,9 +446,10 @@ sp "$L?\$select=HasUniqueRoleAssignments,EnableVersioning,MajorVersionLimit"
 sp "$L/roleassignments?\$expand=Member&\$select=Member/Title" | jq -r '.value[].Member.Title'
 ```
 
-**Change.** In the browser: **List settings → Permissions for this list → Stop Inheriting
-Permissions**, then remove Members and Visitors. Then **List settings → Versioning settings →
-Create a version each time you edit an item: Yes**, and keep 500 versions. Scripted:
+**Change.** In the browser, the path to use: **List settings → Permissions for this list → Stop
+Inheriting Permissions**, then remove Members and Visitors. Then **List settings → Versioning
+settings → Create a version each time you edit an item: Yes**, and keep 500 versions.
+Scripted, only if `AllSites.FullControl` is consented (H-4a leaves it out; see T-4):
 
 ```bash
 sp -X POST "$L/breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)"
@@ -436,7 +468,9 @@ traces
 | where tostring(parse_json(message).msg) startswith "directory refresh failed"
 ```
 
-**Rollback.** `sp -X POST "$L/resetroleinheritance()"`. Leave versioning on; it costs nothing.
+**Rollback.** In the browser, **List settings → Permissions for this list → Delete unique
+permissions**; scripted (needs `AllSites.FullControl`), `sp -X POST "$L/resetroleinheritance()"`.
+Leave versioning on; it costs nothing.
 
 ⚠️ **The row edits themselves do not happen here.** Taking Yahor's id off PESKOVOI's row, adding
 guest ids and setting `RootFolder` all happen with `tools/directory-bindings.mjs`, in the same
@@ -531,7 +565,8 @@ settings**.
 - Guest invite settings: **"Only users assigned to specific admin roles can invite guest
   users"**.
 
-The same change with Graph, using a token that holds `Policy.ReadWrite.Authorization`:
+The same change with Graph, using a token that holds `Policy.ReadWrite.Authorization` (H-4a
+does not consent it; prefer the admin centre above):
 
 ```bash
 g -X PATCH "$G/policies/authorizationPolicy" \

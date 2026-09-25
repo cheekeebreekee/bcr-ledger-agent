@@ -97,11 +97,12 @@ Graph and SharePoint tokens are set up as described in
 | H-1 | GDPR: processor notice and breach register | Roman + IOD | by 26–28 Sep | — |
 | H-2 | IR-0: evidence export, stored immutably | Yahor, Global Admin, Roman | today; step 1 starts in parallel with H-3 | — |
 | H-3 | **Mandatory:** stop promotion with a setting | Yahor | **immediately, day 0**, without waiting for H-2; H-5, H-6 and H-6b follow **the same working day** ([the bound](#h-3-stop-promotion-now-without-a-deploy)) | — |
-| H-4 | Tenant hardening T-1 to T-9, T-4b included | per step | today–tomorrow | T-4, T-4b, T-5 before H-12; T-4 the day of H-3, checked again after H-6b; T-4b after H-3 is verified, before IR-2; T-1 before H-10 |
+| H-4a | Graph permissions for the operator tools, admin-consented | Global Admin | day 0, before H-4 | — |
+| H-4 | Tenant hardening T-1 to T-9, T-4b included | per step | today–tomorrow | H-4a; T-4, T-4b, T-5 before H-12; T-4 the day of H-3, checked again after H-6b; T-4b after H-3 is verified, before IR-2; T-1 before H-10 |
 | H-5 | Quarantine site | SharePoint Admin | the working day of H-3 | — |
 | H-6 | Ingestion identity write grant on quarantine | Global Admin | the working day of H-3 | H-5 |
 | H-6b | Running build's fallback re-pointed at the quarantine | Yahor | the working day of H-3 | H-3, H-6 verified |
-| H-7 | Directory check and new columns (no new site grants) | Yahor | day 1 | H-2 (IR-0 C stored), T-5 |
+| H-7 | Directory check and new columns (no new site grants) | Yahor | day 1 | H-2 (IR-0 C stored), H-4a, T-5 |
 | H-8 | New app settings, added | Yahor | day 1 | H-5 |
 | H-9 | Bot deploy, gate in `log` | Yahor | day 1 | H-2, H-8 |
 | H-10 | Manifest 0.2.0, availability *Everyone* | Teams Admin | day 1 | H-9, T-1 |
@@ -325,10 +326,54 @@ stays empty.
 **Rollback.** None while the pre-Phase-0 build runs. H-12 step 11 sets it back to `true` once
 the Phase-0 build, which has no promotion, is live.
 
+### H-4a: Consent the permissions the operator tools need
+
+**Owner:** Global Admin. **When:** day 0, before H-4 and before any `check` (H-5b, H-6b, H-7).
+It changes no data; it lets the operator's own token do what this runbook asks of it.
+
+Every `g` and `sp` call and every `tools/*.mjs` run below uses a delegated token from one app
+registration BCR owns: the one the onboarding repo's `tools/graph-login.mjs` signs in with (its
+client id is `GRAPH_CLIENT_ID`; see [`tenant-hardening.md` → Tokens](tenant-hardening.md#tokens)).
+The onboarding setup consented only `Sites.Manage.All` on it, plus SharePoint `AllSites.Read`.
+A token from it carries every delegated permission admin-consented on the registration, so the
+rest is added there, once. Without them `check` and `propose` stop with a 403 at their first read
+of the Teams, and T-1's `--apply` cannot block a sign-in.
+
+In the Entra admin centre: **App registrations → All applications →** that registration **→ API
+permissions → Add a permission → Microsoft Graph → Delegated permissions**. Add these, then
+**Grant admin consent for** the tenant:
+
+| Delegated Graph permission | Needed by |
+|---|---|
+| `User.Read.All`, `GroupMember.Read.All`, `Group.Read.All`, `Channel.ReadBasic.All` | `directory-bindings.mjs` `check`, `propose` and `apply` (apply re-reads every guest it binds); H-5b's check |
+| `Sites.Read.All` | H-2 step 4 (the Directory export), `check`, `propose`, IR-1 |
+| `Sites.ReadWrite.All` | `directory-bindings.mjs apply` and `rollback`: they write the Directory rows |
+| `Sites.Manage.All` (already there) | `--add-columns`; H-5's four columns |
+| `User.ReadWrite.All`, `Directory.Read.All` | T-1's `audit-client-access.mjs --apply` (it blocks sign-in); T-2's licence removal; T-7's sign-in block |
+
+Do **not** add SharePoint `AllSites.FullControl`. Only the scripted SharePoint changes in
+tenant-hardening (T-4, T-4b, T-5) need it, and each of them has a browser path, which needs none
+of this: use the browser. T-8's `Policy.ReadWrite.Authorization` is the same: its browser path
+is the one to use.
+
+The permissions are delegated, so a token never does more than the signed-in person could do in
+the browser. A **403** from a tool, from `g` or from `sp` therefore means one of two things:
+the permission is not consented here, or that person lacks the right on that site or object.
+The `Scopes:` line below tells the two apart.
+
+**Verify.** `node ../bcr-onboarding-agent/tools/graph-login.mjs > /dev/null` signs in and prints
+`Scopes: …` on stderr, which lists every permission in the table. The token itself goes to
+`/dev/null`, never to the screen.
+
+**Rollback.** Remove the added permissions on the same page (**⋯ → Remove permission**) once
+nothing needs them. The read permissions stay for the [standing checks](#standing-checks) until
+Phase 2.
+
 ### H-4: Tenant hardening
 
-**Owner:** per step. **When:** today and tomorrow. Run T-1 to T-9 from
-[`tenant-hardening.md`](tenant-hardening.md), T-4b included. T-10 comes with H-10.
+**Owner:** per step. **When:** today and tomorrow, after H-4a (T-1's `--apply` needs its
+permissions). Run T-1 to T-9 from [`tenant-hardening.md`](tenant-hardening.md), T-4b included,
+using the browser path wherever a step offers one. T-10 comes with H-10.
 
 These must be done before H-12:
 
@@ -534,7 +579,9 @@ below. Both change the Directory, so both wait for that export and that versioni
 `tools/directory-bindings.mjs` runs with a delegated Graph token. By default it reads and
 changes nothing. The flags below match [`tools/README.md`](../../tools/README.md);
 `node tools/directory-bindings.mjs --help` is authoritative. For the token, see that README's
-"Authentication" section: the `az` token has no SharePoint scopes.
+"Authentication" section: the `az` token has no SharePoint scopes. H-4a consents what the token
+needs; a **403** from the tool means a permission is still missing there, or the signed-in person
+cannot read that site. It is never a reason to use another token or to skip the row by hand.
 
 The tool needs the Directory's ids, the ingestion managed identity's app id, the forbidden
 sites, the quarantine site and the tenant's SharePoint host: the same values ingestion is given
@@ -1030,7 +1077,9 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    each PATCH it reads every guest it is about to bind again: the user must still be a `Guest`,
    and the Teams in their `memberOf` must be exactly the row's Team. Otherwise the row is
    `stale` and skipped: run `propose` again. The apply log is a new file every run (an `--out`
-   that exists is refused), written safely before each PATCH; keep every one until H-15.
+   that exists is refused), written safely before each PATCH; keep every one until H-15. A 403
+   from `propose` or `apply` means a permission from H-4a is missing (`Sites.ReadWrite.All` for
+   the write), or the signed-in person cannot edit the Client Directory list (Owners only, T-5).
 7. **Canary on TEST.** The TEST guest uploads a synthetic PDF. Expect:
    - it lands in TEST's `Dokumenty księgowe/…`, visible in the channel's files tab;
    - the card's link opens it there;
