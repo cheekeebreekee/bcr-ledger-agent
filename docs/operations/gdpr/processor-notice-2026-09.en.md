@@ -30,6 +30,15 @@
 >   audit-log sign-in events and the 7-day Entra download, `human-steps.md` H-2). If they have
 >   not been read yet, say that the analysis is continuing; never write that no sign-in record
 >   exists.
+> - Before sending, confirm the two retention sentences in section 4 against the tenant: the
+>   audit-log retention (Purview → Audit: retention policies and licence), and that the H-2
+>   `-SignInUpn` export actually contains `UserLoggedIn`/`UserLoginFailed` events for the
+>   tenant. If either is not confirmed, replace those sentences with only what the exports show.
+> - Write the **[Variant B]** access bullet in section 6 only once `tenant-hardening.md` T-4b's
+>   check after IR-1 is done for the other client's site and leaves none of this client's
+>   documents unlocked, including any that the other client's members moved or copied out of the
+>   locked folders (per the IR-0 Purview export). Its date is the date of the last such lock.
+>   Until then, leave the bullet out; phase 2 reports it.
 
 ---
 
@@ -124,8 +133,9 @@ Done (with dates):
   management;
 - **[Variant B]** {{DATE}}: we switched off the function that assigned documents to a client from
   their content;
-- **[Variant B]** {{DATE}}: we restricted access to the folders in the other client's space where
-  your document(s) were stored, so that its members can no longer open them;
+- **[Variant B]** {{DATE — of the last lock}}: we restricted access to your document(s) in the
+  other client's space, in the folders where they were stored and wherever else in that space
+  they were found, so that its members can no longer open them;
 - {{DATE}}: we secured the event logs in a store whose contents cannot be changed or deleted,
   readable only by BCR management and the data protection officer;
 - {{DATE}}: we stopped automatic deployment of changes to the system.

@@ -15,7 +15,9 @@ relative to the deploys is in [`human-steps.md`](human-steps.md#phase-0).
   [T-3](#t-3-confirm-bcr-group-is-private-read-only) only reads.
   [T-4](#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root) and
   [T-5](#t-5-lock-and-version-the-client-directory-list) change permissions on two things *inside*
-  its site: the ledger's own folders, and the routing list. The only change to its membership is
+  its site: the ledger's own folders, and the routing list. T-4 may also create one of the
+  ledger's own folders, `98_Nieposortowane`, empty, so that it is locked before anything is filed
+  in it. The only change to its membership is
   in [T-7](#t-7-explain-or-remove-authoriseme), which takes `AuthoriseMe@` out of the team, and
   only if Roman decides the account is not needed. Nothing else on this page, T-4b included,
   touches BCR GROUP.
@@ -157,6 +159,25 @@ member of the team can read them: `AuthoriseMe@` today, and any accountant added
 later. Stopping inheritance and leaving only the Owners closes that. The documents stay exactly
 where IR-1 finds them.
 
+**When.** Day 0, the day of [H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy), and
+before H-12. **Then again after
+[H-6b](human-steps.md#h-6b-point-the-running-builds-fallback-at-the-quarantine).** The lock covers
+only the folders that exist when it runs. Until H-6b re-points the running build's fallback at
+the quarantine, that build keeps filing unrouted uploads at this library root (after H-3, only
+under `98_Nieposortowane/YYYY/MM/`, because without the Claude classifier every upload is
+unsorted), and a taxonomy folder it creates after the lock inherits the library's permissions.
+Two things close that:
+
+- **Before the lock,** if `98_Nieposortowane` is not in *Read first*'s list, create it, empty,
+  at the library root (**New → Folder**, the exact name), and lock it with the others. Its
+  `YYYY/MM` subfolders then inherit the lock as the build creates them. Nothing is filed by
+  doing this; it is an empty folder.
+- **Once H-6b is verified,** run *Read first* again and lock every taxonomy folder that was not
+  there before (there should be none).
+
+Record the time of both runs: for items in a folder locked by the second run, W1 ends at that
+later time.
+
 **What gets locked: only the ledger's taxonomy folders at the library root.** They are the
 top-level folders from [`folderTaxonomy.ts`](../../packages/shared/src/parsers/folderTaxonomy.ts),
 where they exist:
@@ -182,6 +203,8 @@ g "$G/teams/<bcr-group-id>/channels?\$select=displayName,membershipType" | jq -r
 ```
 
 Save the list of root folders, and mark which are taxonomy folders and which are channel folders.
+The taxonomy folders on it, plus `98_Nieposortowane` if you create it (see **When**), are IR-1's
+`--expect-root-folders` for this site.
 
 **Change: in the browser.** This is the clearest way, and there are at most 14 folders. On the
 BCR GROUP site, open the document library. For each taxonomy folder: **⋯ → Manage access →
@@ -219,9 +242,18 @@ sp "$I/roleassignments?\$expand=Member&\$select=Member/Title" | jq -r '.value[].
 ```
 
 Only the site's Owners group is listed. In the browser, **Manage access → Check permissions**
-for `AuthoriseMe@` returns *None* on each locked folder. The ingestion identity and the IR-1 tool
-read through a site-level app grant and through an owner's token respectively, so they are not
-affected. **[verify]** that IR-1 still lists the locked folders.
+for `AuthoriseMe@` returns *None* on each locked folder. The ingestion identity reads and writes
+through a site-level app grant, so it is not affected. IR-1 is, unless it runs as an owner: it
+walks with a delegated token, and SharePoint hides a locked folder from anyone outside the
+Owners group. So IR-1 runs with the token of an Owner or site collection admin of every site it
+walks, and with `--expect-root-folders` naming the folders locked here (the list saved in *Read
+first*); it exits non-zero, naming the folder, when the walk does not see one
+([incident → IR-1](incident-2026-09.md#ir-1-inventory)).
+
+⚠️ `clearSubscopes=true` also resets every item inside the folder to inherit, which removes the
+item's sharing links and direct grants. The live permissions of an item therefore no longer
+show a link that existed before the lock; IR-2 takes that history from the IR-0 Purview export
+(`purview-sharing-events.csv`) instead.
 
 **Rollback.** `sp -X POST "$(item <folder>)/resetroleinheritance()"`. This exposes the folder to
 every member again, so only do it if the lock broke something essential, and record why.
@@ -248,8 +280,16 @@ The client barely notices. They are told to look in the "Dokumenty księgowe" ch
 these root folders are not it. The client's own documents that sit there are released into the
 channel folder by IR-2, through the allow-list.
 
-**When.** Day 0 or day 1, with T-4, and **before IR-2 starts** on that site. It must be done
-before H-12 ([`human-steps.md` H-4](human-steps.md#h-4-tenant-hardening)).
+**When.** Day 0 or day 1, with T-4, **after H-3 is verified**
+([`human-steps.md` H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy)), and **before
+IR-2 starts** on that site. It must be done before H-12
+([`human-steps.md` H-4](human-steps.md#h-4-tenant-hardening)). The lock covers only the folders
+that exist when it runs, and until H-3 is in effect the running build can still promote a
+document into a client's site and create a taxonomy folder at its library root. If T-4b ran
+before H-3 was verified, run *Read first* again on each site once it is, and lock every taxonomy
+folder that has appeared since. Once H-3 is in effect, only an upload by an id on a client row
+could still file there before H-12. As far as the records go the only such id is Yahor's (IR-0 C
+confirms or corrects this), and he does not upload through the bot.
 
 **Which sites.** PESKOVOI and TEST, the client sites the ingestion identity could write to, and
 any further site that IR-1 lists (a `site_not_walked` flag, or a further site where
@@ -277,15 +317,17 @@ g "$G/groups/<client-team-id>/owners?\$select=userPrincipalName,userType" \
 ```
 
 Save the lists, and mark which root folders are taxonomy folders and which are channel folders.
-The Team's owners become the site's Owners group, which keeps access: every owner must read
-`Member`. **If a guest is an owner, stop and tell Roman**; locking would leave that guest with
-access.
+The taxonomy folders are IR-1's `--expect-root-folders` for this site. The Team's owners become
+the site's Owners group, which keeps access: every owner must read `Member`. **If a guest is an
+owner, stop and tell Roman**; locking would leave that guest with access.
 
 **Change.** Exactly as in T-4, in the browser or scripted, with `WEB` and `LIB` pointing at this
 client site, for example `WEB=https://<tenant>.sharepoint.com/sites/<client-site>` and
-`LIB='/sites/<client-site>/Shared Documents'`. Pass only the taxonomy folders that exist on this
-site to the `for` loop: `breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)`,
-then remove the site's Members and Visitors groups. The Owners group stays.
+`LIB='/sites/<client-site>/Shared Documents'`, and `MEMBERS` and `VISITORS` read again from that
+`WEB` (they are this site's groups, not BCR GROUP's). Pass only the taxonomy folders that exist
+on this site to the `for` loop: `breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)`,
+then remove the site's Members and Visitors groups. The Owners group stays. Nothing is created
+on a client site.
 
 The ingestion identity writes through its site-level app grant, so its writes are not affected.
 After H-12 it no longer writes to these folders anyway: `RootFolder` then names the channel
@@ -293,9 +335,43 @@ folder.
 
 **Verify,** for each locked folder: `HasUniqueRoleAssignments` is `true` and only the site's
 Owners group is listed (the T-4 commands). In the browser, **Manage access → Check permissions**
-for the client's guest returns *None*. As in T-4, **[verify]** that IR-1, run with a site
-owner's token, still lists the locked folders. Record each site and the time of the lock in the
-status table: it is the end date of W4 for documents already moved.
+for the client's guest returns *None*. As in T-4, IR-1 must still see the locked folders: it
+runs with an Owner's or site collection admin's token and with `--expect-root-folders` naming
+the folders locked here. Record each site and the time of the lock in the status table.
+
+**Then, once IR-1 has run for this site: the items outside the locked folders.** Before the lock
+the client's guest could move a promoted document out of a taxonomy folder (into
+`Dokumenty księgowe`, say), or copy it. Such an item stays readable after the lock. From IR-1's
+register and the IR-0 Purview export (`purview-file-operations.csv`, or the manual fallback's
+`ir0-purview-<site>.csv`), list:
+
+- every item on this site that IR-1 flags as promoted (W4) or `uploader_not_site_guest` and
+  whose current path is not under a folder locked here;
+- every `FileMoved`, `FileCopied` or `FileRenamed` event on such an item by anyone other than
+  staff and the ingestion identity, and where the item or its copy went.
+
+Lock each of them on its own: save its `GET /drives/{driveId}/items/{itemId}/permissions` to the
+evidence store first, then stop inheritance and leave only the site's Owners group. A file
+inside a channel folder is locked this way too; the channel folder itself never is.
+
+```bash
+file_item() {  # a file's list item, with the path percent-encoded
+  local p; p=$(jq -rn --arg p "$LIB/$1" '$p|@uri')
+  echo "$WEB/_api/web/GetFileByServerRelativePath(decodedurl='$p')/ListItemAllFields"
+}
+I=$(file_item '<path under the library>')
+sp -X POST "$I/breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)"
+sp -X POST "$I/roleassignments/getbyprincipalid($MEMBERS)/deleteobject()"
+sp -X POST "$I/roleassignments/getbyprincipalid($VISITORS)/deleteobject()"
+sp "$I/roleassignments?\$expand=Member&\$select=Member/Title" | jq -r '.value[].Member.Title'
+```
+
+The last command must list only the Owners group. An item that already had its own permissions
+(a sharing link, a person added by hand) keeps them through the first command: remove those in
+the browser (**Manage access**), after saving them. Record each item and its lock time in the
+evidence store, not here: for that item, W4 ends at that time. The processor notice and the
+breach register say that the receiving team's members can no longer open the moved documents
+only once this check is done for the site and leaves nothing unlocked.
 
 **Rollback.** `sp -X POST "$(item <folder>)/resetroleinheritance()"`. This gives the client's
 guest access to another client's documents again, so only with Roman's decision, and recorded.
@@ -515,14 +591,42 @@ Nobody else needs it. The real control is the bot's own gate, which refuses anyt
 a 1:1 chat from the BCR tenant with a valid user id. Availability narrows who can install the app
 in the first place.
 
-**When.** Right after the Phase-0 bot deploy, with manifest 0.2.0 (see
-[`human-steps.md`](human-steps.md#h-10-upload-manifest-020-and-set-availability)).
+**When.** Right after the Phase-0 bot deploy, and after [T-1](#t-1-block-sign-in-on-the-nip-client-addresses),
+with manifest 0.2.0 (see
+[`human-steps.md`](human-steps.md#h-10-upload-manifest-020-and-set-availability)). Step 2's case
+for *Everyone* relies on T-1 being done.
+
+**Build the package first** (Yahor, from the repo root; the Teams Administrator only uploads
+it). There is no ready-made zip in the repo: the `artifacts/teams-app.zip` that used to be
+committed was manifest 0.1.5, with team and group-chat scopes and the "Moje dokumenty" tab, and
+must never be uploaded. `teams-app/manifest.json` holds `REPLACE-WITH-BOT-APP-ID` in `id` and
+`bots[0].botId`. Both become the bot's app id, which is also the id of the "Asystent BCR" app
+already in the catalog. **[verify]** in the admin centre that the existing app's *App ID* is
+that value before uploading; if it differs, stop, because the upload would create a second
+app. The build works on a copy, so the tracked manifest keeps its placeholders.
+
+```bash
+# RG and BOT as in human-steps.md → Variables
+BOT_APP_ID=$(az functionapp config appsettings list -g $RG -n $BOT \
+  --query "[?name=='MICROSOFT_APP_ID'].value | [0]" -o tsv)
+T=$(mktemp -d)
+sed "s/REPLACE-WITH-BOT-APP-ID/$BOT_APP_ID/g" teams-app/manifest.json > "$T/manifest.json"
+cp teams-app/color.png teams-app/outline.png "$T/"
+grep -c REPLACE-WITH "$T/manifest.json"                        # must print 0
+OUT="$PWD/artifacts/teams-app.zip"; mkdir -p artifacts; rm -f "$OUT"
+(cd "$T" && zip -X "$OUT" manifest.json color.png outline.png)
+unzip -p "$OUT" manifest.json | jq -r \
+  '.version, (.bots[0].scopes | join(",")), (.staticTabs // [] | length), (.id == .bots[0].botId)'
+```
+
+The last command must print `0.2.0`, `personal`, `0` and `true`, one per line. Anything else:
+do not upload it.
 
 **Change.** In the Teams admin centre:
 
-1. **Teams apps → Manage apps → Asystent BCR → Upload file**, and select `artifacts/teams-app.zip`
-   built from manifest 0.2.0. That version has personal scope only and no tab. If the app is not
-   in the catalog yet, use **Upload new app** instead.
+1. **Teams apps → Manage apps → Asystent BCR → Upload file**, and select the
+   `artifacts/teams-app.zip` just built and checked. That version has personal scope only and no
+   tab. If the app is not in the catalog yet, use **Upload new app** instead.
 2. **Asystent BCR → Users and groups → Available to**: choose **Everyone**. This is the
    Phase-0 choice. The gate is the control: it refuses anything that is not a 1:1 chat from the
    BCR tenant with a valid user id, and T-1 has already blocked the `{NIP}@` accounts.
@@ -544,13 +648,15 @@ in the first place.
    older installs may remain. **[verify]** On each client team: **Manage team → Apps → Asystent
    BCR → Uninstall**. The gate already refuses those installs.
 
-**Verify.** The TEST guest finds "Asystent BCR", opens the chat and gets the help card, and so
-does PESKOVOI's guest when they next use it. Only if availability was later restricted: a staff
-account outside the groups cannot install the app.
+**Verify.** The admin centre shows version **0.2.0** for Asystent BCR. The TEST guest finds
+"Asystent BCR", opens the chat and gets the help card, and so does PESKOVOI's guest when they
+next use it. Only if availability was later restricted: a staff account outside the groups
+cannot install the app.
 
-**Rollback.** Upload the previous package, and set availability back to what it was. ⚠️ The
-previous package brings back the "Moje dokumenty" tab. After the Phase-0 bot deploy that tab only
-shows a static page, but use it only in an emergency.
+**Rollback.** Set availability back to what it was. Do not upload an older package: 0.1.5
+brings back team and group-chat installs and the "Moje dokumenty" tab. If 0.2.0 itself is
+broken, fix `teams-app/manifest.json`, raise its `version` (0.2.1), and build, check (for the
+new version, still `personal` and `0`) and upload that the same way.
 
 ---
 
@@ -568,11 +674,11 @@ laptops (`.env`) are an accepted risk, recorded in
 | T-1 | | | | |
 | T-2 | | | | |
 | T-3 | | | | Time made Private, from Purview |
-| T-4 | | | | Folders locked |
-| T-4b | | | | Per client site: folders locked, time of the lock (end of W4) |
+| T-4 | | | | Folders locked, and the time; whether `98_Nieposortowane` was created first; the check after H-6b, its time, and any folder it locked |
+| T-4b | | | | Per client site: folders locked and the time of the lock; H-3's time; any re-check after H-3; the check after IR-1 of the items outside the locked folders, done or not, and how many it locked (each item and its lock time are in the evidence store). W4 ends, for items already moved, at the latest of these that applies to the item |
 | T-5 | | | | |
 | T-6 | Roman decides | | | Private / deleted |
 | T-7 | Roman decides | | | Explained / removed |
 | T-8 | | | | TEST invite checked |
 | T-9 | Roman confirms tenant level | | | TEST guest checked |
-| T-10 | | | | Everyone (Phase 0) |
+| T-10 | | | | Everyone (Phase 0); version 0.2.0 shown; sha256 of the uploaded zip |

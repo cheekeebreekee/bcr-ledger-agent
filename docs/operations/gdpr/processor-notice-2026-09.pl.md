@@ -27,6 +27,17 @@
 >   (zdarzenia logowania z dziennika audytu i pobrany 7-dniowy dziennik Entra, `human-steps.md`
 >   H-2). Jeśli nie zostały jeszcze przeanalizowane, napisać, że analiza trwa; nigdy nie pisać,
 >   że dzienniki logowania nie istnieją.
+> - Przed wysłaniem potwierdzić w dzierżawie oba zdania o okresach przechowywania w punkcie 4:
+>   okres przechowywania dziennika audytu (Purview → Audyt: zasady przechowywania i licencja)
+>   oraz to, że eksport z H-2 (`-SignInUpn`) rzeczywiście zawiera zdarzenia
+>   `UserLoggedIn`/`UserLoginFailed` z tej dzierżawy. Jeśli któregoś nie potwierdzono, zastąpić
+>   te zdania wyłącznie tym, co wynika z eksportów.
+> - Punkt **[Wariant B]** o ograniczeniu dostępu w punkcie 6 wpisać dopiero wtedy, gdy
+>   sprawdzenie z kroku T-4b w `tenant-hardening.md` (po IR-1) zostało wykonane dla witryny
+>   drugiego klienta i nie pozostawiło bez blokady żadnego dokumentu tego klienta, także
+>   dokumentów, które członkowie drugiego zespołu przenieśli lub skopiowali poza zablokowane
+>   foldery (według eksportu Purview z IR-0). Jego data to data ostatniej takiej blokady. Do
+>   tego czasu pominąć ten punkt; informacja trafi do etapu 2.
 > - Wersja angielska do porównania: [`processor-notice-2026-09.en.md`](processor-notice-2026-09.en.md).
 
 ---
@@ -123,8 +134,10 @@ Zrobione (z datami):
   kierownictwa BCR;
 - **[Wariant B]** {{DATA}}: wyłączyliśmy funkcję, która przypisywała dokumenty do klienta na
   podstawie ich treści;
-- **[Wariant B]** {{DATA}}: ograniczyliśmy dostęp do folderów w przestrzeni innego klienta BCR,
-  w których zapisano Państwa dokument(y), tak że jego członkowie nie mogą ich już otworzyć;
+- **[Wariant B]** {{DATA — ostatniej blokady}}: ograniczyliśmy dostęp do Państwa dokumentu(ów)
+  w przestrzeni innego klienta BCR, w folderach, w których je zapisano, oraz w każdym innym
+  miejscu tej przestrzeni, w którym je znaleziono, tak że jego członkowie nie mogą ich już
+  otworzyć;
 - {{DATA}}: zabezpieczyliśmy dzienniki zdarzeń w magazynie, którego zawartości nie można zmienić
   ani usunąć, z dostępem ograniczonym do kierownictwa BCR i inspektora ochrony danych;
 - {{DATA}}: wstrzymaliśmy automatyczne wdrażanie zmian w systemie.

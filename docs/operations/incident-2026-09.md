@@ -85,10 +85,10 @@ whether anyone used it. Dates marked *record* are filled in from the IR-0 export
 
 | # | Window | Exposed | To whom | Opened | Closed by |
 |---|---|---|---|---|---|
-| W1 | **Fallback bucket** at the BCR GROUP library root | Every unrouted upload, from every client, plus staff uploads | Members of BCR GROUP: Roman, Yahor and `AuthoriseMe@` | Multi-tenant routing go-live, on or before 16 Jul 2026 (*record* the deploy date) | New uploads: the Phase-0 ingestion deploy. Existing items: the folder lock in [tenant hardening](tenant-hardening.md#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root), then IR-2 moves them out. |
+| W1 | **Fallback bucket** at the BCR GROUP library root | Every unrouted upload, from every client, plus staff uploads | Members of BCR GROUP: Roman, Yahor and `AuthoriseMe@` | Multi-tenant routing go-live, on or before 16 Jul 2026 (*record* the deploy date) | New uploads: the fallback re-pointed at the quarantine ([H-6b](human-steps.md#h-6b-point-the-running-builds-fallback-at-the-quarantine)), then the Phase-0 ingestion deploy. Existing items: the folder lock in [tenant hardening T-4](tenant-hardening.md#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root), checked again after H-6b, then IR-2 moves them out. |
 | W2 | **BCR GROUP was Public** | Everything in W1, and the `Onboarding klientów` channel | Any internal account, including the three `{NIP}@` accounts, which could sign in | Unknown (*record* from the group's history) | Made Private between 23 and 25 Sep (*record*) |
 | W3 | **`{NIP}@` accounts could sign in** | Their own client team (added by hand), any Public team, Viva Engage Communities | Whoever held those credentials | Account creation, by hand | Sign-in blocked: [tenant hardening T-1](tenant-hardening.md#t-1-block-sign-in-on-the-nip-client-addresses) |
-| W4 | **Content promotion** | A document moved into the site of whichever client's NIP it named, at that site's library root | Members of that client's Team, including the client's guest | Go-live (as W1) | New moves: `ANTHROPIC_ENABLED=false` ([H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy)), then the Phase-0 ingestion deploy (P0-1). Items already moved: the client-site folder lock ([tenant hardening T-4b](tenant-hardening.md#t-4b-lock-the-ledger-folders-at-the-library-root-of-the-client-sites)), then IR-2 moves them. |
+| W4 | **Content promotion** | A document moved into the site of whichever client's NIP it named, at that site's library root | Members of that client's Team, including the client's guest | Go-live (as W1) | New moves: `ANTHROPIC_ENABLED=false` ([H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy)), then the Phase-0 ingestion deploy (P0-1). Items already moved: the client-site folder lock ([tenant hardening T-4b](tenant-hardening.md#t-4b-lock-the-ledger-folders-at-the-library-root-of-the-client-sites), after H-3), and a lock of its own on each such item found outside those folders (T-4b's Verify), then IR-2 moves them. For an item, W4 ends at the later of its lock and H-3. |
 | W5 | **Personal Tab IDOR** | The client name, ClientId and SharePoint URL of any user whose object id is known | Anyone on the internet with the URL | Manifest 0.1.5 and `/api/mydocs` (about 16 Jul) | The Phase-0 bot deploy (the page becomes static), manifest 0.2.0, and the Phase-0 ingestion deploy (`/api/user-target` deleted) |
 | W6 | **The upload register in App Insights** | File names, client titles, site paths, user ids | Anyone with read on the App Insights resource | First deploy | P0-9 logs ids only. Old lines age out after 30 days, except the copy IR-0 takes deliberately. |
 | W7 | **Bricore team Public** | Its `Dokumenty księgowe` channel | Any internal account | Unknown | [Tenant hardening T-6](tenant-hardening.md#t-6-the-bricore-team) |
@@ -113,7 +113,7 @@ item closes a named root cause. The human-run steps and their order are in
 |---|---|---|
 | G0 | No deploy on push to `main` (done, `f5a2bd4`). A full appSettings deploy would have wiped the hand-set routing settings. | deploy risk |
 | P0-1 | Content-based promotion deleted. Routing uses the uploader's identity only; the invoice-direction flip stays inside the bound client. | R3 |
-| P0-2 | A staff-only quarantine site replaces the fallback bucket. Unmapped, staff, conflicting, stale, forbidden-target and unwritable-target uploads go there, never to BCR GROUP. | R2 |
+| P0-2 | A staff-only quarantine site replaces the fallback bucket. Unmapped, unbound (a row the binding tool has not bound), staff, conflicting, stale, forbidden-target and unwritable-target uploads go there, never to BCR GROUP. A row whose site resolves in Graph to BCR GROUP's or the quarantine's site collection, however its path is spelled, is refused (`sharepoint.forbidden_site`) and its upload quarantined as forbidden-target. The reasons are listed in [`human-steps.md` H-12](human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries). | R2 |
 | P0-3 | The bot refuses anything that is not a 1:1 chat from the BCR tenant with a valid user id; ingestion re-checks the same three things. Manifest 0.2.0 is personal scope only. | R6 |
 | P0-4 | The Directory snapshot is built in two passes and is order-independent. The alias and person-name maps are gone. A snapshot older than 15 minutes routes nothing. | R4 |
 | P0-5 | Personal Tab removed; `/api/user-target` deleted. | R6 (IDOR) |
@@ -261,9 +261,15 @@ sign-in events of the `{NIP}@` accounts and `AuthoriseMe@`.
 
 **Use the script:** `tools/ir0/export-purview.ps1`, exactly as in
 [`human-steps.md` H-2](human-steps.md#h-2-preserve-the-evidence-ir-0-before-anything-changes-the-logs)
-(with `-FileOperations` and `-SignInUpn`). It gathers every page, starts a new session for every
-window, and splits a window that reaches the 50,000-record session cap. The manual commands
-below are the reference for what it does. They collect **all** pages into one variable and
+(with `-FileOperations`, `-SignInUpn` and `-StartDate 2026-03-01T00:00:00Z`). It gathers every
+page, starts a new session for every window, and splits a window that reaches the 50,000-record
+session cap. It also exports the sharing events (`purview-sharing-events.csv`), which IR-2 needs
+because the T-4/T-4b locks erase item-level links.
+
+**The manual commands below are a fallback only,** for when the script cannot run. They are
+**not equivalent** to it: one session per search cannot split a window, so each search stops
+with an error when it reaches the session cap, and must then be run again per month (change
+`StartDate` and `EndDate`) until none does. They collect **all** pages into one variable and
 export once: `Export-Csv` overwrites its file, so exporting page by page keeps only the last
 page, and an empty final page leaves an empty file.
 
@@ -274,11 +280,16 @@ Get-AdminAuditLogConfig | Format-List UnifiedAuditLogIngestionEnabled   # must b
 # Collect every page of one ReturnLargeSet session. A new SessionId per search, always:
 # re-using one continues the old session instead of starting a new result set.
 function Get-AllPages([hashtable] $Search) {
-  $sid = [guid]::NewGuid().ToString(); $all = @()
+  $sid = [guid]::NewGuid().ToString(); $all = @(); $total = 0
   do {
     $page = @(Search-UnifiedAuditLog @Search -SessionId $sid -SessionCommand ReturnLargeSet -ResultSize 5000)
+    if ($page.Count -gt 0) { $total = $page[0].ResultCount }
     $all += $page
-  } while ($page.Count -gt 0 -and $all.Count -lt $page[0].ResultCount)
+  } while ($page.Count -gt 0 -and $all.Count -lt $total)
+  # A session stops at 50,000 records and then returns an empty page, which looks complete.
+  if ($all.Count -ge 50000 -or $all.Count -lt $total) {
+    throw "Got $($all.Count) of $total records: the session cap was reached. Split the date range."
+  }
   $all
 }
 
@@ -292,9 +303,20 @@ foreach ($site in 'BCRGROUPSp.zo.o', '<PESKOVOI site>', '<TEST site>') {
     Export-Csv "ir0-purview-$site.csv" -NoTypeInformation -Encoding UTF8
 }
 
-# Group events: who joined, who was added, when visibility changed.
+# Sharing: links created, used or removed. The T-4/T-4b locks clear item-level links, so this is
+# the only record of them afterwards (IR-2).
+$sharing = Get-AllPages @{ StartDate = '2026-03-01'; EndDate = (Get-Date).ToUniversalTime()
+  RecordType = 'SharePointSharingOperation' }
+foreach ($site in 'BCRGROUPSp.zo.o', '<PESKOVOI site>', '<TEST site>') {
+  $sharing | Where-Object { ($_.AuditData | ConvertFrom-Json).SiteUrl -like "*/sites/$site*" } |
+    Export-Csv "ir0-purview-sharing-$site.csv" -NoTypeInformation -Encoding UTF8
+}
+
+# Group events: who joined, who was added or made owner, when visibility changed.
 Get-AllPages @{ StartDate = '2026-03-01'; EndDate = (Get-Date).ToUniversalTime()
-  Operations = 'Add member to group.','Remove member from group.','Update group.','MemberAdded','MemberRemoved','TeamSettingChanged' } |
+  Operations = 'Add member to group.','Remove member from group.','Add owner to group.',
+    'Remove owner from group.','Update group.','MemberAdded','MemberRemoved','MemberRoleChanged',
+    'TeamSettingChanged' } |
   Export-Csv ir0-purview-groups.csv -NoTypeInformation -Encoding UTF8
 
 # Sign-ins of the accounts in W2/W3 [verify that the tenant records them].
@@ -330,20 +352,58 @@ outside the ledger resource group's shared storage**, with:
 - a `SHA256SUMS` file listing every export, so a later reader can prove nothing changed.
 
 The laptop copies are personal data. Delete them once the upload is verified, and record the
-hashes, not the files, in the [status table](#status).
+hashes, not the files, in the [status table](#status). IR-1 needs the trace export on disk: it
+downloads it back from the store for the run and deletes it again afterwards
+([IR-1](#ir-1-inventory)).
 
 ---
 
 ## IR-1: inventory
 
 `tools/inventory-misfiled.mjs` is read-only. It walks the default library of BCR GROUP,
-PESKOVOI and TEST, the only sites the ingestion identity could write to. It lists every item
-the ingestion identity created (`createdBy.application.id` is the ingestion managed identity),
-and every item under a ledger taxonomy folder at a library root.
+PESKOVOI and TEST, the only sites the ingestion identity could write to. It registers every item
+the ingestion identity created or last modified (`createdBy` or `lastModifiedBy`
+`application.id` is the ingestion managed identity), and every item IR-0 names. It does **not**
+register every item under a ledger taxonomy folder: pass `--all-items` for that. At the end it
+prints the applications that created files. Check that list against `--ingest-app-ids`: any
+application id that wrote under a root taxonomy folder and is not in `--ingest-app-ids` (an
+earlier or recreated ingestion identity, say) is added to it, and the run repeated.
 
 Confirm the three-site bound before trusting it. `tools/directory-bindings.mjs check` reports,
 for each Directory row, whether the ingestion identity holds a grant on that site. Any further
 site where it holds `write` is added to the walk.
+
+**Whose token.** IR-1 walks with a delegated token, and SharePoint trims every listing to what
+that user may see. After T-4 and T-4b, the locked taxonomy folders are visible only to the
+site's Owners, so a member's token silently skips them, and every item in them is missing from
+the register, from IR-2 and from the list of affected clients. So IR-1 runs with the token of
+someone who is an **Owner or a site collection admin of every site it walks**. If Yahor is not,
+someone who is runs it; on BCR GROUP that is one of its existing site Owners, and nobody is
+added to BCR GROUP for this. On a client site, the SharePoint Administrator may instead make him
+a site collection admin for the run and remove that afterwards, recorded in the status table.
+
+**The expected folders.** For each walked site, pass `--expect-root-folders <label>=<folders>`
+with the taxonomy folders saved in T-4's or T-4b's *Read first* (and any added by a re-check).
+The tool exits non-zero, naming the folder, when the walk does not see one, which is what a
+token without Owner rights produces. It always prints, per site, the taxonomy folders it found at
+the library root: compare them with the saved lists before trusting the run.
+
+**The IR-0 trace export, back from the store.** H-2 deletes the laptop copies. Download the
+export again with an account that holds Storage Blob Data Reader on the store (Roman, the IOD or
+`yahor.simak@bcr-group.pl`), check it against its `SHA256SUMS`, and delete it again once IR-1 has
+run. The blob path is `ir0/<upload date>/<export folder>/`, as `evidence-store.sh` printed it.
+
+```bash
+R=tools/out/ir0-restore; mkdir -p -m 700 "$R"
+az storage blob download-batch --auth-mode login --account-name <storage account> \
+  -s ir0-evidence -d "$R" --pattern 'ir0/<upload date>/ir0-appinsights-<UTC>/*'
+(cd "$R/ir0/<upload date>/ir0-appinsights-<UTC>" && shasum -a 256 -c SHA256SUMS)   # every line OK
+```
+
+Never drop `--ir0` to get a run through. Without it the tool cannot tell a fallback or a
+promoted upload from any other, so it flags every item the ingestion created or modified as
+`no_ir0_given` (suspect): the run is then complete but says nothing, and every such item goes to
+IR-2.
 
 Run it with the `directory-bindings.mjs propose` plan from
 [`human-steps.md` H-7](human-steps.md#h-7-check-the-directory-before-the-deploy-and-add-the-new-columns)
@@ -356,9 +416,13 @@ node tools/inventory-misfiled.mjs \
   --site 'BCRGROUP=<tenant>.sharepoint.com:/sites/BCRGROUPSp.zo.o' \
   --site 'PESKOVOI=<tenant>.sharepoint.com:/sites/<PESKOVOI site>' \
   --site 'TEST=<tenant>.sharepoint.com:/sites/<TEST site>' \
+  --expect-root-folders 'BCRGROUP=<taxonomy folders from T-4 Read first>' \
+  --expect-root-folders 'PESKOVOI=<taxonomy folders from T-4b Read first>' \
+  --expect-root-folders 'TEST=<taxonomy folders from T-4b Read first>' \
   --ingest-app-ids "$INGEST_MI_APPID" --fallback-site BCRGROUP \
-  --ir0 tools/out/ir0-appinsights-<UTC>/ \
+  --ir0 tools/out/ir0-restore/ir0/<upload date>/ir0-appinsights-<UTC>/ \
   --bindings-plan tools/out/directory-bindings-plan-<UTC>.json
+rm -rf tools/out/ir0-restore                                    # once the run is checked
 ```
 
 For each item it records:
@@ -376,7 +440,10 @@ For each item it records:
   into IR-2.
 
 It does **not** read an item's sharing links or join the Purview export. Both are checked by
-hand, per item, in [IR-2](#checks-per-item-by-hand).
+hand, per item, in [IR-2](#checks-per-item-by-hand). Once IR-1 has run for a client site,
+T-4b's Verify uses the register to lock, one by one, the flagged items that sit outside the
+locked folders
+([tenant hardening T-4b](tenant-hardening.md#t-4b-lock-the-ledger-folders-at-the-library-root-of-the-client-sites)).
 
 The output is a register of client documents, so it goes to the evidence store and nowhere
 else. Items it flags as *suspect* (promoted, fallback, uploader unknown or ambiguous, uploader
@@ -431,9 +498,15 @@ produced.
 
 IR-1 does not do these, so the person deciding does, before signing:
 
-- **Sharing links.** In Graph Explorer, `GET /drives/{driveId}/items/{itemId}/permissions`. Any
-  link, or any grant that is not inherited from the site, goes in the register row's `Reason`,
-  and the link is removed before the item is moved.
+- **Sharing links.** Filter IR-0's `purview-sharing-events.csv` (or the fallback's
+  `ir0-purview-sharing-<site>.csv`) for the item's URL or `ObjectId`: every link created, used or
+  removed. This is the record that counts. T-4 and T-4b stopped inheritance with
+  `clearSubscopes=true`, which reset every item in a locked folder and removed its links and
+  direct grants, so the live permissions no longer show them. For an item T-4b locked on its own,
+  also read the permissions it saved before the lock. Then, in Graph Explorer,
+  `GET /drives/{driveId}/items/{itemId}/permissions` for what is there now. Any link, or any
+  grant that is not inherited from the site, past or present, goes in the register row's
+  `Reason`, and a live link is removed before the item is moved.
 - **Access events.** Filter the IR-0 Purview file-operations export for the item (its URL or
   `ObjectId`). Count the events by anyone other than staff and the ingestion identity into
   `NonStaffAccess`. For an item in W4 that includes the receiving client's guest.
@@ -566,11 +639,13 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-2: Entra sign-in log, last 7 days, for the `{NIP}@` accounts and `AuthoriseMe@` | Global Admin | todo | | `SHA256SUMS` |
 | H-2: IR-0 C, Directory export | Yahor | todo | | `SHA256SUMS` |
 | H-2: evidence store created, readers verified, uploader write removed, laptop copies deleted | Roman, Yahor | todo | | |
-| H-3: `ANTHROPIC_ENABLED=false` (mandatory) | Yahor | todo | | |
+| H-3: `ANTHROPIC_ENABLED=false` (mandatory) | Yahor | todo | | time of the change; if H-6b did not follow the same working day, Roman's decision (interim writes accepted, or ingestion stopped until H-6b) |
 | BCR GROUP made Private (time from Purview) | — | done | *record* | T-3 |
 | H-4: tenant hardening T-1 … T-9 | per step | todo | | [`tenant-hardening.md`](tenant-hardening.md#status) |
-| T-4b: client-site root folders locked (end of W4 for items already moved) | SharePoint Admin | todo | | sites and lock times in [`tenant-hardening.md`](tenant-hardening.md#status) |
-| IR-1 inventory | Yahor | todo | | `SHA256SUMS` |
+| T-4 checked again after H-6b | BCR GROUP site owner | todo | | time, and any folder locked, in [`tenant-hardening.md`](tenant-hardening.md#status) |
+| T-4b: client-site root folders locked after H-3 (end of W4 for the items in them: the later of the lock and H-3) | SharePoint Admin | todo | | sites, lock times and H-3's time in [`tenant-hardening.md`](tenant-hardening.md#status) |
+| IR-1 inventory: run with an Owner's or site collection admin's token and `--expect-root-folders` for every site; `--ir0` restored from the store; exit 0 | Yahor, or an Owner of each site | todo | | `SHA256SUMS`; any temporary site collection admin added and removed |
+| T-4b: items outside the locked folders checked after IR-1, and locked one by one | SharePoint Admin | todo | | per site: done, and the number of items locked (the items themselves in the evidence store) |
 | H-5, H-6: quarantine site and ingestion write grant | SharePoint Admin, Global Admin | todo | | |
 | H-6b: running build's fallback re-pointed at the quarantine | Yahor | todo | | `FALLBACK_*` names; values in the evidence store (`SHA256SUMS`) |
 | H-7: Directory check; duplicate `0002` resolved; per-row decisions, incl. which sites get a grant in H-12 | Yahor, Roman | todo | | |
@@ -579,12 +654,13 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-10: manifest 0.2.0 and availability (T-10) | Teams Admin | todo | | |
 | H-11: gate `enforce` after 24 h clean | Yahor | todo | | |
 | H-12: ingestion deploy, further site grants, bindings, canaries | Yahor, Roman reviews | todo | | apply log hash; sha256 of the saved pre-Phase-0 ingestion package |
-| H-13: ingestion grant on BCR GROUP downgraded to `read` | Global Admin | todo | | |
+| H-13: ingestion grant on BCR GROUP downgraded to `read` | Global Admin | todo | | any other application `write`/`owner` entry on BCR GROUP (application id and roles), and Roman's decision on it |
 | H-14: `FALLBACK_*` settings removed, pre-Phase-0 packages deleted | Yahor | todo | | |
 | IR-2 relocation complete, allow-lists issued | Roman + second person | todo | | |
 | IR-3: phase-2 notices to every affected client | Roman + IOD | todo | | |
 | IR-3 (3): UODO decision for BCR-controlled data recorded | Roman + IOD | todo | | |
 | H-15: Phase-0 exit criteria signed off | Yahor, Roman | todo | | |
+| Standing checks: whole plan applied after each onboarding; weekly `check` | Yahor | from H-12 | | date of each run; apply-log hash ([`human-steps.md`](human-steps.md#standing-checks)) |
 
 ## What this changes permanently
 
