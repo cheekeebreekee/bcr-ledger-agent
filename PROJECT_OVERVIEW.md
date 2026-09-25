@@ -225,7 +225,7 @@ bcr-ledger-agent/
 │   ├── client-directory-admin-guide.md  # the routing list and its rules
 │   ├── security.md                      # threat model T1–T17 and accepted risks
 │   ├── setup-guide.md, admin-sharepoint-grant.md, deployment.md, local-development.md
-├── artifacts/                           # Built zips (teams-bot, document-ingestion, teams-app)
+├── artifacts/                           # build output, git-ignored: fresh zips per deploy
 ├── .env.example                         # Documented env var template
 └── PROJECT_OVERVIEW.md                  # ← this file
 ```
@@ -352,13 +352,27 @@ this deploy. Download it without printing its URL, which can carry a SAS token (
 [`human-steps.md` H-9, step 1](docs/operations/human-steps.md#h-9-deploy-the-bot-with-the-gate-in-log-mode)
 has the command. One exception: a pre-Phase-0 ingestion package is never a rollback.
 
-**2. Package.** Each app's `package` script (`tools/package-function.mjs`) builds a **new** zip
-every time: a fresh staging folder, production dependencies only, and `@bcr/shared` copied from
-the `packages/shared/dist` just built. It fails if that copy lacks the Phase-0 config.
+**2. Package.** `yarn workspace @bcr/<pkg> package` cleans `dist` and the `tsbuildinfo`,
+rebuilds, and runs `tools/package-function.mjs`, which builds a **new** zip every time, in a fresh
+staging folder:
+
+- it deletes the old zip before anything else, so a failed run leaves no zip rather than a stale
+  one;
+- it fails if any compiled `dist/**/*.js`, the app's or `@bcr/shared`'s, has no `src/**/*.ts`
+  behind it, so the output of a deleted source (such as the old `functions/userTarget.js`) is
+  never shipped;
+- it ships no `*.map`, `*.d.ts` or `*.tsbuildinfo`;
+- it installs production dependencies at the exact versions in `yarn.lock`, with install scripts
+  disabled, and checks every top-level dependency's version against the root `node_modules`;
+- it vendors `@bcr/shared` from the `packages/shared/dist` just built, and fails if that copy
+  lacks the Phase-0 config.
+
+`artifacts/*.zip` are git-ignored and no longer tracked: the zips that used to be committed were
+pre-Phase-0 builds. Never commit a zip, and deploy only one built for this deploy.
 
 ```bash
-corepack yarn build && corepack yarn workspace @bcr/teams-bot package            # → artifacts/teams-bot.zip
-corepack yarn build && corepack yarn workspace @bcr/document-ingestion package   # → artifacts/document-ingestion.zip
+corepack yarn workspace @bcr/teams-bot package            # → artifacts/teams-bot.zip
+corepack yarn workspace @bcr/document-ingestion package   # → artifacts/document-ingestion.zip
 ```
 
 **3. Check the vendored `@bcr/shared` before deploying** (lesson 10). Both counts must be
@@ -468,8 +482,10 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
     `dist` shipped next to a July copy of `@bcr/shared`. A bot built that way ignores
     `BOT_GATE_MODE`; an ingestion built that way fails at cold start. The `package` script now
     runs `tools/package-function.mjs`, which stages a fresh folder and copies `@bcr/shared` from
-    `packages/shared/dist`. Still check the zip before every deploy
-    ([Build and deploy](#build-and-deploy), step 3).
+    `packages/shared/dist`. It also deletes the old zip first, refuses a compiled file with no
+    source behind it, and installs dependencies at the `yarn.lock` versions; and the zips are no
+    longer committed, so there is no old archive to update. Still check the zip before every
+    deploy ([Build and deploy](#build-and-deploy), step 3).
 
 11. **The Teams manifest v1.17 schema** rejects the `packageName` field. Remove it before
     uploading.

@@ -272,6 +272,12 @@ check that every setting the code reads exists in Bicep, `what-if`, and environm
 - **Quarantine cards leak nothing.** A quarantined document's card carries no link, folder or
   client name.
 - **The single-document route is deleted.** `/api/ingest` was an unused second entry point.
+- **Deploy packages are built, not kept.** The committed `artifacts/*.zip` were pre-Phase-0
+  builds, and packaging updated an archive in place, so a new `dist` could ship next to an old
+  `@bcr/shared`, or next to the compiled output of a deleted function. The zips are now
+  git-ignored and built fresh for each deploy from a cleaned `dist`, with production
+  dependencies at the `yarn.lock` versions and install scripts disabled; packaging fails on a
+  compiled file with no source behind it.
 
 ## Accepted risks
 

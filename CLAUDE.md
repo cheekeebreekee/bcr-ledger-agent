@@ -79,12 +79,18 @@ then needs the Phase-0 ingestion settings the template lacks, set once with `app
 > `docs/operations/human-steps.md` (Phase 0), and add settings with
 > `az functionapp config appsettings set … -o none`, which merges.
 
-`yarn build && yarn workspace @bcr/<pkg> package` builds a fresh zip into `artifacts/`
-(`tools/package-function.mjs` stages it and vendors the just-built `@bcr/shared`). Before
-deploying, check that the vendored copy is current: `unzip -p artifacts/<pkg>.zip
-node_modules/@bcr/shared/dist/config.js | grep -c botGateMode` (ingestion:
-`forbiddenTargetSitePaths`) must be greater than 0. CI (`.github/workflows/ci.yml`) runs lint →
-type-check → build → test plus `bicep build`/`bicep lint`.
+`yarn workspace @bcr/<pkg> package` builds a fresh zip into `artifacts/`. It cleans `dist` and the
+`tsbuildinfo`, rebuilds, then runs `tools/package-function.mjs`, which deletes the old zip first,
+fails if any `dist/**/*.js` (the app's or `@bcr/shared`'s) has no `src/**/*.ts` behind it, ships
+no `*.map`/`*.d.ts`/`*.tsbuildinfo`, installs production dependencies at the exact `yarn.lock`
+versions with install scripts disabled (checking each top-level version against the root
+`node_modules`), and vendors the just-built `@bcr/shared`. `artifacts/*.zip` are git-ignored build
+output: never commit one, and deploy only a zip built for that deploy. Before deploying, still
+check the vendored copy: `unzip -p artifacts/<pkg>.zip node_modules/@bcr/shared/dist/config.js |
+grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths`) must be greater than 0.
+
+CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test, plus `bicep build` and
+`bicep lint`.
 
 ---
 
