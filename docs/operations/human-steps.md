@@ -73,15 +73,15 @@ Graph and SharePoint tokens are set up as described in
 | H-0 | Automatic deploys stopped | Yahor | done, 25 Sep | — |
 | H-1 | GDPR: processor notice and breach register | Roman + IOD | by 26–28 Sep | — |
 | H-2 | IR-0: evidence export, stored immutably | Yahor, Global Admin, Roman | today | — |
-| H-3 | **Mandatory:** stop promotion with a setting | Yahor | as soon as H-2 is stored | H-2 |
-| H-4 | Tenant hardening T-1 to T-9, T-4b included | per step | today–tomorrow | T-4, T-4b, T-5 before H-12; T-4b before IR-2 |
-| H-5 | Quarantine site | SharePoint Admin | day 1 | — |
-| H-6 | Ingestion identity write grant on quarantine | Global Admin | day 1 | H-5 |
-| H-6b | Running build's fallback re-pointed at the quarantine | Yahor | day 1 | H-3, H-6 verified |
+| H-3 | **Mandatory:** stop promotion with a setting | Yahor | as soon as H-2 is stored; H-5, H-6 and H-6b follow **the same working day** ([the bound](#h-3-stop-promotion-now-without-a-deploy)) | H-2 |
+| H-4 | Tenant hardening T-1 to T-9, T-4b included | per step | today–tomorrow | T-4, T-4b, T-5 before H-12; T-4 the day of H-3, checked again after H-6b; T-4b after H-3 is verified, before IR-2; T-1 before H-10 |
+| H-5 | Quarantine site | SharePoint Admin | the working day of H-3 | — |
+| H-6 | Ingestion identity write grant on quarantine | Global Admin | the working day of H-3 | H-5 |
+| H-6b | Running build's fallback re-pointed at the quarantine | Yahor | the working day of H-3 | H-3, H-6 verified |
 | H-7 | Directory check and new columns (no new site grants) | Yahor | day 1 | H-2 (IR-0 C stored), T-5 |
 | H-8 | New app settings, added | Yahor | day 1 | H-5 |
 | H-9 | Bot deploy, gate in `log` | Yahor | day 1 | H-2, H-8 |
-| H-10 | Manifest 0.2.0, availability *Everyone* | Teams Admin | day 1 | H-9 |
+| H-10 | Manifest 0.2.0, availability *Everyone* | Teams Admin | day 1 | H-9, T-1 |
 | H-11 | Gate to `enforce` | Yahor | day 2 | 24 h of clean logs |
 | H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-6, H-6b, H-7, H-11, T-4, T-4b, T-5 |
 | H-13 | Ingestion grant on BCR GROUP to `read` | Global Admin | after H-12 | H-12 verified |
@@ -262,6 +262,21 @@ target at the staff-only quarantine, so they wait there and not in BCR GROUP.
 az functionapp config appsettings set -g $RG -n $INGEST --settings ANTHROPIC_ENABLED=false -o none
 ```
 
+**The gap until H-6b has a bound.** From H-3 until H-6b, the fallback target is still the BCR
+GROUP library root, so every upload the running build cannot route is written there, under
+`98_Nieposortowane/YYYY/MM/`. Keep the order, because promotion is the cross-client path and
+stopping it first is worth these interim writes. But H-5, H-6 and H-6b follow H-3 **the same
+working day**, and T-4 runs that day too: it locks `98_Nieposortowane` at that root to Owners,
+creating it empty first if it is missing, so the interim writes land in a folder only the
+Owners can read. If they cannot all happen that day, Roman decides, and the decision goes in the
+incident's status table:
+
+- either accept the interim writes into BCR GROUP's `98_Nieposortowane`, locked by T-4 (T-4 is
+  checked again after H-6b, in case the build created another folder after the lock);
+- or stop ingestion until H-6b with the emergency stop,
+  `az functionapp stop -g $RG -n $INGEST`. Nothing is filed anywhere, and users get the bot's
+  generic error. `az functionapp start -g $RG -n $INGEST` once H-6b is verified.
+
 **Verify.** `az functionapp config appsettings list -g $RG -n $INGEST --query "[?name=='ANTHROPIC_ENABLED']" -o table`
 reads `false`. After the restart, `aiq 'traces | where tostring(parse_json(message).msg) == "promoted fallback → directory client via content NIP match"' <time of the change>`
 stays empty.
@@ -277,18 +292,27 @@ the Phase-0 build, which has no promotion, is live.
 These must be done before H-12:
 
 - **T-4** (lock the ledger folders at the BCR GROUP root), because IR-2 needs the fallback
-  documents to stay put and unread until they are moved;
+  documents to stay put and unread until they are moved. Run it the day of H-3, creating
+  `98_Nieposortowane` empty first if it is missing, and **check it again after H-6b**: until
+  H-6b re-points the fallback, the running build can create a taxonomy folder at that root, and
+  a folder created after the lock is not locked;
 - **T-4b** (lock the same folders at the library root of PESKOVOI, TEST and any site IR-1
-  lists), **today or tomorrow and before IR-2 starts**, for the same reason, and because there
-  the audience is another client's guest. It closes W4 for documents already promoted;
+  lists), **after H-3 is verified, today or tomorrow, and before IR-2 starts**, for the same
+  reason, and because there the audience is another client's guest. Until H-3 is in effect,
+  promotion can still create a taxonomy folder at a client's library root that the lock did not
+  cover. With the item-by-item locks its Verify adds once IR-1 has run for the site, it closes
+  W4 for documents already promoted;
 - **T-5** (lock and version the Client Directory), because H-7 and H-12 edit the list, and
   versioning is the record of those edits. So T-5 also comes **before H-7**.
+
+**T-1** (block sign-in on the `{NIP}@` addresses) must be done before H-10: T-10 makes the bot
+available to *Everyone* on the grounds that those accounts can no longer sign in.
 
 Row edits other than the `0002` status change in H-7 wait for H-12.
 
 ### H-5: Create the quarantine site
 
-**Owner:** SharePoint Administrator. **When:** day 1.
+**Owner:** SharePoint Administrator. **When:** the same working day as H-3 (see H-3's bound).
 
 The quarantine replaces the fallback bucket. Uploads that cannot be tied to exactly one client
 go there, and it is readable only by the people who triage it. It is a communication site: no
@@ -355,7 +379,7 @@ Roman and the lawyer to confirm.
 ### H-6: Grant the ingestion identity write on the quarantine site
 
 **Owner:** Global Admin (or anyone who may start jobs on the onboarding Automation account).
-**When:** day 1, after H-5.
+**When:** the same working day as H-3, after H-5.
 
 The onboarding repo's runbook `Grant-TeamSiteAccess.ps1` makes the grant. It runs in the
 onboarding Automation account, whose identity holds `Sites.FullControl.All`. A person starts the
@@ -380,8 +404,9 @@ H-12.
 
 ### H-6b: Point the running build's fallback at the quarantine
 
-**Owner:** Yahor. **When:** day 1, after H-3, and as soon as H-6's grant is verified (the job
-reported `granted` or `exists`, and about 5 minutes have passed).
+**Owner:** Yahor. **When:** the same working day as H-3, after it, and as soon as H-6's grant is
+verified (the job reported `granted` or `exists`, and about 5 minutes have passed). Then check
+T-4 again ([H-4](#h-4-tenant-hardening)).
 
 Until H-12, the running ingestion is the pre-Phase-0 build. Every onboarded guest is unmapped
 (R1), so their uploads go to its fallback target, which is the BCR GROUP library root. T-4 locks
@@ -668,11 +693,13 @@ with the gate itself, use H-11's rollback (`BOT_GATE_MODE=log`).
 
 ### H-10: Upload manifest 0.2.0 and set availability
 
-**Owner:** Teams Administrator. **When:** after H-9.
+**Owner:** Teams Administrator. **When:** after H-9, and after T-1 has blocked sign-in on the
+`{NIP}@` accounts ([H-4](#h-4-tenant-hardening)).
 
 Follow [T-10 in tenant-hardening](tenant-hardening.md#t-10-teams-app-availability-for-the-bot),
 with availability set to **Everyone**: in Phase 0 nothing adds client guests to a group, so a
-restricted list would lock PESKOVOI's and the TEST guest out. Version 0.2.0 has personal scope
+restricted list would lock PESKOVOI's and the TEST guest out. The case for *Everyone* relies on
+T-1 being done. Version 0.2.0 has personal scope
 only and no "Moje dokumenty" tab. Tell the clients before they
 see the change: the tab disappears, and a document the bot cannot place now says "Dokument
 przekazano do weryfikacji przez zespół BCR" instead of showing a link.
@@ -721,7 +748,7 @@ These steps go in **one** window because each fixes a failure the others would c
 - H-6's grant is in place.
 - H-8's settings are present.
 - The gate is in `enforce` (H-11).
-- T-4, T-4b and T-5 are done.
+- T-4 (and its check after H-6b), T-4b and T-5 are done.
 - Every H-7 finding has a decision.
 
 **Emergency stop,** at any point: `az functionapp stop -g $RG -n $INGEST`. Nothing is filed
