@@ -9,6 +9,8 @@ import {
   type Classifier,
   type ClassifierContext,
   type DocumentCategory,
+  type DocumentParty,
+  type PartyRole,
 } from '@bcr/shared';
 
 export interface ClaudeClassifierOptions {
@@ -19,10 +21,6 @@ export interface ClaudeClassifierOptions {
   readonly maxContentBytes: number;
   /** Below this confidence the result is discarded → manual review. */
   readonly confidenceThreshold: number;
-  /** Client legal/company name — lets the model decide invoice direction. */
-  readonly clientCompanyName?: string;
-  /** Client tax id (NIP) — primary signal for invoice direction. */
-  readonly clientNip?: string;
   /** Injectable for tests. */
   readonly client?: Pick<Anthropic, 'messages'>;
 }
@@ -34,6 +32,12 @@ interface ClassifyToolInput {
   readonly month?: number | null;
   readonly confidence: number;
   readonly reasoning?: string;
+  readonly parties?: readonly {
+    readonly role: string;
+    readonly nip?: string | null;
+    readonly company_name?: string | null;
+    readonly person_name?: string | null;
+  }[];
 }
 
 const TOOL_NAME = 'classify_document';
@@ -57,16 +61,12 @@ export class ClaudeClassifier implements Classifier {
   private readonly model: string;
   private readonly maxContentBytes: number;
   private readonly confidenceThreshold: number;
-  private readonly clientCompanyName: string | undefined;
-  private readonly clientNip: string | undefined;
 
   constructor(opts: ClaudeClassifierOptions) {
     this.client = opts.client ?? new Anthropic({ apiKey: opts.apiKey });
     this.model = opts.model;
     this.maxContentBytes = opts.maxContentBytes;
     this.confidenceThreshold = opts.confidenceThreshold;
-    this.clientCompanyName = opts.clientCompanyName || undefined;
-    this.clientNip = opts.clientNip || undefined;
   }
 
   async classify(ctx: ClassifierContext): Promise<Classification | null> {
@@ -92,7 +92,7 @@ export class ClaudeClassifier implements Classifier {
       const message = await this.client.messages.create({
         model: this.model,
         max_tokens: MAX_TOKENS,
-        system: this.systemPrompt(),
+        system: this.systemPrompt(ctx.client),
         tools: [this.toolDefinition()],
         tool_choice: { type: 'tool', name: TOOL_NAME },
         messages: [
@@ -166,19 +166,29 @@ export class ClaudeClassifier implements Classifier {
         ...(date ? { year: date.year, month: date.month } : {}),
         ...(input.reasoning ? { reasoning: input.reasoning } : {}),
       },
+      ...(input.parties && input.parties.length > 0
+        ? { parties: normalizeParties(input.parties) }
+        : {}),
     };
   }
 
-  private systemPrompt(): string {
-    const identity =
-      this.clientCompanyName || this.clientNip
-        ? `Dokumenty należą do klienta: ${this.clientCompanyName ?? '(nazwa nieznana)'}` +
-          `${this.clientNip ? `, NIP: ${this.clientNip}` : ''}. ` +
-          'Gdy na fakturze klient występuje jako SPRZEDAWCA/WYSTAWCA, jest to faktura ' +
-          'sprzedaży. Gdy klient jest NABYWCĄ/KUPUJĄCYM, jest to faktura zakupu. ' +
-          'Porównuj nazwę firmy oraz NIP, aby ustalić kierunek faktury.'
-        : 'Tożsamość klienta nie została podana — przy fakturach kieruj się treścią dokumentu, ' +
-          'a w razie wątpliwości wybierz kategorię "nieposortowane".';
+  private systemPrompt(client: ClassifierContext['client']): string {
+    // When the caller has pre-resolved a client (via channel, user identity,
+    // or a prior turn), we prime Claude with that identity so it can decide
+    // invoice direction (sales vs purchase) confidently. When absent, Claude
+    // is instructed to extract parties without deciding direction — the
+    // resolver then infers direction post-classification.
+    const identity = client && (client.nip || client.companyName)
+      ? `Dokumenty należą do klienta: ${client.companyName || '(nazwa nieznana)'}` +
+        `${client.nip ? `, NIP: ${client.nip}` : ''}. ` +
+        'Gdy na fakturze klient występuje jako SPRZEDAWCA/WYSTAWCA, jest to faktura ' +
+        'sprzedaży. Gdy klient jest NABYWCĄ/KUPUJĄCYM, jest to faktura zakupu. ' +
+        'Porównuj nazwę firmy oraz NIP, aby ustalić kierunek faktury.'
+      : 'Tożsamość klienta nie jest podana. Wyodrębnij WSZYSTKIE strony (parties) ' +
+        'występujące w dokumencie z ich rolami i numerami NIP — kierunek faktury ' +
+        '(sprzedaż/zakup) zostanie ustalony później na podstawie tych danych. ' +
+        'Jeśli nie potrafisz jednoznacznie określić kategorii bez tożsamości klienta, ' +
+        'wybierz kategorię "nieposortowane" — nadal jednak WYPEŁNIJ pole parties.';
 
     return [
       'Jesteś asystentem księgowym polskiego biura rachunkowego. Twoim zadaniem jest ' +
@@ -188,7 +198,9 @@ export class ClaudeClassifier implements Classifier {
       'Zawsze wywołuj narzędzie "classify_document". Dla kategorii datowanych podaj rok ' +
         '(RRRR) i miesiąc (1-12) na podstawie daty dokumentu (np. daty wystawienia faktury ' +
         'lub okresu wyciągu). Ustaw "confidence" rzetelnie: niska wartość, gdy nie masz ' +
-        'pewności. Krótko uzasadnij wybór w polu "reasoning" (po polsku).',
+        'pewności. Krótko uzasadnij wybór w polu "reasoning" (po polsku). ' +
+        'Wypełniaj pole "parties" dla faktur, umow i innych dokumentów, na których ' +
+        'występują zidentyfikowane strony (firmy z NIP-em lub osoby fizyczne).',
       '',
       'Dostępne kategorie:',
       categoryCatalog
@@ -236,6 +248,39 @@ export class ClaudeClassifier implements Classifier {
           reasoning: {
             type: 'string',
             description: 'Krótkie uzasadnienie wyboru kategorii (po polsku).',
+          },
+          parties: {
+            type: 'array',
+            description:
+              'Strony zidentyfikowane w dokumencie. Wypełniaj dla faktur ' +
+              '(sprzedawca + nabywca), umów (strony umowy) i innych dokumentów, ' +
+              'na których występują zidentyfikowane podmioty.',
+            items: {
+              type: 'object',
+              properties: {
+                role: {
+                  type: 'string',
+                  enum: ['seller', 'buyer', 'issuer', 'recipient', 'unknown'],
+                  description:
+                    'Rola strony: seller=sprzedawca/wystawca faktury, ' +
+                    'buyer=nabywca/kupujący, issuer=wystawca dokumentu (nie faktury), ' +
+                    'recipient=adresat/odbiorca, unknown=nieokreślona.',
+                },
+                nip: {
+                  type: ['string', 'null'],
+                  description: 'NIP strony (tylko cyfry, można zwrócić z formatowaniem).',
+                },
+                company_name: {
+                  type: ['string', 'null'],
+                  description: 'Pełna nazwa firmy, jeśli strona jest osobą prawną.',
+                },
+                person_name: {
+                  type: ['string', 'null'],
+                  description: 'Imię i nazwisko, jeśli strona jest osobą fizyczną.',
+                },
+              },
+              required: ['role'],
+            },
           },
         },
         required: ['category', 'confidence'],
@@ -299,11 +344,47 @@ function extractToolInput(message: Anthropic.Message): ClassifyToolInput | null 
           month: input.month ?? null,
           confidence: input.confidence,
           ...(typeof input.reasoning === 'string' ? { reasoning: input.reasoning } : {}),
+          ...(Array.isArray(input.parties) ? { parties: input.parties } : {}),
         };
       }
     }
   }
   return null;
+}
+
+const PARTY_ROLES = new Set<PartyRole>([
+  'seller',
+  'buyer',
+  'issuer',
+  'recipient',
+  'unknown',
+]);
+
+/**
+ * Turn the raw tool output into the immutable `DocumentParty` shape. Drops
+ * entries that carry no useful signal (no NIP, no name, no person name) and
+ * normalizes NIPs to digits-only so downstream lookups don't have to.
+ */
+function normalizeParties(
+  raw: NonNullable<ClassifyToolInput['parties']>,
+): readonly DocumentParty[] {
+  const out: DocumentParty[] = [];
+  for (const p of raw) {
+    const role: PartyRole = PARTY_ROLES.has(p.role as PartyRole)
+      ? (p.role as PartyRole)
+      : 'unknown';
+    const nip = typeof p.nip === 'string' ? p.nip.replace(/\D+/g, '') : '';
+    const companyName = typeof p.company_name === 'string' ? p.company_name.trim() : '';
+    const personName = typeof p.person_name === 'string' ? p.person_name.trim() : '';
+    if (!nip && !companyName && !personName) continue;
+    out.push({
+      role,
+      ...(nip ? { nip } : {}),
+      ...(companyName ? { companyName } : {}),
+      ...(personName ? { personName } : {}),
+    });
+  }
+  return out;
 }
 
 function resolveDate(

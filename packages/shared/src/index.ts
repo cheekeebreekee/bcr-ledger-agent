@@ -4,6 +4,7 @@
  */
 export * from './types/document';
 export * from './types/sharepoint';
+export * from './types/clientDirectory';
 export * from './types/bot';
 export * from './types/classification';
 export * from './parsers/folderTaxonomy';

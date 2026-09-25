@@ -99,13 +99,22 @@ export const ingestionConfigSchema = z.object({
   ingestionAppId: z.string().uuid('INGESTION_APP_ID must be a UUID'),
   expectedAudience: z.string().min(1, 'EXPECTED_AUDIENCE is required'),
   expectedRoles: csvList(['Documents.Ingest']),
-  sharepointSiteHostname: z.string().min(3, 'SHAREPOINT_SITE_HOSTNAME is required'),
-  sharepointSitePath: z
+  // --- Multi-tenant Client Directory (SharePoint list, see §4.2) ---
+  /** Graph site id (`<hostname>,<siteGuid>,<webGuid>`) where the Client Directory list lives. */
+  clientDirectorySiteId: z.string().min(1, 'CLIENT_DIRECTORY_SITE_ID is required'),
+  /** Graph list id (GUID) of the Client Directory list. */
+  clientDirectoryListId: z.string().uuid('CLIENT_DIRECTORY_LIST_ID must be a UUID'),
+  /** How long the directory snapshot is cached in-process before refetching (ms). Default 5 min. */
+  clientDirectoryCacheTtlMs: numeric(5 * 60 * 1000),
+  // --- Fallback SharePoint target (BCR Group) for unmapped uploads ---
+  fallbackClientId: optionalStr('bcr-group'),
+  fallbackSiteHostname: z.string().min(3, 'FALLBACK_SITE_HOSTNAME is required'),
+  fallbackSitePath: z
     .string()
-    .min(1, 'SHAREPOINT_SITE_PATH is required')
-    .refine((p) => p.startsWith('/'), 'SHAREPOINT_SITE_PATH must start with /'),
-  sharepointDriveName: optionalStr('Documents'),
-  sharepointRootFolder: optionalStr(),
+    .min(1, 'FALLBACK_SITE_PATH is required')
+    .refine((p) => p.startsWith('/'), 'FALLBACK_SITE_PATH must start with /'),
+  fallbackDriveName: optionalStr('Documents'),
+  fallbackRootFolder: optionalStr(),
   // --- Claude (Anthropic) content classification ---
   anthropicEnabled: boolish(false),
   anthropicApiKey: optionalStr(),
@@ -114,11 +123,6 @@ export const ingestionConfigSchema = z.object({
   anthropicMaxContentBytes: numeric(10 * 1024 * 1024),
   /** Minimum confidence to accept a classification; below this → manual review. */
   anthropicConfidenceThreshold: numeric(0.6),
-  // --- Client identity (per-client deployment) ---
-  /** Legal/company name of the client this SharePoint space belongs to. */
-  clientCompanyName: optionalStr(),
-  /** Client tax id (NIP), used to decide invoice direction (sales vs purchase). */
-  clientNip: optionalStr(),
   applicationInsightsConnectionString: optionalStr(),
   logLevel,
 });

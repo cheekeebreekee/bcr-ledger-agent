@@ -27,29 +27,28 @@ export function buildHelpCard(): unknown {
       },
       {
         type: 'TextBlock',
-        text: 'Wyślij mi dokument w załączniku, a ja umieszczę go w odpowiednim folderze w SharePoint.',
+        text:
+          'Wyślij mi dokument w załączniku (PDF, JPG, PNG lub tekst) — ' +
+          'przeanalizuję jego treść i umieszczę w odpowiednim folderze w SharePoint.',
         wrap: true,
       },
       {
         type: 'TextBlock',
-        text: 'Rozpoznawane wzorce nazw plików:',
-        weight: 'Bolder',
+        text:
+          'Klasyfikacja odbywa się na podstawie treści dokumentu — nazwa pliku ' +
+          'nie ma znaczenia. Rozpoznaję m.in. faktury sprzedaży i zakupu, ' +
+          'paragony, umowy, wyciągi bankowe, raporty, deklaracje podatkowe, ' +
+          'korespondencję oraz dokumenty kadrowe.',
+        wrap: true,
         spacing: 'Medium',
       },
       {
-        type: 'FactSet',
-        facts: [
-          { title: 'Faktura', value: 'Faktura_<MM>_<RRRR>.pdf' },
-          { title: 'Paragon', value: 'Paragon_<RRRR>-<MM>-<DD>.png' },
-          { title: 'Umowa', value: 'Umowa_<Kontrahent>_<RRRR>.pdf' },
-          { title: 'Wyciąg', value: 'Wyciag_<Konto>_<RRRR>_<MM>.pdf' },
-          { title: 'Raport', value: 'Raport_Q<1-4>_<RRRR>.xlsx' },
-          { title: 'Deklaracja', value: 'Deklaracja_<VAT-7|PIT|CIT>_<MM>_<RRRR>.pdf' },
-        ],
-      },
-      {
         type: 'TextBlock',
-        text: 'Wskazówka: jeśli nazwa pliku nie pasuje do żadnego wzorca, dokument trafi do folderu „Nieposortowane” do ręcznego sprawdzenia.',
+        text:
+          'Wskazówka: dokumenty, których nie da się jednoznacznie sklasyfikować, ' +
+          'trafiają do folderu „Nieposortowane” do ręcznego sprawdzenia. ' +
+          'W odpowiedzi otrzymasz kartę z kategorią, folderem docelowym oraz ' +
+          'krótkim uzasadnieniem wyboru.',
         wrap: true,
         isSubtle: true,
         spacing: 'Medium',

@@ -23,6 +23,8 @@ const sourceSchema = z.object({
   channelId: z.string().min(1),
   conversationId: z.string().min(1),
   activityId: z.string().min(1),
+  // Present only for messages posted in a Teams team channel; absent for 1:1 chats.
+  teamsChannelId: z.string().min(1).optional(),
   userAadObjectId: z.string().optional(),
   userDisplayName: z.string().optional(),
 });
@@ -73,6 +75,7 @@ export function validateIngestionPayload(raw: unknown): IngestionRequestPayload 
       channelId: source.channelId,
       conversationId: source.conversationId,
       activityId: source.activityId,
+      teamsChannelId: source.teamsChannelId,
       userAadObjectId: source.userAadObjectId,
       userDisplayName: source.userDisplayName,
     },
@@ -106,6 +109,7 @@ export function validateBatchIngestionPayload(raw: unknown): IngestionBatchReque
       channelId: source.channelId,
       conversationId: source.conversationId,
       activityId: source.activityId,
+      teamsChannelId: source.teamsChannelId,
       userAadObjectId: source.userAadObjectId,
       userDisplayName: source.userDisplayName,
     },

@@ -15,53 +15,17 @@ import {
   type IngestionResponsePayload,
   type IngestionUploadResult,
   type Logger,
+  type ResolvedClient,
 } from '@bcr/shared';
-import { loadIngestionConfig } from '../config';
-import { AuthMiddleware } from '../auth/authMiddleware';
-import { createGraphClient } from '../services/graphClient';
-import { SharePointService } from '../services/sharePointService';
-import { ClassificationService, FallbackClassifier } from '../services/classificationService';
-import { ClaudeClassifier } from '../services/claudeClassifier';
+import {
+  auth,
+  classification,
+  clientResolver,
+  sharePointFactory,
+} from '../runtime';
 import { validateBatchIngestionPayload, validateIngestionPayload } from './validation';
 
 const log = createLogger('ingestion/ingestDocument');
-
-// ---------------------------------------------------------------------------
-// Cold-start wiring. Singletons per Function App worker.
-// ---------------------------------------------------------------------------
-
-const config = loadIngestionConfig();
-
-const auth = new AuthMiddleware({
-  tenantId: config.azureTenantId,
-  expectedAudience: config.expectedAudience,
-  expectedRoles: config.expectedRoles,
-});
-
-const graph = createGraphClient();
-
-const sharePoint = new SharePointService(graph, {
-  siteHostname: config.sharepointSiteHostname,
-  sitePath: config.sharepointSitePath,
-  driveName: config.sharepointDriveName,
-  ...(config.sharepointRootFolder ? { rootFolder: config.sharepointRootFolder } : {}),
-});
-
-const classification = new ClassificationService([
-  ...(config.anthropicEnabled && config.anthropicApiKey
-    ? [
-        new ClaudeClassifier({
-          apiKey: config.anthropicApiKey,
-          model: config.anthropicModel,
-          maxContentBytes: config.anthropicMaxContentBytes,
-          confidenceThreshold: config.anthropicConfidenceThreshold,
-          ...(config.clientCompanyName ? { clientCompanyName: config.clientCompanyName } : {}),
-          ...(config.clientNip ? { clientNip: config.clientNip } : {}),
-        }),
-      ]
-    : []),
-  new FallbackClassifier(),
-]);
 
 // ---------------------------------------------------------------------------
 // HTTP trigger
@@ -97,12 +61,26 @@ export async function handleIngest(
       filename: payload.filename,
       conversationId: payload.source.conversationId,
       activityId: payload.source.activityId,
+      teamsChannelId: payload.source.teamsChannelId,
     });
 
     const content = Buffer.from(payload.contentBase64, 'base64');
     turnLog.info({ sizeBytes: content.length }, 'document received');
 
-    const result = await ingest(payload, content, turnLog);
+    const resolved = await clientResolver.resolve(payload.source);
+    turnLog.info(
+      {
+        clientId: resolved.clientId,
+        title: resolved.title,
+        resolution: resolved.source,
+        matchedBy: resolved.matchedBy,
+        siteHostname: resolved.target.siteHostname,
+        sitePath: resolved.target.sitePath,
+      },
+      'client resolved',
+    );
+
+    const result = await ingest(payload, content, turnLog, resolved);
     return {
       status: 200,
       jsonBody: {
@@ -136,13 +114,29 @@ export async function handleIngestBatch(
     const batchLog = reqLog.child({
       conversationId: payload.source.conversationId,
       activityId: payload.source.activityId,
+      teamsChannelId: payload.source.teamsChannelId,
       documentCount: payload.documents.length,
     });
     batchLog.info('batch received');
 
+    // Resolve the target client once per batch (all docs in a batch share
+    // a Teams activity, so they all belong to the same client).
+    const resolved = await clientResolver.resolve(payload.source);
+    batchLog.info(
+      {
+        clientId: resolved.clientId,
+        title: resolved.title,
+        resolution: resolved.source,
+        matchedBy: resolved.matchedBy,
+        siteHostname: resolved.target.siteHostname,
+        sitePath: resolved.target.sitePath,
+      },
+      'client resolved',
+    );
+
     const results: IngestionBatchItemResult[] = [];
     for (const document of payload.documents) {
-      results.push(await ingestOne(payload, document, batchLog));
+      results.push(await ingestOne(payload, document, batchLog, resolved));
     }
 
     return {
@@ -161,6 +155,7 @@ async function ingestOne(
   payload: IngestionBatchRequestPayload,
   document: IngestionDocument,
   batchLog: Logger,
+  resolved: ResolvedClient,
 ): Promise<IngestionBatchItemResult> {
   const docLog = batchLog.child({ filename: document.filename });
   try {
@@ -170,6 +165,7 @@ async function ingestOne(
       { ...document, source: payload.source },
       content,
       docLog,
+      resolved,
     );
     return { filename: document.filename, status: 'uploaded', result };
   } catch (err) {
@@ -186,19 +182,53 @@ async function ingest(
   payload: IngestionRequestPayload,
   content: Buffer,
   reqLog: Logger,
+  preResolved: ResolvedClient,
 ): Promise<IngestionUploadResult> {
+  // Pass the pre-resolved client identity into the classifier so Claude can
+  // decide invoice direction confidently. When pre-resolution was fallback,
+  // we omit the hint \u2014 direction is derived post-hoc from extracted parties.
+  const classifierClient =
+    preResolved.source === 'directory' && (preResolved.nip || preResolved.companyName)
+      ? { nip: preResolved.nip, companyName: preResolved.companyName }
+      : undefined;
+
   const classified = await classification.classify({
     filename: payload.filename,
     contentType: payload.contentType,
     readContent: async () => content,
+    ...(classifierClient ? { client: classifierClient } : {}),
   });
   reqLog.info(
-    { documentType: classified.documentType, folderPath: classified.folderPath },
+    {
+      documentType: classified.documentType,
+      folderPath: classified.folderPath,
+      partyCount: classified.parties?.length ?? 0,
+    },
     'classified',
   );
 
+  // Post-classification refinement: content-based promotion + direction flip.
+  const post = await clientResolver.resolvePostClassification(preResolved, classified);
+  if (post.promotedFromFallback || post.directionCorrection) {
+    reqLog.info(
+      {
+        clientId: post.client.clientId,
+        title: post.client.title,
+        resolution: post.client.source,
+        matchedBy: post.client.matchedBy,
+        siteHostname: post.client.target.siteHostname,
+        sitePath: post.client.target.sitePath,
+        promotedFromFallback: post.promotedFromFallback,
+        directionCorrection: post.directionCorrection,
+        folderPath: post.classification.folderPath,
+      },
+      'client refined post-classification',
+    );
+  }
+
+  const sharePoint = sharePointFactory.forTarget(post.client.target);
   const item = await sharePoint.uploadDocument({
-    folderPath: classified.folderPath,
+    folderPath: post.classification.folderPath,
     filename: payload.filename,
     contentType: payload.contentType,
     content,
@@ -208,14 +238,14 @@ async function ingest(
   return {
     driveItemId: item.id,
     webUrl: item.webUrl,
-    folderPath: classified.folderPath,
+    folderPath: post.classification.folderPath,
     finalFilename: item.name,
     classification: {
-      documentType: classified.documentType,
-      confidence: classified.confidence,
-      classifier: classified.classifier,
-      ...(typeof classified.fields.reasoning === 'string'
-        ? { reasoning: classified.fields.reasoning }
+      documentType: post.classification.documentType,
+      confidence: post.classification.confidence,
+      classifier: post.classification.classifier,
+      ...(typeof post.classification.fields.reasoning === 'string'
+        ? { reasoning: post.classification.fields.reasoning }
         : {}),
     },
   };

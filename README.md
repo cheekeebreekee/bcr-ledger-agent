@@ -2,13 +2,25 @@
 
 A Microsoft Teams **AI Agent** that watches a chat for document attachments,
 classifies each file by analysing its **content with Claude** (Anthropic API),
-and uploads it to the correct folder in SharePoint Online — all hosted on
-Microsoft Azure and written in Node.js + TypeScript.
+and uploads it to the correct folder in the user's client's SharePoint Online
+space — all hosted on Microsoft Azure and written in Node.js + TypeScript.
 
 > Example  
-> A user drops `Invoice_03_2026.pdf` into the chat with the bot.  
+> A PESKOVOI employee DMs the bot with `8652567240-20260217-FD.pdf` (a KSeF
+> purchase invoice).  
 > The bot replies with an adaptive card:  
-> *“✅ Uploaded `Invoice_03_2026.pdf` → `Documents/Invoices/2026/03/`.”*
+> *“✅ Zarchiwizowano → `01_Faktury/02_Faktury_zakupu/2026/02/` in PESKOVOI's SharePoint.”*
+
+**One deployment routes for many clients.** Which SharePoint site a
+document lands in is decided per-upload by a *Client Directory*
+SharePoint list — no per-client deployment, no channel setup. See
+[`docs/client-directory-admin-guide.md`](./docs/client-directory-admin-guide.md).
+
+**Users interact via 1:1 DM.** Teams channel uploads don't reliably
+reach bots (drag-drop bypasses Bot Framework; `@mentions` don't carry
+attachments) — the app manifest ships a *Personal Tab* (“Moje
+dokumenty”) that deep-links each user into their SharePoint document
+library from inside Teams.
 
 ---
 

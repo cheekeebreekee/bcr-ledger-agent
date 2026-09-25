@@ -19,9 +19,30 @@ export interface TeamsAttachmentRef {
 /** Where an ingestion request originated (shared by single & batch calls). */
 export interface IngestionSource {
   readonly tenantId: string;
+  /**
+   * Bot Framework platform id — always the literal `"msteams"` for Teams.
+   * Do NOT use this to identify a specific Teams channel; use `teamsChannelId` instead.
+   */
   readonly channelId: string;
+  /**
+   * The Bot Framework conversation id (`activity.conversation.id`). For a
+   * channel-scoped Teams conversation this is derived from the Teams channel
+   * id but may include a `;messageid=...` suffix on reply threads.
+   */
   readonly conversationId: string;
   readonly activityId: string;
+  /**
+   * The Teams channel id (`activity.channelData.channel.id`), format
+   * `19:<hash>@thread.tacv2`. Present only for messages posted inside a
+   * team channel — undefined for 1:1 personal chats and group chats.
+   *
+   * Kept as observability only: Teams channel messages don't reliably
+   * deliver file attachments to bots (files drop-attached in a channel
+   * bypass Bot Framework entirely, and `@mention` messages only carry
+   * the mention HTML). Routing is user-identity-based; this field is
+   * logged for support/telemetry.
+   */
+  readonly teamsChannelId: string | undefined;
   /** Present when the message came from a signed-in Teams user. */
   readonly userAadObjectId: string | undefined;
   readonly userDisplayName: string | undefined;
@@ -87,4 +108,26 @@ export interface IngestionBatchItemResult {
 export interface IngestionBatchResponsePayload {
   readonly status: 'completed';
   readonly results: readonly IngestionBatchItemResult[];
+}
+
+/**
+ * Response of `GET /api/user-target?userAadObjectId={guid}`. Tells the
+ * caller (currently the bot's Personal Tab handler) which SharePoint site
+ * a given Teams user belongs to, so the tab can send them there directly.
+ */
+export interface UserTargetResponsePayload {
+  /** Directory client id, or the fallback client id when no user match. */
+  readonly clientId: string;
+  /** Human-readable client name (from `Title` or fallback title). */
+  readonly title: string;
+  /** How the client was resolved: `'directory'` for a user match, `'fallback'` otherwise. */
+  readonly source: 'directory' | 'fallback';
+  /** SharePoint hostname, e.g. `bcrgroupeu.sharepoint.com`. */
+  readonly siteHostname: string;
+  /** Site path, e.g. `/sites/0002PESKOVOISp.zo.o.-Ksigowo`. */
+  readonly sitePath: string;
+  /** Drive display name (Polish locale usually `Dokumenty`). */
+  readonly driveName: string;
+  /** Best-effort deep link to the client's document library homepage. */
+  readonly sharepointWebUrl: string;
 }

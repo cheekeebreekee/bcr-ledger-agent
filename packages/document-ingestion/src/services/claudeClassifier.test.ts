@@ -38,8 +38,6 @@ describe('ClaudeClassifier', () => {
     );
     const c = new ClaudeClassifier({
       ...baseOpts,
-      clientCompanyName: 'ACME Sp. z o.o.',
-      clientNip: '1234567890',
       client: makeClient(create),
     });
 
@@ -171,19 +169,67 @@ describe('ClaudeClassifier', () => {
     expect(await c.classify(ctx())).toBeNull();
   });
 
-  it('includes client identity in the system prompt when provided', async () => {
+  it('does NOT prime the system prompt with client identity when ctx.client is absent', async () => {
     const create: CreateFn = jest
       .fn()
       .mockResolvedValue(toolMessage({ category: 'inne', confidence: 0.9 }));
     const c = new ClaudeClassifier({
       ...baseOpts,
-      clientCompanyName: 'ACME Sp. z o.o.',
-      clientNip: '1234567890',
       client: makeClient(create),
     });
     await c.classify(ctx());
     const system = create.mock.calls[0][0].system as string;
-    expect(system).toContain('ACME Sp. z o.o.');
-    expect(system).toContain('1234567890');
+    expect(system).not.toContain('ACME Sp. z o.o.');
+    expect(system).not.toContain('1234567890');
+    expect(system).toMatch(/Tożsamość klienta nie jest podana/);
+  });
+
+  it('primes the system prompt with client identity when ctx.client is provided', async () => {
+    const create: CreateFn = jest
+      .fn()
+      .mockResolvedValue(toolMessage({ category: 'faktury_sprzedazy', year: 2026, month: 3, confidence: 0.9 }));
+    const c = new ClaudeClassifier({
+      ...baseOpts,
+      client: makeClient(create),
+    });
+    await c.classify(
+      ctx({ client: { nip: '9571185285', companyName: 'PESKOVOI Sp. z o.o.' } }),
+    );
+    const system = create.mock.calls[0][0].system as string;
+    expect(system).toContain('PESKOVOI Sp. z o.o.');
+    expect(system).toContain('9571185285');
+    expect(system).toContain('SPRZEDAWCA');
+    expect(system).toContain('NABYWCĄ');
+  });
+
+  it('extracts parties from the tool output when returned', async () => {
+    const create: CreateFn = jest.fn().mockResolvedValue(
+      toolMessage({
+        category: 'nieposortowane',
+        year: 2026,
+        month: 2,
+        confidence: 0.75,
+        parties: [
+          { role: 'seller', nip: '865-256-72-40', company_name: 'Autorud Stalowa Wola Sp. z o.o.' },
+          { role: 'buyer', nip: '9571185285', company_name: 'PESKOVOI Sp. z o.o.' },
+          { role: 'unknown', nip: null, company_name: null, person_name: null }, // dropped: no signal
+        ],
+      }),
+    );
+    const c = new ClaudeClassifier({ ...baseOpts, client: makeClient(create) });
+    const result = await c.classify(ctx());
+    expect(result?.parties).toEqual([
+      { role: 'seller', nip: '8652567240', companyName: 'Autorud Stalowa Wola Sp. z o.o.' },
+      { role: 'buyer', nip: '9571185285', companyName: 'PESKOVOI Sp. z o.o.' },
+    ]);
+  });
+
+  it('leaves parties undefined when the tool omits them', async () => {
+    const create: CreateFn = jest
+      .fn()
+      .mockResolvedValue(toolMessage({ category: 'inne', confidence: 0.9 }));
+    const c = new ClaudeClassifier({ ...baseOpts, client: makeClient(create) });
+    const result = await c.classify(ctx());
+    expect(result?.parties).toBeUndefined();
   });
 });

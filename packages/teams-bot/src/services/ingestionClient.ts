@@ -6,6 +6,7 @@ import {
   type IngestionBatchResponsePayload,
   type IngestionRequestPayload,
   type IngestionResponsePayload,
+  type UserTargetResponsePayload,
 } from '@bcr/shared';
 
 export interface IngestionClientOptions {
@@ -57,17 +58,36 @@ export class IngestionClient {
     return this.post<IngestionBatchResponsePayload>('/api/ingest/batch', payload);
   }
 
+  /**
+   * Resolve which SharePoint site a given Teams user's documents live in.
+   * Used by the bot's Personal Tab to deep-link the user to the right
+   * document library.
+   */
+  async getUserTarget(userAadObjectId: string): Promise<UserTargetResponsePayload> {
+    this.log.debug({ userAadObjectId }, 'GET /api/user-target');
+    const qs = new URLSearchParams({ userAadObjectId }).toString();
+    return this.get<UserTargetResponsePayload>(`/api/user-target?${qs}`);
+  }
+
   private async post<T>(path: string, payload: unknown): Promise<T> {
+    return this.send<T>('POST', path, payload);
+  }
+
+  private async get<T>(path: string): Promise<T> {
+    return this.send<T>('GET', path);
+  }
+
+  private async send<T>(method: 'GET' | 'POST', path: string, payload?: unknown): Promise<T> {
     const token = await this.acquireToken();
     const url = new URL(path, this.opts.baseUrl).toString();
 
     const { statusCode, body } = await this.fetcher(url, {
-      method: 'POST',
+      method,
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify(payload),
+      ...(payload !== undefined ? { body: JSON.stringify(payload) } : {}),
     });
 
     const responseText = await body.text();

@@ -1,53 +1,9 @@
 import { app, type HttpRequest, type HttpResponseInit, type InvocationContext } from '@azure/functions';
-import {
-  CloudAdapter,
-  ConfigurationBotFrameworkAuthentication,
-  type ConfigurationBotFrameworkAuthenticationOptions,
-  type Activity,
-} from 'botbuilder';
+import type { Activity } from 'botbuilder';
 import { createLogger } from '@bcr/shared';
-import { LedgerBot } from '../bot/ledgerBot';
-import { loadBotConfig } from '../config';
-import { IngestionClient } from '../services/ingestionClient';
-import { AttachmentDownloader } from '../services/attachmentDownloader';
+import { adapter, bot } from '../runtime';
 
 const log = createLogger('bot/messages');
-
-// ---------------------------------------------------------------------------
-// Cold-start wiring. Everything below is constructed exactly once per worker.
-// ---------------------------------------------------------------------------
-
-const config = loadBotConfig();
-
-const auth = new ConfigurationBotFrameworkAuthentication(
-  {
-    MicrosoftAppId: config.microsoftAppId,
-    MicrosoftAppPassword: config.microsoftAppPassword,
-    MicrosoftAppType: config.microsoftAppType,
-    MicrosoftAppTenantId: config.microsoftAppTenantId,
-  } satisfies ConfigurationBotFrameworkAuthenticationOptions,
-);
-
-const adapter = new CloudAdapter(auth);
-
-adapter.onTurnError = async (context, error) => {
-  log.error({ err: error, activityId: context.activity.id }, 'unhandled turn error');
-  await context.sendActivity(
-    '⚠️ Sorry — something went wrong on my side. The error has been logged for investigation.',
-  );
-};
-
-const ingestionClient = new IngestionClient({
-  baseUrl: config.ingestionBaseUrl,
-  scope: config.ingestionScope,
-  tenantId: config.microsoftAppTenantId,
-  clientId: config.microsoftAppId,
-  clientSecret: config.microsoftAppPassword,
-});
-
-const attachmentDownloader = new AttachmentDownloader();
-
-const bot = new LedgerBot({ ingestionClient, attachmentDownloader });
 
 // ---------------------------------------------------------------------------
 // HTTP trigger registration

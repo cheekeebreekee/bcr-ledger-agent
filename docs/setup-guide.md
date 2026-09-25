@@ -402,17 +402,28 @@ references for secrets).
 | `INGESTION_BASE_URL` | teams-bot | `http://localhost:7071` locally, `https://func-bcr-ingest-<env>-XXXX.azurewebsites.net` in Azure. |
 | `INGESTION_SCOPE` | teams-bot | `api://<INGESTION_APP_ID>/.default` — see §2b |
 
-### 6c. Ingestion API auth & target site (`packages/document-ingestion/local.settings.json`)
+### 6c. Ingestion API auth & multi-tenant routing (`packages/document-ingestion/local.settings.json`)
+
+The ingest function is multi-tenant — it decides per-upload which client's
+SharePoint site to use, based on the uploader's AAD id (via the Client
+Directory list) or the document's extracted NIP. See
+[`docs/client-directory-admin-guide.md`](./client-directory-admin-guide.md)
+for the routing model, and [`ARCHITECTURE.md §4.2`](../ARCHITECTURE.md#42-multi-tenant-client-routing-implemented)
+for the design.
 
 | Variable | How to find it |
 |---|---|
 | `INGESTION_APP_ID` | Ingestion app reg → **Overview → Application (client) ID** *(§2b)* |
 | `EXPECTED_AUDIENCE` | `api://<INGESTION_APP_ID>` (no `/.default` suffix) |
 | `EXPECTED_ROLES` | Comma-separated list. Default `Documents.Ingest`. Add new role names if you create more in step §2b. |
-| `SHAREPOINT_SITE_HOSTNAME` | The first part of your SharePoint URL — e.g. `contoso.sharepoint.com` |
-| `SHAREPOINT_SITE_PATH` | The path part — must start with `/`, e.g. `/sites/BCR-Ledger`. UI: open the site in SharePoint, copy from the URL. |
-| `SHAREPOINT_DRIVE_NAME` | Display name of the document library. Default is **Documents** (the built-in library). For a custom library use its exact display name. |
-| `SHAREPOINT_ROOT_FOLDER` | *(optional)* Prefix every upload with this folder (e.g. `Ledger`). Leave blank to upload at drive root. |
+| `CLIENT_DIRECTORY_SITE_ID` | Microsoft Graph site id (`<hostname>,<siteGuid>,<webGuid>`) of the SharePoint site that hosts the Client Directory list. `GET https://graph.microsoft.com/v1.0/sites/{hostname}:/{sitePath}` returns it. |
+| `CLIENT_DIRECTORY_LIST_ID` | GUID of the Client Directory list itself. Returned by `GET /sites/{id}/lists?$filter=displayName eq 'Client Directory'`. |
+| `CLIENT_DIRECTORY_CACHE_TTL_MS` | *(optional)* Directory snapshot cache TTL in milliseconds. Default `300000` (5 min). |
+| `FALLBACK_CLIENT_ID` | *(optional)* Short business key logged when routing falls back. Default `bcr-group`. |
+| `FALLBACK_SITE_HOSTNAME` | SharePoint hostname of the fallback bucket (BCR Group), e.g. `bcrgroupeu.sharepoint.com`. |
+| `FALLBACK_SITE_PATH` | Site path (must start with `/`), e.g. `/sites/BCRGROUPSp.zo.o`. |
+| `FALLBACK_DRIVE_NAME` | Fallback library display name. `Dokumenty` on Polish tenants, `Documents` elsewhere. |
+| `FALLBACK_ROOT_FOLDER` | *(optional)* Sub-folder prefix under the fallback drive root. |
 
 ### 6d. Claude document classification
 
@@ -426,8 +437,11 @@ Skip (set `ANTHROPIC_ENABLED=false`) if you want fallback-only routing
 | `ANTHROPIC_MODEL` | Model id. Default `claude-opus-4-5-20251101`. |
 | `ANTHROPIC_MAX_CONTENT_BYTES` | Max document size sent to the API. Default `10485760` (10 MiB); larger files skip AI and go to manual review. |
 | `ANTHROPIC_CONFIDENCE_THRESHOLD` | Minimum model confidence (`0`–`1`) to accept a category. Default `0.6`; below this routes to manual review. |
-| `CLIENT_COMPANY_NAME` | The client's legal company name — lets the model tell sales vs. purchase invoices. |
-| `CLIENT_NIP` | The client's NIP (tax id) — same purpose as above. |
+
+> **Note:** the previous `CLIENT_COMPANY_NAME` / `CLIENT_NIP` env vars
+> have been removed. Client identity is now injected into the Claude
+> prompt **per request** based on the pre-resolved client (from the
+> Client Directory) — no per-deployment configuration needed.
 
 ### 6e. Telemetry
 
@@ -555,17 +569,19 @@ union requests, exceptions, traces
 | `INGESTION_SCOPE` | `api://<INGESTION_APP_ID>/.default` | Bot Function App setting |
 | `EXPECTED_AUDIENCE` | `api://<INGESTION_APP_ID>` | Ingestion Function App setting |
 | `EXPECTED_ROLES` | App roles you defined | Ingestion Function App setting |
-| `SHAREPOINT_SITE_HOSTNAME` | SharePoint URL | Ingestion Function App setting |
-| `SHAREPOINT_SITE_PATH` | SharePoint URL path | Ingestion Function App setting |
-| `SHAREPOINT_DRIVE_NAME` | SharePoint library display name | Ingestion Function App setting |
-| `SHAREPOINT_ROOT_FOLDER` | your choice | Ingestion Function App setting |
+| `CLIENT_DIRECTORY_SITE_ID` | Graph site id of Client Directory list host | Ingestion Function App setting |
+| `CLIENT_DIRECTORY_LIST_ID` | Client Directory list GUID | Ingestion Function App setting |
+| `CLIENT_DIRECTORY_CACHE_TTL_MS` | *(optional)* cache TTL, default 300000 | Ingestion Function App setting |
+| `FALLBACK_CLIENT_ID` | short key for fallback bucket logs | Ingestion Function App setting |
+| `FALLBACK_SITE_HOSTNAME` | SharePoint URL of fallback (BCR Group) | Ingestion Function App setting |
+| `FALLBACK_SITE_PATH` | Fallback site path | Ingestion Function App setting |
+| `FALLBACK_DRIVE_NAME` | Fallback library display name | Ingestion Function App setting |
+| `FALLBACK_ROOT_FOLDER` | *(optional)* fallback sub-folder | Ingestion Function App setting |
 | `ANTHROPIC_ENABLED` | feature flag | Ingestion Function App setting |
 | `ANTHROPIC_API_KEY` | Anthropic Console | **Key Vault** secret `anthropic-api-key` |
 | `ANTHROPIC_MODEL` | constant (model id) | Ingestion Function App setting |
 | `ANTHROPIC_MAX_CONTENT_BYTES` | constant | Ingestion Function App setting |
 | `ANTHROPIC_CONFIDENCE_THRESHOLD` | constant | Ingestion Function App setting |
-| `CLIENT_COMPANY_NAME` | client legal name | Ingestion Function App setting |
-| `CLIENT_NIP` | client tax id | Ingestion Function App setting |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | App Insights Overview | Both Function Apps |
 | `LOG_LEVEL` | constant | Both Function Apps |
 | `NODE_ENV` | `production` in Azure | Both Function Apps |

@@ -49,11 +49,12 @@ sequenceDiagram
   participant BS as Azure Bot Service
   participant FB as Bot Function App
   participant FI as Ingestion Function App
+  participant CD as Client Directory (SharePoint list)
   participant CL as Claude (Anthropic API)
   participant GR as Microsoft Graph
   participant SP as SharePoint Online
 
-  U->>TC: Attaches Invoice_03_2026.pdf + Receipt_2026-03.png + message
+  U->>TC: DMs bot with Invoice_03_2026.pdf + Receipt_2026-03.png
   TC->>BS: POST activity (message + attachments)
   BS->>FB: POST /api/messages (JWT signed by BF)
   FB->>FB: ActivityHandler validates JWT
@@ -61,17 +62,23 @@ sequenceDiagram
   BS-->>FB: file bytes
   FB->>FI: POST /api/ingest/batch (Bearer token, { documents[], source })
   FI->>FI: Validate AAD token (audience = ingestion app)
+  FI->>CD: getSnapshot() — 5min cached, byNip / byUserAadObjectId maps
+  CD-->>FI: entries + lookup maps
+  FI->>FI: resolve(source.userAadObjectId) → pre-resolved client (or fallback)
   loop for each document
-    FI->>CL: messages.create(document content + tool schema)
-    CL-->>FI: category + year/month + confidence + reasoning
-    alt confidence < threshold
-      FI->>FI: fallback → 98_Nieposortowane/<YYYY>/<MM>/
+    FI->>CL: messages.create(content + tool schema, primed with resolved client identity)
+    CL-->>FI: category + year/month + confidence + reasoning + parties[]
+    FI->>FI: resolvePostClassification(preResolved, classified)
+    Note over FI: promotes fallback to Directory client on party NIP match;<br/>flips faktury_sprzedazy ⇄ faktury_zakupu on client role
+    alt final client + folder path known
+      FI->>GR: ensureFolder + PUT /content (via per-client SharePointService)
+      GR->>SP: write file into resolved client's site
+      SP-->>GR: 201 Created (driveItem)
+      GR-->>FI: driveItem JSON
+    else confidence too low or category unknown
+      FI->>GR: PUT into 98_Nieposortowane/<YYYY>/<MM>/ on the resolved (or fallback) site
     end
-    FI->>GR: ensureFolder + PUT /content
-    GR->>SP: write file
-    SP-->>GR: 201 Created (driveItem)
-    GR-->>FI: driveItem JSON
-    Note over FI: a per-document failure becomes a `rejected` row,<br/>it does not abort the batch
+    Note over FI: per-document failure → `rejected` row, batch continues
   end
   FI-->>FB: 200 { status: 'completed', results[] }
   FB-->>BS: Activity (one adaptive card with a summary Table)
@@ -83,6 +90,13 @@ sequenceDiagram
 > `POST /api/ingest` (returning `{ status: 'uploaded', result }`) is retained
 > for backwards compatibility and programmatic callers. The Teams bot always
 > uses the batch route so the user gets one consolidated response.
+
+> **Bot delivery model.** Only 1:1 DMs with the bot reliably deliver file
+> attachments through Bot Framework. Files posted into Teams channels
+> either bypass the bot entirely (drag-drop) or arrive without their
+> content (`@mention` messages carry only the mention HTML). The bot's
+> app manifest keeps `"scopes": ["personal", "team", "groupchat"]` for
+> completeness but only the `personal` scope is functional today.
 
 
 ---
@@ -99,13 +113,21 @@ fallback always succeeds last.
    block, text → `text` block) to the Anthropic Messages API together with a
    forced tool whose `input_schema` is generated from the folder taxonomy
    ([`folderTaxonomy.ts`](./packages/shared/src/parsers/folderTaxonomy.ts)).
-   The model returns a `category`, optional `year`/`month`, and a `confidence`
-   score. The category maps to a literal SharePoint path via `buildFolderPath`;
-   `dated` categories get a nested `YYYY/MM` leaf. Invoice direction
-   (sales vs. purchase) is resolved by injecting the client's identity
-   (`CLIENT_COMPANY_NAME` + `CLIENT_NIP`) into the system prompt. The
-   classifier **never throws** — unsupported content type, oversized files
-   (`ANTHROPIC_MAX_CONTENT_BYTES`), confidence below
+   The model returns a `category`, optional `year`/`month`, a `confidence`
+   score, and an optional `parties[]` array (seller/buyer/issuer/recipient/
+   unknown, each with NIP + company name + person name). The category maps
+   to a literal SharePoint path via `buildFolderPath`; `dated` categories get
+   a nested `YYYY/MM` leaf.
+
+   Client identity is passed **per call** via `ClassifierContext.client`
+   (populated from the pre-resolved routing decision). When present, the
+   model is primed with the client's NIP + name and can decide invoice
+   direction (sales vs purchase) directly. When absent (fallback routing),
+   the model extracts parties without deciding direction and the
+   `ClientResolver` derives direction post-classification (see §4.2).
+
+   The classifier **never throws** — unsupported content type, oversized
+   files (`ANTHROPIC_MAX_CONTENT_BYTES`), confidence below
    `ANTHROPIC_CONFIDENCE_THRESHOLD`, unknown categories, and API errors all
    return `null` so the fallback runs. Disabled when `ANTHROPIC_ENABLED=false`
    or no API key is configured.
@@ -151,46 +173,114 @@ The relevant shared contracts live in
 `IngestionBatchRequestPayload`, `IngestionBatchItemResult`, and
 `IngestionBatchResponsePayload`.
 
-### 4.2 Multi-tenant client routing (planned, not yet implemented)
+### 4.2 Multi-tenant client routing (implemented)
 
-Today the ingestion function is wired at cold start to exactly **one**
-`SharePointTarget` (one client's SharePoint site/drive) plus a static
-`CLIENT_COMPANY_NAME`/`CLIENT_NIP` pair used only to disambiguate invoice
-direction. The following design lets a **single deployment** route
-documents to **many** clients' SharePoint spaces:
+A single deployment routes documents to many clients' SharePoint spaces.
+The resolver runs in **two phases** — once before classification (envelope
+signals only) and once after (content signals from Claude's `parties[]`).
 
-- **Client Directory** — a SharePoint list on the **BCR Group** site is
-  the single source of truth. One row per client:
-  `ClientId`, `NIP`, `CompanyNameAliases` (one alias per line),
-  `PersonNames` (one name per line), `TeamsChannelId`, `SiteHostname`,
-  `SitePath`, `DriveName`, `RootFolder`, `Status`. See
-  [`docs/client-directory-admin-guide.md`](./docs/client-directory-admin-guide.md)
-  for how to create and manage it.
-- **Channel-authoritative routing (non-admin uploads).** Each client has
-  their own dedicated Teams channel (Teams/AAD membership already
-  restricts non-admin users to only their own channel). The upload's
-  `source.conversationId` (already part of `IngestionSource`, populated
-  from `activity.conversation?.id` in `LedgerBot`) is looked up directly
-  against `TeamsChannelId` in the Client Directory — that row's site/drive
-  **is** the destination. No document content is consulted to make this
-  decision. **Do not confuse this with the Bot Framework `channelId`
-  field** (`activity.channelId`), which is always the literal platform
-  string `"msteams"` and carries no per-client information.
-- **Content-based routing (admin uploads only).** Uploaders whose
-  `source.userAadObjectId` is a registered admin are exempt from the
-  channel lookup — admins have access to every channel, so their upload's
-  destination is instead resolved from `ClaudeClassifier`'s extracted
-  NIP/company-name/person-name against the same Directory rows (exact,
-  normalized match only — no fuzzy matching, to avoid mis-filing into the
-  wrong client). No match → falls back to `BCR Group` → `Shared`, using
-  the same `buildFolderPath()` taxonomy.
-- **Invoice direction** becomes derived rather than static: compare the
-  *resolved* client's own `NIP` (from their Directory row) against the
-  extracted seller/buyer NIP on the invoice, instead of a fixed
-  `CLIENT_NIP` env var.
-- **No cross-check between channel and content** is performed for
-  non-admin uploads (a deliberate simplification — see repo history for
-  the reasoning): the channel is trusted as-is.
+#### Client Directory
+
+A SharePoint list on the BCR Group site is the single source of truth.
+One row per client, columns: `Title`, `ClientId`, `NIP`,
+`CompanyNameAliases` (one alias per line), `PersonNames` (one name per
+line), `UserAadObjectIds` (one AAD id per line), `SiteHostname`,
+`SitePath`, `DriveName`, `RootFolder`, `IsAdmin`, `Status`. The list id
+and site id are configured on the ingest function via
+`CLIENT_DIRECTORY_LIST_ID` and `CLIENT_DIRECTORY_SITE_ID`. See
+[`docs/client-directory-admin-guide.md`](./docs/client-directory-admin-guide.md)
+for onboarding runbooks.
+
+[`ClientDirectoryReader`](./packages/document-ingestion/src/services/clientDirectoryReader.ts)
+fetches the list at cold start (following `@odata.nextLink` pagination),
+caches the parsed snapshot in memory for `CLIENT_DIRECTORY_CACHE_TTL_MS`
+(default 5 min), and rebuilds lookup maps (`byNip`, `byCompanyAlias`,
+`byPersonName`, `byUserAadObjectId`) on every refresh. Duplicate keys
+across clients are fail-closed: if the same NIP or AAD id shows up on
+two rows, the reader drops the ambiguous key from the map and logs a
+warning so an unresolved document falls back rather than mis-routes.
+
+#### Phase 1 — pre-classification resolution
+
+[`ClientResolver.resolve(source)`](./packages/document-ingestion/src/services/clientResolver.ts)
+reads `source.userAadObjectId` (from `activity.from.aadObjectId`, captured
+by the bot on every turn) and looks it up in `byUserAadObjectId`. If the
+row is a non-admin client, that's the destination. If it's an admin row
+(or no match), the resolver returns the configured fallback bucket — but
+doesn't yet commit; content-based routing may still promote it in phase 2.
+
+Channel-based routing was designed and briefly deployed but was removed
+after live testing. Teams doesn't reliably deliver channel file uploads
+to bots — drag-drop bypasses Bot Framework entirely, and `@mention`
+messages only carry the mention HTML in `activity.attachments`. The bot
+is DM-only in practice, so user-identity routing is the sole primary
+path. `source.teamsChannelId` is still captured for observability but
+nothing keys on it.
+
+#### Phase 2 — post-classification refinement
+
+Once Claude has returned a `Classification` (with `parties[]` populated
+when the document is an invoice/contract),
+[`ClientResolver.resolvePostClassification(preResolved, classification)`](./packages/document-ingestion/src/services/clientResolver.ts)
+does two things:
+
+1. **Fallback → client promotion.** If pre-resolution was `fallback` and
+   exactly one `parties[].nip` matches a Directory client (via
+   `snapshot.byNip`), the routing is retroactively promoted to that
+   client. Ambiguous cases (multiple Directory clients present in the
+   same document, e.g. an inter-client invoice) keep the fallback —
+   fail-closed to avoid mis-filing.
+2. **Invoice direction override.** If the resolved client's NIP appears
+   in `parties[]` with `role: 'seller'` or `role: 'buyer'`, and the
+   current category is `faktury_sprzedazy`, `faktury_zakupu`, or
+   `nieposortowane`, `applyInvoiceDirection` rebuilds the folder path
+   with the correct direction. This is the safety net for cases where
+   pre-resolution routed to fallback (no client identity was primed
+   into Claude), and it corrects Claude when it guesses direction wrong.
+
+#### Per-client SharePoint clients
+
+[`SharePointServiceFactory`](./packages/document-ingestion/src/services/sharePointServiceFactory.ts)
+memoises one `SharePointService` per unique target
+(`{hostname, sitePath, driveName, rootFolder}`) so cold-start site/drive
+resolution is amortised across many uploads. New client rows automatically
+spin up a new service on first use.
+
+#### Fallback bucket
+
+When no user or content routing resolves, uploads land in the fallback
+target defined by `FALLBACK_SITE_HOSTNAME`, `FALLBACK_SITE_PATH`,
+`FALLBACK_DRIVE_NAME`, `FALLBACK_ROOT_FOLDER`, `FALLBACK_CLIENT_ID`. Dev
+fallback is the BCR Group site's default `Dokumenty` library.
+
+### 4.3 Personal Tab — “Moje dokumenty”
+
+A Teams personal tab that gives every user a one-click deep-link to their
+client's SharePoint document library from inside Teams.
+
+- **Manifest** — `teams-app/manifest.json` adds a `staticTabs` entry with
+  `contentUrl` templated on `{userObjectId}` and `{theme}` (both
+  substituted by Teams at tab-load time).
+- **Content endpoint** — `GET /api/mydocs?userObjectId={id}&theme={theme}`
+  on the bot function
+  ([`packages/teams-bot/src/functions/mydocs.ts`](./packages/teams-bot/src/functions/mydocs.ts)).
+  Anonymous auth (called by the Teams iframe); serves a small themed HTML
+  page with the resolved client's name and an "Otwórz w SharePoint"
+  button. The button uses the Teams JS SDK's `microsoftTeams.app.openLink`
+  (falls back to `window.open`). SharePoint refuses to be iframed
+  cross-origin, so the tab deep-links out instead of embedding.
+- **Lookup endpoint** — `GET /api/user-target?userAadObjectId={id}` on the
+  ingest function
+  ([`packages/document-ingestion/src/functions/userTarget.ts`](./packages/document-ingestion/src/functions/userTarget.ts)).
+  Same JWT auth as `/api/ingest` (`Documents.Ingest` role). Reuses the
+  same `ClientResolver` as the ingest pipeline so “where the tab sends
+  the user” always matches “where the bot files their documents”. Returns
+  `{clientId, title, source, siteHostname, sitePath, driveName,
+  sharepointWebUrl}`. The web URL is constructed heuristically
+  (`Dokumenty` for Polish tenants, `Shared Documents` for English).
+- **Auth trail** — Teams tab → anonymous GET to bot's `/api/mydocs` →
+  bot calls ingest's `/api/user-target` with its existing MSAL
+  client-credentials JWT (same one used for `/api/ingest`).
 
 ---
 

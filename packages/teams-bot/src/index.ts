@@ -4,3 +4,4 @@
  * at module load time, so this file simply pulls in our function modules.
  */
 import './functions/messages';
+import './functions/mydocs';

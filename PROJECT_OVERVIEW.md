@@ -2,61 +2,94 @@
 
 > **One-line summary:** A Microsoft Teams bot for Polish accounting clients
 > that auto-files document attachments (faktury, paragony, umowy, wyciągi,
-> raporty, deklaracje) into the correct SharePoint folder structure by
-> analysing each document's **content with Claude** (Anthropic API).
+> raporty, deklaracje) into each client's SharePoint folder structure by
+> analysing each document's **content with Claude** (Anthropic API), with
+> per-upload routing driven by a Client Directory SharePoint list.
 
 ---
 
 ## What it does
 
-User drops a file into a Teams chat with the bot:
+A registered user DMs the bot in Teams (channels don't work — see below):
 
 ```
 User → DM bot in Teams → attaches "Faktura_03_2026.pdf"
        ↓
        Bot downloads the attachment
        ↓
-       Bot calls ingestion API (with bearer JWT for Documents.Ingest role)
+       Bot calls ingestion API (Bearer JWT for Documents.Ingest role)
        ↓
-       Ingestion API calls Claude with the document content + the folder
-       taxonomy as a tool schema:
-         invoice where client is the buyer → 01_Faktury/02_Faktury_zakupu/2026/03
-       ↓
-       Ingestion API uploads to SharePoint via Microsoft Graph (managed identity)
+       Ingestion API:
+         (1) Resolves the user's client via Client Directory (byUserAadObjectId)
+         (2) Calls Claude with the document content + client identity primed
+         (3) Claude returns category + confidence + parties[] (seller/buyer/NIP)
+         (4) Post-classification: promotes fallback → client on party NIP match,
+             flips invoice sales⇄purchase when client role in parties disagrees
+         (5) Uploads to the resolved client's SharePoint via Microsoft Graph
        ↓
        Bot replies with Polish Adaptive Card:
          "✅ Zarchiwizowano Faktura_03_2026.pdf"
-         + Otwórz w SharePoint button → file in 01_Faktury/02_Faktury_zakupu/2026/03/
+         + Otwórz w SharePoint button → file in resolved client's site
 ```
 
 Documents Claude classifies with low confidence (or whose type it cannot
-determine) fall back to `98_Nieposortowane/RRRR/MM/` for manual review.
+determine) fall back to `98_Nieposortowane/RRRR/MM/` on the resolved
+client's site (or on the BCR Group fallback bucket if no user match).
+
+**Personal Tab “Moje dokumenty”** — the Teams app manifest ships a
+personal tab that deep-links each user directly to their client's
+SharePoint document library. Uses the Teams SDK to open SharePoint from
+inside Teams.
 
 ---
 
 ## Architecture
 
 ```
-Microsoft Teams (client)
+Microsoft Teams (client — 1:1 DM only for file uploads;
+                          personal tab "Moje dokumenty")
         │
         ▼  POST /api/messages (BotFramework auth)
 ┌────────────────────────────┐     ┌────────────────────────────┐
 │  func-bcr-bot-dev-…        │     │  Key Vault                 │
 │  (Node 22 Functions v4)    │◀────│  kv-bcr-dev-…              │
 │  @bcr/teams-bot            │     │  (bot-app-password ref)    │
-└──────────┬─────────────────┘     └────────────────────────────┘
-           │  POST /api/ingest (Bearer JWT)
-           │  client_credentials grant → audience api://b8b90018-…
+│  ┝ /api/messages           │     └────────────────────────────┘
+│  ┕ /api/mydocs (tab HTML)  │
+└──────────┬─────────────────┘
+           │  POST /api/ingest(/batch) or GET /api/user-target (Bearer JWT)
+           │  client_credentials → audience api://b8b90018-…
            │  role: Documents.Ingest
            ▼
-┌────────────────────────────┐     ┌────────────────────────────┐
-│  func-bcr-ingest-dev-…     │────▶│  SharePoint Online         │
-│  (Node 22 Functions v4)    │     │  bcrgroupeu.sharepoint.com │
-│  @bcr/document-ingestion   │     │  /sites/0000TESTSp.zo.o.-  │
-│  ↳ system-assigned MI      │     │   Ksigowo                  │
-│    d5226274-… / 7984e56c-… │     │  Drive: "Dokumenty"        │
-│    role: Sites.Selected    │     │                            │
-└────────────────────────────┘     └────────────────────────────┘
+┌────────────────────────────┐
+│  func-bcr-ingest-dev-…     │
+│  (Node 22 Functions v4)    │
+│  @bcr/document-ingestion   │      Two-phase resolver:
+│  ┝ /api/health             │      1. resolve(source) → byUserAadObjectId
+│  ┝ /api/ingest             │      2. classify() w/ primed client identity
+│  ┝ /api/ingest/batch       │      3. resolvePostClassification() → promote
+│  ┝ /api/user-target        │         fallback, flip invoice direction
+│  ┕ system-assigned MI      │      4. sharePointFactory.forTarget()
+│    d5226274-… / 7984e56c-… │         .uploadDocument()
+│    role: Sites.Selected    │
+└──────────┬─────────────────┘
+           │                        Claude (Anthropic Messages API)
+           ├───▶  content + tool schema → category + parties[]
+           │
+           ▼
+┌───────────────────────────────────────────────────────────────┐
+│  Microsoft Graph → SharePoint Online (bcrgroupeu.sharepoint.com)│
+│                                                                │
+│  Client Directory (BCR GROUP site, list 2a5613f1-…)            │
+│    rows: ClientId · NIP · Aliases · UserAadObjectIds ·         │
+│          SiteHostname/SitePath/DriveName · IsAdmin · Status    │
+│                                                                │
+│  Per-client sites (dev):                                       │
+│    ┝ /sites/BCRGROUPSp.zo.o          — fallback bucket         │
+│    ┝ /sites/0002PESKOVOISp.zo.o.-…   — PESKOVOI (0002)         │
+│    ┕ /sites/0000TESTSp.zo.o.-…       — TEST (dev only)         │
+│  Drive: "Dokumenty" on all (Polish locale)                     │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ### Identities & permissions
@@ -88,13 +121,17 @@ Two-step SharePoint grant required (see Lessons Learned):
 | Key Vault | `kv-bcr-dev-vyyintffz6ehq` (RBAC mode) |
 | App Insights | `appi-bcr-dev-vyyintffz6ehq` |
 | Storage | `stbcrdevvyyintffz6ehq` |
-| SharePoint site | `https://bcrgroupeu.sharepoint.com/sites/0000TESTSp.zo.o.-Ksigowo` |
-| SharePoint drive | **Dokumenty** (Polish locale — NOT "Documents") |
+| SharePoint sites (in use) | `/sites/BCRGROUPSp.zo.o` (fallback + hosts Client Directory list), `/sites/0002PESKOVOISp.zo.o.-Ksigowo` (PESKOVOI), `/sites/0000TESTSp.zo.o.-Ksigowo` (dev-only sandbox). All on `bcrgroupeu.sharepoint.com`. |
+| SharePoint drive | **Dokumenty** (Polish locale — NOT "Documents"). Per-client `DriveName` set on Client Directory rows; fallback via `FALLBACK_DRIVE_NAME`. |
+| Client Directory list | `2a5613f1-6193-4c04-8a3d-d606617fb411` on BCR GROUP site |
 
 Endpoints:
 - Bot: `POST https://func-bcr-bot-dev-vyyintffz6ehq.azurewebsites.net/api/messages`
+- Bot Personal Tab HTML: `GET https://func-bcr-bot-dev-vyyintffz6ehq.azurewebsites.net/api/mydocs?userObjectId=<guid>&theme=<theme>` (anonymous, called by Teams)
 - Ingestion health: `GET https://func-bcr-ingest-dev-vyyintffz6ehq.azurewebsites.net/api/health`
-- Ingestion: `POST https://func-bcr-ingest-dev-vyyintffz6ehq.azurewebsites.net/api/ingest`
+- Ingestion (single doc): `POST https://func-bcr-ingest-dev-vyyintffz6ehq.azurewebsites.net/api/ingest` (Bearer JWT)
+- Ingestion (batch): `POST https://func-bcr-ingest-dev-vyyintffz6ehq.azurewebsites.net/api/ingest/batch` (Bearer JWT)
+- Ingestion user-target: `GET https://func-bcr-ingest-dev-vyyintffz6ehq.azurewebsites.net/api/user-target?userAadObjectId=<guid>` (Bearer JWT, called by bot for the Personal Tab)
 
 ---
 
@@ -140,15 +177,22 @@ bcr-ledger-agent/
 The ingestion API sends each document's **content** (PDF / image / text) to
 Claude (Anthropic Messages API) together with a tool schema generated from the
 folder taxonomy. The model returns a category id, an optional `year`/`month`,
-and a confidence score. The category id maps to a literal SharePoint path via
-[`buildFolderPath`](packages/shared/src/parsers/folderTaxonomy.ts); `dated`
-categories get a nested `YYYY/MM` leaf. If confidence is below
+a confidence score, and an optional `parties[]` array (seller/buyer/issuer/
+recipient with NIP + company name). The category id maps to a literal
+SharePoint path via [`buildFolderPath`](packages/shared/src/parsers/folderTaxonomy.ts);
+`dated` categories get a nested `YYYY/MM` leaf. If confidence is below
 `ANTHROPIC_CONFIDENCE_THRESHOLD` (default `0.6`), or no AI is configured, the
 deterministic fallback routes the file to `98_Nieposortowane/RRRR/MM/`.
 
-Invoice direction (sales vs. purchase) is resolved by giving the model the
-client's identity (`CLIENT_COMPANY_NAME` + `CLIENT_NIP`): if the client is the
-seller it is `Faktura sprzedaży`, if the buyer it is `Faktura zakupu`.
+**Client identity is injected per request** via `ClassifierContext.client`
+(populated from the pre-resolved routing decision). When present, Claude
+knows the client's NIP/name and can decide invoice direction (sales vs
+purchase) directly. When absent (fallback routing), Claude extracts
+`parties[]` without deciding direction and
+[`ClientResolver.resolvePostClassification`](packages/document-ingestion/src/services/clientResolver.ts)
+derives direction from party role vs client NIP — flipping
+`faktury_sprzedazy`/`faktury_zakupu`/`nieposortowane` categories when the
+resolved client's NIP matches a party's role in the document.
 
 | Kategoria (id) | Folder docelowy | Datowany |
 |---|---|---|
@@ -181,12 +225,24 @@ by that single catalog, so they can never drift apart.
 
 Three Adaptive Cards (see [`packages/teams-bot/src/bot/responseBuilder.ts`](packages/teams-bot/src/bot/responseBuilder.ts)):
 
-- **Help / welcome** — "📂 Asystent Archiwizacji Dokumentów" + Polish pattern list
-- **Success** — "✅ Zarchiwizowano **<plik>**" + Typ / Pewność / Folder / "Otwórz w SharePoint" button
-- **Failure** — "⚠️ Nie udało się zarchiwizować pliku **<plik>**" + error reason
+- **Help / welcome** — "📂 Asystent Archiwizacji Dokumentów" + short
+  description of content-based classification (no more filename patterns).
+- **Batch result table** — one card per Teams activity, one row per
+  attachment: **Dokument · Folder · Pewność · Uzasadnienie**, plus an
+  "Otwórz" action per uploaded file.
+- **Failure** — rejected items in the same table get an error reason
+  instead of a folder.
+
+**Personal Tab “Moje dokumenty”** ([`packages/teams-bot/src/functions/mydocs.ts`](packages/teams-bot/src/functions/mydocs.ts)):
+calls the ingest function's `/api/user-target` endpoint to resolve the
+user → client, then renders a themed HTML page (Teams SDK, light/dark/
+contrast) with an "Otwórz w SharePoint" button that deep-links via
+`microsoftTeams.app.openLink`. SharePoint can't be iframed cross-origin,
+so we deep-link out instead of embedding.
 
 Teams app metadata (Polish, see [`teams-app/manifest.json`](teams-app/manifest.json)):
 - App name: **Asystent BCR** / **Asystent Archiwizacji Dokumentów BCR**
+- Static tab: **Moje dokumenty** (`scopes: ["personal"]`)
 - Command list: `/pomoc`
 
 ---
@@ -239,15 +295,18 @@ cd teams-app && python3 _make_icons.py        # one-time
 
 ---
 
-## Current state (2026-06-17)
+## Current state (2026-07-16)
 
-- ✅ All 11 Azure resources deployed
-- ✅ Bot + ingestion functions running, **all Polish localization deployed**
+- ✅ All Azure resources deployed to `dev`
+- ✅ Bot + ingestion functions running, all Polish localization deployed
 - ✅ Key Vault references resolve
-- ✅ SharePoint grants complete (both Graph app role + per-site write to the MI)
-- ✅ End-to-end smoke test passing — `Faktura_03_2026.pdf` lands in `Faktury/2026/03/`
-- ✅ Teams app package built: [`artifacts/teams-app.zip`](artifacts/teams-app.zip) (manifest v0.1.1, Bot App ID injected, icons included, `packageName` removed for Teams v1.17 schema compliance)
-- ⏳ **Pending:** Teams Admin (Roman, Global Administrator) to upload the zip via <https://admin.teams.microsoft.com> → Teams apps → Manage apps → Upload new app, and optionally publish org-wide / pin via Setup policies.
+- ✅ SharePoint grants complete on **TEST**, **BCR GROUP**, and **PESKOVOI** sites (Sites.Selected app role + per-site write to the MI)
+- ✅ Multi-tenant Client Directory list live on BCR GROUP site (id `2a5613f1-6193-4c04-8a3d-d606617fb411`) with the PESKOVOI (0002) row populated — NIP `9571185285`, 5 company aliases, Yahor's AAD id in `UserAadObjectIds`
+- ✅ Two-phase resolver in production: pre-classification (by `userAadObjectId`) + post-classification (fallback → client promotion via party NIP, invoice-direction flip via party role)
+- ✅ Personal Tab `/api/mydocs` deployed — verified rendering PESKOVOI info for Yahor's AAD id
+- ✅ End-to-end smoke test passing: KSeF purchase invoice `8652567240-20260217-6672A3400000-FD 5.pdf` → resolved as PESKOVOI via user id → Claude classified `faktury_zakupu` → filed at `01_Faktury/02_Faktury_zakupu/2026/02/` in PESKOVOI's site
+- ✅ Teams app package rebuilt at [`artifacts/teams-app.zip`](artifacts/teams-app.zip) (manifest v0.1.5 with `staticTabs`, Bot App ID injected)
+- ⏳ **Pending:** re-sideload the v0.1.5 app package via Teams Admin Center to enable the Personal Tab for existing users; onboarding of additional client rows in the Client Directory as clients come on board.
 
 ---
 
@@ -266,7 +325,7 @@ cd teams-app && python3 _make_icons.py        # one-time
 
 5. **`resourceId` in `appRoleAssignments` POST body** must be the **Microsoft Graph SP's object id in this tenant** (`d36dca77-…` for BCR Group EU), NOT the Graph app id `00000003-…` and NOT a user object id.
 
-6. **SharePoint drive name is locale-dependent.** Polish tenants use `Dokumenty`, not `Documents`. Always look up via `GET /sites/{id}/drives`. Currently set via env var `SHAREPOINT_DRIVE_NAME=Dokumenty`.
+6. **SharePoint drive name is locale-dependent.** Polish tenants use `Dokumenty`, not `Documents`. Always look up via `GET /sites/{id}/drives`. Per-client drive names live on Client Directory rows (`DriveName` column); the fallback bucket's is `FALLBACK_DRIVE_NAME`.
 
 7. **`config-zip` flake.** Single-shot 24 MB blob PUT to storage can hit "Bad Request" / connection timeout on slow networks. Just retry once; succeeds.
 
@@ -285,6 +344,14 @@ cd teams-app && python3 _make_icons.py        # one-time
 14. **`@anthropic-ai/sdk` must be ≥ 0.40** for typed PDF `document` content blocks. The pinned `0.32.1` lacked `DocumentBlockParam`/`ContentBlockParam`; upgraded to `^0.104.2`. Content blocks are typed as `Anthropic.Messages.ContentBlockParam`.
 
 15. **Stale nested workspace copy.** Yarn left a physical (non-symlink) copy of `@bcr/shared` at `packages/document-ingestion/node_modules/@bcr/shared` that shadowed the live package, so `tsc -b` kept seeing old types after editing shared. Fix: `rm -rf packages/document-ingestion/node_modules/@bcr/shared` (resolution then falls back to the root symlink) — or re-run `yarn install`.
+
+16. **Teams channels are a footgun for bot file uploads.** Files dropped into a Teams channel (drag-drop OR paperclip on channel composer) go straight into `Shared Documents/<ChannelName>/` on the Team's own SharePoint site and **never reach the bot** — `activity.attachments` only contains the `@mention` HTML (`contentType: text/html`). Bot delivery of file bytes only works in **1:1 DMs**. Channel-based routing was designed, briefly implemented, and removed after live testing; user-identity routing (`UserAadObjectIds`) is the only functional path.
+
+17. **Two-phase resolution.** The ingestion pipeline resolves the target client **twice** — once from the envelope before calling Claude (so client identity can be primed into the prompt), and once after (using extracted `parties[]` to promote fallback uploads or flip invoice direction). Keeping these separate is important: any refinement failure degrades to the pre-resolved routing so uploads never block on the second phase.
+
+18. **Client Directory list dedup is fail-closed.** If the same NIP or AAD id appears on two different Directory rows, the reader removes the ambiguous key from the lookup maps and logs a warning. Better to fall back than to mis-file into the wrong client's SharePoint site. Onboarding admins should watch for duplicate-warning traces in App Insights.
+
+19. **`config-zip` → blob workaround.** When Kudu upload keeps timing out ("Bad Request" or "Connection aborted"), the fix is to upload the zip directly to the storage account (`stbcrdev...`, container `function-releases`) with `az storage blob upload --auth-mode login`, generate a long-lived SAS with the account key (user-delegation SAS is capped at 7 days), and set `WEBSITE_RUN_FROM_PACKAGE=<sas url>` on the function app + restart. Bypasses Kudu entirely.
 
 ---
 

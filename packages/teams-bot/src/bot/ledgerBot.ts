@@ -60,6 +60,28 @@ export class LedgerBot extends ActivityHandler {
     const attachments = filterFileAttachments(activity.attachments ?? []);
 
     if (attachments.length === 0) {
+      // Debug: log the raw attachment shapes so we can diagnose why nothing
+      // passed the filter (Teams channel @mention flows have different
+      // payloads than 1:1 chats). Kept as `info` so we can query it via
+      // App Insights without turning on debug for the whole app.
+      const rawShapes = (activity.attachments ?? []).map((a) => ({
+        contentType: a.contentType,
+        name: a.name,
+        hasContentUrl: Boolean(a.contentUrl),
+        contentKeys:
+          a.content && typeof a.content === 'object'
+            ? Object.keys(a.content as object).slice(0, 20)
+            : typeof a.content,
+      }));
+      this.log.info(
+        {
+          conversationId: activity.conversation?.id,
+          teamsChannelId: activity.channelData?.channel?.id,
+          rawAttachmentCount: (activity.attachments ?? []).length,
+          rawAttachmentShapes: rawShapes,
+        },
+        'no file attachments passed filter — sending help card',
+      );
       await context.sendActivity(
         MessageFactory.attachment(CardFactory.adaptiveCard(buildHelpCard())),
       );
@@ -69,6 +91,7 @@ export class LedgerBot extends ActivityHandler {
     const turnLog = this.log.child({
       activityId: activity.id,
       conversationId: activity.conversation?.id,
+      teamsChannelId: activity.channelData?.channel?.id,
       attachmentCount: attachments.length,
     });
 
@@ -118,6 +141,8 @@ export class LedgerBot extends ActivityHandler {
             channelId: activity.channelId ?? 'msteams',
             conversationId: activity.conversation?.id ?? '',
             activityId: activity.id ?? '',
+            // Present for team-channel messages, undefined for 1:1 personal chats.
+            teamsChannelId: activity.channelData?.channel?.id,
             userAadObjectId: activity.from?.aadObjectId,
             userDisplayName: activity.from?.name,
           },
