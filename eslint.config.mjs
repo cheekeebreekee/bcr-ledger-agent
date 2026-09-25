@@ -10,7 +10,9 @@ export default [
       parserOptions: {
         ecmaVersion: 2022,
         sourceType: 'module',
-        project: ['./packages/*/tsconfig.json'],
+        // Not the package tsconfigs: they exclude *.test.ts (kept out of dist), so
+        // tests would fail to parse. tsconfig.eslint.json covers src/ and tests.
+        project: ['./tsconfig.eslint.json'],
       },
     },
     plugins: {
