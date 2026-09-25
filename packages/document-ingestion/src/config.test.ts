@@ -23,7 +23,8 @@ describe('loadIngestionConfig', () => {
   });
 
   it('fails fast, naming the variable, when a required setting is missing', () => {
-    const { QUARANTINE_SITE_PATH: _omit, ...missing } = env;
+    const missing: NodeJS.ProcessEnv = { ...env };
+    delete missing['QUARANTINE_SITE_PATH'];
     expect(() => loadIngestionConfig(missing)).toThrow(/QUARANTINE_SITE_PATH/);
   });
 });

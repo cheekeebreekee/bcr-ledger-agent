@@ -132,25 +132,3 @@ export interface IngestionBatchResponsePayload {
   readonly status: 'completed';
   readonly results: readonly IngestionBatchItemResult[];
 }
-
-/**
- * Response of `GET /api/user-target?userAadObjectId={guid}`. Tells the
- * caller (currently the bot's Personal Tab handler) which SharePoint site
- * a given Teams user belongs to, so the tab can send them there directly.
- */
-export interface UserTargetResponsePayload {
-  /** Directory client id, or the fallback client id when no user match. */
-  readonly clientId: string;
-  /** Human-readable client name (from `Title` or fallback title). */
-  readonly title: string;
-  /** How the client was resolved: `'directory'` for a user match, `'fallback'` otherwise. */
-  readonly source: 'directory' | 'fallback';
-  /** SharePoint hostname, e.g. `bcrgroupeu.sharepoint.com`. */
-  readonly siteHostname: string;
-  /** Site path, e.g. `/sites/0002PESKOVOISp.zo.o.-Ksigowo`. */
-  readonly sitePath: string;
-  /** Drive display name (Polish locale usually `Dokumenty`). */
-  readonly driveName: string;
-  /** Best-effort deep link to the client's document library homepage. */
-  readonly sharepointWebUrl: string;
-}
