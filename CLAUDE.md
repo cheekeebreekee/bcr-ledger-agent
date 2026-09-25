@@ -56,9 +56,15 @@ Local run (two processes; `prestart` builds, and `@bcr/shared` must be built fir
 ```bash
 cp packages/teams-bot/local.settings.json.example packages/teams-bot/local.settings.json
 cp packages/document-ingestion/local.settings.json.example packages/document-ingestion/local.settings.json
-yarn start:bot            # http://localhost:3978/api/messages  (point Bot Framework Emulator here)
+yarn start:bot            # http://localhost:3978/api/messages
 yarn start:ingestion      # http://localhost:7071/api/ingest/batch
 ```
+
+The Bot Framework Emulator no longer gets a file through: the gate accepts only a Teams 1:1 chat
+from the BCR tenant with a GUID `aadObjectId`, which Emulator activities lack (silence in
+`enforce`; in a local `BOT_GATE_MODE=log`, ingestion's source check still answers 400). Test bot
+turns with `TestAdapter` (`ledgerBot.test.ts`) and ingestion with a direct call, as in
+`docs/local-development.md`.
 
 Deploy: `infrastructure/deploy.sh <env>` (`yarn deploy:prod`) deploys Bicep, then zip-deploys both
 Function Apps; `deploy.yml` does the same via Azure OIDC. Both are for a **new** environment only,

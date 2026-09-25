@@ -85,8 +85,8 @@ Each `packages/*` is independently buildable and deployable.
 
 ## Quick start (local)
 
-Requirements: **Node 22 LTS**, **Yarn 4**, **Azure Functions Core Tools v4**,
-**Azure CLI**, and a Bot Framework Emulator install.
+Requirements: **Node 22 LTS**, **Yarn 4**, **Azure Functions Core Tools v4** and
+**Azure CLI**.
 
 ```bash
 # 1. Install deps for all workspaces
@@ -104,8 +104,10 @@ yarn start:bot           # http://localhost:3978/api/messages
 yarn start:ingestion     # http://localhost:7071/api/ingest/batch
 ```
 
-Then point the **Bot Framework Emulator** at `http://localhost:3978/api/messages`
-and drag any file named like `Invoice_03_2026.pdf` into the chat.
+The Bot Framework Emulator cannot get a file filed any more: the bot's gate accepts only a
+Teams 1:1 chat from the BCR tenant with a user object id, and Emulator activities carry none of
+that. [`docs/local-development.md`](./docs/local-development.md) shows what works locally: the
+bot's `TestAdapter` tests for card work, and a direct call to the ingestion API.
 
 ---
 

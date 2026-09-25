@@ -18,7 +18,7 @@ exact UI path (and CLI equivalent) where you can find or generate it.
 | **Yarn 4 via Corepack** | 4.3.1 | `corepack enable && corepack prepare yarn@4.3.1 --activate` |
 | **Azure CLI** | ≥ 2.65 | <https://learn.microsoft.com/cli/azure/install-azure-cli> |
 | **Azure Functions Core Tools** | bundled per workspace | installed by `yarn install` |
-| **Bot Framework Emulator** *(optional, for local testing)* | latest | <https://github.com/microsoft/BotFramework-Emulator/releases> |
+| **Bot Framework Emulator** *(optional)* | latest | <https://github.com/microsoft/BotFramework-Emulator/releases>. It cannot get a file through the bot's gate; see [`local-development.md`](./local-development.md). |
 | **`jq`** | any | `brew install jq` |
 
 You will also need:
@@ -710,7 +710,7 @@ union requests, exceptions, traces
 ## 11. Where to go next
 
 - [`local-development.md`](./local-development.md) — running both functions
-  locally + Emulator + curl recipes.
+  locally, what the Emulator cannot do, and curl recipes.
 - [`security.md`](./security.md) — threat model, secrets inventory,
   compliance checklist.
 - [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — full sequence diagram and
