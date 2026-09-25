@@ -147,6 +147,11 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
 
-# Packaging staging (tools/package-function.mjs) and harness worktrees
+# Build output of tools/package-function.mjs and the teams-app build, never
+# committed: a tracked zip is silently put back at the deploy path by any
+# `git checkout`, `git restore` or `git stash`, and the July builds were.
+# Build them fresh (teams-app/README.md, tools/package-function.mjs).
+artifacts/*.zip
 artifacts/staging-*/
+# Harness worktrees
 .claude/worktrees/
