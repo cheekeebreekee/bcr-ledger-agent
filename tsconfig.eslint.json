@@ -1,0 +1,15 @@
+{
+  // Lint-only project. The per-package tsconfigs exclude `*.test.ts` so tests
+  // stay out of `dist`, but ESLint's `parserOptions.project` needs every linted
+  // file in some program — otherwise each test file is a "file was not found"
+  // parsing error. Never built: no emit, not composite.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": ["packages/*/src/**/*.ts"]
+}

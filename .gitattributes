@@ -1,0 +1,7 @@
+# Text is stored and checked out with LF everywhere. infrastructure/deploy.sh and the
+# tools/*.mjs operator scripts start with a shebang, and a CRLF checkout breaks them.
+* text=auto eol=lf
+
+# Binary: never diff or convert.
+*.png binary
+*.zip binary
