@@ -11,6 +11,7 @@ import {
   findDuplicates,
   findTeamForSite,
   folderAtDriveRoot,
+  forbiddenTargetReasons,
   healthExpectations,
   healthSatisfies,
   isSiteCollectionPath,
@@ -207,6 +208,73 @@ describe('findDuplicates', () => {
     assert.deepEqual(byKind('userId').map((d) => d.listItemIds), [['1', '2']]);
     assert.deepEqual(byKind('site').map((d) => d.listItemIds), [['1', '3']]);
     assert.deepEqual(byKind('target').map((d) => d.listItemIds), [['1', '3']]);
+  });
+
+  test('a DriveId or TeamId on two client rows is a conflict, case-folded (C4); admin rows have none', () => {
+    const bound = (id, site, drive, teamId, extra = {}) =>
+      parseDirectoryRow(
+        item(id, { ClientId: `00${id}`, NIP: `000000000${id}`, SitePath: site, DriveId: drive, TeamId: teamId, ...extra }),
+      );
+    const d = findDuplicates([
+      bound(1, '/sites/A', 'b!Drive', TEAM_A),
+      bound(2, '/sites/B', 'B!DRIVE', g('a0b2')),
+      bound(3, '/sites/C', 'b!other', TEAM_A.toUpperCase()),
+      bound(4, '', 'b!Drive', TEAM_A, { IsAdmin: true }),
+    ]);
+    const of = (k) => d.filter((x) => x.kind === k).map((x) => x.listItemIds);
+    assert.deepEqual(of('driveId'), [['1', '2']]);
+    assert.deepEqual(of('teamId'), [['1', '3']]);
+    const a = assessRow(rowA(), factsA(), ctxA({ duplicates: d }));
+    assert.ok(skipCodes(a).includes('duplicate_driveId') && skipCodes(a).includes('duplicate_teamId'));
+  });
+});
+
+describe('forbiddenTargetReasons', () => {
+  const DIR_COLLECTION = g('d01');
+  const guard = (over = {}) => ({
+    forbiddenSitePaths: new Set(['/sites/bcrgroup', '/sites/quarantine']),
+    tenantHost: 'contoso.sharepoint.com',
+    directorySiteCollectionId: DIR_COLLECTION,
+    ...over,
+  });
+  const site = (collection, path = '/sites/0001CLIENTA', host = 'contoso.sharepoint.com') => ({
+    id: `${host},${collection},${g('0e0')}`,
+    webUrl: `https://${host}${path}`,
+  });
+
+  test('nothing forbids a client row on its own site', () => {
+    assert.deepEqual(forbiddenTargetReasons(rowA(), site(g('5a1')), guard()), []);
+  });
+
+  test('by path, by host, and by the site Graph resolves', () => {
+    const why = (row, s, g2 = guard()) => forbiddenTargetReasons(row, s, g2).join(' | ');
+    assert.match(why(rowA({ SitePath: '/sites/BCRGROUP' })), /forbidden target/);
+    assert.match(why(rowA({ SitePath: '/Sites//Quarantine/' })), /forbidden target/);
+    assert.match(why(rowA({ SiteHostname: 'fabrikam.sharepoint.com' })), /not contoso\.sharepoint\.com/);
+    // Whatever the path says: the Directory's collection, an alias of a
+    // forbidden site, a sub-site of one, another host.
+    assert.match(why(rowA(), site(DIR_COLLECTION.toUpperCase())), /Client Directory's own site collection/);
+    assert.match(why(rowA(), site(g('5a1'), '/sites/BCRGROUP')), /resolves to \/sites\/bcrgroup/);
+    assert.match(why(rowA(), site(g('5a1'), '/sites/Quarantine/sub')), /resolves to \/sites\/quarantine/);
+    assert.match(why(rowA(), site(g('5a1'), '/sites/0001CLIENTA', 'fabrikam.sharepoint.com')), /host fabrikam/);
+    assert.match(why(rowA(), { id: 'not-three-parts', webUrl: 'https://contoso.sharepoint.com/sites/x' }), /cannot be checked/);
+  });
+
+  test('an unresolved site and an admin row add nothing; the checks need no resolution', () => {
+    assert.deepEqual(forbiddenTargetReasons(rowA(), { error: '404' }, guard()), []);
+    assert.deepEqual(forbiddenTargetReasons(rowA({ IsAdmin: true, SitePath: '/sites/BCRGROUP' }), undefined, guard()), []);
+    assert.equal(forbiddenTargetReasons(rowA({ SitePath: '/sites/bcrgroup' }), undefined, guard()).length, 1);
+  });
+
+  test('assessRow skips a row resolving to BCR GROUP and gives it no grant advice', () => {
+    const a = assessRow(
+      rowA(),
+      factsA({ site: site(DIR_COLLECTION), permissions: null }),
+      ctxA(guard()),
+    );
+    assert.ok(skipCodes(a).includes('forbidden_target'));
+    assert.equal(a.evidence.writeGrant, 'n/a');
+    assert.equal(a.proposed.TeamId, TEAM_A, 'the proposal is still shown, never applied');
   });
 });
 
@@ -498,6 +566,15 @@ describe('assessRow', () => {
     assert.ok(skipCodes(assessRow(rowA(), unreadable, ctxA())).includes('guest_memberships_unreadable'));
   });
 
+  test('a client row without RootFolder, DriveId and TeamId is reported as routing nobody (C3)', () => {
+    assert.ok(codes(assessRow(rowA(), factsA(), ctxA())).includes('warn:unbound_target'));
+    const half = assessRow(rowA({ RootFolder: CHANNEL, DriveId: DRIVE_A }), factsA(), ctxA());
+    assert.ok(codes(half).includes('warn:unbound_target'), 'one missing field is enough');
+    const bound = rowA({ RootFolder: CHANNEL, DriveId: DRIVE_A, TeamId: TEAM_A });
+    assert.ok(!codes(assessRow(bound, factsA(), ctxA())).includes('warn:unbound_target'));
+    assert.ok(!codes(assessRow(rowA({ IsAdmin: true }), {}, ctxA())).includes('warn:unbound_target'));
+  });
+
   test('a duplicate key skips; a duplicate user id only warns', () => {
     const dups = [
       { kind: 'nip', key: '0000000001', listItemIds: ['1', '7'] },
@@ -602,6 +679,31 @@ describe('buildPlan', () => {
       assert.equal(r.action, 'SKIP');
       assert.ok(r.reasons.some((x) => x.code === 'target_conflict'), JSON.stringify(r.reasons));
     }
+  });
+
+  test('two rows on different sites that would end with one DriveId or TeamId are both skipped (C4)', () => {
+    const twin = parseDirectoryRow(item(2, { ClientId: '0002', NIP: '0000000002', SitePath: '/sites/0002ALIAS' }));
+    const noGuests = { members: [], owners: [], memberOfByUser: new Map() };
+    // Both sites lead to Team A and its drive: the second is an alias.
+    const p = plan([rowA(), twin], { 1: factsA(noGuests), 2: factsA(noGuests) });
+    for (const r of p.rows) {
+      assert.equal(r.action, 'SKIP');
+      const details = r.reasons.filter((x) => x.code === 'target_conflict').map((x) => x.detail).join(' | ');
+      assert.match(details, /(DriveId|TeamId) would equal that of row\(s\) [12]/);
+    }
+
+    // A row already bound to that Team keeps it; the newcomer is skipped.
+    const bound = rowA({ RootFolder: CHANNEL, DriveId: DRIVE_A, TeamId: TEAM_A });
+    const q = plan([bound, twin], { 1: factsA(noGuests), 2: factsA(noGuests) });
+    assert.deepEqual(q.rows.map((r) => r.action), ['NOOP', 'SKIP']);
+  });
+
+  test('validatePlan refuses a PATCH that leaves the row unbound (C3)', () => {
+    const p = plan([rowA()], { 1: factsA() });
+    const unbound = structuredClone(p);
+    delete unbound.rows[0].patch.TeamId;
+    unbound.digest = planDigest(unbound.rows);
+    assert.ok(validatePlan(unbound).some((e) => /leaves TeamId empty/.test(e)));
   });
 
   test('validatePlan refuses a plan edited after propose', () => {

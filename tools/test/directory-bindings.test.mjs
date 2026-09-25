@@ -12,7 +12,10 @@ import { IDS, createTenant } from './tenant-fixture.mjs';
 
 const NOW = new Date('2026-09-25T10:00:00Z');
 const TOKEN = fakeJwt({ upn: 'operator@contoso.example', scp: 'Sites.Read.All', exp: 1_900_000_000 });
-const DIR_ARGS = ['--site-id', IDS.dirSite, '--list-id', IDS.list, '--ingest-app-ids', IDS.ingestApp];
+const GUARD_ARGS = ['--forbidden-site-paths', '/sites/BCRGROUP'];
+const DIR_ARGS = ['--site-id', IDS.dirSite, '--list-id', IDS.list, '--ingest-app-ids', IDS.ingestApp, ...GUARD_ARGS];
+/** The same, without the forbidden list. */
+const DIR_ONLY = DIR_ARGS.slice(0, -GUARD_ARGS.length);
 const HEALTH_URL = 'https://ingest.contoso.example/api/health';
 const HEALTH_ARGS = ['--health-url', HEALTH_URL];
 const P0_HEALTH = { status: 'ok', build: { phase: 'p0', routing: 'identity-only' } };
@@ -80,6 +83,77 @@ describe('directory-bindings check', () => {
       /not a \/sites\/<name> or \/teams\/<name> path/,
     );
     await assert.rejects(h.run(['check', ...DIR_ARGS, '--forbidden-site-paths', '/sites/x/../BCRGROUP']), CliError);
+  });
+
+  test('refuses to run without the forbidden list, or with a malformed guard value', async () => {
+    const h = harness();
+    for (const command of ['check', 'propose']) {
+      await assert.rejects(h.run([command, ...DIR_ONLY]), /FORBIDDEN_TARGET_SITE_PATHS \/ --forbidden-site-paths is required/);
+    }
+    await assert.rejects(h.run(['check', ...DIR_ARGS, '--quarantine-site-path', '/sites/Q/sub']), /--quarantine-site-path/);
+    await assert.rejects(h.run(['check', ...DIR_ARGS, '--tenant-host', 'contoso.example']), /--tenant-host/);
+    // The environment counts as the flag does.
+    const envOnly = await main(['check', ...DIR_ONLY], {
+      env: { GRAPH_TOKEN: TOKEN, FORBIDDEN_TARGET_SITE_PATHS: '/sites/BCRGROUP' },
+      print: () => {},
+      graphFetch: h.tenant.fetch,
+      now: () => NOW,
+    });
+    assert.equal(envOnly, 0);
+    assert.deepEqual(h.writes(), []);
+  });
+
+  test('never binds BCR GROUP, the quarantine or another host, whatever the path list says', async () => {
+    const h = harness();
+    const client = { Status: 'Active', DriveName: 'Dokumenty', RootFolder: '' };
+    h.tenant.state.items.set('6', {
+      ...client,
+      Title: 'Row on BCR GROUP',
+      ClientId: '0006',
+      NIP: '0000000006',
+      SiteHostname: IDS.host,
+      SitePath: '/sites/BCRGROUP',
+    });
+    h.tenant.state.items.set('7', {
+      ...client,
+      Title: 'Row on the quarantine',
+      ClientId: '0007',
+      NIP: '0000000007',
+      SiteHostname: IDS.host,
+      SitePath: '/sites/QUARANTINE',
+    });
+    h.tenant.state.items.set('8', {
+      ...client,
+      Title: 'Row on another host',
+      ClientId: '0008',
+      NIP: '0000000008',
+      SiteHostname: 'fabrikam.sharepoint.com',
+      SitePath: '/sites/0008CLIENT',
+    });
+    // BCR GROUP is not on this list: its site collection is the Directory's.
+    const file = join(h.outDir, 'guarded-plan.json');
+    const args = [...DIR_ONLY, '--forbidden-site-paths', '/sites/SomethingElse', '--out', file];
+    assert.equal(
+      await h.run(['propose', ...args, '--quarantine-site-path', '/sites/QUARANTINE', '--tenant-host', IDS.host]),
+      0,
+    );
+    const plan = JSON.parse(readFileSync(file, 'utf8'));
+    const byId = Object.fromEntries(plan.rows.map((r) => [r.listItemId, r]));
+    for (const id of ['6', '7', '8']) {
+      assert.equal(byId[id].action, 'SKIP', id);
+      assert.ok(byId[id].reasons.some((r) => r.code === 'forbidden_target'), `${id}: ${JSON.stringify(byId[id].reasons)}`);
+    }
+    assert.match(byId['6'].reasons.find((r) => r.code === 'forbidden_target').detail, /Client Directory's own site collection/);
+    assert.match(byId['8'].reasons.find((r) => r.code === 'forbidden_target').detail, /not contoso\.sharepoint\.com/);
+    assert.equal(byId['1'].action, 'PATCH', 'the clean row is unaffected');
+    assert.deepEqual(plan.guards, {
+      forbiddenSitePaths: ['/sites/quarantine', '/sites/somethingelse'],
+      quarantineSitePath: '/sites/quarantine',
+      tenantHost: IDS.host,
+      directorySiteCollectionId: IDS.dirSite.split(',')[1],
+    });
+    assert.match(h.out.text(), /site collection \S+ \(the Client Directory's\) is never bound/);
+    assert.deepEqual(h.writes(), []);
   });
 
   test('refuses flags that belong to another command', async () => {

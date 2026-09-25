@@ -12,6 +12,10 @@
  *   4  client C  — Public team → SKIP
  *   5  inactive  — not examined
  *
+ * The Client Directory list lives on BCR GROUP's site (`/sites/BCRGROUP`,
+ * the staff Team's root site), as it does in the tenant. `/sites/QUARANTINE`
+ * is a site with no Team.
+ *
  * Guests A and B are also in a security group that is not a Team; it must
  * not count against them. The "multi" guest is in Teams A and C, so it is
  * bound to neither. `memberOf` reports whether a group is a Team only when
@@ -45,7 +49,9 @@ export const IDS = Object.freeze({
   siteA: `${HOST},${g('5a1')},${g('5a2')}`,
   siteB: `${HOST},${g('5b1')},${g('5b2')}`,
   siteC: `${HOST},${g('5c1')},${g('5c2')}`,
-  siteStaff: `${HOST},${g('5f1')},${g('5f2')}`,
+  // BCR GROUP's site is the one the Client Directory list lives on.
+  siteStaff: `${HOST},${g('d01')},${g('d02')}`,
+  siteQuarantine: `${HOST},${g('5e1')},${g('5e2')}`,
   driveA: 'b!fakeDriveA',
   driveB: 'b!fakeDriveB',
   driveC: 'b!fakeDriveC',
@@ -111,6 +117,8 @@ export function createTenant() {
     ['/sites/0002CLIENTB', { id: IDS.siteB, team: IDS.teamB, drive: IDS.driveB, channel: IDS.channelB }],
     ['/sites/0003CLIENTC', { id: IDS.siteC, team: IDS.teamC, drive: IDS.driveC, channel: IDS.channelC }],
     ['/sites/BCRGROUP', { id: IDS.siteStaff, team: IDS.teamStaff, drive: 'b!fakeDriveStaff' }],
+    // Not a Team site: the staff-only quarantine.
+    ['/sites/QUARANTINE', { id: IDS.siteQuarantine, drive: 'b!fakeDriveQuarantine' }],
   ]);
   const siteById = new Map([...sites].map(([path, s]) => [s.id, { ...s, path }]));
   const siteByTeam = new Map([...sites].map(([path, s]) => [s.team, { ...s, path }]));
