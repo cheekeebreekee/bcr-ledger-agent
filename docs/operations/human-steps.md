@@ -818,13 +818,27 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
 ```bash
 aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
   | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
-  | where msg in ("document.filed", "document.quarantined", "directory.conflict", "ingestion.caller.rejected")
+  | where msg in ("document.filed", "document.quarantined", "document.quarantine_failed",
+      "directory.conflict", "ingestion.caller.rejected")
   | summarize count() by msg, reason = tostring(m.quarantineReason), kind = tostring(m.kind)' \
   <start of the window>
 ```
 
 `directory.conflict` should be empty, or explained by a decision from H-7.
-`ingestion.caller.rejected` should be empty.
+`ingestion.caller.rejected` and `document.quarantine_failed` should be empty.
+
+**After the window.** Phase 0 has **no alert rule**: alerting comes with the monitoring work in
+Phase 1. A failed quarantine write is fail-closed (the user gets "spróbuj ponownie", nothing is
+written anywhere else), but if the quarantine grant or `QUARANTINE_DRIVE_NAME` breaks, every
+unbound, staff and stale upload is refused and nobody is told. Until Phase 1, Yahor runs this
+every working day. Any row means: check H-6's grant and the quarantine library name first.
+
+```bash
+aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
+  | extend m = parse_json(message) | where tostring(m.msg) == "document.quarantine_failed"
+  | project timestamp, itemCount, quarantineReason = tostring(m.quarantineReason)' \
+  <24 hours ago, UTC>
+```
 
 **Rollback.**
 
@@ -902,7 +916,7 @@ Bicep drift fix (gate G1), not here.
 | Group-chat, foreign-tenant and missing-oid activities produce no download | The bot's gate tests; the H-11 group-chat check |
 | The tab IDOR is gone | Manifest 0.2.0 live; `/api/user-target` returns 404 |
 | `conflictBehavior=fail` everywhere | Unit tests; a second canary upload with the same name gets `_1` |
-| App-id pinning is live | `BOT_CALLER_APP_IDS` set; `ingestion.caller.rejected` appears for a token from any other app |
+| App-id pinning is live | `BOT_CALLER_APP_IDS` set (H-8 verify); the `authMiddleware` unit test "rejects the right role held by an app that is not on the allow-list" passes in CI; a live token from another app registration is refused with 403. Such a token lacks `Documents.Ingest`, so the role check refuses it first and logs no `ingestion.caller.rejected`. Do not grant `Documents.Ingest` to a test app to produce one. |
 | Every onboarded client's guest is bound, or quarantined with a known reason | H-7 and H-12 records in the incident's status table |
 | The IR-0 export is stored | H-2 verification |
 | The taxonomy folders at the library root of every client site the ingestion identity could write to are Owners-only | T-4b's status row lists every such site (PESKOVOI, TEST and each site IR-1 added); **Check permissions** for each client's guest returns *None* |

@@ -11,11 +11,14 @@ relative to the deploys is in [`human-steps.md`](human-steps.md#phase-0).
 
 ⚠️ **Three rules for every step on this page.**
 
-- **BCR GROUP stays Private, and this page does not change the team.** Its visibility, its
-  membership and its channels are untouched. [T-3](#t-3-confirm-bcr-group-is-private-read-only) only
-  reads. [T-4](#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root) and
+- **BCR GROUP stays Private.** This page never changes its visibility or its channels.
+  [T-3](#t-3-confirm-bcr-group-is-private-read-only) only reads.
+  [T-4](#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root) and
   [T-5](#t-5-lock-and-version-the-client-directory-list) change permissions on two things *inside*
-  its site: the ledger's own folders, and the routing list.
+  its site: the ledger's own folders, and the routing list. The only change to its membership is
+  in [T-7](#t-7-explain-or-remove-authoriseme), which takes `AuthoriseMe@` out of the team, and
+  only if Roman decides the account is not needed. Nothing else on this page, T-4b included,
+  touches BCR GROUP.
 - **Nothing here deletes or moves a client document.** Documents stay where IR-1 finds them, and
   IR-2 moves them later, with two people signing off.
 - **Save every "before" output.** The rollback needs it. Save it in the IR evidence store with the
