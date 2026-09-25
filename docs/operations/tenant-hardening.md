@@ -173,8 +173,9 @@ Do not change it from here. Take the exact time it became Private from the Purvi
 
 **Why.** Every upload the ledger could not route went to the root of the BCR GROUP team library,
 in the ledger's own taxonomy folders. Those folders hold documents from every client, and every
-member of the team can read them: `AuthoriseMe@` today, and anyone who becomes a member later. Stopping inheritance and leaving only the Owners closes that. The documents stay exactly
-where IR-1 finds them.
+member of the team can read them: `AuthoriseMe@` today, and anyone who becomes a member later.
+Stopping inheritance and leaving only the Owners closes that. The documents stay exactly where
+IR-1 finds them.
 
 **When.** Day 0, the day of [H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy), and
 before H-12. **Then again after

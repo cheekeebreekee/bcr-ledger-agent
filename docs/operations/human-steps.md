@@ -694,8 +694,8 @@ For every row, `check` reports:
 3 wins over 4. **At H-7, expect `0`**, or `4` with the `incomplete` rows listed, to act on as
 above. Nothing is bound yet (`DriveId` and `TeamId` stay empty until H-12), so Yahor's staff id
 on PESKOVOI's row, and any staff id on TEST's, is `not routing (unbound)` and does not make it
-exit 3. It is still a finding to decide on below; H-12 step 5 removes it. An exit 3 at H-7
-would mean a row is already bound and routes someone it should not: stop and tell Roman.
+exit 3. It is still a finding to decide on below; H-12 removes it (steps 5 and 8). An exit 3
+at H-7 would mean a row is already bound and routes someone it should not: stop and tell Roman.
 
 **Write grants read "unknown" with this token,** because reading site permissions needs
 `Sites.FullControl.All`. Verify each one **read-only**: in Graph Explorer, with
@@ -847,7 +847,8 @@ If it prints anything, correct that setting now with a merge-only
 mistake would stop the new build at cold start. The running ingestion ignores the new settings,
 so correcting them is harmless. It does read `CLIENT_DIRECTORY_SITE_ID`: if that one is reported,
 set it to the same site's three-part id,
-`g "$G/sites/$SP_HOST:/sites/BCRGROUPSp.zo.o?\$select=id" | jq -r .id`, and run T-5's `directory refresh failed` query for the next 15 minutes.
+`g "$G/sites/$SP_HOST:/sites/BCRGROUPSp.zo.o?\$select=id" | jq -r .id`, and run T-5's
+`directory refresh failed` query for the next 15 minutes.
 
 If you changed `MICROSOFT_APP_TYPE`, the TEST guest's `pomoc` came back.
 
@@ -1149,10 +1150,13 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    `propose`, and a health endpoint that does not report `build.routing=identity-only`. Before
    each PATCH it reads every guest it is about to bind again: the user must still be a `Guest`,
    and the Teams in their `memberOf` must be exactly the row's Team. Otherwise the row is
-   `stale` and skipped: run `propose` again. The apply log is a new file every run (an `--out`
-   that exists is refused), written safely before each PATCH; keep every one until H-15. A 403
-   from `propose` or `apply` means a permission from H-4a is missing (`Sites.ReadWrite.All` for
-   the write), or the signed-in person cannot edit the Client Directory list (Owners only, T-5).
+   `stale` and skipped: run `propose` again. A plan changed after `propose`, its `createdAt`
+   included, is refused too: an old plan is never edited, it is proposed again. The apply log is
+   a new file every run (an `--out` that exists is refused, as it is for `check` and `propose`,
+   so no report can replace an apply log), written safely before each PATCH; keep every one until
+   H-15. A 403 from `propose` or `apply` means a permission from H-4a is missing
+   (`Sites.ReadWrite.All` for the write), or the signed-in person cannot edit the Client
+   Directory list (Owners only, T-5).
 7. **Canary on TEST.** The TEST guest uploads a synthetic PDF. Expect:
    - it lands in TEST's `Dokumenty księgowe/…`, visible in the channel's files tab;
    - the card's link opens it there;
@@ -1195,7 +1199,8 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
      Sub-steps 6 and 7, only after the upload and after the canary guest has left the Team:
 
      ```bash
-     node tools/directory-bindings.mjs propose --write-verified <TEST sitePath> --write-verified <PESKOVOI sitePath>
+     node tools/directory-bindings.mjs propose \
+       --write-verified <TEST sitePath> --write-verified <PESKOVOI sitePath>
      # The dry run. Then run the same command again with --apply added.
      node tools/directory-bindings.mjs apply --plan tools/out/<plan from 6>.json \
        --health-url https://$INGEST.azurewebsites.net/api/health
