@@ -12,7 +12,7 @@
     "test": "jest --passWithNoTests",
     "test:coverage": "jest --coverage --passWithNoTests",
     "type-check": "tsc --noEmit",
-    "package": "yarn build && zip -r ../../artifacts/document-ingestion.zip dist host.json package.json node_modules"
+    "package": "yarn build && node ../../tools/package-function.mjs document-ingestion"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",

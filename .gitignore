@@ -146,3 +146,7 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Packaging staging (tools/package-function.mjs) and harness worktrees
+artifacts/staging-*/
+.claude/worktrees/
