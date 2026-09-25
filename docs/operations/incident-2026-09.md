@@ -124,7 +124,8 @@ item closes a named root cause. The human-run steps and their order are in
 | Bindings | `tools/directory-bindings.mjs` writes each row's guest ids, channel folder, `DriveId` and `TeamId` from Graph, and removes staff ids from client rows. | R1, R4, R5 |
 | Tenant | `{NIP}@` sign-in blocked and mailboxes unlicensed; ledger folders on BCR GROUP locked to Owners (T-4); the same folders at the library root of every client site the ingestion identity could write to locked to Owners (T-4b); the Directory list locked and versioned; guest and sharing defaults tightened. | R2, W2, W3, W4 (items already moved), W7 |
 
-**Until the Phase-0 build is live, without a deploy** (mandatory, from the day IR-0 is stored):
+**Until the Phase-0 build is live, without a deploy** (mandatory, from day 0; promotion is stopped
+at once, without waiting for IR-0, because stopping it deletes no past log data):
 
 - **Promotion off.** Promotion needs the parties that only the Claude classifier extracts, so
   `ANTHROPIC_ENABLED=false` on the running ingestion stops R3 at once, at the cost of every new

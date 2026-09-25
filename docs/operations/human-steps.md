@@ -83,8 +83,8 @@ Graph and SharePoint tokens are set up as described in
 |---|---|---|---|---|
 | H-0 | Automatic deploys stopped | Yahor | done, 25 Sep | — |
 | H-1 | GDPR: processor notice and breach register | Roman + IOD | by 26–28 Sep | — |
-| H-2 | IR-0: evidence export, stored immutably | Yahor, Global Admin, Roman | today | — |
-| H-3 | **Mandatory:** stop promotion with a setting | Yahor | as soon as H-2 is stored; H-5, H-6 and H-6b follow **the same working day** ([the bound](#h-3-stop-promotion-now-without-a-deploy)) | H-2 |
+| H-2 | IR-0: evidence export, stored immutably | Yahor, Global Admin, Roman | today; step 1 starts in parallel with H-3 | — |
+| H-3 | **Mandatory:** stop promotion with a setting | Yahor | **immediately, day 0**, without waiting for H-2; H-5, H-6 and H-6b follow **the same working day** ([the bound](#h-3-stop-promotion-now-without-a-deploy)) | — |
 | H-4 | Tenant hardening T-1 to T-9, T-4b included | per step | today–tomorrow | T-4, T-4b, T-5 before H-12; T-4 the day of H-3, checked again after H-6b; T-4b after H-3 is verified, before IR-2; T-1 before H-10 |
 | H-5 | Quarantine site | SharePoint Admin | the working day of H-3 | — |
 | H-6 | Ingestion identity write grant on quarantine | Global Admin | the working day of H-3 | H-5 |
@@ -141,7 +141,8 @@ never withdraws one.
 **Owner:** Roman (creates the store, as subscription Owner), Yahor (trace and Directory
 exports), Global Admin (Purview export and the Entra sign-in log). **When:** today. App Insights
 keeps 30 days, and each day of delay deletes a day of evidence. This must also happen **before
-H-9 and H-12**, because the Phase-0 code changes what is logged.
+H-9 and H-12**, because the Phase-0 code changes what is logged. H-3 does not wait for it: it
+deletes no past data, so it runs at once, and step 1 starts in parallel.
 
 What to export, and why each join works, is in
 [incident → IR-0](incident-2026-09.md#ir-0-preserve-the-evidence-first). Every script is
@@ -268,8 +269,11 @@ the IOD sets the right one before the policy is locked.
 
 ### H-3: Stop promotion now, without a deploy
 
-**Owner:** Yahor runs it; Roman is told. **When:** as soon as H-2 is stored, because IR-0 is
-copied before anything changes what the running build logs. **Mandatory.**
+**Owner:** Yahor runs it; Roman is told. **When:** immediately, on day 0, **without waiting for
+H-2**. It changes one setting and restarts the app. It deletes no past App Insights, Purview,
+Entra or Directory data, and every IR-0 export covers past data only, so it costs the evidence
+nothing; start H-2 step 1 (the trace export) in parallel. Every hour it waits, the running build
+can still file a document into another client's site. **Mandatory.**
 
 Until H-12 the running ingestion is the pre-Phase-0 build, and it still has content promotion
 (root cause R3): an upload it cannot route is filed into whichever client's NIP the document
@@ -479,7 +483,10 @@ jq -r '.[].name' "$H6B/fallback-before.json"
 ```
 
 Upload `$H6B` to the evidence store as in H-2 steps 5 and 6 (`--upload-dir "$H6B"`, then take
-the write access away again), and delete the local copy.
+the write access away again), and delete the local copy. H-3 does not wait for H-2, so the store
+may not exist yet. Then keep `$H6B` where it is, under the git-ignored `tools/out/` with the
+folder at mode 700 and the file at 600 (as created above), and go on with step 2. Upload it once
+H-2 step 5 has created the store, and only then delete the local copy.
 
 **2. Re-point.** The same site, library and folder as `QUARANTINE_*` in H-8. `FALLBACK_CLIENT_ID`
 is only a label and stays as it is. `appsettings set` merges, so nothing else changes.
