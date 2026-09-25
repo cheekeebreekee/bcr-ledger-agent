@@ -1,22 +1,26 @@
-import type { IngestionBatchItemResult, IngestionResponsePayload } from '@bcr/shared';
+import type { IngestionBatchItemResult, IngestionUploadResult } from '@bcr/shared';
+import { QUARANTINED_TEXT, escapeMarkdown, rejectionText } from './cardText';
 
 /**
  * Adaptive Card payloads. We hand-author the JSON (rather than using a
  * heavyweight template library) so the cards stay legible and easy to diff.
  *
- * All user-facing strings are in Polish — this bot is deployed to a Polish
- * client base. Filename conventions accept Polish keywords primarily, with
- * English equivalents as a fallback for tools that emit English names.
+ * All user-facing strings are Polish and fixed (see `cardText.ts`). A card
+ * lists allowed fields only — the filename, the category label, the folder
+ * inside the uploader's own space and a link to it — and every one of them
+ * goes through `escapeMarkdown()`. It never shows model free text, confidence,
+ * error messages, or anything about a quarantined document beyond its name.
  *
  * Schema reference: https://adaptivecards.io/explorer/
  */
 
 const ADAPTIVE_CARD_VERSION = '1.5';
+const SCHEMA = 'http://adaptivecards.io/schemas/adaptive-card.json';
 
 export function buildHelpCard(): unknown {
   return {
     type: 'AdaptiveCard',
-    $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+    $schema: SCHEMA,
     version: ADAPTIVE_CARD_VERSION,
     body: [
       {
@@ -28,8 +32,8 @@ export function buildHelpCard(): unknown {
       {
         type: 'TextBlock',
         text:
-          'Wyślij mi dokument w załączniku (PDF, JPG, PNG lub tekst) — ' +
-          'przeanalizuję jego treść i umieszczę w odpowiednim folderze w SharePoint.',
+          'Wyślij mi dokument w załączniku (PDF, JPG, PNG lub tekst) w tym prywatnym czacie — ' +
+          'przeanalizuję jego treść i umieszczę go w odpowiednim folderze Twojej firmy.',
         wrap: true,
       },
       {
@@ -45,130 +49,49 @@ export function buildHelpCard(): unknown {
       {
         type: 'TextBlock',
         text:
-          'Wskazówka: dokumenty, których nie da się jednoznacznie sklasyfikować, ' +
-          'trafiają do folderu „Nieposortowane” do ręcznego sprawdzenia. ' +
-          'W odpowiedzi otrzymasz kartę z kategorią, folderem docelowym oraz ' +
-          'krótkim uzasadnieniem wyboru.',
+          'Dokumenty, których nie da się jednoznacznie sklasyfikować, trafiają do folderu ' +
+          '„Nieposortowane” w Twoim zespole i są sprawdzane przez księgowego. ' +
+          'W odpowiedzi otrzymasz kartę z kategorią i folderem docelowym każdego pliku.',
         wrap: true,
         isSubtle: true,
         spacing: 'Medium',
       },
-    ],
-  };
-}
-
-export function buildSuccessCard(
-  result: NonNullable<IngestionResponsePayload['result']>,
-): unknown {
-  return {
-    type: 'AdaptiveCard',
-    $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
-    version: ADAPTIVE_CARD_VERSION,
-    body: [
       {
         type: 'TextBlock',
-        text: `✅ Zarchiwizowano **${result.finalFilename}**`,
-        size: 'Medium',
-        weight: 'Bolder',
+        text:
+          'Zarchiwizowane pliki znajdziesz w swoim zespole w Teams: ' +
+          'kanał „Dokumenty księgowe” → karta „Udostępnione”.',
         wrap: true,
-      },
-      {
-        type: 'FactSet',
-        facts: [
-          { title: 'Typ', value: result.classification.documentType },
-          {
-            title: 'Pewność',
-            value: `${Math.round(result.classification.confidence * 100)}%`,
-          },
-          { title: 'Folder', value: result.folderPath },
-          { title: 'Sklasyfikowano przez', value: result.classification.classifier },
-        ],
-      },
-    ],
-    actions: [
-      {
-        type: 'Action.OpenUrl',
-        title: 'Otwórz w SharePoint',
-        url: result.webUrl,
+        isSubtle: true,
+        spacing: 'Small',
       },
     ],
   };
 }
 
 /**
- * One consolidated summary table for a batch of documents. Each row shows
- * where the document was filed and the reasoning behind that classification,
- * so the user gets a single response instead of a card per file.
+ * One consolidated summary table for a batch of documents: one row per
+ * document, in the order given.
+ *
+ *  - uploaded: ✅ name | category label | folder, plus an "Otwórz" button
+ *    into the uploader's own space;
+ *  - quarantined: 📨 name | fixed "przekazano do weryfikacji" line | —, and
+ *    no link (the document is in a staff-only area);
+ *  - rejected: ⚠️ name | generic Polish message chosen by error code | —.
  */
 export function buildBatchResultCard(results: readonly IngestionBatchItemResult[]): unknown {
-  const uploaded = results.filter((r) => r.status === 'uploaded').length;
-  const rejected = results.length - uploaded;
+  const uploaded = results.filter((r) => r.status === 'uploaded' && r.result).length;
+  const quarantined = results.filter((r) => r.status === 'quarantined').length;
+  const rejected = results.length - uploaded - quarantined;
 
   const headerCell = (text: string) => ({
     type: 'TableCell',
     items: [{ type: 'TextBlock', text, weight: 'Bolder', wrap: true }],
   });
 
-  const cell = (items: unknown[]) => ({ type: 'TableCell', items });
-
-  const rows = results.map((item) => {
-    if (item.status === 'uploaded' && item.result) {
-      const { result } = item;
-      return {
-        type: 'TableRow',
-        cells: [
-          cell([{ type: 'TextBlock', text: `✅ ${result.finalFilename}`, wrap: true }]),
-          cell([{ type: 'TextBlock', text: result.folderPath, wrap: true }]),
-          cell([
-            {
-              type: 'TextBlock',
-              text: `${Math.round(result.classification.confidence * 100)}%`,
-              wrap: true,
-            },
-          ]),
-          cell([
-            {
-              type: 'TextBlock',
-              text: result.classification.documentType,
-              wrap: true,
-              isSubtle: true,
-            },
-          ]),
-        ],
-      };
-    }
-    return {
-      type: 'TableRow',
-      cells: [
-        cell([{ type: 'TextBlock', text: `⚠️ ${item.filename}`, wrap: true, color: 'Attention' }]),
-        cell([{ type: 'TextBlock', text: '—', wrap: true }]),
-        cell([{ type: 'TextBlock', text: '—', wrap: true }]),
-        cell([
-          {
-            type: 'TextBlock',
-            text: item.error?.message ?? 'Archiwizacja nie powiodła się',
-            wrap: true,
-            color: 'Attention',
-            isSubtle: true,
-          },
-        ]),
-      ],
-    };
-  });
-
-  const links = results
-    .filter((r): r is IngestionBatchItemResult & { result: NonNullable<IngestionBatchItemResult['result']> } =>
-      r.status === 'uploaded' && Boolean(r.result?.webUrl),
-    )
-    .map((r) => ({
-      type: 'Action.OpenUrl',
-      title: r.result.finalFilename,
-      url: r.result.webUrl,
-    }));
-
   return {
     type: 'AdaptiveCard',
-    $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+    $schema: SCHEMA,
     version: ADAPTIVE_CARD_VERSION,
     body: [
       {
@@ -180,7 +103,10 @@ export function buildBatchResultCard(results: readonly IngestionBatchItemResult[
       },
       {
         type: 'TextBlock',
-        text: `Zarchiwizowano: ${uploaded}  •  Błędy: ${rejected}`,
+        text:
+          `Zarchiwizowano: ${uploaded}  •  ` +
+          `Przekazano do weryfikacji: ${quarantined}  •  ` +
+          `Odrzucono: ${rejected}`,
         isSubtle: true,
         spacing: 'None',
         wrap: true,
@@ -189,51 +115,76 @@ export function buildBatchResultCard(results: readonly IngestionBatchItemResult[
         type: 'Table',
         firstRowAsHeaders: true,
         gridStyle: 'default',
-        columns: [{ width: 2 }, { width: 2 }, { width: 1 }, { width: 3 }],
+        columns: [{ width: 3 }, { width: 2 }, { width: 3 }],
         rows: [
           {
             type: 'TableRow',
-            cells: [
-              headerCell('Dokument'),
-              headerCell('Folder'),
-              headerCell('Pewność'),
-              headerCell('Uzasadnienie'),
-            ],
+            cells: [headerCell('Dokument'), headerCell('Kategoria'), headerCell('Folder')],
           },
-          ...rows,
+          ...results.map(buildRow),
         ],
       },
     ],
-    ...(links.length > 0 ? { actions: links } : {}),
   };
 }
 
-export function buildFailureCard(filename: string, errorMessage: string): unknown {
-  return {
-    type: 'AdaptiveCard',
-    $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
-    version: ADAPTIVE_CARD_VERSION,
-    body: [
-      {
-        type: 'TextBlock',
-        text: `⚠️ Nie udało się zarchiwizować pliku **${filename}**`,
-        size: 'Medium',
-        weight: 'Bolder',
-        color: 'Attention',
-        wrap: true,
-      },
-      {
-        type: 'TextBlock',
-        text: errorMessage,
-        wrap: true,
-        isSubtle: true,
-      },
-      {
-        type: 'TextBlock',
-        text: 'Spróbuj ponownie wysłać plik. Jeśli problem się powtórzy, skontaktuj się z zespołem wsparcia.',
-        wrap: true,
-        spacing: 'Medium',
-      },
+function buildRow(item: IngestionBatchItemResult) {
+  if (item.status === 'uploaded' && item.result) {
+    return uploadedRow(item.result);
+  }
+  if (item.status === 'quarantined') {
+    return row(textCell(`📨 ${escapeMarkdown(item.filename)}`), textCell(QUARANTINED_TEXT), dash());
+  }
+  return row(
+    textCell(`⚠️ ${escapeMarkdown(item.filename)}`, { color: 'Attention' }),
+    textCell(rejectionText(item.error?.code), { color: 'Attention', isSubtle: true }),
+    dash(),
+  );
+}
+
+function uploadedRow(result: IngestionUploadResult) {
+  const url = safeHttpsUrl(result.webUrl);
+  const documentCell = {
+    type: 'TableCell',
+    items: [
+      { type: 'TextBlock', text: `✅ ${escapeMarkdown(result.finalFilename)}`, wrap: true },
+      // The button title is fixed text: Action titles are not markdown, and a
+      // fixed label keeps the filename out of a second, unescaped place.
+      ...(url
+        ? [
+            {
+              type: 'ActionSet',
+              actions: [{ type: 'Action.OpenUrl', title: 'Otwórz', url }],
+            },
+          ]
+        : []),
     ],
   };
+  return row(
+    documentCell,
+    textCell(escapeMarkdown(result.classification.documentType)),
+    textCell(escapeMarkdown(result.folderPath), { isSubtle: true }),
+  );
+}
+
+function row(...cells: unknown[]) {
+  return { type: 'TableRow', cells };
+}
+
+function textCell(text: string, style: { color?: string; isSubtle?: boolean } = {}) {
+  return { type: 'TableCell', items: [{ type: 'TextBlock', text, wrap: true, ...style }] };
+}
+
+function dash() {
+  return textCell('—');
+}
+
+/** Only an absolute https URL becomes a button; anything else is dropped. */
+function safeHttpsUrl(raw: string): string | undefined {
+  try {
+    const url = new URL(raw);
+    return url.protocol === 'https:' ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
 }

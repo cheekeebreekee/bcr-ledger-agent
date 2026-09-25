@@ -4,10 +4,14 @@ import {
   createLogger,
   type IngestionBatchRequestPayload,
   type IngestionBatchResponsePayload,
-  type IngestionRequestPayload,
-  type IngestionResponsePayload,
-  type UserTargetResponsePayload,
+  LedgerAgentError,
 } from '@bcr/shared';
+
+/** The subset of undici's `request` the client uses; injectable for tests. */
+export type IngestionFetcher = (
+  url: string,
+  options: { method: 'POST'; headers: Record<string, string>; body: string },
+) => Promise<{ statusCode: number; body: { text(): Promise<string> } }>;
 
 export interface IngestionClientOptions {
   readonly baseUrl: string;
@@ -15,106 +19,88 @@ export interface IngestionClientOptions {
   readonly tenantId: string;
   readonly clientId: string;
   readonly clientSecret: string;
-  /** Optional override for tests. */
-  readonly fetcher?: typeof request;
+  /** Optional override for tests. Defaults to undici's `request`. */
+  readonly fetcher?: IngestionFetcher;
+  /**
+   * Optional override for tests. Defaults to MSAL client-credentials against
+   * `tenantId`, which caches the token and renews it before expiry.
+   */
+  readonly acquireToken?: () => Promise<string>;
 }
 
 /**
- * Thin HTTP client for the document-ingestion Function App.
+ * Thin HTTP client for the document-ingestion Function App. Its only call is
+ * `POST /api/ingest/batch`.
  *
- * Acquires an AAD token via MSAL **client-credentials** and caches it; MSAL
- * handles renewal so we just call `acquireTokenByClientCredential` on every
- * request and let the SDK return the cached token until it expires.
+ * Errors carry the HTTP status and nothing from the response body: the body
+ * could echo a filename or internal detail, and error messages end up in
+ * logs. The bot turns any failure into one generic Polish row per document.
  */
 export class IngestionClient {
   private readonly log = createLogger('bot/ingestionClient');
-  private readonly msal: ConfidentialClientApplication;
-  private readonly fetcher: typeof request;
+  private readonly fetcher: IngestionFetcher;
+  private readonly acquireToken: () => Promise<string>;
 
   constructor(private readonly opts: IngestionClientOptions) {
-    this.msal = new ConfidentialClientApplication({
-      auth: {
-        clientId: opts.clientId,
-        clientSecret: opts.clientSecret,
-        authority: `https://login.microsoftonline.com/${opts.tenantId}`,
-      },
-    });
     this.fetcher = opts.fetcher ?? request;
-  }
-
-  async ingest(payload: IngestionRequestPayload): Promise<IngestionResponsePayload> {
-    this.log.debug({ filename: payload.filename }, 'POST /api/ingest');
-    return this.post<IngestionResponsePayload>('/api/ingest', payload);
+    this.acquireToken = opts.acquireToken ?? msalClientCredentials(opts);
   }
 
   /**
    * Classifies and files several documents from the same Teams activity in a
    * single request. Returns one consolidated table of per-document outcomes.
    */
-  async ingestBatch(
-    payload: IngestionBatchRequestPayload,
-  ): Promise<IngestionBatchResponsePayload> {
+  async ingestBatch(payload: IngestionBatchRequestPayload): Promise<IngestionBatchResponsePayload> {
     this.log.debug({ documentCount: payload.documents.length }, 'POST /api/ingest/batch');
-    return this.post<IngestionBatchResponsePayload>('/api/ingest/batch', payload);
-  }
-
-  /**
-   * Resolve which SharePoint site a given Teams user's documents live in.
-   * Used by the bot's Personal Tab to deep-link the user to the right
-   * document library.
-   */
-  async getUserTarget(userAadObjectId: string): Promise<UserTargetResponsePayload> {
-    this.log.debug({ userAadObjectId }, 'GET /api/user-target');
-    const qs = new URLSearchParams({ userAadObjectId }).toString();
-    return this.get<UserTargetResponsePayload>(`/api/user-target?${qs}`);
-  }
-
-  private async post<T>(path: string, payload: unknown): Promise<T> {
-    return this.send<T>('POST', path, payload);
-  }
-
-  private async get<T>(path: string): Promise<T> {
-    return this.send<T>('GET', path);
-  }
-
-  private async send<T>(method: 'GET' | 'POST', path: string, payload?: unknown): Promise<T> {
     const token = await this.acquireToken();
-    const url = new URL(path, this.opts.baseUrl).toString();
+    const url = new URL('/api/ingest/batch', this.opts.baseUrl).toString();
 
     const { statusCode, body } = await this.fetcher(url, {
-      method,
+      method: 'POST',
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${token}`,
       },
-      ...(payload !== undefined ? { body: JSON.stringify(payload) } : {}),
+      body: JSON.stringify(payload),
     });
 
+    // Always drain the body so undici can reuse the connection.
     const responseText = await body.text();
-    let parsed: T;
-    try {
-      parsed = JSON.parse(responseText) as T;
-    } catch {
-      throw new Error(
-        `Ingestion API returned non-JSON response (HTTP ${statusCode}): ${responseText.slice(0, 200)}`,
-      );
-    }
 
     if (statusCode < 200 || statusCode >= 300) {
-      const errorMessage =
-        (parsed as { error?: { message?: string } })?.error?.message ?? 'unknown error';
-      throw new Error(`Ingestion API HTTP ${statusCode}: ${errorMessage}`);
+      this.log.warn({ statusCode }, 'ingestion API returned an error status');
+      throw new LedgerAgentError('IngestionFailed', `Ingestion API HTTP ${statusCode}`, 502);
     }
-    return parsed;
-  }
 
-  private async acquireToken(): Promise<string> {
-    const result = await this.msal.acquireTokenByClientCredential({
-      scopes: [this.opts.scope],
-    });
+    try {
+      return JSON.parse(responseText) as IngestionBatchResponsePayload;
+    } catch {
+      throw new LedgerAgentError(
+        'IngestionFailed',
+        `Ingestion API returned a non-JSON response (HTTP ${statusCode})`,
+        502,
+      );
+    }
+  }
+}
+
+function msalClientCredentials(opts: IngestionClientOptions): () => Promise<string> {
+  const msal = new ConfidentialClientApplication({
+    auth: {
+      clientId: opts.clientId,
+      clientSecret: opts.clientSecret,
+      authority: `https://login.microsoftonline.com/${opts.tenantId}`,
+    },
+  });
+  return async () => {
+    const result = await msal.acquireTokenByClientCredential({ scopes: [opts.scope] });
     if (!result?.accessToken) {
-      throw new Error('MSAL returned no access token for the ingestion API');
+      throw new LedgerAgentError(
+        'IngestionFailed',
+        'MSAL returned no access token for the ingestion API',
+        502,
+      );
     }
     return result.accessToken;
-  }
+  };
 }

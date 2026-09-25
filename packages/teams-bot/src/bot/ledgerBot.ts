@@ -9,15 +9,22 @@ import {
   createLogger,
   type IngestionBatchItemResult,
   type IngestionDocument,
+  type Logger,
 } from '@bcr/shared';
 import type { IngestionClient } from '../services/ingestionClient';
 import type { AttachmentDownloader } from '../services/attachmentDownloader';
 import { buildBatchResultCard, buildHelpCard } from './responseBuilder';
+import { DOWNLOAD_FAILED, INGESTION_FAILED } from './cardText';
+import { activityTenantId } from './gate';
 
 export interface LedgerBotDeps {
-  readonly ingestionClient: IngestionClient;
-  readonly attachmentDownloader: AttachmentDownloader;
+  readonly ingestionClient: Pick<IngestionClient, 'ingestBatch'>;
+  readonly attachmentDownloader: Pick<AttachmentDownloader, 'download'>;
 }
+
+type DownloadOutcome =
+  | { readonly ok: true; readonly document: IngestionDocument }
+  | { readonly ok: false; readonly failure: IngestionBatchItemResult };
 
 /**
  * The bot's brain. Three responsibilities:
@@ -26,11 +33,16 @@ export interface LedgerBotDeps {
  *   2. For each incoming message, detect file attachments, download them,
  *      and forward the whole set to the ingestion API in a single batch.
  *   3. Translate the batch response into one consolidated table card that
- *      shows, per document, where it was filed and why.
+ *      shows, per document, where it was filed.
+ *
+ * Which activities reach this class at all is decided earlier, by the gate
+ * middleware registered on the adapter (`gateMiddleware.ts`).
  *
  * We deliberately keep this class free of HTTP/SDK plumbing — that lives
  * in `functions/messages.ts` — so it stays trivially unit-testable with
  * a `TestAdapter`.
+ *
+ * Logs carry ids and counts only, never filenames or user names.
  */
 export class LedgerBot extends ActivityHandler {
   private readonly log = createLogger('bot/ledgerBot');
@@ -60,25 +72,14 @@ export class LedgerBot extends ActivityHandler {
     const attachments = filterFileAttachments(activity.attachments ?? []);
 
     if (attachments.length === 0) {
-      // Debug: log the raw attachment shapes so we can diagnose why nothing
-      // passed the filter (Teams channel @mention flows have different
-      // payloads than 1:1 chats). Kept as `info` so we can query it via
-      // App Insights without turning on debug for the whole app.
-      const rawShapes = (activity.attachments ?? []).map((a) => ({
-        contentType: a.contentType,
-        name: a.name,
-        hasContentUrl: Boolean(a.contentUrl),
-        contentKeys:
-          a.content && typeof a.content === 'object'
-            ? Object.keys(a.content as object).slice(0, 20)
-            : typeof a.content,
-      }));
+      // Kept as `info` so a "why did nothing upload" report can be answered
+      // from App Insights. Content types only — names are user data.
       this.log.info(
         {
+          activityId: activity.id,
           conversationId: activity.conversation?.id,
-          teamsChannelId: activity.channelData?.channel?.id,
           rawAttachmentCount: (activity.attachments ?? []).length,
-          rawAttachmentShapes: rawShapes,
+          rawAttachmentContentTypes: (activity.attachments ?? []).map((a) => a.contentType),
         },
         'no file attachments passed filter — sending help card',
       );
@@ -99,36 +100,14 @@ export class LedgerBot extends ActivityHandler {
 
     // Download every attachment first. A download failure for one file is
     // captured as a rejected row so it still shows up in the summary table
-    // rather than aborting the whole batch.
-    const documents: IngestionDocument[] = [];
-    const downloadFailures: IngestionBatchItemResult[] = [];
-
-    await Promise.all(
-      attachments.map(async (attachment) => {
-        const fileName = attachment.name ?? 'attachment.bin';
-        const childLog = turnLog.child({ filename: fileName });
-        try {
-          childLog.info('downloading attachment');
-          const { content, contentType } =
-            await this.deps.attachmentDownloader.download(attachment);
-          documents.push({
-            filename: fileName,
-            contentType,
-            contentBase64: content.toString('base64'),
-          });
-        } catch (err) {
-          childLog.error({ err }, 'failed to download attachment');
-          downloadFailures.push({
-            filename: fileName,
-            status: 'rejected',
-            error: {
-              code: 'DownloadFailed',
-              message: err instanceof Error ? err.message : 'Nieznany błąd',
-            },
-          });
-        }
-      }),
+    // rather than aborting the whole batch. `Promise.all` keeps the order.
+    const outcomes = await Promise.all(
+      attachments.map((attachment, attachmentIndex) =>
+        this.downloadOne(attachment, turnLog.child({ attachmentIndex })),
+      ),
     );
+    const documents = outcomes.flatMap((o) => (o.ok ? [o.document] : []));
+    const downloadFailures = outcomes.flatMap((o) => (o.ok ? [] : [o.failure]));
 
     let batchResults: IngestionBatchItemResult[] = [];
     if (documents.length > 0) {
@@ -137,7 +116,7 @@ export class LedgerBot extends ActivityHandler {
         const response = await this.deps.ingestionClient.ingestBatch({
           documents,
           source: {
-            tenantId: activity.channelData?.tenant?.id ?? activity.conversation?.tenantId ?? '',
+            tenantId: activityTenantId(activity) ?? '',
             channelId: activity.channelId ?? 'msteams',
             conversationId: activity.conversation?.id ?? '',
             activityId: activity.id ?? '',
@@ -151,11 +130,10 @@ export class LedgerBot extends ActivityHandler {
         batchResults = [...response.results];
       } catch (err) {
         turnLog.error({ err }, 'batch ingestion failed');
-        const message = err instanceof Error ? err.message : 'Archiwizacja nie powiodła się';
         batchResults = documents.map((doc) => ({
           filename: doc.filename,
           status: 'rejected',
-          error: { code: 'IngestionFailed', message },
+          error: { code: INGESTION_FAILED, message: 'Ingestion request failed' },
         }));
       }
     }
@@ -164,6 +142,28 @@ export class LedgerBot extends ActivityHandler {
     await context.sendActivity(
       MessageFactory.attachment(CardFactory.adaptiveCard(buildBatchResultCard(allResults))),
     );
+  }
+
+  private async downloadOne(attachment: Attachment, childLog: Logger): Promise<DownloadOutcome> {
+    const filename = attachment.name ?? 'attachment.bin';
+    try {
+      childLog.info('downloading attachment');
+      const { content, contentType } = await this.deps.attachmentDownloader.download(attachment);
+      return {
+        ok: true,
+        document: { filename, contentType, contentBase64: content.toString('base64') },
+      };
+    } catch (err) {
+      childLog.error({ err }, 'failed to download attachment');
+      return {
+        ok: false,
+        failure: {
+          filename,
+          status: 'rejected',
+          error: { code: DOWNLOAD_FAILED, message: 'Attachment download failed' },
+        },
+      };
+    }
   }
 }
 
