@@ -140,8 +140,9 @@ at the root of the BCR GROUP team library. Every member of that team could read 
 the team was Public, so could any internal account.
 **Now:** a staff-only quarantine site replaces the fallback. It has no group, unique
 permissions and sharing disabled. Until the Phase-0 build is live, the running build's
-`FALLBACK_SITE_*` settings point at that site (human steps H-6b). The documents already in BCR GROUP are locked to its Owners
-(tenant step T-4) and are being moved one by one, with two people signing off (IR-2).
+`FALLBACK_SITE_*` settings point at that site (human steps H-6b). The documents already in BCR
+GROUP are locked to its Owners (tenant step T-4) and are being moved one by one, with two people
+signing off (IR-2).
 **Status: Replaced by quarantine in P0.**
 
 ### T10. Directory tampering
@@ -264,8 +265,8 @@ check that every setting the code reads exists in Bicep, `what-if`, and environm
 - **Application Insights** keeps telemetry for 30 days (`logAnalytics.bicep`). From Phase 0 it
   holds ids and codes, not names, file names or URLs.
 - **IR evidence store:** the pre-Phase-0 logs, the Purview export, the sign-in exports and the
-  Directory export for the incident. It is immutable, readable by Roman, the IOD and `yahor.simak@bcr-group.pl` only,
-  and kept until the date the IOD sets.
+  Directory export for the incident. It is immutable, readable by Roman, the IOD and
+  `yahor.simak@bcr-group.pl` only, and kept until the date the IOD sets.
 - **Quarantine site:** items are kept 90 days after triage. That is the plan's default, for Roman
   and the lawyer to confirm.
 - **Client documents** live in each client's Team, in the "Dokumenty księgowe" channel folder.

@@ -21,8 +21,8 @@
 >   określoną formę powiadomienia.
 > - Krąg odbiorców w Wariancie A zależy od kroku T-7 w `tenant-hardening.md`. Nie opisywać
 >   konta `AuthoriseMe@` jako konta pracownika BCR, dopóki wynik T-7 nie zostanie zapisany w
->   tabeli statusu incydentu. Jeśli okaże się czymś innym niż konto personelu BCR, napisać, czym
->   jest, a jego zdarzenia dostępu z IR-0 podać w punkcie 4 osobno od dostępu personelu.
+>   tabeli statusu incydentu. Jeśli okaże się czymś innym niż konto personelu BCR, napisać,
+>   czym jest, a jego zdarzenia dostępu z IR-0 podać w punkcie 4 osobno od dostępu personelu.
 > - Akapit o logowaniach w punkcie 4 podaje tylko to, co wynika z eksportów logowań z IR-0
 >   (zdarzenia logowania z dziennika audytu i pobrany 7-dniowy dziennik Entra, `human-steps.md`
 >   H-2). Jeśli nie zostały jeszcze przeanalizowane, napisać, że analiza trwa; nigdy nie pisać,
@@ -58,10 +58,10 @@ dokumentów nie trafiła do Państwa przestrzeni.
 **[Wariant A]** Dokumenty zostały zapisane we wspólnej bibliotece dokumentów zespołu BCR GROUP,
 przeznaczonej dla pracowników BCR. Dostęp do niej mieli członkowie tego zespołu: pracownicy BCR
 oraz jedno konto organizacyjne BCR{{UWAGA_T7 — do czasu rozstrzygnięcia T-7: „, którego
-przeznaczenie wyjaśniamy”; po T-7: czym jest to konto i kto z niego korzysta}}. W okresie {{OKRES_ZESPÓŁ_PUBLICZNY}} zespół był ustawiony jako publiczny. Mogło
-wtedy do niego dołączyć każde konto wewnętrzne w naszej organizacji Microsoft 365, w tym trzy
-konta skrzynek pocztowych przypisanych klientom BCR, które nie powinny były mieć możliwości
-logowania.
+przeznaczenie wyjaśniamy”; po T-7: czym jest to konto i kto z niego korzysta}}. W okresie
+{{OKRES_ZESPÓŁ_PUBLICZNY}} zespół był ustawiony jako publiczny. Mogło wtedy do niego dołączyć
+każde konto wewnętrzne w naszej organizacji Microsoft 365, w tym trzy konta skrzynek pocztowych
+przypisanych klientom BCR, które nie powinny były mieć możliwości logowania.
 
 **[Wariant B]** {{LICZBA_DOKUMENTÓW_B}} dokument(y) został(y) zapisany(e) w przestrzeni innego
 klienta BCR. Asystent przypisywał dokument do klienta na podstawie numeru NIP występującego w
@@ -93,8 +93,8 @@ członkami jego zespołu”.}}
 **Czy stwierdzono dostęp osób nieuprawnionych:** {{USTALENIA_DOSTĘPU — np. „Analiza dziennika
 audytu Microsoft 365 trwa; dotychczas nie stwierdziliśmy otwarcia ani pobrania Państwa dokumentów
 przez osobę spoza personelu BCR, a przez konto organizacyjne wspomniane w punkcie 1:
-{{żadnego / następujące}}.” albo „Stwierdziliśmy, że dnia … dokument został otwarty przez osobę
-spoza personelu BCR.”}}
+{{żadnego / następujące}}.” albo „Stwierdziliśmy, że dnia … dokument został otwarty przez
+osobę spoza personelu BCR.”}}
 
 Bez licencji Microsoft Entra ID P1 dziennik logowań Entra obejmuje tylko 7 dni. Dziennik audytu
 Microsoft 365 rejestruje operacje na plikach i logowania interaktywne przez około 180 dni.

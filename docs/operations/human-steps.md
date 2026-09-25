@@ -81,15 +81,16 @@ Graph and SharePoint tokens are set up as described in
 | H-7 | Directory check and new columns (no new site grants) | Yahor | day 1 | H-2 (IR-0 C stored), T-5 |
 | H-8 | New app settings, added | Yahor | day 1 | H-5 |
 | H-9 | Bot deploy, gate in `log` | Yahor | day 1 | H-2, H-8 |
-| H-10 | Manifest 0.2.0 and availability | Teams Admin | day 1 | H-9 |
+| H-10 | Manifest 0.2.0, availability *Everyone* | Teams Admin | day 1 | H-9 |
 | H-11 | Gate to `enforce` | Yahor | day 2 | 24 h of clean logs |
 | H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-6, H-6b, H-7, H-11, T-4, T-4b, T-5 |
 | H-13 | Ingestion grant on BCR GROUP to `read` | Global Admin | after H-12 | H-12 verified |
-| H-14 | `FALLBACK_*` settings removed | Yahor | ≥ 24 h after H-12 | H-12 verified |
+| H-14 | `FALLBACK_*` settings and saved pre-Phase-0 packages removed | Yahor | ≥ 24 h after H-12 | H-12 verified |
 | H-15 | Exit criteria checked | Yahor, Roman | end of phase | all |
 
 IR-1 (inventory) and IR-2 (relocation) run alongside, from the day H-2 is stored. They are
-described in the incident doc.
+described in the incident doc. IR-1 takes the plan H-7 writes; IR-2 moves nothing on a site
+before that site's folders are locked (T-4, T-4b).
 
 ---
 
@@ -123,9 +124,9 @@ never withdraws one.
 ### H-2: Preserve the evidence (IR-0), before anything changes the logs
 
 **Owner:** Roman (creates the store, as subscription Owner), Yahor (trace and Directory
-exports), Global Admin (Purview export and the Entra sign-in log). **When:** today. App Insights keeps 30 days, and each
-day of delay deletes a day of evidence. This must also happen **before H-9 and H-12**, because the
-Phase-0 code changes what is logged.
+exports), Global Admin (Purview export and the Entra sign-in log). **When:** today. App Insights
+keeps 30 days, and each day of delay deletes a day of evidence. This must also happen **before
+H-9 and H-12**, because the Phase-0 code changes what is logged.
 
 What to export, and why each join works, is in
 [incident → IR-0](incident-2026-09.md#ir-0-preserve-the-evidence-first). Every script is
@@ -280,8 +281,8 @@ These must be done before H-12:
 - **T-4b** (lock the same folders at the library root of PESKOVOI, TEST and any site IR-1
   lists), **today or tomorrow and before IR-2 starts**, for the same reason, and because there
   the audience is another client's guest. It closes W4 for documents already promoted;
-- **T-5** (lock and version the Client Directory), because H-12 edits the rows, and versioning
-  is the record of that edit.
+- **T-5** (lock and version the Client Directory), because H-7 and H-12 edit the list, and
+  versioning is the record of those edits. So T-5 also comes **before H-7**.
 
 Row edits other than the `0002` status change in H-7 wait for H-12.
 

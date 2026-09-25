@@ -185,7 +185,10 @@ Bicep deploy replaces them all, and the template has drifted (lesson 20).
 
 **Removed in Phase 0:** `FALLBACK_CLIENT_ID`, `FALLBACK_SITE_HOSTNAME`, `FALLBACK_SITE_PATH`,
 `FALLBACK_DRIVE_NAME` and `FALLBACK_ROOT_FOLDER`. The fallback bucket they described is replaced
-by the quarantine. They are deleted from the app once the Phase-0 build is verified
+by the quarantine. Until the Phase-0 ingestion is deployed, the old build still reads them, so
+they are first pointed at the quarantine site
+([human-steps H-6b](docs/operations/human-steps.md#h-6b-point-the-running-builds-fallback-at-the-quarantine)),
+and deleted from the app once the Phase-0 build is verified
 ([human-steps H-14](docs/operations/human-steps.md#h-14-remove-the-fallback_-settings)).
 
 **Stale, still set by Bicep, read by nothing:** `SHAREPOINT_SITE_HOSTNAME`,
