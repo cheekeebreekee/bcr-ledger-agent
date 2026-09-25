@@ -511,12 +511,14 @@ wrong client's space.
    entrustment agreement (*umowa powierzenia*), so it is the **processor** and each client is
    the **controller**. Under Art. 33(2) BCR notifies each affected client without undue delay:
    PESKOVOI now, and each onboarded client that IR-1 finds with items in W1 or W4. The notice is
-   **phased** under Art. 33(4): what happened, which data categories, what was done, and that
-   the investigation continues. Each client, as controller, decides whether to notify UODO.
+   **phased** as findings are established, so that each controller can meet its own Art. 33(4)
+   duty: what happened, which data categories, what was done, and that the investigation
+   continues. Each client, as controller, decides whether to notify UODO.
    Template: [`gdpr/processor-notice-2026-09.pl.md`](gdpr/processor-notice-2026-09.pl.md)
    (English mirror: [`.en.md`](gdpr/processor-notice-2026-09.en.md)).
-2. **BCR's own breach register**, Art. 33(5), today: the incident, the exposure windows, the
-   containment steps, and the reasoning for each notification decision.
+2. **BCR's own breach register**, today: under Art. 33(5) for the data BCR controls, and as the
+   processor's record under Art. 28(3)(f) for client documents. It holds the incident, the
+   exposure windows, the containment steps, and the reasoning for each notification decision.
    Template: [`gdpr/breach-register-entry-2026-09.md`](gdpr/breach-register-entry-2026-09.md).
 3. **UODO directly, only where BCR is the controller**, which is BCR's own data (its staff,
    its own records, the routing list and the telemetry about uploads), and only if the Purview

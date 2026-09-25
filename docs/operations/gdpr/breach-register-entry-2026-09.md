@@ -2,8 +2,11 @@
 
 > ⚠️ **DRAFT — the IOD or lawyer must confirm it before it goes into the register.**
 
-GDPR Art. 33(5) requires BCR to document every personal data breach: the facts, its effects
-and the remedial action taken. The record must also show why BCR did or did not notify. This
+GDPR Art. 33(5) requires BCR, as controller, to document breaches of the data it controls (here
+the Client Directory and the telemetry). For client documents, where BCR is the processor, the
+breach is documented to support the controllers, under Art. 28(3)(f) and the entrustment
+agreements. Either way the record gives the facts, the effects and the remedial action taken,
+and shows why BCR did or did not notify. This
 entry is written into BCR's own breach register today, and updated as IR-0 to IR-3 progress.
 
 Field names are in Polish, the language of the register, with the English meaning in brackets.
@@ -56,7 +59,7 @@ ClientId only. The detail per client is in the IR register (evidence store).
 
 | | Decyzja (decision) | Uzasadnienie (reasoning) | Data (date) |
 |---|---|---|---|
-| **Administratorzy, art. 33 ust. 2** (controllers) | Powiadomienie każdego klienta, którego dokumenty były w W1 lub W4, etapami (art. 33 ust. 4). | BCR jest podmiotem przetwarzającym; decyzję o zgłoszeniu do UODO podejmuje administrator. | zob. tabela klientów |
+| **Administratorzy, art. 33 ust. 2** (controllers) | Powiadomienie każdego klienta, którego dokumenty były w W1 lub W4, etapami (art. 28 ust. 3 lit. f RODO i umowa powierzenia; por. art. 33 ust. 4). | BCR jest podmiotem przetwarzającym; decyzję o zgłoszeniu do UODO podejmuje administrator. | zob. tabela klientów |
 | **UODO, art. 33 ust. 1** (dane, dla których BCR jest administratorem) | {{ZGŁOSZONO / NIE ZGŁOSZONO}} | Zgłoszenie tylko wtedy, gdy dziennik audytu wykaże dostęp tożsamości spoza personelu BCR do danych osobowych, dla których BCR jest administratorem. {{WYNIK}} | {{DATA}} |
 | **Osoby, których dane dotyczą, art. 34** (data subjects) | {{…}} | Przy wysokim ryzyku (np. PESEL wraz z danymi o wynagrodzeniu, dane bankowe) zawiadomienie następuje przez administratora i na jego decyzję; BCR dostarcza potrzebne informacje. | {{DATA}} |
 

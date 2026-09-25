@@ -22,6 +22,10 @@
 >   access to another controller's document is recorded in the breach register.
 > - Before sending, check the entrustment agreement (*umowa powierzenia*). It may set a shorter
 >   deadline or a required form.
+> - Variant A's audience depends on `tenant-hardening.md` T-7. Do not describe `AuthoriseMe@` as
+>   BCR staff until T-7's outcome is recorded in the incident's status table. If it turns out to
+>   be anything other than a BCR-staff account, say what it is, and list its access events from
+>   IR-0 in section 4 separately from staff access.
 > - The sign-in paragraph in section 4 states only what the IR-0 sign-in exports show (the
 >   audit-log sign-in events and the 7-day Entra download, `human-steps.md` H-2). If they have
 >   not been read yet, say that the analysis is continuing; never write that no sign-in record
@@ -37,7 +41,7 @@
 | **Basis** | GDPR Art. 33(2) and Art. 28(3)(f) |
 | **Reference** | IR-2026-09/{{CLIENT_NUMBER}} |
 | **Date** | {{DATE_SENT}} |
-| **Phase** | 1. We provide the information in phases, as Art. 33(4) GDPR allows. |
+| **Phase** | 1. We will send further information in phases as it is established, so that you can meet your own obligations, including Art. 33(4) GDPR. |
 
 Dear Sir or Madam,
 
@@ -54,7 +58,9 @@ that, because of errors in the assistant's configuration and software, some of y
 did not reach your space.
 
 **[Variant A]** The documents were stored in the shared document library of the BCR GROUP team,
-which is meant for BCR staff. The members of that team, who are BCR staff, had access to it.
+which is meant for BCR staff. The members of that team had access to it: BCR staff and one
+organisational account of BCR{{T7_NOTE — until T-7 is recorded: ", whose use we are still
+confirming"; after T-7: what the account is and who uses it}}.
 During {{PERIOD_TEAM_WAS_PUBLIC}} the team was set to public. During that time any internal
 account in our Microsoft 365 organisation could have joined it, including three mailbox
 accounts assigned to BCR clients that should not have been able to sign in.
@@ -82,14 +88,16 @@ to these documents was restricted to BCR management on …"}}
 
 ## 4. Who had or could have had access
 
-{{RECIPIENTS — Variant A: "BCR staff who are members of the BCR GROUP team; while the team was
-public, also any internal account of the organisation". Variant B: "people representing another
-business, a BCR client, who are members of its team".}}
+{{RECIPIENTS — Variant A: "the members of the BCR GROUP team: BCR staff and one organisational
+account of BCR (see section 1); while the team was public, also any internal account of the
+organisation". Variant B: "people representing another business, a BCR client, who are members
+of its team".}}
 
 **Whether access by unauthorised people was found:** {{ACCESS_FINDINGS — e.g. "The analysis of the
-Microsoft 365 file-operation log is continuing; so far we have found no opening or download of
-your documents by anyone outside BCR staff." or "We found that on … a document was opened by a
-person outside BCR staff."}}
+Microsoft 365 audit log is continuing; so far we have found no opening or download of your
+documents by anyone outside BCR staff, and {{none / the following}} by the organisational account
+mentioned in section 1." or "We found that on … a document was opened by a person outside BCR
+staff."}}
 
 Without the Microsoft Entra ID P1 licence, the Entra sign-in log keeps only 7 days. The
 Microsoft 365 audit log records file operations and interactive sign-ins for about 180 days. Our
