@@ -20,6 +20,12 @@
  * walk did not find are rows too: a file promoted into a client site that was
  * not walked is exactly the case that matters most.
  *
+ * An upload routed by identity is clean only if its uploader is a guest of
+ * the site's own Team. Those guests come from `--site-guests` or a
+ * `directory-bindings.mjs propose` plan (`--bindings-plan`); without either,
+ * every identity-routed item is suspect (`uploader_guest_unverified`).
+ * Sharing links are not read here: IR-2 checks them per item.
+ *
  * Output: a JSON register (with parameters, input hashes and a summary) and a
  * CSV of the same rows, both in tools/out/ with their sha256 printed.
  *
@@ -61,7 +67,9 @@ import {
   indexIr0,
   isCandidate,
   parseIr0Export,
+  parseSiteGuests,
   parseSiteSpec,
+  siteGuestsFromPlan,
   summarizeRegister,
 } from './lib/misfiled.mjs';
 
@@ -70,6 +78,7 @@ Usage:
   node tools/inventory-misfiled.mjs --site <[label=]host:/sites/Path> [--site ...]
        --ingest-app-ids <appId[,appId]> [--drive-name Dokumenty]... [--all-drives]
        [--ir0 <export.json|dir>]... [--fallback-site <label|/sites/Path>]...
+       [--site-guests <label>=<oid,oid,...>]... [--bindings-plan <plan.json>]
        [--all-items] [--no-versions] [--window-ms 10000] [--concurrency 4] [--out-dir <dir>]
 
   --site            a site to walk; repeat for each (BCR GROUP, PESKOVOI, TEST)
@@ -79,8 +88,11 @@ Usage:
   --ir0             IR-0 App Insights export(s) (tools/ir0/export-appinsights.sh output);
                     a directory means every *.json in it
   --fallback-site   which walked site was the fallback bucket (BCR GROUP)
+  --site-guests     the guests of a site's own Team (object ids); repeat per site
+  --bindings-plan   a directory-bindings.mjs propose plan: the guests of each row's Team
+                    Without either, every upload routed by identity is suspect.
   --all-items       register every file, not only the ingestion's
-  --no-versions     skip the per-file versions call
+  --no-versions     skip the per-file versions call (every row then reads versions_unreadable)
 
 Environment: GRAPH_TOKEN (delegated; Sites.Read.All or Files.Read.All). Read-only.
 `.trim();
@@ -93,6 +105,8 @@ const OPTIONS = {
   'all-drives': { type: 'boolean' },
   ir0: { type: 'string', multiple: true },
   'fallback-site': { type: 'string', multiple: true },
+  'site-guests': { type: 'string', multiple: true },
+  'bindings-plan': { type: 'string' },
   'all-items': { type: 'boolean' },
   'no-versions': { type: 'boolean' },
   'window-ms': { type: 'string' },
@@ -204,6 +218,37 @@ export async function main(argv, deps = {}) {
     fallbackSitePaths.add(normalizeSitePath(match.sitePath));
   }
 
+  // Guests of each site's own Team: an identity-routed upload by anyone else
+  // (staff, most of all) is suspect. With no list, all of them are.
+  let siteGuests = null;
+  let bindingsPlanInput = null;
+  let sharedPlanSites = [];
+  if (values['bindings-plan'] || values['site-guests']?.length) {
+    siteGuests = new Map();
+    if (values['bindings-plan']) {
+      const { data, sha256 } = readJsonFile(values['bindings-plan']);
+      let fromPlan;
+      try {
+        fromPlan = siteGuestsFromPlan(data);
+      } catch (err) {
+        throw new CliError(`--bindings-plan ${values['bindings-plan']}: ${err.message}`);
+      }
+      bindingsPlanInput = { path: values['bindings-plan'], sha256, createdAt: data.createdAt ?? '' };
+      sharedPlanSites = fromPlan.sharedSites;
+      for (const [site, ids] of fromPlan.guests) siteGuests.set(site, new Set(ids));
+    }
+    let explicit;
+    try {
+      explicit = parseSiteGuests(values['site-guests'], sites);
+    } catch (err) {
+      throw new CliError(err.message);
+    }
+    for (const [site, ids] of explicit) {
+      if (!siteGuests.has(site)) siteGuests.set(site, new Set());
+      for (const id of ids) siteGuests.get(site).add(id);
+    }
+  }
+
   const driveNames = values['all-drives'] ? [] : csvList(values['drive-name'] ?? ['Dokumenty']);
   if (values['all-drives'] && values['drive-name']) {
     throw new CliError('--all-drives and --drive-name are exclusive');
@@ -230,6 +275,23 @@ export async function main(argv, deps = {}) {
   print(`  ingest     ${ingestAppIds.join(', ')}`);
   if (!fallbackSitePaths.size) {
     print(warn('  no --fallback-site: files in the fallback bucket are not flagged as such'));
+  }
+  if (!siteGuests) {
+    print(
+      warn(
+        '  no --site-guests or --bindings-plan: every upload routed by identity is suspect ' +
+          '(uploader_guest_unverified)',
+      ),
+    );
+  } else {
+    for (const s of sites) {
+      const ids = siteGuests.get(normalizeSitePath(s.sitePath));
+      print(`  guests     ${s.label}: ${ids ? `${ids.size} guest id(s)` : warn('none given (unverified)')}`);
+    }
+    if (bindingsPlanInput) print(dim(`             from plan ${bindingsPlanInput.path} made ${bindingsPlanInput.createdAt}`));
+    for (const shared of sharedPlanSites) {
+      print(warn(`             ${shared}: several plan rows name this site; its guests are not used`));
+    }
   }
 
   // --- IR-0 ---------------------------------------------------------------
@@ -331,7 +393,10 @@ export async function main(argv, deps = {}) {
       .filter((item) => isCandidate(item, { ingestAppIds: ingestSet, ir0, includeAll: values['all-items'] }))
       .map((item) => ({ item, drive: w.drive })),
   );
-  if (!values['no-versions']) {
+  if (values['no-versions']) {
+    // An unknown version count may hide an earlier document: fail closed.
+    for (const { item } of candidates) item.versionsError = 'not read (--no-versions)';
+  } else {
     print('');
     print(dim(`reading versions of ${candidates.length} file(s)…`));
     await mapLimit(candidates, concurrency, async ({ item, drive }) => {
@@ -351,6 +416,7 @@ export async function main(argv, deps = {}) {
     ir0,
     ingestAppIds: ingestSet,
     fallbackSitePaths,
+    siteGuests,
     includeAll: Boolean(values['all-items']),
   });
   const summary = summarizeRegister(rows);
@@ -368,6 +434,11 @@ export async function main(argv, deps = {}) {
       allDrives: Boolean(values['all-drives']),
       ingestAppIds,
       fallbackSites: [...fallbackSitePaths],
+      siteGuests: siteGuests
+        ? Object.fromEntries([...siteGuests].map(([site, ids]) => [site, [...ids].sort()]))
+        : null,
+      bindingsPlan: bindingsPlanInput,
+      sharedPlanSites,
       allItems: Boolean(values['all-items']),
       versions: !values['no-versions'],
       windowMs,

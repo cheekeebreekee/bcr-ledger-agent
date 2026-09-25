@@ -120,6 +120,10 @@ describe('directory-bindings propose', () => {
     assert.ok(byId['3'].reasons.some((r) => r.code === 'admin_row'));
     assert.ok(byId['4'].reasons.some((r) => r.code === 'public_team'));
     assert.equal(byId['5'], undefined);
+    // For IR-1 (--bindings-plan): the guests of each Team alone, only where they were read.
+    assert.deepEqual(byId['1'].eligibleGuests.map((g) => g.id), [IDS.guestA]);
+    assert.deepEqual(byId['4'].eligibleGuests, []);
+    assert.equal('eligibleGuests' in byId['3'], false, 'an admin row has no Team to read');
     assert.deepEqual(h.writes(), [], 'propose must not write to Graph');
   });
 

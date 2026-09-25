@@ -790,6 +790,7 @@ export function assessRow(row, facts = {}, ctx = {}) {
     addedUserIds,
     eligibleGuests: people?.eligible ?? [],
     excludedPeople: people?.excluded ?? [],
+    guestsRead: Boolean(people),
   };
 }
 
@@ -857,6 +858,12 @@ export function buildPlan({ rows, assessments, directory, ingestAppIds = [], cre
       proposed: a.proposed ? { ...a.proposed } : null,
       removedUserIds: a.removedUserIds,
       addedUserIds: a.addedUserIds,
+      // The guests of this Team alone, where the Team's people were read.
+      // IR-1 (`inventory-misfiled.mjs --bindings-plan`) checks uploaders
+      // against them; it is not what gets written (that is `patch`).
+      ...(a.guestsRead
+        ? { eligibleGuests: a.eligibleGuests.map(({ id, userPrincipalName }) => ({ id, userPrincipalName })) }
+        : {}),
       // The Team's guests who are not bound, and why: a reviewer must see a
       // guest left out because they are also in another Team, and which one.
       excludedGuests: (a.excludedPeople ?? [])
