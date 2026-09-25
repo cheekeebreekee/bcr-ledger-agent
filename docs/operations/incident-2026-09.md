@@ -345,6 +345,22 @@ Confirm the three-site bound before trusting it. `tools/directory-bindings.mjs c
 for each Directory row, whether the ingestion identity holds a grant on that site. Any further
 site where it holds `write` is added to the walk.
 
+Run it with the `directory-bindings.mjs propose` plan from
+[`human-steps.md` H-7](human-steps.md#h-7-check-the-directory-before-the-deploy-and-add-the-new-columns)
+(H-12's plan, once it exists). The plan gives each site's guests, and without it the tool cannot
+tell a client guest's upload from anyone else's. `--site-guests <label>=<oid,…>` is the manual
+alternative. The flags are described in [`tools/README.md`](../../tools/README.md).
+
+```bash
+node tools/inventory-misfiled.mjs \
+  --site 'BCRGROUP=<tenant>.sharepoint.com:/sites/BCRGROUPSp.zo.o' \
+  --site 'PESKOVOI=<tenant>.sharepoint.com:/sites/<PESKOVOI site>' \
+  --site 'TEST=<tenant>.sharepoint.com:/sites/<TEST site>' \
+  --ingest-app-ids "$INGEST_MI_APPID" --fallback-site BCRGROUP \
+  --ir0 tools/out/ir0-appinsights-<UTC>/ \
+  --bindings-plan tools/out/directory-bindings-plan-<UTC>.json
+```
+
 For each item it records:
 
 - `driveItemId`, the site, the path at the time of inventory, created and modified times;
@@ -354,14 +370,19 @@ For each item it records:
 - **every IR-0 log line for that `driveItemId`**, and the uploader id that the join above
   yields, or `unknown`;
 - whether the logs show it as promoted, fallback, or routed by identity;
-- the item's own sharing links, if any;
-- from the Purview export: whether any principal other than staff and the ingestion identity
-  has an access event on it.
+- whether the uploader is a guest of that site's own client (`uploader_not_site_guest` when not).
+  Before Phase 0 the only id on a client row was staff, so every upload routed "by identity"
+  into PESKOVOI was a staff upload, whatever its content. This flag is what brings those items
+  into IR-2.
+
+It does **not** read an item's sharing links or join the Purview export. Both are checked by
+hand, per item, in [IR-2](#checks-per-item-by-hand).
 
 The output is a register of client documents, so it goes to the evidence store and nowhere
-else. Items it flags as *suspect* (promoted, uploader unknown, uploader not a guest of the
-site's own client, or more than one version) are the input to IR-2, and later jobs skip them
-unless IR-2 clears them.
+else. Items it flags as *suspect* (promoted, fallback, uploader unknown or ambiguous, uploader
+not a guest of the site's own client, and the other flags in `tools/README.md`) are the input to
+IR-2. An item with more than one version goes through IR-2's version rule whether or not it is
+flagged. Later jobs process only what IR-2 has cleared ([the allow-list](#the-allow-list)).
 
 The inventory also answers the GDPR question "which clients are affected": every client with
 an item in W1 or W4.
@@ -385,7 +406,9 @@ produced.
 1. **Take the uploader from IR-0.** The uploader's `userAadObjectId`, joined on `driveItemId`
    as described above.
 2. **Map the uploader to candidate clients by Team membership.** Read the uploader's
-   `memberOf` and count the Teams whose description starts `BCR Group — `.
+   `memberOf` and count every Team (groups whose `resourceProvisioningOptions` contains `Team`),
+   not only those whose description starts `BCR Group — `: the five Teams `[0000]`–`[0004]`,
+   PESKOVOI's among them, predate onboarding and carry no such description.
    - A **guest of exactly one** client Team: that client is the candidate owner.
    - A guest of **several** client Teams: those clients are the candidates.
    - **Staff** (a `Member` of the tenant): membership does not narrow it, because staff belong
@@ -403,6 +426,17 @@ produced.
    incident again.
 5. **Belongs to no client** (a test file, BCR's own paper): it stays locked where it is and is
    deleted after BCR's retention decision.
+
+### Checks per item, by hand
+
+IR-1 does not do these, so the person deciding does, before signing:
+
+- **Sharing links.** In Graph Explorer, `GET /drives/{driveId}/items/{itemId}/permissions`. Any
+  link, or any grant that is not inherited from the site, goes in the register row's `Reason`,
+  and the link is removed before the item is moved.
+- **Access events.** Filter the IR-0 Purview file-operations export for the item (its URL or
+  `ObjectId`). Count the events by anyone other than staff and the ingestion identity into
+  `NonStaffAccess`. For an item in W4 that includes the receiving client's guest.
 
 ### Versions before any move
 
@@ -461,8 +495,9 @@ cleared as belonging to that client, with both signatures:
 **Every later job that touches ledger items at a library root must take this file and use
 nothing else**: the root-to-channel-folder migration, the index backfill and the
 review-task backfill. Each of them refuses to run on a drive while the register still has open
-items for it, skips every IR-1 suspect item that is not on the list, and shows included and
-excluded counts per client in its dry run before anyone approves `--apply`. Without this, those
+items for it, **processes only the `driveItemId`s on the list and skips every other item**,
+suspect or not, and shows included and excluded counts per client in its dry run before anyone
+approves `--apply`. Without this, those
 jobs would take the misfiled documents and make them searchable, billable and permanent in the
 wrong client's space.
 

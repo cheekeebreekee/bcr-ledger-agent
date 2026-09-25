@@ -505,7 +505,7 @@ should still work. **[verify]** Lowering the capability also disables existing A
 
 | Runs it | Decides | Closes |
 |---|---|---|
-| Teams Administrator | **Roman**: staff plus client guests, or everyone | Who can install the bot at all |
+| Teams Administrator | *Everyone* in Phase 0; a restricted group only later, with the sub-steps below | Who can install the bot at all |
 
 **Why.** Client guests need the app in BCR's org catalog, and the app has to be allowed for them.
 Nobody else needs it. The real control is the bot's own gate, which refuses anything that is not
@@ -520,19 +520,30 @@ in the first place.
 1. **Teams apps → Manage apps → Asystent BCR → Upload file**, and select `artifacts/teams-app.zip`
    built from manifest 0.2.0. That version has personal scope only and no tab. If the app is not
    in the catalog yet, use **Upload new app** instead.
-2. **Asystent BCR → Users and groups → Available to**. Choose **specific users or groups**: a
-   staff group plus a security group of client guests, for example `BCR Ledger – goście
-   klientów`. Each guest is added to that group when `directory-bindings.mjs` binds them. If Roman
-   does not want to maintain that group, choose *Everyone*. That is acceptable once T-1 is done,
-   because the gate is the control.
+2. **Asystent BCR → Users and groups → Available to**: choose **Everyone**. This is the
+   Phase-0 choice. The gate is the control: it refuses anything that is not a 1:1 chat from the
+   BCR tenant with a valid user id, and T-1 has already blocked the `{NIP}@` accounts.
+   Do **not** restrict it to a group of client guests in Phase 0. Nothing fills such a group:
+   neither onboarding nor `directory-bindings.mjs` adds anyone to one, so PESKOVOI's guest and
+   the TEST guest would lose the bot on day 1, and H-11 and H-12 could not run.
+
+   If Roman later wants the restricted option, do these first, in this order, and only then
+   change *Available to*:
+   - create a security group for client guests;
+   - add the staff group, the TEST guest, every bound client guest and the canary guest to it:
+     `az ad group member add --group <group-id> --member-id <user-object-id>`;
+   - check the members with `az ad group member list --group <group-id> -o table`;
+   - from then on, add each newly bound guest by hand, before telling the client to use the bot
+     ([admin guide, Onboarding](../client-directory-admin-guide.md#onboarding-a-client-phase-0)).
 3. Optional: pin the app for guests in the global app setup policy, so they find it without
    searching.
 4. Remove any team or group-chat installations. Version 0.2.0 cannot be added to a team, but
    older installs may remain. **[verify]** On each client team: **Manage team → Apps → Asystent
    BCR → Uninstall**. The gate already refuses those installs.
 
-**Verify.** The TEST guest finds "Asystent BCR", opens the chat and gets the help card. If
-availability is restricted, a staff account outside the groups cannot install the app.
+**Verify.** The TEST guest finds "Asystent BCR", opens the chat and gets the help card, and so
+does PESKOVOI's guest when they next use it. Only if availability was later restricted: a staff
+account outside the groups cannot install the app.
 
 **Rollback.** Upload the previous package, and set availability back to what it was. ⚠️ The
 previous package brings back the "Moje dokumenty" tab. After the Phase-0 bot deploy that tab only
@@ -561,4 +572,4 @@ laptops (`.env`) are an accepted risk, recorded in
 | T-7 | Roman decides | | | Explained / removed |
 | T-8 | | | | TEST invite checked |
 | T-9 | Roman confirms tenant level | | | TEST guest checked |
-| T-10 | | | | Everyone / groups |
+| T-10 | | | | Everyone (Phase 0) |

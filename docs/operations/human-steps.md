@@ -440,8 +440,18 @@ changes nothing. The flags below match [`tools/README.md`](../../tools/README.md
 `node tools/directory-bindings.mjs --help` is authoritative. For the token, see that README's
 "Authentication" section: the `az` token has no SharePoint scopes.
 
+The tool needs the Directory's ids, the ingestion identity's app id and the forbidden sites.
+Without the first two it stops; without the app id every write grant reads "unknown" and every
+client row is skipped. Set them in every new shell before running it:
+
 ```bash
 export GRAPH_TOKEN=$(node ../bcr-onboarding-agent/tools/graph-login.mjs)
+export DIRECTORY_SITE_ID=$(az functionapp config appsettings list -g $RG -n $INGEST \
+  --query "[?name=='CLIENT_DIRECTORY_SITE_ID'].value | [0]" -o tsv)
+export DIRECTORY_LIST_ID=$(az functionapp config appsettings list -g $RG -n $INGEST \
+  --query "[?name=='CLIENT_DIRECTORY_LIST_ID'].value | [0]" -o tsv)
+export INGEST_APP_IDS=$INGEST_MI_APPID
+export FORBIDDEN_TARGET_SITE_PATHS=/sites/BCRGROUPSp.zo.o
 node tools/directory-bindings.mjs check
 ```
 
@@ -450,8 +460,31 @@ For every row, `check` reports:
 - staff ids on client rows;
 - duplicate ClientIds, NIPs and targets;
 - whether the client's Team is Private and its channel is standard;
+- whether the Team carries onboarding's `BCR Group — …` description. The five Teams
+  `[0000]`–`[0004]`, TEST and PESKOVOI among them, predate onboarding and have none. That is a
+  warning, not a skip: the Team is found from the row's own site;
 - whether the ingestion identity has write on the row's site;
-- whether the guests are in exactly one client Team.
+- whether each guest is in this client's Team and **in no other Team**. A guest who is also in
+  any other Team, marked or not, is excluded (`guest_in_other_team`) and is never bound; their
+  uploads go to quarantine.
+
+**Write grants read "unknown" with this token,** because reading site permissions needs
+`Sites.FullControl.All`. Verify each one **read-only**: in Graph Explorer, with
+`Sites.FullControl.All` consented (see [`admin-sharepoint-grant.md`](../admin-sharepoint-grant.md)),
+`GET /sites/{site-id}/permissions` must show a `write` role for the ingestion identity's app id.
+Then pass that site to `propose` with `--write-verified` (H-12 step 5). Do **not** "verify" by
+running `Grant-TeamSiteAccess.ps1`: when it finds no write grant it **creates** one. Never point
+it at BCR GROUP, where it would undo H-13.
+
+**A plan for IR-1, now.** `propose` is read-only apart from the plan file it writes under
+`tools/out/`. Run it once here: the plan lists each site's guests, and IR-1 takes it with
+`--bindings-plan` to flag uploads by anyone who is not a guest of that site's client
+(`uploader_not_site_guest`; see
+[incident → IR-1](incident-2026-09.md#ir-1-inventory)).
+
+```bash
+node tools/directory-bindings.mjs propose                  # → tools/out/directory-bindings-plan-<UTC>.json
+```
 
 Decide what happens to each finding **before** H-12, and write the decisions in the incident's
 status table:
@@ -467,8 +500,10 @@ status table:
   grant it now.** While the pre-Phase-0 build runs, every new write grant is one more site that
   content promotion can write into; the incident's three-site bound depends on it. The grants
   are made in H-12 step 3, once step 2 has shown the Phase-0 build is live.
-- **Anything else the check flags** (a non-standard channel, a guest in several teams): that row
-  is not bound in Phase 0, and its uploads go to quarantine. Record the reason.
+- **Anything else the check skips** (a non-standard channel, a Public Team, a drive mismatch):
+  that row is not bound in Phase 0, and its uploads go to quarantine. Record the reason. A guest
+  excluded as `guest_in_other_team` is recorded the same way; the row itself can still be bound
+  for its other guests.
 
 Then add the two new columns, `DriveId` and `TeamId`. The code running today does not read
 them.
@@ -634,8 +669,10 @@ with the gate itself, use H-11's rollback (`BOT_GATE_MODE=log`).
 
 **Owner:** Teams Administrator. **When:** after H-9.
 
-Follow [T-10 in tenant-hardening](tenant-hardening.md#t-10-teams-app-availability-for-the-bot).
-Version 0.2.0 has personal scope only and no "Moje dokumenty" tab. Tell the clients before they
+Follow [T-10 in tenant-hardening](tenant-hardening.md#t-10-teams-app-availability-for-the-bot),
+with availability set to **Everyone**: in Phase 0 nothing adds client guests to a group, so a
+restricted list would lock PESKOVOI's and the TEST guest out. Version 0.2.0 has personal scope
+only and no "Moje dokumenty" tab. Tell the clients before they
 see the change: the tab disappears, and a document the bot cannot place now says "Dokument
 przekazano do weryfikacji przez zespół BCR" instead of showing a link.
 
@@ -704,13 +741,15 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    pre-Phase-0 build: it is a record of what ran, and **never** a rollback (standing rules).
 2. **Check that it is the Phase-0 build.**
    `curl -s https://$INGEST.azurewebsites.net/api/health` reports the Phase-0 build:
-   `"build":{"phase":"p0","routing":"identity-only"}`. The tool enforces this itself when you
-   pass `--health-url https://$INGEST.azurewebsites.net/api/health --expect-health build.routing=identity-only`.
-   `directory-bindings.mjs` refuses to apply until it does.
+   `"build":{"phase":"p0","routing":"identity-only"}`. `directory-bindings.mjs apply` checks
+   this itself: it refuses to write unless the `--health-url` it is given reports
+   `build.routing=identity-only`. `--expect-health` only adds further checks.
 3. **Grant the further client sites.** Only now, with the Phase-0 build live and content
    promotion gone, grant the ingestion identity write on each client site that H-7 recorded for
-   binding: H-6's runbook, with that client's site id. Per-site grants take about 5 minutes to
-   take effect, so make them before step 4 and wait before that client's apply.
+   binding: H-6's runbook, with that client's site id. Then confirm each grant read-only, as in
+   H-7 (`GET /sites/{site-id}/permissions` shows `write` for the ingestion app id). Per-site
+   grants take about 5 minutes to take effect, so make them before step 5 and wait before that
+   client's apply.
 4. **Negative canary: quarantine.** A canary guest bound to no row uploads a synthetic PDF. The
    canary guest is a BCR-controlled outside account, invited as a guest and in no client Team.
    Expect:
@@ -718,35 +757,53 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    - the file is on the quarantine site under `Kwarantanna/YYYY/MM/<batchId>/`, with
      `UploaderOid`, `QuarantineReason = unmapped`, `OriginalFilename` and `DocumentId` filled in;
    - a `document.quarantined` log line appears.
-5. **Propose, and have it reviewed.** `node tools/directory-bindings.mjs propose` writes a plan
-   under `tools/out/`. The plan holds client data and never leaves that folder. Roman and Yahor
-   read it row by row:
+5. **Propose, and have it reviewed.** Set the variables from H-7 again in this shell. Two
+   decisions are passed as flags: PESKOVOI's row holds Yahor's staff id, which is removed only
+   with `--confirm-remove-staff` for that row, and each site whose write grant was confirmed
+   read-only (in H-7, or in step 3 here) is passed with `--write-verified`. Without them the
+   tool skips those rows, and step 8 cannot run.
+
+   ```bash
+   # add --write-verified <sitePath> for each further site granted in step 3
+   node tools/directory-bindings.mjs propose --confirm-remove-staff <PESKOVOI listItemId> \
+     --write-verified <TEST sitePath> --write-verified <PESKOVOI sitePath>
+   ```
+
+   It writes a plan under `tools/out/`. The plan holds client data and never leaves that folder.
+   Roman and Yahor read it row by row:
    - `UserAadObjectIds` holds only that Team's guests, and no staff;
+   - PESKOVOI's row shows Yahor's id removed as staff under PATCH;
+   - no guest excluded as `guest_in_other_team` appears on any row;
    - `RootFolder` is the channel folder's name as Graph returns it;
    - `DriveId` and `TeamId` are set;
    - host, path and drive are unchanged.
+
+   This plan is also IR-1's `--bindings-plan` input from now on. If a site's guests differ from
+   the H-7 plan, run IR-1 again for that site with this one.
 6. **Apply TEST first.** A dry run, then the same with `--apply`:
 
    ```bash
    node tools/directory-bindings.mjs apply --plan tools/out/<plan>.json --only <TEST listItemId> \
-     --health-url https://$INGEST.azurewebsites.net/api/health \
-     --expect-health build.routing=identity-only            # then again with --apply
+     --health-url https://$INGEST.azurewebsites.net/api/health   # then again with --apply
    ```
 
    The tool prints each row before and after, and writes a rollback log. It refuses a plan older
-   than 24 hours, a row changed since `propose`, and a health endpoint that is not the P0 build.
+   than 24 hours, a row changed since `propose`, and a health endpoint that does not report
+   `build.routing=identity-only`.
 7. **Canary on TEST.** The TEST guest uploads a synthetic PDF. Expect:
    - it lands in TEST's `Dokumenty księgowe/…`, visible in the channel's files tab;
    - the card's link opens it there;
    - a `document.filed` line appears.
 
    Then delete the canary file.
-8. **Apply PESKOVOI, then canary.** This apply also takes Yahor's id off the row. For a real
-   client, the canary must come from an identity bound to that client, and there are two ways:
+8. **Apply PESKOVOI, then canary.** The same `apply` with `--only <PESKOVOI listItemId>`. It
+   takes Yahor's id off the row because step 5 ran `propose` with `--confirm-remove-staff` for
+   that row; check that the printed after-state no longer holds it. For a real client, the
+   canary must come from an identity bound to that client, and there are two ways:
    - by arrangement, the client's contact sends the synthetic canary file BCR gives them; or
    - BCR's canary guest joins that one client Team for the canary only. At that moment it is in
-     no other client Team. Afterwards it leaves, and the tool is run again to take its id off
-     the row.
+     no other Team at all, or the tool excludes it (`guest_in_other_team`). Afterwards it
+     leaves, and the tool is run again (`propose`, then `apply`) to take its id off the row.
 
    Never use a real client document, and never a staff account, because staff go to quarantine
    by design.

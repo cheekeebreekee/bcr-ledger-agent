@@ -39,11 +39,11 @@ Two rules follow from that, and they are the ones that were broken:
 
 | Reason | When |
 |---|---|
-| `unmapped` | The id is on no row, or only on a row that was excluded. |
+| `unmapped` | The id is on no `Active` row. |
 | `staff` | The id is on an `IsAdmin` row. Staff are never routed to a client. |
-| `conflict` | The id is on two rows, or the row's target is shared with another row (see [Duplicates and conflicts](#duplicates-and-conflicts)). |
+| `conflict` | The id is on two rows (a client row and an `IsAdmin` row count too), or its only row was excluded because its target is shared with another row (see [Duplicates and conflicts](#duplicates-and-conflicts)). |
 | `stale_directory` | The list could not be refreshed for longer than the stale cap, or the row's `DriveId` does not match. |
-| `forbidden_target` | The row points at BCR GROUP or at the quarantine site. |
+| `forbidden_target` | The id's only row was excluded because it points at a forbidden site: BCR GROUP, the quarantine site, or a SharePoint host other than the tenant's. |
 | `target_unwritable` | The client's site refused the write after retries, usually because the ingestion identity has no grant there. |
 
 5. **Content never changes the client.** After classification, the only thing content can change
@@ -63,9 +63,10 @@ sharing is disabled. No client can reach it.
   zespół BCR." No link, no folder and no client name, because the uploader may not be who they
   claim, and a link would say where documents are kept.
 
-**Triage rule.** Decide the owner from the uploader: take `UploaderOid`, then the client Teams
-that person is a guest of (`GET /users/{id}/memberOf`, groups whose description starts
-`BCR Group —`).
+**Triage rule.** Decide the owner from the uploader: take `UploaderOid`, then every Team that
+person belongs to (`GET /users/{id}/memberOf`, groups whose `resourceProvisioningOptions`
+contains `Team`). Count every Team, not only those whose description starts `BCR Group —`: the
+five Teams `[0000]`–`[0004]` predate onboarding and carry no such description.
 
 - If they belong to several clients, ask them.
 - The content may break a tie between clients the identity already produced. It never decides on
@@ -98,7 +99,7 @@ grant is read-only, and ingestion can never write to BCR GROUP again.
 | `NIP` | Single line | Onboarding | Digits only. Used **only** to decide invoice direction inside this client. It never picks a client. |
 | `CompanyNameAliases` | Multi-line, plain | Onboarding | The first line is the name given to the classifier for this client. Nothing routes on it. |
 | `PersonNames` | Multi-line, plain | — | Not read any more. Leave it empty. |
-| `UserAadObjectIds` | Multi-line, plain | **The tool** | One id per line. **The client's guests only**, each a guest in this client's Team and in no other client Team. **Never staff.** This is what routes uploads. |
+| `UserAadObjectIds` | Multi-line, plain | **The tool** | One id per line. **The client's guests only**, each a guest in this client's Team and in no other Team (the tool excludes anyone else as `guest_in_other_team`). **Never staff.** This is what routes uploads. |
 | `SiteHostname` | Single line | Onboarding | The tenant's SharePoint host. |
 | `SitePath` | Single line | Onboarding | e.g. `/sites/0002PESKOVOISp.zo.o.-Ksigowo`. Must start with `/`. Must not be BCR GROUP or the quarantine site. |
 | `DriveName` | Single line | Onboarding | The library name. `Dokumenty` on this Polish tenant. |
@@ -136,8 +137,9 @@ the real one (the row whose `SitePath` is PESKOVOI's site), and the other is set
   and every upload goes to quarantine as `stale_directory`. Before Phase 0, a failed refresh kept
   an old snapshot forever, so a corrected row (a wrong id removed, say) might never take effect.
 - **Forbidden targets.** `FORBIDDEN_TARGET_SITE_PATHS` lists sites no row may ever route to: at
-  least BCR GROUP. The quarantine site is added automatically. A row pointing at one is excluded
-  as `forbidden_target`.
+  least BCR GROUP. The quarantine site is added automatically. A row pointing at one, or at
+  another SharePoint host, is excluded, and its users' uploads go to quarantine as
+  `forbidden_target`.
 
 ## Onboarding a client (Phase 0)
 
@@ -149,10 +151,15 @@ after onboarding:
    `Grant-TeamSiteAccess.ps1` runbook with the ingestion identity's app id. The runbook call is
    in [human-steps H-6](operations/human-steps.md#h-6-grant-the-ingestion-identity-write-on-the-quarantine-site).
    Without this grant the tool skips the row. Only once the Phase-0 ingestion is live: under the
-   old build, every new grant was one more site content promotion could write into.
-2. `node tools/directory-bindings.mjs check`: review what it reports for the row.
-3. `node tools/directory-bindings.mjs propose`: read the proposed `UserAadObjectIds`,
-   `RootFolder`, `DriveId` and `TeamId`.
+   old build, every new grant was one more site content promotion could write into. Confirm the
+   grant **read-only** afterwards (`GET /sites/{site-id}/permissions` in Graph Explorer shows
+   `write` for the ingestion app id). The runbook is not a check: when it finds no grant it
+   creates one, so never run it against BCR GROUP or any other forbidden site.
+2. `node tools/directory-bindings.mjs check`, with the variables from
+   [human-steps H-7](operations/human-steps.md#h-7-check-the-directory-before-the-deploy-and-add-the-new-columns):
+   review what it reports for the row.
+3. `node tools/directory-bindings.mjs propose --write-verified <that site's path>`: read the
+   proposed `UserAadObjectIds`, `RootFolder`, `DriveId` and `TeamId`.
 4. A second person reviews the proposal. Then apply it (`--help` gives the command). The tool
    prints the row before and after, and writes a rollback log.
 5. **Canary:** a synthetic document, never a real one, uploaded by an identity bound to that
@@ -160,7 +167,10 @@ after onboarding:
    file.
 6. Tell the client to use the bot in a 1:1 chat. In Teams, they switch to the BCR organisation,
    open chat and search for "Asystent BCR". Their files are in their team → "Dokumenty
-   księgowe" → Files.
+   księgowe" → Files. In Phase 0 the app is available to everyone in the org
+   ([tenant-hardening T-10](operations/tenant-hardening.md#t-10-teams-app-availability-for-the-bot)).
+   If availability is ever restricted to groups, add the guest to that group first; nothing
+   does it automatically.
 
 ## Staff
 
