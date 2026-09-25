@@ -8,10 +8,15 @@
  * - **Staff are never client users (I9).** A `Member` id on a client row is
  *   reported, and removed only when the operator confirms it for that row.
  *   Only Guests are proposed, and never a team owner.
- * - **Ambiguity is skipped, never guessed (I3).** A guest in several
- *   `BCR Group —` teams is not bound. A duplicate ClientId, NIP, site or
- *   target skips every row that shares it. An unreadable fact skips the row
- *   rather than being read as "absent".
+ * - **Ambiguity is skipped, never guessed (I3).** A guest who belongs to any
+ *   Team besides the row's own (a client Team with or without the
+ *   `BCR Group —` marker, or BCR GROUP) is not bound. A duplicate ClientId,
+ *   NIP, site or target skips every row that shares it. An unreadable fact
+ *   skips the row rather than being read as "absent".
+ * - **A site path means one site.** SitePath is compared the way the
+ *   ingestion builds its request (empty segments dropped, case folded), and a
+ *   `.` or `..` segment, which URL parsing would resolve to another site, makes
+ *   the row invalid.
  * - **A binding already set is not changed here (I10).** A row whose RootFolder,
  *   DriveId or TeamId is set to something else is skipped for a person to look
  *   at.
@@ -23,10 +28,18 @@ export const CHANNEL_NAME = 'Dokumenty księgowe';
 
 /**
  * The client-team description convention is `BCR Group — {recordNumber}`.
- * Any dash is accepted. Over-matching can only raise a guest's count of BCR
- * teams, which excludes the guest; that is the safe direction.
+ * Any dash is accepted. Onboarding writes it; the Teams that predate
+ * onboarding (`[0000]`–`[0004]`, among them TEST and PESKOVOI) do not carry
+ * it. So it is a sanity check on a row's own Team (a warning), and it never
+ * decides which Teams a guest belongs to: every Team-provisioned group counts.
  */
 export const BCR_TEAM_DESCRIPTION = /^\s*BCR\s+Group\s*[—–-]/i;
+
+/**
+ * What `apply` always requires of the ingestion `/api/health` body, whatever
+ * else the operator asks for: only the Phase-0 build routes by identity alone.
+ */
+export const P0_HEALTH_EXPECTATION = 'build.routing=identity-only';
 
 export const PLAN_KIND = 'bcr.directory-bindings.plan';
 export const LOG_KIND = 'bcr.directory-bindings.apply-log';
@@ -74,14 +87,36 @@ export function normalizeNip(value) {
   return String(value ?? '').replace(/\D+/g, '');
 }
 
-/** `/Sites/Foo/` → `/sites/foo`. SharePoint URLs are case-insensitive. */
-export function normalizeSitePath(path) {
-  const t = String(path ?? '')
+/**
+ * The segments of a site path as the ingestion requests it: trimmed, split on
+ * `/`, empty segments dropped (`encodeGraphPath` drops them too). `null` when
+ * a segment is `.` or `..`: URL parsing resolves those, so `/sites/x/../Y`
+ * would be compared as one site and requested as another.
+ */
+export function sitePathSegments(path) {
+  const segments = String(path ?? '')
     .trim()
-    .toLowerCase()
-    .replace(/\/+$/, '');
-  if (!t) return '';
-  return t.startsWith('/') ? t : `/${t}`;
+    .split('/')
+    .filter(Boolean);
+  return segments.some((s) => s === '.' || s === '..') ? null : segments;
+}
+
+/**
+ * `/Sites//Foo/` → `/sites/foo`, the canonical form every comparison uses.
+ * SharePoint URLs are case-insensitive. `''` for an empty path, and `null`
+ * for one that is not canonical (see `sitePathSegments`); callers treat
+ * `null` as "matches nothing" and refuse the row.
+ */
+export function normalizeSitePath(path) {
+  const segments = sitePathSegments(path);
+  if (segments === null) return null;
+  return segments.length ? `/${segments.join('/')}`.toLowerCase() : '';
+}
+
+/** A site path as an operator names it on the command line: `/sites/<name>` or `/teams/<name>`. */
+export function isSiteCollectionPath(path) {
+  const canonical = normalizeSitePath(path);
+  return Boolean(canonical) && /^\/(sites|teams)\/[^/]+$/.test(canonical);
 }
 
 /** For display-name comparison only: NFC, trimmed, single spaces, lower case. */
@@ -106,10 +141,13 @@ export function pickFields(fields, names) {
   return out;
 }
 
+/** `host|/sites/foo`, or `''` when the path is not canonical (it then matches nothing). */
 export function siteKey(hostname, sitePath) {
+  const path = normalizeSitePath(sitePath);
+  if (path === null) return '';
   return `${String(hostname ?? '')
     .trim()
-    .toLowerCase()}|${normalizeSitePath(sitePath)}`;
+    .toLowerCase()}|${path}`;
 }
 
 /** `https://Host/sites/Foo%20Bar/` → `host|/sites/foo bar`, or `''` if not a URL. */
@@ -134,8 +172,10 @@ export function siteUrlKey(webUrl) {
  * collide, never fewer.
  */
 export function targetKey(row, rootFolder = row.rootFolder) {
+  const site = siteKey(row.siteHostname, row.sitePath);
+  if (!site) return '';
   return [
-    siteKey(row.siteHostname, row.sitePath),
+    site,
     String(row.driveName ?? '').toLowerCase(),
     String(rootFolder ?? '').trim().toLowerCase(),
   ].join('|');
@@ -233,6 +273,24 @@ export function isBcrTeamGroup(group) {
 }
 
 /**
+ * Whether a group from `/users/{id}/memberOf` is a Team: its
+ * `resourceProvisioningOptions` contains `Team`, or it is one of the Teams the
+ * tenant listing returned, or it carries the client-team marker. A group whose
+ * `resourceProvisioningOptions` was not returned at all cannot be told apart,
+ * so it counts as a Team: an unknown may only exclude a guest, never bind one.
+ *
+ * @param {{id?:string, description?:string, resourceProvisioningOptions?:string[]}} group
+ * @param {Set<string>} [knownTeamIds]  normalised ids of every Team in the tenant
+ */
+export function isTeamGroup(group, knownTeamIds) {
+  const options = group?.resourceProvisioningOptions;
+  if (Array.isArray(options) && options.some((o) => String(o).toLowerCase() === 'team')) return true;
+  if (knownTeamIds?.has(normalizeGuid(group?.id))) return true;
+  if (isBcrTeamGroup(group)) return true;
+  return !Array.isArray(options);
+}
+
+/**
  * Index Teams by their root site, from one `{ team, site }` per Team where
  * `site` is the `/groups/{id}/sites/root` response or `{ error }`.
  *
@@ -295,13 +353,22 @@ export function pickAccountingChannel(channels, name = CHANNEL_NAME) {
  * Split a team's people into the guests that may be bound to this client and
  * everyone else, with the reason.
  *
+ * A guest is eligible only when this Team is the only Team they belong to.
+ * Every Team counts, not only those carrying the `BCR Group —` marker: the
+ * client Teams that predate onboarding have no marker, and neither has BCR
+ * GROUP. A guest who is also in any other Team is excluded as
+ * `guest_in_other_team`, with those Teams listed for the reviewer; binding
+ * them here would file every upload of theirs, including another company's
+ * documents, into this client's channel.
+ *
  * @param {object} p
  * @param {string} p.teamId
  * @param {Array<{id:string,userType?:string,displayName?:string,userPrincipalName?:string}>} p.members
  * @param {Array<{id:string}>} p.owners
- * @param {Map<string, Array<{id:string,description?:string}> | {error:string}>} p.memberOfByUser
+ * @param {Map<string, Array<{id:string,displayName?:string,description?:string,resourceProvisioningOptions?:string[]}> | {error:string}>} p.memberOfByUser
+ * @param {Set<string>} [p.knownTeamIds]  normalised ids of every Team in the tenant
  */
-export function classifyTeamPeople({ teamId, members, owners, memberOfByUser }) {
+export function classifyTeamPeople({ teamId, members, owners, memberOfByUser, knownTeamIds }) {
   const team = normalizeGuid(teamId);
   const ownerIds = new Set((owners ?? []).map((o) => normalizeGuid(o.id)).filter(Boolean));
   const eligible = [];
@@ -323,13 +390,18 @@ export function classifyTeamPeople({ teamId, members, owners, memberOfByUser }) 
       excluded.push({ ...who, reason: 'memberships_unreadable' });
       continue;
     }
-    const bcrTeamIds = groups.filter(isBcrTeamGroup).map((g) => normalizeGuid(g.id));
-    if (bcrTeamIds.length > 1) {
-      excluded.push({ ...who, reason: 'guest_in_several_bcr_teams', bcrTeamIds });
+    const teams = groups.filter((g) => isTeamGroup(g, knownTeamIds));
+    const otherTeams = teams
+      .filter((g) => normalizeGuid(g.id) !== team)
+      .map((g) => ({ id: normalizeGuid(g.id) || String(g.id ?? ''), displayName: g.displayName ?? '' }));
+    if (otherTeams.length) {
+      excluded.push({ ...who, reason: 'guest_in_other_team', otherTeams });
       continue;
     }
-    if (bcrTeamIds.length === 0 || bcrTeamIds[0] !== team) {
-      excluded.push({ ...who, reason: 'guest_not_in_this_bcr_team', bcrTeamIds });
+    if (!teams.length) {
+      // The roster says they are a member; their own memberships do not.
+      // Two reads disagree, so nothing is inferred from either.
+      excluded.push({ ...who, reason: 'guest_not_in_this_team' });
       continue;
     }
     eligible.push(who);
@@ -405,6 +477,19 @@ export function survivesIngestionSanitiser(name) {
 
 const isError = (v) => Boolean(v && typeof v === 'object' && 'error' in v);
 
+const describeTeam = (t) => `${t.id}${t.displayName ? ` "${t.displayName}"` : ''}`;
+
+/**
+ * What to do when the grant cannot be read. Verifying is a read. The grant
+ * runbook is a write: it creates a write grant whenever it finds none, so it
+ * is never the way to "check" one.
+ */
+export const WRITE_GRANT_UNKNOWN =
+  'unknown: verify read-only with GET /sites/{site-id}/permissions (Graph Explorer, ' +
+  'Sites.FullControl.All); it must list a "write" role for the ingestion app id. ' +
+  "Grant-TeamSiteAccess.ps1 CREATES a write grant: run it only to grant one on this client's own site, " +
+  'never on a forbidden site such as BCR GROUP. Once verified, pass';
+
 /**
  * Everything the tool can say about one row: the problems, and the values it
  * would propose. Used by `check` (problems only) and `propose`.
@@ -416,6 +501,7 @@ const isError = (v) => Boolean(v && typeof v === 'object' && 'error' in v);
  * @param {object} facts
  * @param {object} ctx
  * @param {Set<string>} [ctx.forbiddenSitePaths]  normalised site paths
+ * @param {Set<string>} [ctx.knownTeamIds]       normalised ids of every Team in the tenant
  * @param {Set<string>} [ctx.ingestAppIds]
  * @param {Set<string>} [ctx.writeVerified]       normalised site paths or list item ids
  * @param {Set<string>} [ctx.confirmRemoveStaff]  list item ids
@@ -433,7 +519,18 @@ export function assessRow(row, facts = {}, ctx = {}) {
   if (!row.isAdmin && (!row.siteHostname || !row.sitePath)) {
     add('no_site', 'skip', 'row has no SiteHostname/SitePath');
   }
-  if (ctx.forbiddenSitePaths?.has(normalizeSitePath(row.sitePath))) {
+  const canonicalPath = normalizeSitePath(row.sitePath);
+  const pathNotCanonical = canonicalPath === null;
+  if (pathNotCanonical) {
+    add(
+      'site_path_not_canonical',
+      'skip',
+      'SitePath has a "." or ".." segment, which URL parsing resolves to another site. ' +
+        'Correct it by hand to the path of the site itself',
+    );
+  }
+  const forbidden = Boolean(canonicalPath && ctx.forbiddenSitePaths?.has(canonicalPath));
+  if (forbidden) {
     add('forbidden_target', 'skip', 'SitePath is a forbidden target (FORBIDDEN_TARGET_SITE_PATHS)');
   }
 
@@ -500,7 +597,15 @@ export function assessRow(row, facts = {}, ctx = {}) {
       add('public_team', 'skip', 'the Team is Public; binding skipped (this tool never changes visibility)');
     }
     if (!isBcrTeamGroup(team)) {
-      add('team_not_bcr', 'skip', 'the Team description does not follow "BCR Group — {recordNumber}"');
+      // The Team is the one whose root site is this row's own site, found
+      // uniquely; the marker adds nothing to that. Teams that predate
+      // onboarding never had it, so it is reported, not required.
+      add(
+        'team_not_bcr',
+        'warn',
+        'the Team description does not follow "BCR Group — {recordNumber}" (a Team that ' +
+          "predates onboarding?). It is bound because it is the one Team whose root site is this row's site",
+      );
     }
     const existingTeam = normalizeGuid(row.teamId);
     if (row.teamId && existingTeam !== normalizeGuid(team.id)) {
@@ -586,41 +691,56 @@ export function assessRow(row, facts = {}, ctx = {}) {
         members,
         owners,
         memberOfByUser: facts.memberOfByUser ?? new Map(),
+        ...(ctx.knownTeamIds ? { knownTeamIds: ctx.knownTeamIds } : {}),
       });
       const unreadable = people.excluded.filter((e) => e.reason === 'memberships_unreadable');
       if (unreadable.length) {
         add('guest_memberships_unreadable', 'skip', `${unreadable.length} guest(s) whose memberships could not be read`);
       }
-      const several = people.excluded.filter((e) => e.reason === 'guest_in_several_bcr_teams');
-      if (several.length) {
-        add('guest_in_several_bcr_teams', 'warn', `${several.length} guest(s) not bound: in several BCR teams`);
+      const inOther = people.excluded.filter((e) => e.reason === 'guest_in_other_team');
+      if (inOther.length) {
+        const list = inOther
+          .map((e) => `${e.userPrincipalName || e.id} also in ${e.otherTeams.map(describeTeam).join(', ')}`)
+          .join('; ');
+        add('guest_in_other_team', 'warn', `${inOther.length} guest(s) not bound: ${list}`);
+      }
+      const disagree = people.excluded.filter((e) => e.reason === 'guest_not_in_this_team');
+      if (disagree.length) {
+        add(
+          'guest_not_in_this_team',
+          'warn',
+          `${disagree.length} guest(s) not bound: listed as members, but their memberships do not include this Team`,
+        );
       }
       if (people.eligible.length === 0) {
-        add('no_eligible_guest', 'warn', "no guest belongs to exactly this BCR team; the client's uploads go to quarantine");
+        add(
+          'no_eligible_guest',
+          'warn',
+          "no guest belongs to this Team alone; the client's uploads go to quarantine",
+        );
       }
     }
   }
 
   // --- write grant ---------------------------------------------------------
   // Only for a client row whose site resolved: an admin row files nowhere,
-  // and an unresolved site is already a skip with a better reason.
+  // and an unresolved site is already a skip with a better reason. Never for
+  // a forbidden or non-canonical site: that row is never bound, and advice
+  // about the ingestion's grant there could only lead someone to widen it.
   const siteResolved = Boolean(site && !isError(site));
-  const grant = row.isAdmin || !siteResolved ? 'n/a' : evaluateWriteGrant(facts.permissions, ctx.ingestAppIds);
+  const grant =
+    row.isAdmin || forbidden || pathNotCanonical || !siteResolved
+      ? 'n/a'
+      : evaluateWriteGrant(facts.permissions, ctx.ingestAppIds);
   evidence.writeGrant = grant;
   if (grant === 'missing') {
     add('write_grant_missing', 'skip', 'the ingestion identity has no write permission on this site');
   } else if (grant === 'unknown') {
-    const verified =
-      ctx.writeVerified?.has(normalizeSitePath(row.sitePath)) || ctx.writeVerified?.has(row.listItemId);
+    const verified = ctx.writeVerified?.has(canonicalPath) || ctx.writeVerified?.has(row.listItemId);
     if (verified) {
       evidence.writeGrant = 'operator-verified';
     } else {
-      add(
-        'write_grant_unknown',
-        'skip',
-        'unknown, verify via runbook (Grant-TeamSiteAccess.ps1 reports "exists"), then pass ' +
-          `--write-verified ${row.sitePath || row.listItemId}`,
-      );
+      add('write_grant_unknown', 'skip', `${WRITE_GRANT_UNKNOWN} --write-verified ${row.sitePath || row.listItemId}`);
     }
   }
 
@@ -644,10 +764,12 @@ export function assessRow(row, facts = {}, ctx = {}) {
       if (user === null) reason = 'not_found';
       else if (user && !isError(user) && user.userType === 'Member') reason = 'staff';
       else if (excludedById.has(id)) reason = excludedById.get(id).reason;
+      const otherTeams = excludedById.get(id)?.otherTeams;
       removedUserIds.push({
         id,
         reason,
         userPrincipalName: (user && !isError(user) && user.userPrincipalName) || '',
+        ...(otherTeams ? { otherTeams } : {}),
       });
     }
     for (const raw of row.invalidUserIds) removedUserIds.push({ id: raw, reason: 'not_a_guid' });
@@ -735,6 +857,16 @@ export function buildPlan({ rows, assessments, directory, ingestAppIds = [], cre
       proposed: a.proposed ? { ...a.proposed } : null,
       removedUserIds: a.removedUserIds,
       addedUserIds: a.addedUserIds,
+      // The Team's guests who are not bound, and why: a reviewer must see a
+      // guest left out because they are also in another Team, and which one.
+      excludedGuests: (a.excludedPeople ?? [])
+        .filter((p) => p.reason !== 'owner' && p.reason !== 'not_a_guest')
+        .map(({ id, userPrincipalName, reason, otherTeams }) => ({
+          id,
+          userPrincipalName,
+          reason,
+          ...(otherTeams ? { otherTeams } : {}),
+        })),
       evidence: a.evidence,
     };
     if (skips.length === 0 && !a.proposed) {
@@ -789,6 +921,7 @@ export function buildPlan({ rows, assessments, directory, ingestAppIds = [], cre
       const row = rowById.get(e.listItemId);
       if (!row.active || row.isAdmin || !row.siteHostname || !row.sitePath) continue;
       const key = targetKey(row, finalRootFolder(e));
+      if (!key) continue; // a non-canonical SitePath is already a SKIP and targets nothing
       if (!byTarget.has(key)) byTarget.set(key, []);
       byTarget.get(key).push(e);
     }
@@ -886,6 +1019,14 @@ export function changedSinceApply(logRow, currentFields) {
   return Object.keys(logRow.patch ?? {}).filter(
     (f) => fieldString(currentFields?.[f]) !== fieldString(logRow.after?.[f]),
   );
+}
+
+/**
+ * The expectations `apply` checks: always the P0 routing marker, then any
+ * the operator adds. Extra ones can only narrow the gate, never replace it.
+ */
+export function healthExpectations(extra = []) {
+  return [P0_HEALTH_EXPECTATION, ...extra.filter((e) => e !== P0_HEALTH_EXPECTATION)];
 }
 
 /**
