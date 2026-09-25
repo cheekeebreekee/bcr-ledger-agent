@@ -34,7 +34,15 @@
 #   - Evidence is never overwritten: a blob that exists with another sha256
 #     stops the run.
 #   - No public access, no shared keys, TLS 1.2, a CanNotDelete lock on the
-#     account.
+#     account. An existing account is reused only if it already has all
+#     three: the script never loosens or tightens someone else's account.
+#   - Only the named readers can read. Every "Storage Blob Data *" role that
+#     reaches the container (assigned there or inherited from the account,
+#     resource group, subscription or above) must be a named reader's Reader
+#     role, or, with --grant-uploader, the operator's Contributor role.
+#     Anything else stops the run, dry run included, and is listed.
+#   - With --grant-uploader, the command that removes the operator's write
+#     role again is printed at the end, to run once the upload is checked.
 #
 # Uses the Azure CLI only.
 # -----------------------------------------------------------------------------
@@ -136,9 +144,76 @@ echo "  target        $RG / $ACCOUNT / $CONTAINER ($LOCATION)"
 echo "  retention     $RETENTION_DAYS days, version-level, left unlocked"
 echo
 
+# --- who may hold a data role ---------------------------------------------------------
+# Resolved first: the reuse check below compares every data role on the
+# container with exactly these people.
+GUID_RE='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+resolve_user() {
+  if [[ "$1" =~ $GUID_RE ]]; then lower "$1"; else lower "$(az ad user show --id "$1" --query id --output tsv 2>/dev/null || true)"; fi
+}
+READER_OIDS=()
+READERS_ALL_NAMED=1
+for reader in "${READERS[@]}"; do
+  oid=""
+  if [[ "$reader" != "<"* ]]; then oid=$(resolve_user "$reader"); fi
+  if [[ -z "$oid" ]]; then
+    READERS_ALL_NAMED=0
+    if [[ "$reader" != "<"* && $APPLY == 1 ]]; then die "reader $reader: no such user in this tenant"; fi
+  fi
+  READER_OIDS+=("$oid")
+done
+MY_OID=""
+if [[ $GRANT_UPLOADER == 1 ]]; then MY_OID=$(lower "$(az ad signed-in-user show --query id --output tsv)"); fi
+
+# "<object id>|<role>" per line: the only data-plane assignments allowed.
+ALLOWED_DATA_ROLES=""
+for oid in "${READER_OIDS[@]}"; do
+  if [[ -n "$oid" ]]; then ALLOWED_DATA_ROLES+="$oid|$READER_ROLE"$'\n'; fi
+done
+if [[ -n "$MY_OID" ]]; then ALLOWED_DATA_ROLES+="$MY_OID|$UPLOADER_ROLE"$'\n'; fi
+
+# Every "Storage Blob Data *" assignment that reaches $1, inherited ones
+# included, as "principalId<TAB>role<TAB>scope<TAB>principalName". The name,
+# which can be empty, is last: `read` collapses empty tab-separated fields.
+data_roles_at() {
+  az role assignment list --scope "$1" --include-inherited \
+    --query "[?starts_with(roleDefinitionName, 'Storage Blob Data')].[principalId, roleDefinitionName, scope, principalName]" \
+    --output tsv
+}
+
+# Report the data roles reaching $1 and stop on any that is not allowed.
+check_data_roles() {
+  local scope="$1" rows pid role name at unexpected=0
+  rows=$(data_roles_at "$scope") || die "cannot list role assignments on $scope (needs Microsoft.Authorization/roleAssignments/read)"
+  echo "  data roles reaching the container (from $scope, inherited included):"
+  if [[ -z "$rows" ]]; then echo "    none"; fi
+  while IFS=$'\t' read -r pid role at name; do
+    [[ -n "$pid" ]] || continue
+    if printf '%s' "$ALLOWED_DATA_ROLES" | grep -Fqx "$(lower "$pid")|$role"; then
+      echo "    ok          $role  ${name:-$pid}  @ $at"
+    else
+      unexpected=$((unexpected + 1))
+      echo "    NOT ALLOWED $role  ${name:-$pid}  @ $at"
+    fi
+  done <<<"$rows"
+  if ((unexpected > 0)); then
+    if [[ $READERS_ALL_NAMED == 0 && $APPLY != 1 ]]; then
+      echo "  ⚠ $unexpected assignment(s) not verified: name every reader (ROMAN_UPN, IOD_UPN or --reader) to check them"
+      return 0
+    fi
+    die "$unexpected data role assignment(s) above would let someone other than the named readers reach the evidence.
+  One on the container, account or resource group: remove it (az role assignment delete --ids …) or use a
+  new account in a new resource group. One inherited from the subscription or above reaches any account
+  here: settle with Roman where the evidence may live before anything is uploaded."
+  fi
+}
+
 # --- resource group -------------------------------------------------------------
 echo "Resource group"
+RG_EXISTS=0
 if az group show --name "$RG" --output none 2>/dev/null; then
+  RG_EXISTS=1
   echo "  exists"
 else
   run az group create --name "$RG" --location "$LOCATION" --tags purpose=ir0-evidence system=bcr-ledger-agent
@@ -151,8 +226,15 @@ if az storage account show --name "$ACCOUNT" --resource-group "$RG" --output non
   ACCOUNT_EXISTS=1
   public=$(az storage account show --name "$ACCOUNT" --resource-group "$RG" --query allowBlobPublicAccess --output tsv)
   sharedkey=$(az storage account show --name "$ACCOUNT" --resource-group "$RG" --query allowSharedKeyAccess --output tsv)
-  echo "  exists (allowBlobPublicAccess=$public, allowSharedKeyAccess=$sharedkey)"
+  tls=$(az storage account show --name "$ACCOUNT" --resource-group "$RG" --query minimumTlsVersion --output tsv)
+  echo "  exists (allowBlobPublicAccess=${public:-unset}, allowSharedKeyAccess=${sharedkey:-unset}, minimumTlsVersion=${tls:-unset})"
   [[ "$public" != "true" ]] || die "$ACCOUNT allows public blob access; this is not an evidence account. Use another name."
+  # Unset means allowed. With shared keys on, anyone who can list the keys
+  # reads the container, whatever its role assignments say.
+  [[ "$sharedkey" == "false" ]] ||
+    die "$ACCOUNT allows shared key access (allowSharedKeyAccess=${sharedkey:-unset}); this is not an evidence account. Use another name."
+  [[ "$tls" == "TLS1_2" || "$tls" == "TLS1_3" ]] ||
+    die "$ACCOUNT accepts TLS below 1.2 (minimumTlsVersion=${tls:-unset}); this is not an evidence account. Use another name."
 else
   run az storage account create --name "$ACCOUNT" --resource-group "$RG" --location "$LOCATION" \
     --sku Standard_GRS --kind StorageV2 --min-tls-version TLS1_2 --https-only true \
@@ -232,26 +314,36 @@ else
     --container-name "$CONTAINER" --period "$RETENTION_DAYS" --allow-protected-append-writes false
 fi
 
+# --- who can read it now ------------------------------------------------------------------
+# The narrowest scope that exists: roles assigned there or above all reach
+# the container once it exists.
+echo "Access"
+if [[ $CONTAINER_EXISTS == 1 ]]; then
+  check_data_roles "$SCOPE"
+elif [[ $ACCOUNT_EXISTS == 1 ]]; then
+  check_data_roles "$ACCOUNT_ID"
+elif [[ $RG_EXISTS == 1 ]]; then
+  check_data_roles "/subscriptions/$SUB_ID/resourceGroups/$RG"
+else
+  check_data_roles "/subscriptions/$SUB_ID"
+fi
+
 # --- readers ------------------------------------------------------------------------------
 echo "Readers ($READER_ROLE on the container)"
-GUID_RE='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
-resolve_user() {
-  if [[ "$1" =~ $GUID_RE ]]; then echo "$1"; else az ad user show --id "$1" --query id --output tsv 2>/dev/null || true; fi
-}
 has_role() { # object id, role
   [[ $CONTAINER_EXISTS == 1 ]] || return 1
   local n
   n=$(az role assignment list --assignee "$1" --role "$2" --scope "$SCOPE" --query "length(@)" --output tsv 2>/dev/null || echo 0)
   [[ "$n" != "0" && -n "$n" ]]
 }
-for reader in "${READERS[@]}"; do
+for i in "${!READERS[@]}"; do
+  reader="${READERS[$i]}"
   if [[ "$reader" == "<"* ]]; then
     echo "  $reader — placeholder; --apply refuses until it is set"
     continue
   fi
-  oid=$(resolve_user "$reader")
+  oid="${READER_OIDS[$i]}"
   if [[ -z "$oid" ]]; then
-    [[ $APPLY == 1 ]] && die "reader $reader: no such user in this tenant"
     echo "  $reader — NOT FOUND in the directory"
     continue
   fi
@@ -265,11 +357,10 @@ done
 
 if [[ $GRANT_UPLOADER == 1 ]]; then
   echo "Uploader ($UPLOADER_ROLE on the container)"
-  my_oid=$(az ad signed-in-user show --query id --output tsv)
-  if has_role "$my_oid" "$UPLOADER_ROLE"; then
+  if has_role "$MY_OID" "$UPLOADER_ROLE"; then
     echo "  $ME — already assigned"
   else
-    run az role assignment create --assignee-object-id "$my_oid" --assignee-principal-type User \
+    run az role assignment create --assignee-object-id "$MY_OID" --assignee-principal-type User \
       --role "$UPLOADER_ROLE" --scope "$SCOPE"
     if [[ $APPLY == 1 ]]; then echo "  (role assignments take a few minutes to apply; uploads retry)"; fi
   fi
@@ -312,9 +403,29 @@ if [[ ${#UPLOAD_LIST[@]} -gt 0 ]]; then
   done
 fi
 
+# The operator's write role is for the upload only. It is not removed here:
+# a person removes it once the upload is checked against SHA256SUMS.
+print_uploader_removal() {
+  echo
+  echo "Write access: $ME holds $UPLOADER_ROLE on the container until removed. Once every"
+  echo "file is uploaded and its sha256 checked, remove it, so that only the readers remain:"
+  echo "  az role assignment delete --assignee-object-id $MY_OID --role '$UPLOADER_ROLE' \\"
+  echo "    --scope $SCOPE"
+  echo "If Azure refuses with ScopeLocked, the account's CanNotDelete lock is in the way. Lift it"
+  echo "for that one command only, and put it back at once:"
+  echo "  az lock delete --name ir0-evidence-nodelete --resource-group $RG --resource-name $ACCOUNT \\"
+  echo "    --resource-type Microsoft.Storage/storageAccounts"
+  echo "  (the role assignment delete above)"
+  echo "  az lock create --name ir0-evidence-nodelete --lock-type CanNotDelete --resource-group $RG \\"
+  echo "    --resource-name $ACCOUNT --resource-type Microsoft.Storage/storageAccounts \\"
+  echo "    --notes 'IR-0 evidence: do not delete'"
+  echo "A later run of this script without --grant-uploader refuses while the role is there."
+}
+
 # --- resulting state -------------------------------------------------------------------------------
 echo
 if [[ $APPLY != 1 ]]; then
+  if [[ $GRANT_UPLOADER == 1 ]]; then print_uploader_removal; echo; fi
   echo "Dry run: nothing was changed. Re-run with --apply."
   echo
   exit 0
@@ -335,6 +446,11 @@ echo
 echo "Role assignments on the container"
 az role assignment list --scope "$SCOPE" \
   --query "[].{principal:principalName, type:principalType, role:roleDefinitionName}" --output table
+echo
+echo "Data roles that reach the container, inherited included"
+az role assignment list --scope "$SCOPE" --include-inherited \
+  --query "[?starts_with(roleDefinitionName, 'Storage Blob Data')].{principal:principalName, type:principalType, role:roleDefinitionName, scope:scope}" \
+  --output table
 if [[ ${#UPLOAD_LIST[@]} -gt 0 ]]; then
   echo
   echo "Blobs under $PREFIX/"
@@ -352,4 +468,5 @@ echo "period can then only be extended, and nothing in the container can be dele
 echo "for $RETENTION_DAYS days after it was written."
 echo "  az storage container immutability-policy lock --account-name $ACCOUNT --resource-group $RG \\"
 echo "    --container-name $CONTAINER --if-match '$etag'"
+if [[ $GRANT_UPLOADER == 1 ]]; then print_uploader_removal; fi
 echo
