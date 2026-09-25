@@ -39,6 +39,11 @@ database. The containment has three strands, and this checklist puts them in one
   the cross-client write path. A rollback reverts individual commits and is deployed as a new
   build. For an emergency there is a stop switch that files nothing anywhere
   ([H-12](#h-12-the-change-window-ingestion-deploy-bindings-canaries)).
+- **BCR GROUP stays Private.** No step changes its visibility, its membership or its channels;
+  T-3 only reads them, and T-7 at most blocks one account's sign-in. Inside its site, T-4 locks
+  (and may create, empty) the ledger's own folders, T-5 locks the Client Directory list, and
+  H-13 lowers the ingestion identity's own grant to `read`
+  ([`tenant-hardening.md`](tenant-hardening.md)).
 - **Yahor does not upload through the bot** until the full implementation is done. His id stays
   on PESKOVOI's Directory row until the binding tool removes it in H-12.
 - **Secret rotation is deferred** until Roman provides new credentials. It is an accepted risk

@@ -41,7 +41,7 @@ broken; the audit confirmed it and found the mechanism.
 |---|---|
 | 23 Sep | Roman asked whether onboarded clients could reach the `Onboarding klientów` channel. The tenant audit (`bcr-onboarding-agent/docs/operations/client-access.md`) found the three `{NIP}@` client addresses enabled and licensed, and the BCR GROUP and Bricore teams Public. |
 | 23–25 Sep | A read-only audit of both repos: 33 security findings, each re-checked by an independent reviewer, all 33 held. They reduce to the six root causes below. |
-| between 23 and 25 Sep | BCR GROUP was made Private. **Record the exact time here from the Purview `Update group` event** once IR-0 is exported. It stays Private; this response never changes it. |
+| between 23 and 25 Sep | BCR GROUP was made Private. **Record the exact time here from the Purview `Update group` event** once IR-0 is exported. It stays Private; this response never changes its visibility, its membership or its channels. |
 | 25 Sep | Automatic deploys to "dev" (which is production: it serves PESKOVOI, `0002`) were stopped, commit `f5a2bd4` (gate G0). The Phase-0 contract was committed, `21b0883`. Roman agreed the GDPR option in [IR-3](#ir-3-gdpr). |
 
 **Awareness**, for the GDPR clock, arguably began with the 23–25 September audit. The 72-hour

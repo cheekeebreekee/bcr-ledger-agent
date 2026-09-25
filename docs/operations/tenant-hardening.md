@@ -17,16 +17,15 @@ own line.
 
 ⚠️ **Three rules for every step on this page.**
 
-- **BCR GROUP stays Private.** This page never changes its visibility or its channels.
-  [T-3](#t-3-confirm-bcr-group-is-private-read-only) only reads.
+- **BCR GROUP stays Private, and its visibility, membership and channels never change.**
+  [T-3](#t-3-confirm-bcr-group-is-private-read-only) only reads them.
   [T-4](#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root) and
   [T-5](#t-5-lock-and-version-the-client-directory-list) change permissions on two things *inside*
   its site: the ledger's own folders, and the routing list. T-4 may also create one of the
   ledger's own folders, `98_Nieposortowane`, empty, so that it is locked before anything is filed
-  in it. The only change to its membership is
-  in [T-7](#t-7-explain-or-remove-authoriseme), which takes `AuthoriseMe@` out of the team, and
-  only if Roman decides the account is not needed. Nothing else on this page, T-4b included,
-  touches BCR GROUP.
+  in it. [T-7](#t-7-explain-authoriseme-or-block-its-sign-in) at most blocks the sign-in of
+  `AuthoriseMe@`, which leaves the team's membership as it is. Nothing else on this page, T-4b
+  included, touches BCR GROUP.
 - **Nothing here deletes or moves a client document.** Documents stay where IR-1 finds them, and
   IR-2 moves them later, with two people signing off.
 - **Save every "before" output.** The rollback needs it. Save it in the IR evidence store with the
@@ -174,8 +173,7 @@ Do not change it from here. Take the exact time it became Private from the Purvi
 
 **Why.** Every upload the ledger could not route went to the root of the BCR GROUP team library,
 in the ledger's own taxonomy folders. Those folders hold documents from every client, and every
-member of the team can read them: `AuthoriseMe@` today, and any accountant added to BCR GROUP
-later. Stopping inheritance and leaving only the Owners closes that. The documents stay exactly
+member of the team can read them: `AuthoriseMe@` today, and anyone who becomes a member later. Stopping inheritance and leaving only the Owners closes that. The documents stay exactly
 where IR-1 finds them.
 
 **When.** Day 0, the day of [H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy), and
@@ -292,9 +290,10 @@ unique permissions**; scripted (needs `AllSites.FullControl`),
 `sp -X POST "$(item <folder>)/resetroleinheritance()"`. This exposes the folder to every member
 again, so only do it if the lock broke something essential, and record why.
 
-**Before anyone joins BCR GROUP.** No accountant is added to BCR GROUP, and the planned
-"Weryfikacja dokumentów" channel is not created, until this step and
-[T-7](#t-7-explain-or-remove-authoriseme) are done.
+**Out of scope for Phase 0: new members or channels in BCR GROUP.** Adding accountants to BCR
+GROUP, and creating the planned "Weryfikacja dokumentów" channel, would change its membership
+and its channels, which no Phase-0 step does. Both are later decisions, and even then not before
+this step and [T-7](#t-7-explain-authoriseme-or-block-its-sign-in) are done.
 
 ## T-4b: Lock the ledger folders at the library root of the client sites
 
@@ -504,7 +503,7 @@ needed. The ledger never wrote there, because it has no grant on that site. Then
 **Rollback.** Private: PATCH back to `Public`, which reopens the window. Deleted:
 `g -X POST "$G/directory/deletedItems/<bricore-id>/restore"` within 30 days.
 
-## T-7: Explain or remove AuthoriseMe@
+## T-7: Explain AuthoriseMe@, or block its sign-in
 
 | Runs it | Decides | Closes |
 |---|---|---|
@@ -512,8 +511,7 @@ needed. The ledger never wrote there, because it has no grant on that site. Then
 
 **Why.** `AuthoriseMe@bcr-group.pl` is the third member of BCR GROUP, beside Roman and Yahor,
 and nobody has written down what it is for. It could read the fallback bucket (W1), so the
-incident has to account for it. It also has to be settled before any accountant is added to
-BCR GROUP.
+incident has to account for it.
 
 **Read.**
 
@@ -529,12 +527,19 @@ Any file access by it in the fallback bucket is evidence for IR-3.
 
 - **Explained and needed:** record the reason in the incident's status table. Check that it is
   in no client Team.
-- **Not needed:** block sign-in (`g -X PATCH "$G/users/<id>" -d '{"accountEnabled":false}'`) and
-  take it out of BCR GROUP (`g -X DELETE "$G/groups/<bcr-group-id>/members/<id>/\$ref"`). This
-  changes who is in the team. It does not change the team's visibility or its channels.
+- **Not needed:** block its sign-in, and nothing more: **Block sign-in** on the account in the
+  Entra admin centre, or `g -X PATCH "$G/users/<id>" -d '{"accountEnabled":false}'`
+  (`User.ReadWrite.All`, H-4a). A blocked account can no longer read the fallback bucket, and
+  BCR GROUP's membership, visibility and channels stay exactly as they are.
 
-**Verify.** Read the account again. **Rollback.** Enable it, and add it back with
-`POST /groups/<bcr-group-id>/members/$ref`.
+**Blocking sign-in is the whole of the Phase-0 action.** Taking `AuthoriseMe@` out of BCR GROUP,
+or any other change to who is in the team, is not part of Phase 0. If it is wanted, it is a
+separate, explicit decision by Roman and the team's owner, made and recorded outside this
+runbook.
+
+**Verify.** Read the account again: `accountEnabled` is `false` if it was blocked, and `memberOf`
+still lists BCR GROUP. **Rollback.** Enable it again:
+`g -X PATCH "$G/users/<id>" -d '{"accountEnabled":true}'`.
 
 ## T-8: Entra external collaboration
 
@@ -732,7 +737,7 @@ laptops (`.env`) are an accepted risk, recorded in
 | T-4b | | | | Per client site: folders locked and the time of the lock; H-3's time; any re-check after H-3; the check after IR-1 of the items outside the locked folders, done or not, and how many it locked (each item and its lock time are in the evidence store). W4 ends, for items already moved, at the latest of these that applies to the item |
 | T-5 | | | | |
 | T-6 | Roman decides | | | Private / deleted |
-| T-7 | Roman decides | | | Explained / removed |
+| T-7 | Roman decides | | | Explained / sign-in blocked (membership unchanged) |
 | T-8 | | | | TEST invite checked |
 | T-9 | Roman confirms tenant level | | | TEST guest checked |
 | T-10 | | | | Everyone (Phase 0); version 0.2.0 shown; sha256 of the uploaded zip |
