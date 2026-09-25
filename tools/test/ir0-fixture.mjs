@@ -6,12 +6,13 @@
 import { LEGACY_MESSAGES as M } from '../lib/misfiled.mjs';
 
 const g = (s) => `00000000-0000-4000-8000-${s.padStart(12, '0')}`;
-export const U1 = g('u1');
-export const U2 = g('u2');
-export const U3 = g('u3');
-export const U4 = g('u4');
-export const U5 = g('u5');
-export const U6 = g('u6');
+// Uploader object ids: synthetic, but valid GUIDs, as real oids are.
+export const U1 = g('f001');
+export const U2 = g('f002');
+export const U3 = g('f003');
+export const U4 = g('f004');
+export const U5 = g('f005');
+export const U6 = g('f006');
 export const HOST = 'https://contoso.sharepoint.com';
 
 /** A pino line as the ingestion wrote it. */

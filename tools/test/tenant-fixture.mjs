@@ -5,10 +5,17 @@
  *   1  client A  — clean: private team, standard channel, one eligible guest,
  *                  ingestion write grant readable → PATCH
  *   2  client B  — a staff (Member) id on the row, site permissions
- *                  unreadable → SKIP until confirmed and verified
+ *                  unreadable → SKIP until confirmed and verified. Its Team
+ *                  predates onboarding: no "BCR Group —" description, which
+ *                  is a warning only
  *   3  admin row — IsAdmin → SKIP
  *   4  client C  — Public team → SKIP
  *   5  inactive  — not examined
+ *
+ * Guests A and B are also in a security group that is not a Team; it must
+ * not count against them. The "multi" guest is in Teams A and C, so it is
+ * bound to neither. `memberOf` reports whether a group is a Team only when
+ * `resourceProvisioningOptions` is selected, as Graph does.
  *
  * All identifiers are fake: `00000000-0000-4000-8000-…` GUIDs, NIPs
  * `000000000x`, `contoso.sharepoint.com`.
@@ -29,6 +36,7 @@ export const IDS = Object.freeze({
   teamB: g('a002'),
   teamC: g('a003'),
   teamStaff: g('a0ff'),
+  groupNotTeam: g('a0ee'),
   guestA: g('b001'),
   guestB: g('b002'),
   guestMulti: g('b003'),
@@ -87,11 +95,16 @@ export function createTenant() {
   ]);
   const teams = [
     { id: IDS.teamA, displayName: '0001 Client A', description: 'BCR Group — 0001', visibility: 'Private' },
-    { id: IDS.teamB, displayName: '0002 Client B', description: 'BCR Group — 0002', visibility: 'Private' },
+    { id: IDS.teamB, displayName: '0002 Client B', description: '', visibility: 'Private' },
     { id: IDS.teamC, displayName: '0003 Client C', description: 'BCR Group — 0003', visibility: 'Public' },
     { id: IDS.teamStaff, displayName: 'BCR GROUP', description: 'BCR staff team', visibility: 'Private' },
   ].map((t) => ({ ...t, resourceProvisioningOptions: ['Team'] }));
-  const teamById = new Map(teams.map((t) => [t.id, t]));
+  const securityGroup = {
+    id: IDS.groupNotTeam,
+    displayName: 'All client guests',
+    description: 'security group',
+    resourceProvisioningOptions: [],
+  };
 
   const sites = new Map([
     ['/sites/0001CLIENTA', { id: IDS.siteA, team: IDS.teamA, drive: IDS.driveA, channel: IDS.channelA }],
@@ -108,6 +121,7 @@ export function createTenant() {
     [IDS.teamB, [IDS.guestB, IDS.staff]],
     [IDS.teamC, [IDS.guestMulti]],
     [IDS.teamStaff, [IDS.staff, IDS.ownerA]],
+    [IDS.groupNotTeam, [IDS.guestA, IDS.guestB]],
   ]);
   const owners = new Map([
     [IDS.teamA, [IDS.ownerA]],
@@ -160,9 +174,16 @@ export function createTenant() {
       return jsonResponse(200, { value: ids.map(userOut) });
     }
     if ((m = path.match(/^\/users\/([^/]+)\/memberOf$/))) {
-      const groups = teams.filter((t) => (members.get(t.id) ?? []).includes(m[1]));
+      const withKind = String(query.get('$select')).includes('resourceProvisioningOptions');
+      const groups = [...teams, securityGroup].filter((t) => (members.get(t.id) ?? []).includes(m[1]));
       return jsonResponse(200, {
-        value: groups.map((t) => ({ '@odata.type': '#microsoft.graph.group', id: t.id, displayName: t.displayName, description: t.description })),
+        value: groups.map((t) => ({
+          '@odata.type': '#microsoft.graph.group',
+          id: t.id,
+          displayName: t.displayName,
+          description: t.description,
+          ...(withKind ? { resourceProvisioningOptions: t.resourceProvisioningOptions } : {}),
+        })),
       });
     }
     if ((m = path.match(/^\/users\/([^/]+)$/))) {

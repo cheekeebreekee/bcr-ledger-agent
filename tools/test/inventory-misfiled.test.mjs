@@ -5,8 +5,9 @@ import { join } from 'node:path';
 import { describe, test } from 'node:test';
 
 import { main } from '../inventory-misfiled.mjs';
+import { PLAN_KIND } from '../lib/bindings.mjs';
 import { capture, fakeFetch, fakeJwt, jsonResponse } from './fake-graph.mjs';
-import { traces } from './ir0-fixture.mjs';
+import { U3, U4, traces } from './ir0-fixture.mjs';
 
 const g = (s) => `00000000-0000-4000-8000-${s.padStart(12, '0')}`;
 const INGEST = g('e1');
@@ -106,6 +107,7 @@ describe('inventory-misfiled', () => {
         '--ingest-app-ids', INGEST,
         '--fallback-site', 'BCR',
         '--ir0', ir0File,
+        '--site-guests', `0001CLIENTA=${U3}`,
       ],
       fetch,
       outDir,
@@ -143,6 +145,53 @@ describe('inventory-misfiled', () => {
     assert.match(out.text(), /sha256  [0-9a-f]{64}/);
   });
 
+  test('an identity-routed upload is clean only against a guest list: none, a plan, --no-versions', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'ir1-test-'));
+    const ir0File = join(outDir, 'ir0.json');
+    writeFileSync(ir0File, JSON.stringify(traces()));
+    const base = [
+      '--site', 'BCR=contoso.sharepoint.com:/sites/BCRGROUP',
+      '--site', 'https://contoso.sharepoint.com/sites/0001CLIENTA',
+      '--ingest-app-ids', INGEST,
+      '--fallback-site', 'BCR',
+      '--ir0', ir0File,
+    ];
+    const registerOf = async (extra) => {
+      const dir = mkdtempSync(join(tmpdir(), 'ir1-out-'));
+      const { promise, out } = run([...base, ...extra, '--out-dir', dir], tenant().fetch, outDir);
+      assert.equal(await promise, 0);
+      const name = readdirSync(dir).find((n) => n.endsWith('.json'));
+      const reg = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+      return { reg, row: Object.fromEntries(reg.rows.map((r) => [r.driveItemId, r])), out };
+    };
+
+    const none = await registerOf([]);
+    assert.ok(none.row.d3.flags.includes('uploader_guest_unverified'));
+    assert.equal(none.row.d3.suspect, true);
+    assert.match(none.out.text(), /no --site-guests or --bindings-plan/);
+
+    const planFile = join(outDir, 'plan.json');
+    writeFileSync(
+      planFile,
+      JSON.stringify({
+        kind: PLAN_KIND,
+        createdAt: '2026-09-25T09:00:00Z',
+        rows: [{ sitePath: '/sites/0001CLIENTA', eligibleGuests: [{ id: U4 }] }],
+      }),
+    );
+    const fromPlan = await registerOf(['--bindings-plan', planFile]);
+    assert.ok(fromPlan.row.d3.flags.includes('uploader_not_site_guest'), 'U3 is not a guest of that Team');
+    assert.deepEqual(fromPlan.reg.parameters.siteGuests, { '/sites/0001clienta': [U4] });
+    assert.match(fromPlan.reg.parameters.bindingsPlan.sha256, /^[0-9a-f]{64}$/);
+
+    const both = await registerOf(['--bindings-plan', planFile, '--site-guests', `0001CLIENTA=${U3}`]);
+    assert.equal(both.row.d3.suspect, false);
+
+    const noVersions = await registerOf(['--site-guests', `0001CLIENTA=${U3}`, '--no-versions']);
+    assert.ok(noVersions.row.d3.flags.includes('versions_unreadable'));
+    assert.equal(noVersions.row.d3.suspect, true, 'an unread version history fails closed');
+  });
+
   test('refuses to run without --ingest-app-ids, a site, or with a bad drive name', async () => {
     const { fetch } = tenant();
     const outDir = mkdtempSync(join(tmpdir(), 'ir1-test-'));
@@ -155,6 +204,16 @@ describe('inventory-misfiled', () => {
     await assert.rejects(
       run(['--site', 'a=contoso.sharepoint.com:/sites/X', '--ingest-app-ids', INGEST, '--fallback-site', 'b'], fetch, outDir).promise,
       /not one of the --site values/,
+    );
+    await assert.rejects(
+      run(['--site', 'a=contoso.sharepoint.com:/sites/X', '--ingest-app-ids', INGEST, '--site-guests', `b=${U3}`], fetch, outDir).promise,
+      /--site-guests b: not one of the --site values/,
+    );
+    const notAPlan = join(outDir, 'not-a-plan.json');
+    writeFileSync(notAPlan, JSON.stringify({ kind: 'something else', rows: [] }));
+    await assert.rejects(
+      run(['--site', 'a=contoso.sharepoint.com:/sites/X', '--ingest-app-ids', INGEST, '--bindings-plan', notAPlan], fetch, outDir).promise,
+      /not a directory-bindings plan/,
     );
   });
 });

@@ -21,9 +21,22 @@
  * before it (same `conversationId` or `clientId`, within a short window). Two
  * candidates with different ids make the uploader ambiguous, and it is
  * reported as such, never picked.
+ *
+ * An item can have several `uploaded` lines: the legacy upload replaced a
+ * file of the same name, so two uploads could land on one `driveItemId`, the
+ * earlier content surviving only as a prior version. Every upload is kept,
+ * and the uploaders of all of them are the item's candidates.
+ *
+ * ## Whose site it is
+ *
+ * An identity-routed upload went to the client row that held the uploader's
+ * id. Before Phase 0 the only id on a client row was staff, so "routed by
+ * identity" does not mean "uploaded by that client". The uploader is checked
+ * against the guests of the site's own Team (`--site-guests`, or a
+ * `directory-bindings` plan); without that list, the item is suspect.
  */
 
-import { normalizeGuid, normalizeSitePath } from './bindings.mjs';
+import { PLAN_KIND, normalizeGuid, normalizeSitePath, splitLines } from './bindings.mjs';
 
 export const REGISTER_KIND = 'bcr.ir1.inventory';
 
@@ -43,6 +56,10 @@ export const LEGACY_MESSAGES = Object.freeze({
 /**
  * Flags that make a row suspect: the file may sit where its uploader's client
  * is not, or nobody can yet say whose it is. Everything else is context.
+ *
+ * `has_prior_versions` is suspect because an earlier version can hold another
+ * document (the legacy upload replaced files of the same name), and
+ * `versions_unreadable` because an unknown version count may hide one.
  */
 export const SUSPECT_FLAGS = Object.freeze(
   new Set([
@@ -52,11 +69,16 @@ export const SUSPECT_FLAGS = Object.freeze(
     'admin_uploader',
     'uploader_ambiguous',
     'uploader_unknown',
+    'uploader_not_site_guest',
+    'uploader_guest_unverified',
     'ir0_site_mismatch',
     'ir0_batch_missing',
+    'ir0_filename_repeated_in_batch',
     'no_ir0_record',
     'overwritten_by_ingest',
     'multiple_uploads_same_item',
+    'has_prior_versions',
+    'versions_unreadable',
     'not_found_in_walk',
     'site_not_walked',
   ]),
@@ -91,7 +113,7 @@ export function parseSiteSpec(spec) {
     sitePath = rest.slice(colon + 1);
   }
   sitePath = sitePath.replace(/\/+$/, '');
-  if (!/^\/(sites|teams)\/[^/]+$/i.test(sitePath)) {
+  if (!/^\/(sites|teams)\/[^/]+$/i.test(sitePath) || /\/\.{1,2}$/.test(sitePath)) {
     throw new Error(`site "${spec}": path must be /sites/<name> or /teams/<name>`);
   }
   if (!/^[a-z0-9.-]+$/i.test(hostname)) throw new Error(`site "${spec}": bad hostname`);
@@ -104,7 +126,7 @@ export function sitePathFromWebUrl(webUrl) {
     const u = new URL(String(webUrl ?? ''));
     const parts = u.pathname.split('/').filter(Boolean);
     if (parts.length < 2 || !['sites', 'teams'].includes(parts[0].toLowerCase())) return '';
-    return normalizeSitePath(`/${parts[0]}/${decodeURIComponent(parts[1])}`);
+    return normalizeSitePath(`/${parts[0]}/${decodeURIComponent(parts[1])}`) ?? '';
   } catch {
     return '';
   }
@@ -294,18 +316,26 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
     return { oids, source };
   }
 
-  const uploadCounts = new Map();
-  for (const u of uploads) uploadCounts.set(u.driveItemId, (uploadCounts.get(u.driveItemId) ?? 0) + 1);
+  // `classified` and `refined` lines are found by invocationId + filename.
+  // Two uploads of one name in one batch (the legacy bot named every unnamed
+  // attachment "attachment.bin") make that lookup pick a sibling's line, so
+  // neither upload takes one, and both are flagged.
+  const perNameInBatch = new Map();
+  for (const u of uploads) {
+    const key = `${u.invocationId}|${u.filename}`;
+    perNameInBatch.set(key, (perNameInBatch.get(key) ?? 0) + 1);
+  }
 
-  const index = new Map();
+  const byItem = new Map();
   let withoutBatch = 0;
   let ambiguous = 0;
   for (const u of uploads) {
     const batch = batchFor(u);
     if (!batch) withoutBatch += 1;
     const key = `${u.invocationId}|${u.filename}`;
-    const ref = refined.get(key);
-    const cls = classified.get(key);
+    const repeated = Boolean(u.invocationId) && perNameInBatch.get(key) > 1;
+    const ref = repeated ? undefined : refined.get(key);
+    const cls = repeated ? undefined : classified.get(key);
     const { oids, source } = uploaderFor(batch);
     if (oids.length > 1) ambiguous += 1;
     const uploaderOid = oids.length === 1 ? oids[0] : '';
@@ -313,7 +343,7 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
       batch &&
       admin.find((l) => within(l, batch) && (uploaderOid ? l.userAadObjectId === uploaderOid : false));
     const finalSitePath = ref?.sitePath || batch?.sitePath || '';
-    index.set(u.driveItemId, {
+    const record = {
       driveItemId: u.driveItemId,
       uploadedAt: u.time,
       invocationId: u.invocationId,
@@ -322,6 +352,7 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
       webUrl: u.webUrl,
       webUrlSitePath: sitePathFromWebUrl(u.webUrl),
       batchFound: Boolean(batch),
+      filenameRepeatedInBatch: repeated,
       resolution: batch?.resolution ?? '',
       resolvedClientId: batch?.clientId ?? '',
       matchedBy: batch?.matchedBy ?? '',
@@ -340,9 +371,13 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
       uploaderOidSource: oids.length ? source : '',
       adminUploader: Boolean(adminLine),
       adminClientId: adminLine?.clientId ?? '',
-      uploadCount: uploadCounts.get(u.driveItemId),
-    });
+    };
+    if (!byItem.has(u.driveItemId)) byItem.set(u.driveItemId, []);
+    byItem.get(u.driveItemId).push(record);
   }
+
+  const index = new Map();
+  for (const [driveItemId, list] of byItem) index.set(driveItemId, mergeUploads(list));
 
   return {
     byDriveItemId: index,
@@ -351,11 +386,55 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
       batches: batches.length,
       uploads: uploads.length,
       uniqueDriveItems: index.size,
+      itemsWithSeveralUploads: [...index.values()].filter((v) => v.uploadCount > 1).length,
       uploadsWithoutBatch: withoutBatch,
       uploadsWithAmbiguousUploader: ambiguous,
       promoted: [...index.values()].filter((v) => v.promotedFromFallback).length,
-      fallback: [...index.values()].filter((v) => v.resolution === 'fallback').length,
+      fallback: [...index.values()].filter((v) => v.uploads.some((x) => x.resolution === 'fallback')).length,
     },
+  };
+}
+
+/** The fields of one upload that the register keeps for each of an item's uploads. */
+const UPLOAD_FIELDS = [
+  'uploadedAt',
+  'invocationId',
+  'conversationId',
+  'filename',
+  'webUrlSitePath',
+  'batchFound',
+  'filenameRepeatedInBatch',
+  'resolution',
+  'resolvedClientId',
+  'promotedFromFallback',
+  'finalClientId',
+  'finalSitePath',
+  'uploaderOid',
+  'uploaderOidCandidates',
+  'uploaderOidAmbiguous',
+  'adminUploader',
+];
+
+/**
+ * One index entry for every upload of an item, in time order. The latest
+ * upload describes the current content; the uploader is certain only when
+ * every upload names the same one person.
+ */
+function mergeUploads(list) {
+  const latest = list[list.length - 1];
+  const candidates = [...new Set(list.flatMap((r) => r.uploaderOidCandidates))];
+  const everyUploadResolved = list.every((r) => r.uploaderOid);
+  const severalPeople = candidates.length > 1;
+  return {
+    ...latest,
+    uploaderOid: !severalPeople && everyUploadResolved ? candidates[0] ?? '' : '',
+    uploaderOidCandidates: candidates,
+    uploaderOidAmbiguous: severalPeople,
+    batchFound: list.every((r) => r.batchFound),
+    promotedFromFallback: list.some((r) => r.promotedFromFallback),
+    adminUploader: list.some((r) => r.adminUploader),
+    uploadCount: list.length,
+    uploads: list.map((r) => Object.fromEntries(UPLOAD_FIELDS.map((k) => [k, r[k]]))),
   };
 }
 
@@ -375,26 +454,139 @@ export function isCandidate(item, { ingestAppIds, ir0, includeAll = false }) {
   return ingestAppIds.has(created) || ingestAppIds.has(modified) || Boolean(ir0?.has(item?.id));
 }
 
+/**
+ * `time uploader | …`, every upload of an item, for the CSV; the JSON keeps
+ * the structured list. An upload with several candidates lists them all.
+ */
+function uploadsText(uploads) {
+  if (!Array.isArray(uploads)) return '';
+  return uploads
+    .map((u) => `${u.uploadedAt || '?'} ${(u.uploaderOidCandidates ?? []).join('+') || 'unknown'}`)
+    .join(' | ');
+}
+
 /** `id:size@time | …` for the CSV; the JSON keeps the structured list. */
 function versionsText(versions) {
   if (!Array.isArray(versions)) return '';
   return versions.map((v) => `${v.id || '?'}:${v.size ?? '?'}@${v.modifiedAt || '?'}`).join(' | ');
 }
 
-function ir0Flags(ir0, walkedSitePath) {
-  const flags = [];
-  if (!ir0.batchFound) flags.push('ir0_batch_missing');
-  if (ir0.resolution === 'fallback' && !ir0.promotedFromFallback) flags.push('ir0_fallback');
-  if (ir0.promotedFromFallback) flags.push('promoted_by_content');
-  if (ir0.adminUploader) flags.push('admin_uploader');
-  if (ir0.uploaderOidAmbiguous) flags.push('uploader_ambiguous');
-  else if (!ir0.uploaderOid) flags.push('uploader_unknown');
-  const logged = ir0.webUrlSitePath || normalizeSitePath(ir0.finalSitePath);
-  if (walkedSitePath && logged && logged !== normalizeSitePath(walkedSitePath)) {
-    flags.push('ir0_site_mismatch');
+/**
+ * The site the log says an upload went to, canonical; `null` when the log
+ * names a path that cannot be canonicalised (it then matches no site).
+ */
+function loggedSitePath(upload) {
+  if (upload.webUrlSitePath) return upload.webUrlSitePath;
+  if (!upload.finalSitePath) return '';
+  return normalizeSitePath(upload.finalSitePath);
+}
+
+/**
+ * @param {object} ir0             an index entry (see `mergeUploads`)
+ * @param {string} walkedSitePath  where the file is now; `''` when not found in the walk
+ * @param {Map<string, Set<string>> | null} [siteGuests]  guests of each site's own
+ *   Team, by canonical site path; `null` when no guest list was given at all
+ */
+function ir0Flags(ir0, walkedSitePath, siteGuests = null) {
+  const flags = new Set();
+  const uploads = ir0.uploads?.length ? ir0.uploads : [ir0];
+  const walked = walkedSitePath ? normalizeSitePath(walkedSitePath) : '';
+  for (const u of uploads) {
+    if (!u.batchFound) flags.add('ir0_batch_missing');
+    if (u.filenameRepeatedInBatch) flags.add('ir0_filename_repeated_in_batch');
+    if (u.resolution === 'fallback' && !u.promotedFromFallback) flags.add('ir0_fallback');
+    if (u.promotedFromFallback) flags.add('promoted_by_content');
+    if (u.adminUploader) flags.add('admin_uploader');
+    const logged = loggedSitePath(u);
+    if (walked && (logged === null || (logged && logged !== walked))) flags.add('ir0_site_mismatch');
+    // Routed by identity: to the row that held the uploader's id. Whether
+    // that uploader is the client (a guest of the site's own Team) is a
+    // separate question, and staff ids sat on client rows before Phase 0.
+    if (u.resolution === 'directory' && !u.promotedFromFallback) {
+      const site = walked || logged;
+      const guests = site ? siteGuests?.get(site) : undefined;
+      if (!guests) flags.add('uploader_guest_unverified');
+      else if ((u.uploaderOidCandidates ?? []).some((oid) => !guests.has(oid))) {
+        flags.add('uploader_not_site_guest');
+      }
+    }
   }
-  if (ir0.uploadCount > 1) flags.push('multiple_uploads_same_item');
-  return flags;
+  if (ir0.uploaderOidAmbiguous) flags.add('uploader_ambiguous');
+  else if (!ir0.uploaderOid) flags.add('uploader_unknown');
+  if (ir0.uploadCount > 1) flags.add('multiple_uploads_same_item');
+  return [...flags];
+}
+
+/**
+ * Guests of each site's own Team, from `--site-guests <site>=<oid,oid,...>`
+ * values. `<site>` is a `--site` label or its path.
+ *
+ * @param {string[]} specs
+ * @param {Array<{label:string, sitePath:string}>} sites  the walked sites
+ * @returns {Map<string, Set<string>>} by canonical site path
+ */
+export function parseSiteGuests(specs, sites) {
+  const out = new Map();
+  for (const spec of specs ?? []) {
+    const text = String(spec);
+    const eq = text.indexOf('=');
+    if (eq <= 0) throw new Error(`--site-guests "${text}": expected <site label>=<oid,oid,...>`);
+    const name = text.slice(0, eq).trim();
+    const site = sites.find(
+      (s) => s.label.toLowerCase() === name.toLowerCase() || normalizeSitePath(s.sitePath) === normalizeSitePath(name),
+    );
+    if (!site) throw new Error(`--site-guests ${name}: not one of the --site values`);
+    const ids = text
+      .slice(eq + 1)
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const bad = ids.filter((id) => !normalizeGuid(id));
+    if (bad.length) throw new Error(`--site-guests ${name}: not GUIDs: ${bad.join(', ')}`);
+    const key = normalizeSitePath(site.sitePath);
+    if (!out.has(key)) out.set(key, new Set());
+    for (const id of ids) out.get(key).add(normalizeGuid(id));
+  }
+  return out;
+}
+
+/**
+ * Guests of each site's own Team, from a `directory-bindings.mjs propose`
+ * plan: the guests who belong to that Team and to no other. A site that two
+ * plan rows share is left out (it has no single client), so its items stay
+ * `uploader_guest_unverified`. The plan shows membership when it was made,
+ * not when a file was uploaded.
+ *
+ * @returns {{ guests: Map<string, Set<string>>, sharedSites: string[] }}
+ */
+export function siteGuestsFromPlan(plan) {
+  if (plan?.kind !== PLAN_KIND || !Array.isArray(plan?.rows)) {
+    throw new Error(`not a directory-bindings plan (kind ${PLAN_KIND})`);
+  }
+  const guests = new Map();
+  const shared = new Set();
+  const rowsPerSite = new Map();
+  for (const row of plan.rows) {
+    const key = normalizeSitePath(row?.sitePath);
+    if (key) rowsPerSite.set(key, (rowsPerSite.get(key) ?? 0) + 1);
+  }
+  for (const row of plan.rows) {
+    const key = normalizeSitePath(row?.sitePath);
+    if (!key) continue;
+    if (rowsPerSite.get(key) > 1) {
+      shared.add(key);
+      continue;
+    }
+    // `eligibleGuests` is present only where the Team's people were read; an
+    // older plan has only the proposal, which may also drop ids that sit on
+    // other rows (so it can only flag more, never fewer).
+    let ids;
+    if (Array.isArray(row.eligibleGuests)) ids = row.eligibleGuests.map((g) => normalizeGuid(g?.id));
+    else if (row.proposed) ids = splitLines(row.proposed.UserAadObjectIds).map(normalizeGuid);
+    else continue;
+    guests.set(key, new Set(ids.filter(Boolean)));
+  }
+  return { guests, sharedSites: [...shared] };
 }
 
 /**
@@ -402,7 +594,8 @@ function ir0Flags(ir0, walkedSitePath) {
  *
  * @param {object} item  driveItem + `path`, `parentPath`, optional `versions`/`versionsError`
  * @param {object} where `{ site: {label, hostname, sitePath}, drive: {id, name} }`
- * @param {object} ctx   `{ ingestAppIds:Set, ir0: Map|null, fallbackSitePaths:Set }`
+ * @param {object} ctx   `{ ingestAppIds:Set, ir0: Map|null, fallbackSitePaths:Set,
+ *                          siteGuests: Map|null }`
  */
 export function classifyItem(item, where, ctx) {
   const createdByAppId = normalizeGuid(item?.createdBy?.application?.id);
@@ -426,7 +619,7 @@ export function classifyItem(item, where, ctx) {
   if (versionCount !== null && versionCount > 1) flags.push('has_prior_versions');
   if (item.versionsError) flags.push('versions_unreadable');
   if (ctx.ir0 && (ingestCreated || ingestModified) && !ir0) flags.push('no_ir0_record');
-  if (ir0) flags.push(...ir0Flags(ir0, where.site.sitePath));
+  if (ir0) flags.push(...ir0Flags(ir0, where.site.sitePath, ctx.siteGuests ?? null));
 
   return {
     suspect: flags.some((f) => SUSPECT_FLAGS.has(f)),
@@ -465,8 +658,15 @@ export function classifyItem(item, where, ctx) {
  * that the walk did not find (moved, deleted, or on a site not walked, which
  * is exactly where a content promotion into another client would be).
  */
-export function buildRegister({ walked, ir0, ingestAppIds, fallbackSitePaths, includeAll = false }) {
-  const ctx = { ingestAppIds, ir0, fallbackSitePaths };
+export function buildRegister({
+  walked,
+  ir0,
+  ingestAppIds,
+  fallbackSitePaths,
+  siteGuests = null,
+  includeAll = false,
+}) {
+  const ctx = { ingestAppIds, ir0, fallbackSitePaths, siteGuests };
   const rows = [];
   const seen = new Set();
   const walkedSites = new Set();
@@ -480,14 +680,14 @@ export function buildRegister({ walked, ir0, ingestAppIds, fallbackSitePaths, in
   }
   for (const [driveItemId, rec] of ir0 ?? []) {
     if (seen.has(driveItemId)) continue;
-    const logged = rec.webUrlSitePath || normalizeSitePath(rec.finalSitePath);
-    const flags = [walkedSites.has(logged) ? 'not_found_in_walk' : 'site_not_walked'];
-    flags.push(...ir0Flags(rec, ''));
+    const logged = loggedSitePath(rec);
+    const flags = [logged && walkedSites.has(logged) ? 'not_found_in_walk' : 'site_not_walked'];
+    flags.push(...ir0Flags(rec, '', siteGuests));
     rows.push({
       suspect: true,
       flags,
       site: '',
-      sitePath: logged,
+      sitePath: logged ?? rec.finalSitePath,
       driveName: '',
       driveId: '',
       driveItemId,
@@ -566,6 +766,8 @@ export const REGISTER_COLUMNS = Object.freeze([
   ir0Col('uploaderOid'),
   { header: 'ir0_uploaderOidCandidates', get: (r) => (r.ir0?.uploaderOidCandidates ?? []).join(';') },
   ir0Col('uploaderOidSource'),
+  ir0Col('uploadCount'),
+  { header: 'ir0_allUploads', get: (r) => uploadsText(r.ir0?.uploads) },
   ir0Col('adminUploader'),
   ir0Col('invocationId'),
   ir0Col('conversationId'),

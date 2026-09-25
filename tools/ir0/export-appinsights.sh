@@ -16,6 +16,12 @@
 #   - runs tools/ir0/routing-traces.kql once per chunk of the window, always
 #     with BOTH --start-time and --end-time (with only a start, the CLI's
 #     window is one hour, and the export would silently be one hour long);
+#   - always runs tools/ir0/personal-tab-requests.kql per chunk as well: the
+#     unsampled `requests` rows for /api/mydocs and /api/user-target, the only
+#     record of calls to the anonymous Personal Tab lookup (W5), written to
+#     requests-<chunk>.json;
+#   - keeps itemCount on every row, so a reader can see whether sampling
+#     thinned the traces;
 #   - refuses to continue if a chunk comes back at the API's row limit, since
 #     a truncated export looks complete;
 #   - writes owner-only JSON files, the resolved query, a metadata file and a
@@ -31,6 +37,7 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOLS_DIR="$(dirname "$SCRIPT_DIR")"
 KQL_FILE="$SCRIPT_DIR/routing-traces.kql"
+REQUESTS_KQL_FILE="$SCRIPT_DIR/personal-tab-requests.kql"
 ROW_LIMIT=500000
 
 APP=""
@@ -106,6 +113,7 @@ az account show --output none 2>/dev/null || die "not signed in: run az login"
 az extension show --name application-insights --output none 2>/dev/null ||
   die "the application-insights az extension is missing: az extension add --name application-insights"
 [[ -f "$KQL_FILE" ]] || die "missing $KQL_FILE"
+[[ -f "$REQUESTS_KQL_FILE" ]] || die "missing $REQUESTS_KQL_FILE"
 
 GUID_RE='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
 if [[ -z "$APP" ]]; then
@@ -140,15 +148,18 @@ fi
 echo
 
 KQL_TEMPLATE="$(cat "$KQL_FILE")"
-routing_kql() {
-  local q="${KQL_TEMPLATE//@@START@@/$1}"
-  printf '%s' "${q//@@END@@/$2}"
+REQUESTS_TEMPLATE="$(cat "$REQUESTS_KQL_FILE")"
+fill_window() { # template start end
+  local q="${1//@@START@@/$2}"
+  printf '%s' "${q//@@END@@/$3}"
 }
+routing_kql() { fill_window "$KQL_TEMPLATE" "$1" "$2"; }
+requests_kql() { fill_window "$REQUESTS_TEMPLATE" "$1" "$2"; }
 all_traces_kql() {
   printf '%s\n' \
     "traces" \
     "| where timestamp between (datetime($1) .. datetime($2))" \
-    "| project timestamp, itemId, operation_Id, operation_Name, cloud_RoleName, cloud_RoleInstance, severityLevel, message, customDimensions" \
+    "| project timestamp, itemId, itemCount, operation_Id, operation_Name, cloud_RoleName, cloud_RoleInstance, severityLevel, message, customDimensions" \
     "| order by timestamp asc"
 }
 
@@ -177,6 +188,7 @@ while ((chunk_start < END_EPOCH)); do
   ce=$(from_epoch "$chunk_end")
   tag="${cs//:/-}"
   run_query "$(routing_kql "$cs" "$ce")" "$cs" "$ce" "$OUT_DIR/routing-$tag.json"
+  run_query "$(requests_kql "$cs" "$ce")" "$cs" "$ce" "$OUT_DIR/requests-$tag.json"
   if [[ $ALL_TRACES == 1 ]]; then
     run_query "$(all_traces_kql "$cs" "$ce")" "$cs" "$ce" "$OUT_DIR/all-traces-$tag.json"
   fi
@@ -184,9 +196,10 @@ while ((chunk_start < END_EPOCH)); do
   chunk_start=$chunk_end
 done
 
-# The query exactly as run (window left as placeholders; the window is below).
+# The queries exactly as run (window left as placeholders; the window is below).
 cp "$KQL_FILE" "$OUT_DIR/routing-traces.kql"
-chmod 600 "$OUT_DIR/routing-traces.kql"
+cp "$REQUESTS_KQL_FILE" "$OUT_DIR/personal-tab-requests.kql"
+chmod 600 "$OUT_DIR/routing-traces.kql" "$OUT_DIR/personal-tab-requests.kql"
 {
   echo "kind=bcr.ir0.appinsights-export"
   echo "created_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -197,6 +210,7 @@ chmod 600 "$OUT_DIR/routing-traces.kql"
   echo "chunk_hours=$CHUNK_HOURS"
   echo "chunks=$CHUNKS"
   echo "all_traces=$ALL_TRACES"
+  echo "personal_tab_requests=1"
   echo "rows_total=$TOTAL_ROWS"
   echo "operator=$(az account show --query user.name --output tsv)"
   echo "subscription=$(az account show --query id --output tsv)"

@@ -24,15 +24,18 @@
  * - Only four columns are ever written: RootFolder, UserAadObjectIds, DriveId
  *   and TeamId. Nothing else on a row, and never a Team, channel, group,
  *   permission or visibility. BCR GROUP's visibility is read, never changed.
- * - Ambiguity skips the row: a guest in several BCR teams, a duplicate key,
- *   a Public team, a missing or non-standard channel, a drive mismatch, an
- *   unknown write grant. Staff (Member) ids are removed from a client row only
- *   with `--confirm-remove-staff <listItemId>` for that row.
+ * - Ambiguity skips the row: a duplicate key, a non-canonical SitePath, a
+ *   Public team, a missing or non-standard channel, a drive mismatch, an
+ *   unknown write grant. A guest who is also in any other Team is never bound.
+ *   Staff (Member) ids are removed from a client row only with
+ *   `--confirm-remove-staff <listItemId>` for that row.
  * - `apply` refuses a plan that was edited after `propose` (digest), is older
  *   than `--max-plan-age-hours`, or whose row changed since (stale guard). It
- *   refuses to run unless the ingestion `/api/health` shows the P0 build.
- * - Every applied row is logged before and after, written after each row, so
- *   `rollback` works even after an interrupted run.
+ *   refuses to run unless the ingestion `/api/health` reports
+ *   `build.routing=identity-only`, the marker only the P0 build has.
+ * - Every applied row is logged before the PATCH is sent (`writing`) and again
+ *   after it, and the log is on disk at both points, so `rollback` knows every
+ *   row an interrupted run may have written.
  * - The token is read from `GRAPH_TOKEN` and never printed.
  *
  * See tools/README.md for scopes and the full procedure.
@@ -68,14 +71,18 @@ import {
   fieldString,
   findDuplicates,
   findTeamForSite,
+  healthExpectations,
   healthSatisfies,
+  isSiteCollectionPath,
   mapSitesToTeams,
   normalizeGuid,
   normalizeSitePath,
+  P0_HEALTH_EXPECTATION,
   parseDirectoryRow,
   pickAccountingChannel,
   pickFields,
   rollbackPatch,
+  sitePathSegments,
   splitLines,
   staleFields,
   validatePlan,
@@ -86,8 +93,11 @@ Usage:
   node tools/directory-bindings.mjs check    [common] [--out <report.json>]
   node tools/directory-bindings.mjs propose  [common] [--out <plan.json>]
             [--write-verified <sitePath|listItemId>]... [--confirm-remove-staff <listItemId>]...
-  node tools/directory-bindings.mjs apply    --plan <plan.json> --health-url <url>
-            --expect-health <key=value>... [--only <listItemId>]... [--max-plan-age-hours 24] [--apply]
+  node tools/directory-bindings.mjs apply    --plan <plan.json> --health-url https://<ingestion-host>/api/health
+            [--expect-health <key=value>]... [--only <listItemId>]... [--max-plan-age-hours 24] [--apply]
+
+  apply always requires the health body to report ${P0_HEALTH_EXPECTATION};
+  --expect-health adds further checks, it never replaces that one.
   node tools/directory-bindings.mjs rollback --log <apply-log.json> [--apply]
   node tools/directory-bindings.mjs --add-columns [--site-id ..] [--list-id ..] [--apply]
 
@@ -236,10 +246,20 @@ function assessOptions(values, env) {
   const badIds = ingestAppIds.filter((id) => !normalizeGuid(id));
   if (badIds.length) throw new CliError(`--ingest-app-ids: not GUIDs: ${badIds.join(', ')}`);
   const forbidden = csvList(values['forbidden-site-paths'] ?? env.FORBIDDEN_TARGET_SITE_PATHS);
+  // A forbidden entry that is not a plain site path (a pasted URL, a `..`)
+  // would match no row, and the guard would be off without anyone noticing.
+  const badForbidden = forbidden.filter((p) => !isSiteCollectionPath(p));
+  if (badForbidden.length) {
+    throw new CliError(
+      `--forbidden-site-paths / FORBIDDEN_TARGET_SITE_PATHS: not a /sites/<name> or /teams/<name> path: ` +
+        badForbidden.join(', '),
+    );
+  }
   const writeVerified = new Set();
   for (const v of csvList(values['write-verified'])) {
     writeVerified.add(v);
-    writeVerified.add(normalizeSitePath(v));
+    const canonical = normalizeSitePath(v);
+    if (canonical) writeVerified.add(canonical);
   }
   return {
     ingestAppIds,
@@ -374,8 +394,13 @@ export async function gather(graph, { siteId, listId, channelName, concurrency, 
     if (!memberOfCache.has(id)) {
       memberOfCache.set(
         id,
-        safe(() => graph.all(`/users/${id}/memberOf?$select=id,displayName,description&$top=999`))
-          .then((r) => (Array.isArray(r) ? r.filter(isGroup) : r)),
+        // resourceProvisioningOptions tells a Team from any other group. Every
+        // Team counts, marked or not: a guest in any second Team is not bound.
+        safe(() =>
+          graph.all(
+            `/users/${id}/memberOf?$select=id,displayName,description,resourceProvisioningOptions&$top=999`,
+          ),
+        ).then((r) => (Array.isArray(r) ? r.filter(isGroup) : r)),
       );
     }
     return memberOfCache.get(id);
@@ -386,8 +411,11 @@ export async function gather(graph, { siteId, listId, channelName, concurrency, 
     const facts = { usersById };
     factsByRow.set(row.listItemId, facts);
     if (row.isAdmin || !row.siteHostname || !row.sitePath) return;
+    // A `.`/`..` segment: not looked up, the row is skipped as not canonical.
+    const segments = sitePathSegments(row.sitePath);
+    if (!segments?.length) return;
 
-    const sitePath = encodePath(row.sitePath.replace(/^\/+/, ''));
+    const sitePath = encodePath(segments.join('/'));
     facts.site = await safe(() =>
       graph.get(`/sites/${row.siteHostname}:/${sitePath}?$select=id,webUrl,displayName`),
     );
@@ -445,6 +473,7 @@ function assessAll(gathered, assessCtx) {
     ...assessCtx,
     duplicates: gathered.duplicates,
     unreadableTeamSites: gathered.teamIndex.unreadable.length,
+    knownTeamIds: new Set(gathered.teams.map((t) => normalizeGuid(t.id)).filter(Boolean)),
   };
   return gathered.active.map((row) =>
     assessRow(row, gathered.factsByRow.get(row.listItemId) ?? { usersById: gathered.usersById }, ctx),
@@ -456,6 +485,13 @@ function assessAll(gathered, assessCtx) {
 // ---------------------------------------------------------------------------
 
 const q = (s) => `'${String(s ?? '')}'`;
+
+/** An excluded guest, with the other Teams that excluded them. */
+function describeExcluded(p) {
+  const who = p.userPrincipalName || p.id;
+  const teams = (p.otherTeams ?? []).map((t) => `${t.id}${t.displayName ? ` ${q(t.displayName)}` : ''}`);
+  return `${who ? `${who} ` : ''}(${p.reason}${teams.length ? `: also in ${teams.join(', ')}` : ''})`;
+}
 
 function describeRowIds(row, usersById, eligible) {
   const eligibleIds = new Set(eligible.map((g) => g.id));
@@ -505,7 +541,7 @@ function printRowCheck(print, row, a, facts, usersById) {
     const el = a.eligibleGuests.map((g) => `${g.userPrincipalName || g.displayName} ${dim(g.id)}`);
     print(`    guests     ${el.length ? el.join(', ') : warn('none eligible')}`);
     const ex = a.excludedPeople.filter((p) => p.reason !== 'not_a_guest' && p.reason !== 'owner');
-    for (const p of ex) print(`               ${warn('excluded')} ${p.userPrincipalName || p.id} (${p.reason})`);
+    for (const p of ex) print(`               ${warn('excluded')} ${describeExcluded(p)}`);
     const staffCount = a.excludedPeople.filter((p) => p.reason === 'not_a_guest').length;
     const ownerCount = a.excludedPeople.filter((p) => p.reason === 'owner').length;
     print(`               ${dim(`${staffCount} Member(s) and ${ownerCount} owner(s) of the team are never bound`)}`);
@@ -516,7 +552,8 @@ function printRowCheck(print, row, a, facts, usersById) {
       w === 'granted' ? ok('granted') :
       w === 'operator-verified' ? ok('verified by operator (--write-verified)') :
       w === 'missing' ? bad('missing') :
-      w === 'n/a' ? dim('not checked (site not resolved)') : warn('unknown, verify via runbook');
+      w === 'n/a' ? dim('not checked (forbidden, not canonical or not resolved)') :
+      warn('unknown: verify read-only (GET /sites/{id}/permissions), never with the grant runbook');
     print(`    write      ${text}${facts?.permissionsNote ? dim(` (${facts.permissionsNote})`) : ''}`);
     print(`    bound now  RootFolder ${q(row.rootFolder)} · DriveId ${q(row.driveId)} · TeamId ${q(row.teamId)}`);
   }
@@ -624,9 +661,10 @@ function printPlanRow(print, r) {
     }
   }
   if (r.action === 'PATCH') {
-    for (const u of r.removedUserIds) print(`      ${bad('-')} ${u.id} ${u.userPrincipalName ?? ''} (${u.reason})`);
+    for (const u of r.removedUserIds) print(`      ${bad('-')} ${u.id} ${describeExcluded({ ...u, id: '' })}`);
     for (const u of r.addedUserIds) print(`      ${ok('+')} ${u.id} ${u.userPrincipalName ?? ''}`);
   }
+  for (const g of r.excludedGuests ?? []) print(`    ${warn('not bound')} ${describeExcluded(g)}`);
 }
 
 async function runPropose(ctx) {
@@ -656,7 +694,8 @@ async function runPropose(ctx) {
   print('');
   print('Review the file, then dry-run the apply (nothing is written without --apply):');
   print(`  node tools/directory-bindings.mjs apply --plan ${written.path} \\`);
-  print('    --health-url https://<ingestion-host>/api/health --expect-health <key=value>');
+  print('    --health-url https://<ingestion-host>/api/health');
+  print(dim(`  (apply always requires the health body to report ${P0_HEALTH_EXPECTATION})`));
   print('');
   return 0;
 }
@@ -672,8 +711,9 @@ async function checkHealth(ctx, url, expectations) {
   } catch {
     return { ok: false, missing: [`--health-url is not a URL: ${url}`] };
   }
-  const local = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
-  if (parsed.protocol !== 'https:' && !local) {
+  // https only, localhost included: the gate is about the deployed build,
+  // and a local run of any build would answer whatever it was built with.
+  if (parsed.protocol !== 'https:') {
     return { ok: false, missing: ['--health-url must be https'] };
   }
   try {
@@ -699,6 +739,9 @@ function sameValue(field, a, b) {
   }
   return fieldString(a) === fieldString(b);
 }
+
+/** Apply-log results for a PATCH that may or may not have landed. */
+const UNCERTAIN_WRITES = Object.freeze(['writing', 'write_unknown']);
 
 const snapshotFields = (fields) => ({
   ...pickFields(fields, BINDING_FIELDS),
@@ -767,12 +810,14 @@ async function runApply(ctx) {
 
   // The P0 gate: bindings take effect through the P0 ingestion build (DriveId
   // check, quarantine, no promotion). Applying them to an older build would
-  // route by them without those guards.
-  const expectations = values['expect-health'] ?? [];
-  if (!values['health-url'] || !expectations.length) {
+  // route by them without those guards. The routing marker is always
+  // required; --expect-health can only add to it, so no value an operator
+  // types (such as status=ok, which the old build also reports) opens it.
+  const expectations = healthExpectations(values['expect-health'] ?? []);
+  if (!values['health-url']) {
     const msg =
-      'apply needs --health-url https://<ingestion-host>/api/health and at least one ' +
-      '--expect-health key=value that only the P0 build reports';
+      'apply needs --health-url https://<ingestion-host>/api/health; ' +
+      `it must report ${P0_HEALTH_EXPECTATION}`;
     if (APPLY) throw new CliError(msg);
     print(warn(`  health     not checked: ${msg}`));
   } else {
@@ -839,6 +884,11 @@ async function runApply(ctx) {
         print(`    ${dim('dry run: not written')}`);
         continue;
       }
+      // On disk before the request leaves: if the run dies from here on, the
+      // log still names this row and its before-state, and rollback checks
+      // whether the write landed.
+      entry.result = 'writing';
+      flush();
       await graph.patch(`${listPath(directory)}/items/${encodeURIComponent(r.listItemId)}/fields`, r.patch);
       entry.result = 'patched';
       const after = await readItemFields(graph, directory, r.listItemId);
@@ -853,7 +903,14 @@ async function runApply(ctx) {
         print(`    ${ok('written and read back')}`);
       }
     } catch (err) {
-      entry.result = entry.result === 'patched' ? 'patched_unverified' : 'failed';
+      // A PATCH that threw may still have landed (a lost response), so it is
+      // `write_unknown`, which rollback checks against the row, not `failed`.
+      entry.result =
+        entry.result === 'patched'
+          ? 'patched_unverified'
+          : entry.result === 'writing'
+            ? 'write_unknown'
+            : 'failed';
       entry.error = err.message;
       failures += 1;
       print(`    ${bad(entry.result)} ${err.message}`);
@@ -894,8 +951,10 @@ async function runRollback(ctx) {
   const directory = log.directory;
   if (!directory?.siteId || !directory?.listId) throw new CliError('the log names no directory');
 
+  // `writing` (the run died with the PATCH in flight) and `write_unknown` (the
+  // PATCH threw) may or may not have landed; each is checked against the row.
   const candidates = log.rows.filter((r) =>
-    ['patched', 'patched_mismatch', 'patched_unverified'].includes(r.result),
+    ['patched', 'patched_mismatch', 'patched_unverified', ...UNCERTAIN_WRITES].includes(r.result),
   );
   print('');
   print(bold(`Rollback directory bindings — ${APPLY ? bad('APPLY') : 'DRY RUN (nothing is written)'}`));
@@ -931,6 +990,22 @@ async function runRollback(ctx) {
     try {
       const current = await readItemFields(graph, directory, r.listItemId);
       entry.before = snapshotFields(current);
+      if (UNCERTAIN_WRITES.includes(r.result)) {
+        if (!r.before) {
+          entry.result = 'no_before_state';
+          failures += 1;
+          print(`    ${bad('refused')} the log has no before-state for this row; restore it by hand from the plan`);
+          flush();
+          continue;
+        }
+        const fields = Object.keys(r.patch ?? {});
+        if (fields.every((f) => sameValue(f, current[f], r.before[f]))) {
+          entry.result = 'not_written';
+          print(`    ${ok('not written')} the row still holds its before-state; nothing to restore`);
+          flush();
+          continue;
+        }
+      }
       // A row the apply wrote but could not read back is compared with what it
       // wrote: the patch is the after-state it asked for.
       const changed = changedSinceApply({ ...r, after: r.after ?? r.patch }, current);
@@ -953,7 +1028,10 @@ async function runRollback(ctx) {
         print(`    ${dim('dry run: not written')}`);
         continue;
       }
+      entry.result = 'writing';
+      flush();
       await graph.patch(`${listPath(directory)}/items/${encodeURIComponent(r.listItemId)}/fields`, patch);
+      entry.result = 'restoring_readback';
       const after = await readItemFields(graph, directory, r.listItemId);
       entry.after = snapshotFields(after);
       const mismatched = Object.keys(patch).filter((f) => !sameValue(f, after[f], patch[f]));
@@ -964,10 +1042,15 @@ async function runRollback(ctx) {
       }
       print(`    ${mismatched.length ? bad(entry.result) : ok(entry.result)}`);
     } catch (err) {
-      entry.result = 'failed';
+      entry.result =
+        entry.result === 'restoring_readback'
+          ? 'restored_unverified'
+          : entry.result === 'writing'
+            ? 'write_unknown'
+            : 'failed';
       entry.error = err.message;
       failures += 1;
-      print(`    ${bad('failed')} ${err.message}`);
+      print(`    ${bad(entry.result)} ${err.message}`);
     }
     flush();
   }

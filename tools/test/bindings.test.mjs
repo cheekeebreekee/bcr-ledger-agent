@@ -11,14 +11,19 @@ import {
   findDuplicates,
   findTeamForSite,
   folderAtDriveRoot,
+  healthExpectations,
   healthSatisfies,
+  isSiteCollectionPath,
+  isTeamGroup,
   mapSitesToTeams,
+  normalizeSitePath,
   parseDirectoryRow,
   pickAccountingChannel,
   planDigest,
   rollbackPatch,
   staleFields,
   survivesIngestionSanitiser,
+  targetKey,
   validatePlan,
 } from '../lib/bindings.mjs';
 
@@ -26,6 +31,8 @@ import {
 const g = (s) => `00000000-0000-4000-8000-${s.padStart(12, '0')}`;
 const TEAM_A = g('a001');
 const TEAM_X = g('a0aa');
+const TEAM_LEGACY = g('a0bb');
+const TEAM_STAFF = g('a0ff');
 const GUEST_A = g('b001');
 const GUEST_2 = g('b002');
 const STAFF = g('c001');
@@ -60,7 +67,17 @@ const team = (over = {}) => ({
   ...over,
 });
 
-const bcrGroup = (id, n = '0001') => ({ id, description: `BCR Group — ${n}` });
+/** A memberOf entry for a client Team carrying the onboarding marker. */
+const bcrGroup = (id, n = '0001') => ({
+  id,
+  displayName: `${n} Client`,
+  description: `BCR Group — ${n}`,
+  resourceProvisioningOptions: ['Team'],
+});
+/** A Team without the marker: one that predates onboarding, or BCR GROUP. */
+const plainTeam = (id, displayName) => ({ id, displayName, description: '', resourceProvisioningOptions: ['Team'] });
+/** A group that is not a Team (a security group, a plain M365 group). */
+const plainGroup = (id) => ({ id, displayName: 'unrelated', description: 'unrelated', resourceProvisioningOptions: [] });
 
 /** Facts for a clean row A, with overrides. */
 function factsA(over = {}) {
@@ -88,7 +105,7 @@ function factsA(over = {}) {
       { id: OWNER, userType: 'Member' },
     ],
     owners: [{ id: OWNER }],
-    memberOfByUser: new Map([[GUEST_A, [bcrGroup(TEAM_A), { id: g('f1'), description: 'unrelated' }]]]),
+    memberOfByUser: new Map([[GUEST_A, [bcrGroup(TEAM_A), plainGroup(g('f1'))]]]),
     permissions: [{ roles: ['write'], grantedToIdentitiesV2: [{ application: { id: INGEST } }] }],
     ...over,
   };
@@ -117,11 +134,37 @@ describe('parseDirectoryRow', () => {
   });
 });
 
+describe('site paths', () => {
+  test('normalizeSitePath folds the spellings the ingestion requests as one site', () => {
+    for (const p of ['/sites/Foo', '/sites//Foo', '//sites/foo/', ' /SITES/foo/ ', 'sites/foo']) {
+      assert.equal(normalizeSitePath(p), '/sites/foo', p);
+    }
+    assert.equal(normalizeSitePath(''), '');
+    for (const p of ['/sites/./foo', '/sites/x/../foo', '/sites/foo/.', '/sites/foo/..']) {
+      assert.equal(normalizeSitePath(p), null, p);
+    }
+  });
+
+  test('an operator-named site must be /sites/<name> or /teams/<name>', () => {
+    assert.equal(isSiteCollectionPath('/sites/BCRGROUP'), true);
+    assert.equal(isSiteCollectionPath('/teams/x/'), true);
+    for (const p of ['https://contoso.sharepoint.com/sites/BCRGROUP', '/sites/a/b', '/sites/../x', '', '/']) {
+      assert.equal(isSiteCollectionPath(p), false, p);
+    }
+  });
+
+  test('a non-canonical path has no target key; spellings of one site share one', () => {
+    const a = rowA({ SitePath: '/sites/0001CLIENTA' });
+    assert.equal(targetKey(a), targetKey(rowA({ SitePath: '/sites//0001clienta/' })));
+    assert.equal(targetKey(rowA({ SitePath: '/sites/x/../0001CLIENTA' })), '');
+  });
+});
+
 describe('findDuplicates', () => {
   const rows = [
     rowA({ UserAadObjectIds: GUEST_A }),
     parseDirectoryRow(item(2, { ClientId: '0001', NIP: '0000000002', SitePath: '/sites/B', UserAadObjectIds: GUEST_A })),
-    parseDirectoryRow(item(3, { ClientId: '0003', NIP: '0000000001', SitePath: '/sites/0001clienta/' })),
+    parseDirectoryRow(item(3, { ClientId: '0003', NIP: '0000000001', SitePath: '/sites//0001clienta/' })),
     parseDirectoryRow(item(4, { ClientId: '0004', NIP: '0000000001', SitePath: '/sites/D' })),
     parseDirectoryRow(item(5, { ClientId: '0001', NIP: '0000000001', SitePath: '/sites/0001CLIENTA', Status: 'Inactive' })),
   ];
@@ -151,13 +194,14 @@ describe('team facts', () => {
     assert.equal(pickAccountingChannel([{ ...std, membershipType: 'shared' }]).status, 'not_standard');
   });
 
-  test('classifyTeamPeople binds guests of exactly this BCR team, never Members or owners', () => {
+  test('classifyTeamPeople binds guests of this Team alone, never Members or owners', () => {
     const memberOf = new Map([
-      [GUEST_A, [bcrGroup(TEAM_A)]],
+      [GUEST_A, [bcrGroup(TEAM_A), plainGroup(g('f1'))]],
       [GUEST_2, [bcrGroup(TEAM_A), bcrGroup(TEAM_X, '0099')]],
       [g('b003'), [bcrGroup(TEAM_X, '0099')]],
       [g('b004'), { error: '403' }],
       [g('b005'), [bcrGroup(TEAM_A)]],
+      [g('b006'), [plainGroup(g('f1'))]],
     ]);
     const { eligible, excluded } = classifyTeamPeople({
       teamId: TEAM_A,
@@ -167,20 +211,51 @@ describe('team facts', () => {
         { id: g('b003'), userType: 'Guest' },
         { id: g('b004'), userType: 'Guest' },
         { id: g('b005'), userType: 'Guest' },
+        { id: g('b006'), userType: 'Guest' },
         { id: STAFF, userType: 'Member' },
       ],
       owners: [{ id: g('b005') }],
       memberOfByUser: memberOf,
     });
-    assert.deepEqual(eligible.map((e) => e.id), [GUEST_A]);
+    assert.deepEqual(eligible.map((e) => e.id), [GUEST_A], 'a non-Team group does not count');
     const reason = Object.fromEntries(excluded.map((e) => [e.id, e.reason]));
     assert.deepEqual(reason, {
-      [GUEST_2]: 'guest_in_several_bcr_teams',
-      [g('b003')]: 'guest_not_in_this_bcr_team',
+      [GUEST_2]: 'guest_in_other_team',
+      [g('b003')]: 'guest_in_other_team',
       [g('b004')]: 'memberships_unreadable',
       [g('b005')]: 'owner',
+      [g('b006')]: 'guest_not_in_this_team',
       [STAFF]: 'not_a_guest',
     });
+    const other = excluded.find((e) => e.id === GUEST_2);
+    assert.deepEqual(other.otherTeams, [{ id: TEAM_X, displayName: '0099 Client' }]);
+  });
+
+  test('every Team counts, marked or not; an unreadable kind counts as a Team', () => {
+    const run = (groups, knownTeamIds) =>
+      classifyTeamPeople({
+        teamId: TEAM_A,
+        members: [{ id: GUEST_A, userType: 'Guest' }],
+        owners: [],
+        memberOfByUser: new Map([[GUEST_A, groups]]),
+        ...(knownTeamIds ? { knownTeamIds } : {}),
+      });
+    const legacy = run([bcrGroup(TEAM_A), plainTeam(TEAM_LEGACY, '0003 Legacy client')]);
+    assert.deepEqual(legacy.eligible, []);
+    assert.deepEqual(legacy.excluded[0].otherTeams, [{ id: TEAM_LEGACY, displayName: '0003 Legacy client' }]);
+
+    const staff = run([bcrGroup(TEAM_A), plainTeam(TEAM_STAFF, 'BCR GROUP')]);
+    assert.equal(staff.excluded[0].reason, 'guest_in_other_team');
+
+    // The tenant's Team listing counts even when memberOf leaves the options empty.
+    const listed = run([bcrGroup(TEAM_A), plainGroup(TEAM_X)], new Set([TEAM_X]));
+    assert.equal(listed.excluded[0].reason, 'guest_in_other_team');
+
+    // A group whose kind was not returned at all may only exclude, never bind.
+    assert.equal(isTeamGroup({ id: g('f9') }), true);
+    assert.equal(isTeamGroup(plainGroup(g('f9'))), false);
+    const unknownKind = run([bcrGroup(TEAM_A), { id: g('f9'), displayName: '?' }]);
+    assert.equal(unknownKind.excluded[0].reason, 'guest_in_other_team');
   });
 
   test('evaluateWriteGrant', () => {
@@ -302,7 +377,9 @@ describe('assessRow', () => {
 
     const unknown = assessRow(rowA(), factsA({ permissions: null }), ctxA());
     const p = unknown.problems.find((x) => x.code === 'write_grant_unknown');
-    assert.match(p.detail, /unknown, verify via runbook/);
+    assert.match(p.detail, /verify read-only with GET \/sites\/\{site-id\}\/permissions/);
+    assert.match(p.detail, /Grant-TeamSiteAccess\.ps1 CREATES a write grant/, 'the runbook is named as a write');
+    assert.doesNotMatch(p.detail, /verify via runbook/);
 
     const verified = assessRow(
       rowA(),
@@ -318,6 +395,57 @@ describe('assessRow', () => {
     assert.ok(skipCodes(forbidden).includes('forbidden_target'));
     const admin = assessRow(rowA({ IsAdmin: true }), {}, ctxA());
     assert.ok(skipCodes(admin).includes('admin_row'));
+  });
+
+  test('a forbidden site gets no write-grant advice at all', () => {
+    const a = assessRow(
+      rowA(),
+      factsA({ permissions: null }),
+      ctxA({ forbiddenSitePaths: new Set(['/sites/0001clienta']) }),
+    );
+    assert.deepEqual(skipCodes(a), ['forbidden_target']);
+    assert.equal(a.evidence.writeGrant, 'n/a');
+  });
+
+  test('SitePath spellings: empty segments fold, "." and ".." make the row invalid', () => {
+    const forbiddenCtx = ctxA({ forbiddenSitePaths: new Set(['/sites/0001clienta']) });
+    for (const spelling of ['/sites//0001CLIENTA', '//sites/0001CLIENTA/', ' /Sites/0001clienta ']) {
+      const a = assessRow(rowA({ SitePath: spelling }), factsA(), forbiddenCtx);
+      assert.ok(skipCodes(a).includes('forbidden_target'), spelling);
+    }
+    for (const spelling of ['/sites/./0001CLIENTA', '/sites/x/../0001CLIENTA', '/sites/0001CLIENTA/.']) {
+      const a = assessRow(rowA({ SitePath: spelling }), factsA({ permissions: null }), forbiddenCtx);
+      assert.ok(skipCodes(a).includes('site_path_not_canonical'), spelling);
+      assert.ok(!skipCodes(a).includes('write_grant_unknown'), `${spelling}: no grant advice`);
+    }
+  });
+
+  test('a Team without the "BCR Group —" marker still binds its guest, with a warning', () => {
+    const legacyTeam = team({ description: '' });
+    const facts = factsA({
+      team: legacyTeam,
+      memberOfByUser: new Map([[GUEST_A, [plainTeam(TEAM_A, '0001 Client A'), plainGroup(g('f1'))]]]),
+    });
+    const a = assessRow(rowA(), facts, ctxA({ knownTeamIds: new Set([TEAM_A]) }));
+    assert.deepEqual(skipCodes(a), []);
+    assert.ok(codes(a).includes('warn:team_not_bcr'));
+    assert.equal(a.proposed.UserAadObjectIds, GUEST_A);
+    assert.equal(a.proposed.TeamId, TEAM_A);
+  });
+
+  test('a guest also in an unmarked Team, or in BCR GROUP, is not bound, and says where', () => {
+    for (const [other, name] of [
+      [TEAM_LEGACY, '0003 Legacy client'],
+      [TEAM_STAFF, 'BCR GROUP'],
+    ]) {
+      const facts = factsA({ memberOfByUser: new Map([[GUEST_A, [bcrGroup(TEAM_A), plainTeam(other, name)]]]) });
+      const a = assessRow(rowA(), facts, ctxA({ knownTeamIds: new Set([TEAM_A, other]) }));
+      assert.equal(a.proposed.UserAadObjectIds, '', name);
+      const w = a.problems.find((p) => p.code === 'guest_in_other_team');
+      assert.equal(w.severity, 'warn');
+      assert.match(w.detail, new RegExp(other));
+      assert.ok(codes(a).includes('warn:no_eligible_guest'));
+    }
   });
 
   test('an existing different binding is not overwritten', () => {
@@ -403,6 +531,31 @@ describe('buildPlan', () => {
     assert.deepEqual(r1.addedUserIds, []);
   });
 
+  test('the plan lists guests left out for being in another Team, with that Team', () => {
+    const facts = factsA({
+      members: [
+        { id: GUEST_A, userType: 'Guest', userPrincipalName: 'guest.a#EXT#' },
+        { id: GUEST_2, userType: 'Guest', userPrincipalName: 'guest.2#EXT#' },
+      ],
+      owners: [],
+      memberOfByUser: new Map([
+        [GUEST_A, [bcrGroup(TEAM_A)]],
+        [GUEST_2, [bcrGroup(TEAM_A), plainTeam(TEAM_LEGACY, '0003 Legacy client')]],
+      ]),
+    });
+    const [r] = plan([rowA()], { 1: facts }).rows;
+    assert.equal(r.action, 'PATCH');
+    assert.equal(r.patch.UserAadObjectIds, GUEST_A);
+    assert.deepEqual(r.excludedGuests, [
+      {
+        id: GUEST_2,
+        userPrincipalName: 'guest.2#EXT#',
+        reason: 'guest_in_other_team',
+        otherTeams: [{ id: TEAM_LEGACY, displayName: '0003 Legacy client' }],
+      },
+    ]);
+  });
+
   test('two rows that would end on the same target are both skipped', () => {
     const twin = parseDirectoryRow(
       item(2, { ClientId: '0002', NIP: '0000000002', SitePath: '/sites/0001CLIENTA' }),
@@ -476,5 +629,15 @@ describe('apply and rollback helpers', () => {
     const r = healthSatisfies(body, ['build.phase=p1', 'nothing=x', 'junk']);
     assert.equal(r.ok, false);
     assert.equal(r.missing.length, 3);
+  });
+
+  test('the P0 routing marker is always expected; extras only add to it', () => {
+    assert.deepEqual(healthExpectations(), ['build.routing=identity-only']);
+    assert.deepEqual(healthExpectations(['status=ok']), ['build.routing=identity-only', 'status=ok']);
+    const legacy = { status: 'ok', service: 'document-ingestion', timestamp: 't' };
+    assert.equal(healthSatisfies(legacy, healthExpectations(['status=ok'])).ok, false);
+    assert.equal(healthSatisfies({ build: { phase: 'p0' } }, healthExpectations(['build.phase=p0'])).ok, false);
+    const p0 = { status: 'ok', build: { phase: 'p0', routing: 'identity-only' } };
+    assert.equal(healthSatisfies(p0, healthExpectations(['build.phase=p0'])).ok, true);
   });
 });
