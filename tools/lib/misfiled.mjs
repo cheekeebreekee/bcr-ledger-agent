@@ -36,7 +36,7 @@
  * `directory-bindings` plan); without that list, the item is suspect.
  */
 
-import { PLAN_KIND, normalizeGuid, normalizeSitePath, splitLines } from './bindings.mjs';
+import { PLAN_KIND, normalizeGuid, normalizeSitePath, sitePathSegments, splitLines } from './bindings.mjs';
 
 export const REGISTER_KIND = 'bcr.ir1.inventory';
 
@@ -112,12 +112,15 @@ export function parseSiteSpec(spec) {
     hostname = rest.slice(0, colon);
     sitePath = rest.slice(colon + 1);
   }
-  sitePath = sitePath.replace(/\/+$/, '');
-  if (!/^\/(sites|teams)\/[^/]+$/i.test(sitePath) || /\/\.{1,2}$/.test(sitePath)) {
-    throw new Error(`site "${spec}": path must be /sites/<name> or /teams/<name>`);
+  // The same rule the ingestion and directory-bindings apply (contract C1):
+  // a path that is not canonical could be walked as one site and compared
+  // as another.
+  const segments = sitePathSegments(sitePath);
+  if (!segments) {
+    throw new Error(`site "${spec}": path must be /sites/<name> or /teams/<name> with a plain name`);
   }
   if (!/^[a-z0-9.-]+$/i.test(hostname)) throw new Error(`site "${spec}": bad hostname`);
-  return { label: label || sitePath.split('/')[2], hostname: hostname.toLowerCase(), sitePath };
+  return { label: label || segments[1], hostname: hostname.toLowerCase(), sitePath: `/${segments.join('/')}` };
 }
 
 /** `/sites/foo` from a SharePoint web URL, lower-cased; `''` when it has none. */

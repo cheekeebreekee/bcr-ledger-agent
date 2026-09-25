@@ -19,6 +19,7 @@ import {
 } from '../lib/misfiled.mjs';
 import { PLAN_KIND } from '../lib/bindings.mjs';
 import { HOST, U1, U2, U3, U4, U5, U6, line, traces } from './ir0-fixture.mjs';
+import { SITE_PATH_CASES } from './site-path-cases.mjs';
 
 const g = (s) => `00000000-0000-4000-8000-${s.padStart(12, '0')}`;
 const INGEST = g('e1');
@@ -30,13 +31,28 @@ describe('site specs', () => {
       hostname: 'contoso.sharepoint.com',
       sitePath: '/sites/BCRGROUP',
     });
-    assert.deepEqual(parseSiteSpec('https://Contoso.sharepoint.com/sites/0001%20A/'), {
-      label: '0001 A',
+    assert.deepEqual(parseSiteSpec('https://Contoso.sharepoint.com/sites/0001A/'), {
+      label: '0001A',
       hostname: 'contoso.sharepoint.com',
-      sitePath: '/sites/0001 A',
+      sitePath: '/sites/0001A',
     });
-    for (const bad of ['contoso', 'contoso.sharepoint.com:/sites/a/b', 'x=/sites/a', 'http://h/sites/a', 'h.example:/sites/..']) {
+    for (const bad of [
+      'contoso',
+      'contoso.sharepoint.com:/sites/a/b',
+      'x=/sites/a',
+      'http://h/sites/a',
+      'h.example:/sites/..',
+      'https://contoso.sharepoint.com/sites/0001%20A',
+      'contoso.sharepoint.com:/sites/a.',
+      'contoso.sharepoint.com:/foo/a',
+    ]) {
       assert.throws(() => parseSiteSpec(bad), Error, bad);
+    }
+    // The same table as the ingestion and directory-bindings (C1).
+    for (const [path, canonical] of SITE_PATH_CASES) {
+      const spec = `contoso.sharepoint.com:${path.trim().startsWith('/') ? path.trim() : `/${path.trim()}`}`;
+      if (canonical === null) assert.throws(() => parseSiteSpec(spec), Error, spec);
+      else assert.equal(parseSiteSpec(spec).sitePath.toLowerCase(), canonical, spec);
     }
   });
 

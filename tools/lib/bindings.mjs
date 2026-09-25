@@ -13,10 +13,11 @@
  *   `BCR Group —` marker, or BCR GROUP) is not bound. A duplicate ClientId,
  *   NIP, site or target skips every row that shares it. An unreadable fact
  *   skips the row rather than being read as "absent".
- * - **A site path means one site.** SitePath is compared the way the
- *   ingestion builds its request (empty segments dropped, case folded), and a
- *   `.` or `..` segment, which URL parsing would resolve to another site, makes
- *   the row invalid.
+ * - **A site path means one site.** SitePath is canonicalised by the same
+ *   rule as the ingestion (contract C1: exactly `/sites/<name>` or
+ *   `/teams/<name>`, a plain name, empty segments dropped, case folded).
+ *   Anything else makes the row invalid, because Graph could resolve it to a
+ *   site other than the one compared.
  * - **A binding already set is not changed here (I10).** A row whose RootFolder,
  *   DriveId or TeamId is set to something else is skipped for a person to look
  *   at.
@@ -87,36 +88,47 @@ export function normalizeNip(value) {
   return String(value ?? '').replace(/\D+/g, '');
 }
 
+const SITE_KIND = /^(sites|teams)$/i;
+const SITE_NAME = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
+
 /**
- * The segments of a site path as the ingestion requests it: trimmed, split on
- * `/`, empty segments dropped (`encodeGraphPath` drops them too). `null` when
- * a segment is `.` or `..`: URL parsing resolves those, so `/sites/x/../Y`
- * would be compared as one site and requested as another.
+ * The two segments of a client site path, or `null` when the path is not
+ * canonical. This is the ingestion's `canonicalSitePath` rule (contract C1),
+ * and the two must agree exactly: the tests hold the same table.
+ *
+ * The whole string is trimmed, split on `/`, and empty segments are dropped.
+ * It is canonical only with exactly two segments: `sites` or `teams`, then a
+ * name of letters, digits, `_`, `-` and `.`, not starting with `.` and not
+ * ending with `.`. Everything else is refused, because Graph could resolve it
+ * to a site other than the one compared: `.` and `..` (URL parsing resolves
+ * them), `%` escapes, `\`, whitespace or zero-width characters inside a
+ * segment, sub-sites and one or three-plus segments.
  */
 export function sitePathSegments(path) {
   const segments = String(path ?? '')
     .trim()
     .split('/')
     .filter(Boolean);
-  return segments.some((s) => s === '.' || s === '..') ? null : segments;
+  if (segments.length !== 2) return null;
+  const [kind, name] = segments;
+  if (!SITE_KIND.test(kind) || !SITE_NAME.test(name) || name.endsWith('.')) return null;
+  return segments;
 }
 
 /**
  * `/Sites//Foo/` → `/sites/foo`, the canonical form every comparison uses.
- * SharePoint URLs are case-insensitive. `''` for an empty path, and `null`
- * for one that is not canonical (see `sitePathSegments`); callers treat
+ * SharePoint URLs are case-insensitive. `null` for a path that is not
+ * canonical (see `sitePathSegments`), the empty path included; callers treat
  * `null` as "matches nothing" and refuse the row.
  */
 export function normalizeSitePath(path) {
   const segments = sitePathSegments(path);
-  if (segments === null) return null;
-  return segments.length ? `/${segments.join('/')}`.toLowerCase() : '';
+  return segments ? `/${segments[0]}/${segments[1]}`.toLowerCase() : null;
 }
 
-/** A site path as an operator names it on the command line: `/sites/<name>` or `/teams/<name>`. */
+/** A site path as an operator names it on the command line: canonical, `/sites/<name>` or `/teams/<name>`. */
 export function isSiteCollectionPath(path) {
-  const canonical = normalizeSitePath(path);
-  return Boolean(canonical) && /^\/(sites|teams)\/[^/]+$/.test(canonical);
+  return normalizeSitePath(path) !== null;
 }
 
 /** For display-name comparison only: NFC, trimmed, single spaces, lower case. */
@@ -150,7 +162,11 @@ export function siteKey(hostname, sitePath) {
     .toLowerCase()}|${path}`;
 }
 
-/** `https://Host/sites/Foo%20Bar/` → `host|/sites/foo bar`, or `''` if not a URL. */
+/**
+ * `https://Host/sites/Foo/` → `host|/sites/foo`, or `''` if it is not a URL
+ * or its path is not canonical. Only used to find the Team whose root site
+ * this is; the site id is the primary key for that.
+ */
 export function siteUrlKey(webUrl) {
   try {
     const u = new URL(String(webUrl ?? ''));
@@ -520,13 +536,16 @@ export function assessRow(row, facts = {}, ctx = {}) {
     add('no_site', 'skip', 'row has no SiteHostname/SitePath');
   }
   const canonicalPath = normalizeSitePath(row.sitePath);
-  const pathNotCanonical = canonicalPath === null;
+  // An empty SitePath is `no_site`; only a path that is there can be malformed.
+  const pathNotCanonical = Boolean(row.sitePath) && canonicalPath === null;
   if (pathNotCanonical) {
     add(
       'site_path_not_canonical',
       'skip',
-      'SitePath has a "." or ".." segment, which URL parsing resolves to another site. ' +
-        'Correct it by hand to the path of the site itself',
+      'SitePath is not exactly /sites/<name> or /teams/<name> with a plain name (letters, digits, ' +
+        '"_", "-", "."; no "." or ".." segment, no "%", "\\" or spaces, no sub-site). Graph could ' +
+        'resolve it to another site, and the ingestion excludes the row. Correct it by hand to ' +
+        "the path of the Team's root site",
     );
   }
   const forbidden = Boolean(canonicalPath && ctx.forbiddenSitePaths?.has(canonicalPath));

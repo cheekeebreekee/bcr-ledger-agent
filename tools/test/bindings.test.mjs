@@ -21,11 +21,13 @@ import {
   pickAccountingChannel,
   planDigest,
   rollbackPatch,
+  sitePathSegments,
   staleFields,
   survivesIngestionSanitiser,
   targetKey,
   validatePlan,
 } from '../lib/bindings.mjs';
+import { SITE_PATH_CASES } from './site-path-cases.mjs';
 
 // Synthetic ids only.
 const g = (s) => `00000000-0000-4000-8000-${s.padStart(12, '0')}`;
@@ -135,17 +137,42 @@ describe('parseDirectoryRow', () => {
 });
 
 describe('site paths', () => {
-  test('normalizeSitePath folds the spellings the ingestion requests as one site', () => {
-    for (const p of ['/sites/Foo', '/sites//Foo', '//sites/foo/', ' /SITES/foo/ ', 'sites/foo']) {
-      assert.equal(normalizeSitePath(p), '/sites/foo', p);
-    }
-    assert.equal(normalizeSitePath(''), '');
-    for (const p of ['/sites/./foo', '/sites/x/../foo', '/sites/foo/.', '/sites/foo/..']) {
-      assert.equal(normalizeSitePath(p), null, p);
+  test('normalizeSitePath follows the ingestion rule on the shared edge-case table (C1)', () => {
+    const wrong = SITE_PATH_CASES.filter(([input, want]) => normalizeSitePath(input) !== want).map(
+      ([input, want]) => `${JSON.stringify(input)}: want ${want}, got ${normalizeSitePath(input)}`,
+    );
+    assert.deepEqual(wrong, []);
+    for (const [input, want] of SITE_PATH_CASES) {
+      assert.equal(sitePathSegments(input) === null, want === null, JSON.stringify(input));
     }
   });
 
-  test('an operator-named site must be /sites/<name> or /teams/<name>', () => {
+  test('normalizeSitePath folds the spellings of one site, and refuses everything else', () => {
+    for (const p of ['/sites/Foo', '/sites//Foo', '//sites/foo/', ' /SITES/foo/ ', 'sites/foo']) {
+      assert.equal(normalizeSitePath(p), '/sites/foo', p);
+    }
+    for (const p of [
+      '',
+      '/',
+      '/sites/',
+      '/personal/x',
+      '/sites/./foo',
+      '/sites/x/../foo',
+      '/sites/foo/.',
+      '/sites/foo/..',
+      '/sites/.foo',
+      '/sites/%2e%2e',
+      '/sites\\foo',
+      '/sites/fo​o',
+      '​/sites/foo',
+      '/sites/foo?x',
+      '/sites/foo#x',
+    ]) {
+      assert.equal(normalizeSitePath(p), null, JSON.stringify(p));
+    }
+  });
+
+  test('an operator-named site must be canonical /sites/<name> or /teams/<name>', () => {
     assert.equal(isSiteCollectionPath('/sites/BCRGROUP'), true);
     assert.equal(isSiteCollectionPath('/teams/x/'), true);
     for (const p of ['https://contoso.sharepoint.com/sites/BCRGROUP', '/sites/a/b', '/sites/../x', '', '/']) {
@@ -407,13 +434,22 @@ describe('assessRow', () => {
     assert.equal(a.evidence.writeGrant, 'n/a');
   });
 
-  test('SitePath spellings: empty segments fold, "." and ".." make the row invalid', () => {
+  test('SitePath spellings: empty segments fold; anything not canonical makes the row invalid', () => {
     const forbiddenCtx = ctxA({ forbiddenSitePaths: new Set(['/sites/0001clienta']) });
     for (const spelling of ['/sites//0001CLIENTA', '//sites/0001CLIENTA/', ' /Sites/0001clienta ']) {
       const a = assessRow(rowA({ SitePath: spelling }), factsA(), forbiddenCtx);
       assert.ok(skipCodes(a).includes('forbidden_target'), spelling);
     }
-    for (const spelling of ['/sites/./0001CLIENTA', '/sites/x/../0001CLIENTA', '/sites/0001CLIENTA/.']) {
+    for (const spelling of [
+      '/sites/./0001CLIENTA',
+      '/sites/x/../0001CLIENTA',
+      '/sites/0001CLIENTA/.',
+      '/sites/0001CLIENTA/sub',
+      '/sites/0001CLIENTA.',
+      '/sites/ 0001CLIENTA',
+      '/sites/%30001CLIENTA',
+      '/personal/0001CLIENTA',
+    ]) {
       const a = assessRow(rowA({ SitePath: spelling }), factsA({ permissions: null }), forbiddenCtx);
       assert.ok(skipCodes(a).includes('site_path_not_canonical'), spelling);
       assert.ok(!skipCodes(a).includes('write_grant_unknown'), `${spelling}: no grant advice`);
