@@ -718,7 +718,7 @@ describe('buildPlan', () => {
     const p = plan([rowA()], { 1: factsA() });
     const unbound = structuredClone(p);
     delete unbound.rows[0].patch.TeamId;
-    unbound.digest = planDigest(unbound.rows);
+    unbound.digest = planDigest(unbound);
     assert.ok(validatePlan(unbound).some((e) => /leaves TeamId empty/.test(e)));
   });
 
@@ -731,15 +731,39 @@ describe('buildPlan', () => {
 
     const forged = structuredClone(p);
     forged.rows[0].patch.Status = 'Inactive';
-    forged.digest = planDigest(forged.rows);
+    forged.digest = planDigest(forged);
     assert.ok(validatePlan(forged).some((e) => /not a binding field/.test(e)));
 
     const unsafe = structuredClone(p);
     unsafe.rows[0].patch.RootFolder = '../x';
-    unsafe.digest = planDigest(unsafe.rows);
+    unsafe.digest = planDigest(unsafe);
     assert.ok(validatePlan(unsafe).some((e) => /RootFolder unsafe/.test(e)));
 
     assert.ok(validatePlan({ ...p, rows: [null] }).length > 0);
+  });
+
+  test('the digest covers createdAt, directory and guards, not only the rows', () => {
+    const p = buildPlan({
+      rows: [rowA()],
+      assessments: [assessRow(rowA(), factsA(), ctxA())],
+      directory,
+      guards: { forbiddenSitePaths: ['/sites/bcrgroup'], quarantineSitePath: '', tenantHost: '', directorySiteCollectionId: 'x' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+    });
+    assert.deepEqual(validatePlan(p), []);
+    for (const [name, change] of [
+      ['createdAt', (x) => (x.createdAt = '2026-09-25T00:00:00.000Z')],
+      ['directory', (x) => (x.directory.listId = 'another')],
+      ['guards', (x) => (x.guards.forbiddenSitePaths = [])],
+      ['guards removed', (x) => delete x.guards],
+      ['ingestAppIds', (x) => x.ingestAppIds.push(INGEST)],
+    ]) {
+      const edited = structuredClone(p);
+      change(edited);
+      assert.ok(validatePlan(edited).some((e) => /digest does not match/.test(e)), name);
+    }
+    // A JSON round trip (the plan file) keeps it valid.
+    assert.deepEqual(validatePlan(JSON.parse(JSON.stringify(p))), []);
   });
 });
 

@@ -75,12 +75,16 @@ export FORBIDDEN_TARGET_SITE_PATHS='/sites/BCRGROUP'                      # REQU
 export QUARANTINE_SITE_PATH='/sites/<quarantine site>'                    # always forbidden
 export QUARANTINE_SITE_HOSTNAME='contoso.sharepoint.com'                  # the only host a row may name
 
-node tools/directory-bindings.mjs check
-node tools/directory-bindings.mjs propose [--confirm-remove-staff <listItemId>] [--write-verified <sitePath|listItemId>]
-node tools/directory-bindings.mjs apply --plan <plan.json> --health-url https://<ingestion-host>/api/health [--expect-health <key=value>]... [--apply]
-node tools/directory-bindings.mjs rollback --log <apply-log.json> [--apply]
+node tools/directory-bindings.mjs check [--out <new report.json>]
+node tools/directory-bindings.mjs propose [--confirm-remove-staff <listItemId>] [--write-verified <sitePath|listItemId>] [--out <new plan.json>]
+node tools/directory-bindings.mjs apply --plan <plan.json> --health-url https://<ingestion-host>/api/health [--expect-health <key=value>]... [--only <listItemId>]... [--apply]
+node tools/directory-bindings.mjs rollback --log <apply-log.json> [--only <listItemId>]... [--apply]
 node tools/directory-bindings.mjs --add-columns [--apply]
 ```
+
+Every `--out` names a **new** file: `check`, `propose`, `apply` and `rollback`
+all refuse a path that exists, so a path reused from shell history can never
+replace an apply log that `rollback` needs, or a reviewed plan.
 
 Use the values the ingestion runs with (its app settings of the same names),
 so the tool refuses exactly what the ingestion refuses.
@@ -223,14 +227,17 @@ An existing, different `RootFolder`, `DriveId` or `TeamId` is never overwritten.
 The row is skipped for a person to decide (I10).
 
 The plan is written to `tools/out/directory-bindings-plan-<UTC>.json`, or to
-`--out`, and its sha256 is printed. It carries a digest of its rows, and the
-guards it was made with (`guards`).
+`--out` (a new file: an existing one is refused before anything is read), and
+its sha256 is printed. It records the guards it was made with (`guards`), and
+carries a `digest` of **every other field**: `kind`, `version`, `createdAt`,
+`directory`, `ingestAppIds`, `guards` and `rows`. So a plan whose date, target
+list or guards were edited is refused as surely as one whose rows were.
 
 ### `apply`
 
 Before it writes anything, `apply` refuses a plan in any of these cases:
-- the plan's digest no longer matches: it was **edited** after `propose`;
-- the plan is **older** than `--max-plan-age-hours`. The default is 72, and 72 is also the most it accepts: no flag widens it;
+- the plan's digest no longer matches: it was **edited** after `propose`, in its rows, its `createdAt`, its `directory` or its `guards`;
+- the plan is **older** than `--max-plan-age-hours`. The default is 72, and 72 is also the most it accepts: no flag widens it. Changing `createdAt` breaks the digest: an old plan needs a new `propose`;
 - the forbidden list is not given (`FORBIDDEN_TARGET_SITE_PATHS` or `--forbidden-site-paths`), or a guard value is malformed;
 - `--only` asks for a **SKIP** row;
 - the **ingestion health** check fails. `--health-url` must be `https` and answer 200, and its JSON must report `build.routing=identity-only`. Only the Phase-0 build does (`"build":{"phase":"p0","routing":"identity-only"}`). This is always required. `--expect-health key=value` adds further checks, with dotted keys reaching into nested objects; it can never replace this one. A value such as `status=ok`, which the old build also reports, does not open the gate;

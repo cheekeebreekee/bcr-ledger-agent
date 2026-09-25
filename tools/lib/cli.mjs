@@ -6,6 +6,7 @@
 import { createHash } from 'node:crypto';
 import {
   closeSync,
+  existsSync,
   fsyncSync,
   mkdirSync,
   openSync,
@@ -138,8 +139,9 @@ function fsyncDir(dir) {
  * The write survives a crash: the content goes to a temporary file beside the
  * target, is fsynced, and is renamed over it. A crash leaves the old file or
  * the new one, never a truncated one, which a later reader would refuse
- * whole. With `exclusive`, the target must not exist yet: an apply or
- * rollback log never replaces another file (an earlier log, or the plan).
+ * whole. With `exclusive`, the target must not exist yet: a check report,
+ * a plan, an apply log or a rollback log never replaces another file (an
+ * earlier log that rollback needs, or the plan).
  *
  * @param {string} path
  * @param {string} content
@@ -153,7 +155,7 @@ export function writePrivateFile(path, content, { exclusive = false } = {}) {
       writeNewFile(path, content);
     } catch (err) {
       if (err.code === 'EEXIST') {
-        throw new CliError(`${path} exists; choose a new name. A log never overwrites another file.`);
+        throw new CliError(`${path} exists; choose a new name. An output never replaces another file.`);
       }
       throw err;
     }
@@ -169,6 +171,16 @@ export function writePrivateFile(path, content, { exclusive = false } = {}) {
   }
   fsyncDir(dir);
   return { path, sha256: sha256(content) };
+}
+
+/**
+ * Refuse an output path that already exists, before a long run rather than at
+ * its end. The write itself is still exclusive; this only fails sooner.
+ */
+export function assertNewFile(path) {
+  if (existsSync(path)) {
+    throw new CliError(`${path} exists; choose a new name. An output never replaces another file.`);
+  }
 }
 
 export function writeJsonFile(path, data, opts) {

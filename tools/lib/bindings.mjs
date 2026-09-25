@@ -999,11 +999,24 @@ export function diffBinding(before, proposed) {
 }
 
 /**
- * Digest of the rows exactly as propose wrote them. `apply` recomputes it, so
- * a plan edited by hand after review is refused rather than applied.
+ * Digest of the whole plan as propose wrote it: every field but `digest`
+ * itself, so `createdAt` (the age cap), `directory` and `guards` as well as
+ * the rows. `apply` recomputes it, so a plan edited by hand after review is
+ * refused rather than applied; a plan too old to apply needs a new propose,
+ * not a new date.
  */
-export function planDigest(rows) {
-  return sha256(JSON.stringify(rows));
+export function planDigest(plan) {
+  return sha256(
+    JSON.stringify({
+      kind: plan?.kind,
+      version: plan?.version,
+      createdAt: plan?.createdAt,
+      directory: plan?.directory,
+      ingestAppIds: plan?.ingestAppIds,
+      guards: plan?.guards,
+      rows: plan?.rows,
+    }),
+  );
 }
 
 /**
@@ -1137,21 +1150,22 @@ export function buildPlan({ rows, assessments, directory, ingestAppIds = [], gua
 
   // `proposed` stays on every row, SKIP included: it is what a reviewer reads
   // to judge a skip. Only `patch` is ever applied, and only on PATCH rows.
-  const planRows = entries;
-  return {
+  const plan = {
     kind: PLAN_KIND,
     version: PLAN_VERSION,
     createdAt: createdAt ?? new Date().toISOString(),
     directory,
     ingestAppIds: [...ingestAppIds],
     // What the rows were checked against (forbidden paths, quarantine path,
-    // tenant host, the Directory's site collection). Outside the digest:
-    // `apply` checks every row again, and a recorded value can only add to
-    // what it is given, never remove from it.
+    // tenant host, the Directory's site collection). Covered by the digest;
+    // `apply` also checks every row again, and a recorded value can only add
+    // to what it is given, never remove from it.
     ...(guards ? { guards } : {}),
-    digest: planDigest(planRows),
-    rows: planRows,
+    digest: '',
+    rows: entries,
   };
+  plan.digest = planDigest(plan);
+  return plan;
 }
 
 /** Shape errors in a plan file; empty when it may be applied. */
@@ -1164,8 +1178,11 @@ export function validatePlan(plan) {
     errors.push('rows is not an array');
     return errors;
   }
-  if (plan.digest !== planDigest(plan.rows)) {
-    errors.push('digest does not match the rows: the plan was edited after propose. Re-run propose.');
+  if (plan.digest !== planDigest(plan)) {
+    errors.push(
+      'digest does not match: the plan (its rows, createdAt, directory or guards) was edited after ' +
+        'propose. Re-run propose.',
+    );
   }
   const seen = new Set();
   for (const row of plan.rows) {

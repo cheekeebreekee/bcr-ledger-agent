@@ -216,6 +216,17 @@ describe('directory-bindings check', () => {
       /no GRAPH_TOKEN/,
     );
   });
+
+  test('--out never replaces an existing file, and refuses before reading anything', async () => {
+    const h = harness();
+    const existing = join(h.outDir, 'apply-log-from-history.json');
+    writeFileSync(existing, '{"keep":true}\n');
+    for (const command of ['check', 'propose']) {
+      await assert.rejects(h.run([command, ...DIR_ARGS, '--out', existing]), /exists; choose a new name/, command);
+    }
+    assert.equal(readFileSync(existing, 'utf8'), '{"keep":true}\n');
+    assert.deepEqual(h.tenant.calls, [], 'refused before any Graph read');
+  });
 });
 
 describe('directory-bindings propose', () => {
@@ -368,6 +379,25 @@ describe('directory-bindings apply', () => {
     copy.rows[0].patch.UserAadObjectIds = IDS.staff;
     writeFileSync(edited, JSON.stringify(copy));
     await assert.rejects(h.run(['apply', '--plan', edited, '--apply', ...HEALTH_ARGS]), /digest/);
+
+    // A plan too old to apply is not revived by a new date, and its guards
+    // and directory are covered as well as its rows.
+    const late = new Date(NOW.getTime() + 73 * 3_600_000);
+    for (const [name, change] of [
+      ['createdAt', (p) => (p.createdAt = late.toISOString())],
+      ['guards', (p) => (p.guards.forbiddenSitePaths = [])],
+      ['directory', (p) => (p.directory.listId = 'another-list')],
+    ]) {
+      const copy2 = structuredClone(plan);
+      change(copy2);
+      const f = join(h.outDir, `edited-${name}.json`);
+      writeFileSync(f, JSON.stringify(copy2));
+      await assert.rejects(
+        h.run(['apply', '--plan', f, '--apply', ...HEALTH_ARGS], { now: late }),
+        /digest does not match/,
+        name,
+      );
+    }
 
     const later = new Date(NOW.getTime() + 73 * 3_600_000);
     await assert.rejects(

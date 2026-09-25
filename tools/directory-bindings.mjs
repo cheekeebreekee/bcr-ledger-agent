@@ -35,9 +35,10 @@
  *   required, the quarantine path is always forbidden, a row on another host
  *   than `--tenant-host` is skipped, and a row whose site resolves to the
  *   Client Directory's own site collection is skipped whatever the flags say.
- * - `apply` refuses a plan that was edited after `propose` (digest), is older
- *   than `--max-plan-age-hours` (at most 72), or whose row changed since
- *   (stale guard). Before each PATCH it checks the row again against the
+ * - `apply` refuses a plan that was edited after `propose` (the digest covers
+ *   every field: rows, createdAt, directory, guards), is older than
+ *   `--max-plan-age-hours` (at most 72), or whose row changed since (stale
+ *   guard). Before each PATCH it checks the row again against the
  *   guards it is given, and re-reads every guest the row will route: each
  *   must still be a Guest in the row's Team and in no other Team. It refuses
  *   to run unless the ingestion `/api/health` reports
@@ -50,7 +51,8 @@
  * - Every applied row is logged before the PATCH is sent (`writing`) and again
  *   after it, and the log is on disk at both points, so `rollback` knows every
  *   row an interrupted run may have written. The log is created fresh (an
- *   existing file is refused) and every rewrite is atomic and fsynced.
+ *   existing file is refused) and every rewrite is atomic and fsynced. The
+ *   check report and the plan are created fresh too.
  * - The token is read from `GRAPH_TOKEN` and never printed.
  *
  * See tools/README.md for scopes and the full procedure.
@@ -58,6 +60,7 @@
 
 import {
   CliError,
+  assertNewFile,
   bad,
   bold,
   csvList,
@@ -714,6 +717,7 @@ async function gatherAndAssess(ctx, heading) {
 
 async function runCheck(ctx) {
   const { print, values } = ctx;
+  if (values.out) assertNewFile(values.out);
   const { ids, opts, gathered, assessments } = await gatherAndAssess(
     ctx,
     'Client Directory binding check (read-only)',
@@ -756,7 +760,7 @@ async function runCheck(ctx) {
       routingDrift: drift.map((a) => a.listItemId),
       rows: assessments,
     };
-    const written = writeJsonFile(values.out, report);
+    const written = writeJsonFile(values.out, report, { exclusive: true });
     print(`  report     ${written.path}  sha256 ${written.sha256}`);
   }
   print('');
@@ -798,6 +802,7 @@ function printPlanRow(print, r) {
 
 async function runPropose(ctx) {
   const { print, values } = ctx;
+  if (values.out) assertNewFile(values.out);
   const { ids, opts, gathered, assessments } = await gatherAndAssess(
     ctx,
     'Client Directory binding proposal (read-only)',
@@ -815,7 +820,7 @@ async function runPropose(ctx) {
 
   const count = (action) => plan.rows.filter((r) => r.action === action).length;
   const file = values.out ?? outPath(ctx.outDir, `directory-bindings-plan-${stamp(ctx.now())}.json`);
-  const written = writeJsonFile(file, plan);
+  const written = writeJsonFile(file, plan, { exclusive: true });
   print('');
   print(bold('Plan'));
   print(`  ${ok(`${count('PATCH')} PATCH`)} · ${dim(`${count('NOOP')} NOOP`)} · ${bad(`${count('SKIP')} SKIP`)}`);
