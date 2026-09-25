@@ -16,7 +16,10 @@ documents already filed in the wrong place are found and moved back.
 export, the inventory and the relocation register contain file names, client names and user
 ids. They live in the IR evidence store (see [IR-0](#ir-0-preserve-the-evidence-first)), readable by
 Roman, the IOD and `yahor.simak@bcr-group.pl` only. Nothing from them is pasted here, and no
-NIP, object id or file name should ever be added to this page.
+NIP, object id or file name should ever be added to this page. The one exception is the canary
+guest's object id ([H-5b](human-steps.md#h-5b-invite-the-canary-guest)): a BCR-controlled test
+account, not a client's or a person's, recorded in the status table because every negative
+canary checks against it.
 
 ---
 
@@ -627,7 +630,8 @@ The per-client list of affected documents is sent separately, over a secure chan
 
 ## Status
 
-Update this table as steps complete. Evidence columns hold hashes, commit ids and dates only.
+Update this table as steps complete. Evidence columns hold hashes, commit ids and dates only,
+plus the canary guest's object id (H-5b).
 
 The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 
@@ -650,7 +654,8 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | IR-1 inventory: run with an Owner's or site collection admin's token and `--expect-root-folders` for every site; `--ir0` restored from the store; exit 0 | Yahor, or an Owner of each site | todo | | `SHA256SUMS`; any temporary site collection admin added and removed |
 | T-4b: items outside the locked folders checked after IR-1, and locked one by one | SharePoint Admin | todo | | per site: done, and the number of items locked (the items themselves in the evidence store) |
 | H-5, H-6: quarantine site and ingestion write grant | SharePoint Admin, Global Admin | todo | | |
-| H-6b: running build's fallback re-pointed at the quarantine | Yahor | todo | | `FALLBACK_*` names; values in the evidence store (`SHA256SUMS`) |
+| H-5b: canary guest invited, in no Team; whether it reached the bot before H-10 | Global Admin | todo | | the canary guest's object id (the one object id this page holds; see the top) |
+| H-6b: running build's fallback re-pointed at the quarantine | Yahor | todo | | `FALLBACK_*` names; values in the evidence store (`SHA256SUMS`); which guest verified it (canary or TEST) |
 | H-7: Directory check; duplicate `0002` resolved; per-row decisions, incl. which sites get a grant in H-12 | Yahor, Roman | todo | | |
 | H-8: app settings added | Yahor | todo | | |
 | H-9: bot deploy, gate in `log` | Yahor | todo | | sha256 of the saved pre-Phase-0 bot package |

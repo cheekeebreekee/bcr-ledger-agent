@@ -100,14 +100,15 @@ Graph and SharePoint tokens are set up as described in
 | H-4a | Graph permissions for the operator tools, admin-consented | Global Admin | day 0, before H-4 | — |
 | H-4 | Tenant hardening T-1 to T-9, T-4b included | per step | today–tomorrow | H-4a; T-4, T-4b, T-5 before H-12; T-4 the day of H-3, checked again after H-6b; T-4b after H-3 is verified, before IR-2; T-1 before H-10 |
 | H-5 | Quarantine site | SharePoint Admin | the working day of H-3 | — |
+| H-5b | Canary guest invited, in no Team; its object id recorded | Global Admin | the working day of H-3 | H-4a; needed by H-6b and H-12 |
 | H-6 | Ingestion identity write grant on quarantine | Global Admin | the working day of H-3 | H-5 |
-| H-6b | Running build's fallback re-pointed at the quarantine | Yahor | the working day of H-3 | H-3, H-6 verified |
+| H-6b | Running build's fallback re-pointed at the quarantine | Yahor | the working day of H-3 | H-3, H-5b, H-6 verified |
 | H-7 | Directory check and new columns (no new site grants) | Yahor | day 1 | H-2 (IR-0 C stored), H-4a, T-5 |
 | H-8 | New app settings, added | Yahor | day 1 | H-5 |
 | H-9 | Bot deploy, gate in `log` | Yahor | day 1 | H-2, H-8 |
 | H-10 | Manifest 0.2.0, availability *Everyone* | Teams Admin | day 1 | H-9, T-1 |
 | H-11 | Gate to `enforce` | Yahor | day 2 | 24 h of clean logs |
-| H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-6, H-6b, H-7, H-11, T-4, T-4b, T-5 |
+| H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-5b, H-6, H-6b, H-7, H-11, T-4, T-4b, T-5 |
 | H-13 | Ingestion grant on BCR GROUP to `read` | Global Admin | after H-12 | H-12 verified |
 | H-14 | `FALLBACK_*` settings and saved pre-Phase-0 packages removed | Yahor | ≥ 24 h after H-12 | H-12 verified |
 | H-15 | Exit criteria checked | Yahor, Roman | end of phase | all |
@@ -328,7 +329,7 @@ the Phase-0 build, which has no promotion, is live.
 
 ### H-4a: Consent the permissions the operator tools need
 
-**Owner:** Global Admin. **When:** day 0, before H-4 and before any `check` (H-5b, H-6b, H-7).
+**Owner:** Global Admin. **When:** day 0, before H-4, and before the reads in H-5b, H-6b and H-7.
 It changes no data; it lets the operator's own token do what this runbook asks of it.
 
 Every `g` and `sp` call and every `tools/*.mjs` run below uses a delegated token from one app
@@ -470,6 +471,40 @@ documents and is not deleted.
 **Retention.** Quarantined items are kept 90 days after triage. That is the plan's default, for
 Roman and the lawyer to confirm.
 
+### H-5b: Invite the canary guest
+
+**Owner:** Global Admin. **When:** day 0, the working day of H-3, after H-4a and before H-6b.
+H-6b's check, H-12 steps 4 and 8, the [standing checks](#standing-checks) and H-15 all use it.
+
+The canary guest is BCR's test identity for uploads that must be quarantined: an account outside
+the tenant that BCR controls and keeps for testing. Never a client's address, and never a staff
+member's own. It is a guest in no Team, so it is bound to no row, and every upload it makes must
+end in the quarantine. T-8 lets only admin roles invite guests, so the Global Admin invites it.
+
+1. **Invite it.** Entra admin centre: **Users → All users → New user → Invite external user**,
+   with the canary's address. Add it to no group and no Team.
+2. **Record its object id**, and only the id (no address, no name), in the incident's
+   [status table](incident-2026-09.md#status). It is BCR's own test account, the one object id
+   that table holds, because every negative canary checks against it. Below it is `<canary id>`.
+3. **Check that it reaches the bot today.** Sign in as the canary, accept the invitation, switch
+   to the BCR organisation in Teams, find "Asystent BCR" and send `pomoc`: the help card comes
+   back. Before H-10 makes the app available to *Everyone*, today's availability may keep a
+   guest in no Team out. If it does, H-6b's Verify uses the TEST guest instead (see there), and
+   the canary is first used in H-12.
+
+**Verify.** It is a guest, in no group and no Team:
+
+```bash
+CANARY=<canary id>
+# Must read Guest.
+g "$G/users/$CANARY?\$select=userType" | jq -r .userType
+# Must print 0.
+g "$G/users/$CANARY/memberOf?\$select=id" | jq '.value | length'
+```
+
+**Rollback.** Delete the guest in the Entra admin centre, and record it. Only once no canary
+needs it any more: the standing checks use it until Phase 2.
+
 ### H-6: Grant the ingestion identity write on the quarantine site
 
 **Owner:** Global Admin (or anyone who may start jobs on the onboarding Automation account).
@@ -556,9 +591,22 @@ az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
   "FALLBACK_ROOT_FOLDER=Kwarantanna"
 ```
 
-**Verify.** The canary guest from H-12 step 4 (a BCR-controlled outside account, bound to no
-row, in no client Team) uploads a synthetic PDF. It lands on the quarantine site under
-`Kwarantanna/`, and nothing new appears at the BCR GROUP library root.
+**Verify.** The canary guest from [H-5b](#h-5b-invite-the-canary-guest) (bound to no row, in no
+Team) uploads a synthetic PDF. It lands on the quarantine site under `Kwarantanna/`, and nothing
+new appears at the BCR GROUP library root.
+
+If H-5b found that the canary cannot reach the bot yet, the TEST guest uploads it instead, but
+only once its id is shown to be on no Directory row. Before H-12 an onboarded guest is on no row
+(R1), and with H-3 in effect its upload then takes the fallback like any other. On a row, the
+running build would route it to that row's site instead, and the check would prove nothing.
+With H-7's variables set (and, after T-5, as a BCR GROUP site owner, as in H-2 step 4), this
+reads every row, Active or not, and must print `0`. A grep of `check` would not do here: `check`
+also lists each Team's guests, the TEST guest among them.
+
+```bash
+g "$G/sites/$DIRECTORY_SITE_ID/lists/$DIRECTORY_LIST_ID/items?expand=fields(select=UserAadObjectIds)&\$top=999" \
+  | jq -r '.value[].fields.UserAadObjectIds // empty' | grep -ci '<TEST guest id>'
+```
 
 **Note for triage.** Until H-12 these files come from the old build, so they use its layout,
 `Kwarantanna/<category>/YYYY/MM/`, and have none of the four quarantine columns. Take the
@@ -1026,10 +1074,10 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    confirm each grant read-only, as in H-7 (`GET /sites/{site-id}/permissions` shows `write` for
    `$INGEST_MI_APPID`). Per-site grants take about 5 minutes to take effect, so make them before
    step 5 and wait before that client's apply.
-4. **Negative canary: quarantine.** A canary guest bound to no row uploads a synthetic PDF. The
-   canary guest is a BCR-controlled outside account, invited as a guest and in no client Team.
-   Before this and **every later negative canary**, confirm that with the tool (H-7's variables
-   set): `node tools/directory-bindings.mjs check | grep -ci <canary guest's object id>` prints
+4. **Negative canary: quarantine.** The canary guest from [H-5b](#h-5b-invite-the-canary-guest)
+   uploads a synthetic PDF. It is a BCR-controlled outside account, bound to no row and in no
+   Team. Before this and **every later negative canary**, confirm that with the tool (H-7's
+   variables set): `node tools/directory-bindings.mjs check | grep -ci <canary id>` prints
    `0`, so the id is on no row and in no Team's guest list. Otherwise stop: the upload would be
    filed into a client's channel instead of quarantined. Expect:
    - the card says "Dokument przekazano do weryfikacji przez zespół BCR", with no link;
@@ -1259,7 +1307,7 @@ Bicep drift fix (gate G1), not here.
 | The IR-0 export is stored | H-2 verification |
 | The taxonomy folders at the library root of every client site the ingestion identity could write to are Owners-only | T-4b's status row lists every such site (PESKOVOI, TEST and each site IR-1 added); **Check permissions** for each client's guest returns *None*; T-4b's check of the items outside those folders, after IR-1, is recorded for each site |
 | The BCR GROUP root folders are Owners-only, including any created after the first lock | T-4's status row records the lock and the check after H-6b |
-| The canary guest is bound to no row | `check \| grep -ci <canary guest's object id>` prints `0` (H-12 step 4), after the last canary |
+| The canary guest (H-5b) is bound to no row | `check \| grep -ci <canary id>` prints `0` (H-12 step 4), after the last canary |
 | The whole binding plan is applied, and the standing checks run | A `propose` at exit shows no PATCH row (every row NOOP, or SKIP with a recorded decision); the first weekly `check` is recorded in the incident's status table ([standing checks](#standing-checks)) |
 | `CLAUDE.md` is updated | Merged with the promotion removal |
 | CI runs coverage, green | The CI run on `main` |
@@ -1282,7 +1330,7 @@ new row itself (R1) waits on Roman's re-ruling of Q21.
 |---|---|---|
 | After **any** onboarding | `propose` with H-12 step 5's flags, reviewed, then `apply` of the **whole** plan (a dry run, then `--apply`): never `--only <new row>` | The whole plan carries the PATCH that takes a reused guest's id off the first client's row. A guest in two Teams is then bound to neither, and their uploads go to quarantine until a person decides |
 | **Weekly**, and after any onboarding that reuses an existing guest | `check`. A row id marked *not eligible* (now in another Team, or no longer in the row's Team), or a guest reported as `guest_in_other_team`, means: `propose` and apply the whole plan the same day | Catches Team changes made outside onboarding, and a guest who left their client's Team but can still file into its channel |
-| Before any negative canary | H-12 step 4's `check \| grep -ci <canary guest's object id>` prints `0` | A canary guest left on a row files into that client's channel |
+| Before any negative canary | H-12 step 4's `check \| grep -ci <canary id>` prints `0` | A canary guest left on a row files into that client's channel |
 | Every working day | The query below. A `document.quarantine_failed` row means: check H-6's grant and the quarantine library name first. A `sharepoint.forbidden_site` row is an incident indicator (H-12 step 13) | A failed quarantine write is fail-closed (the user gets "spróbuj ponownie", nothing is written anywhere else), but if the quarantine grant or `QUARANTINE_DRIVE_NAME` breaks, every unbound, staff and stale upload is refused and nobody is told |
 
 ```bash
