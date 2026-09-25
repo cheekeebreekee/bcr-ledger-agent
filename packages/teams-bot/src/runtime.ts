@@ -1,7 +1,7 @@
 /**
- * Cold-start singletons shared between the bot's HTTP functions
- * (`messages` and `mydocs`). Kept in one file so adding a new function
- * is just "import from './runtime'".
+ * Cold-start singletons for the bot's HTTP functions. Kept in one file so
+ * adding a new function is just "import from './runtime'". Wiring only —
+ * the behaviour lives in `bot/**` and `services/**`, where it is tested.
  */
 import {
   CloudAdapter,
@@ -11,6 +11,8 @@ import {
 import { createLogger } from '@bcr/shared';
 import { loadBotConfig } from './config';
 import { LedgerBot } from './bot/ledgerBot';
+import { GateMiddleware } from './bot/gateMiddleware';
+import { createTurnErrorHandler } from './bot/turnError';
 import { IngestionClient } from './services/ingestionClient';
 import { AttachmentDownloader } from './services/attachmentDownloader';
 
@@ -18,23 +20,23 @@ const log = createLogger('bot/runtime');
 
 export const config = loadBotConfig();
 
-export const botFrameworkAuth = new ConfigurationBotFrameworkAuthentication(
-  {
-    MicrosoftAppId: config.microsoftAppId,
-    MicrosoftAppPassword: config.microsoftAppPassword,
-    MicrosoftAppType: config.microsoftAppType,
-    MicrosoftAppTenantId: config.microsoftAppTenantId,
-  } satisfies ConfigurationBotFrameworkAuthenticationOptions,
-);
+export const botFrameworkAuth = new ConfigurationBotFrameworkAuthentication({
+  MicrosoftAppId: config.microsoftAppId,
+  MicrosoftAppPassword: config.microsoftAppPassword,
+  MicrosoftAppType: config.microsoftAppType,
+  MicrosoftAppTenantId: config.microsoftAppTenantId,
+} satisfies ConfigurationBotFrameworkAuthenticationOptions);
 
 export const adapter = new CloudAdapter(botFrameworkAuth);
 
-adapter.onTurnError = async (context, error) => {
-  log.error({ err: error, activityId: context.activity.id }, 'unhandled turn error');
-  await context.sendActivity(
-    '⚠️ Sorry — something went wrong on my side. The error has been logged for investigation.',
-  );
-};
+// The gate runs first, on every activity type, before any bot logic.
+adapter.use(
+  new GateMiddleware({ tenantId: config.microsoftAppTenantId, mode: config.botGateMode }),
+);
+
+adapter.onTurnError = createTurnErrorHandler(log);
+
+log.info({ botGateMode: config.botGateMode }, 'bot runtime initialised');
 
 export const ingestionClient = new IngestionClient({
   baseUrl: config.ingestionBaseUrl,

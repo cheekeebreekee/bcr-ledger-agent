@@ -16,10 +16,28 @@ import { createLogger } from '@bcr/shared';
  *      such as Web Chat) — `contentUrl` points to the bot's attachment
  *      service. The URL itself is signed, so again no auth header is
  *      required, but the underlying bytes might be base64 in `content`.
+ *
+ * Error messages never include the attachment name or URL: they end up in
+ * logs, and both are user data (the URL also carries a SAS token).
  */
 export interface DownloadedAttachment {
   readonly content: Buffer;
   readonly contentType: string;
+}
+
+/** The subset of undici's `request` the downloader uses; injectable for tests. */
+export type DownloadFetcher = (
+  url: string,
+  options: { method: 'GET' },
+) => Promise<{
+  statusCode: number;
+  headers: Record<string, string | string[] | undefined>;
+  body: { arrayBuffer(): Promise<ArrayBuffer> };
+}>;
+
+export interface AttachmentDownloaderOptions {
+  /** Optional override for tests. Defaults to undici's `request`. */
+  readonly fetcher?: DownloadFetcher;
 }
 
 interface TeamsDownloadInfoContent {
@@ -28,38 +46,50 @@ interface TeamsDownloadInfoContent {
   readonly fileType?: string;
 }
 
+const TEAMS_FILE_DOWNLOAD_INFO = 'application/vnd.microsoft.teams.file.download.info';
+const OCTET_STREAM = 'application/octet-stream';
+
 export class AttachmentDownloader {
   private readonly log = createLogger('bot/attachmentDownloader');
+  private readonly fetcher: DownloadFetcher;
+
+  constructor(opts: AttachmentDownloaderOptions = {}) {
+    this.fetcher = opts.fetcher ?? request;
+  }
 
   async download(attachment: Attachment): Promise<DownloadedAttachment> {
-    if (attachment.contentType?.startsWith('application/vnd.microsoft.teams.file.download.info')) {
+    if (attachment.contentType?.startsWith(TEAMS_FILE_DOWNLOAD_INFO)) {
       return this.downloadTeamsFile(attachment);
     }
     if (attachment.contentUrl) {
-      return this.downloadFromUrl(attachment.contentUrl, attachment.contentType ?? 'application/octet-stream');
+      return this.downloadFromUrl(attachment.contentUrl, attachment.contentType ?? OCTET_STREAM);
     }
     if (typeof attachment.content === 'string') {
       // Inline base64 (rare, but seen in some channels)
       return {
         content: Buffer.from(attachment.content, 'base64'),
-        contentType: attachment.contentType ?? 'application/octet-stream',
+        contentType: attachment.contentType ?? OCTET_STREAM,
       };
     }
-    throw new Error(`Attachment "${attachment.name}" has no downloadable payload`);
+    throw new Error('Attachment has no downloadable payload');
   }
 
   private async downloadTeamsFile(attachment: Attachment): Promise<DownloadedAttachment> {
     const content = attachment.content as TeamsDownloadInfoContent | undefined;
     if (!content?.downloadUrl) {
-      throw new Error(`Teams file "${attachment.name}" is missing a downloadUrl`);
+      throw new Error('Teams file attachment is missing a downloadUrl');
     }
-    const inferredContentType = mimeFromExtension(attachment.name) ?? 'application/octet-stream';
+    const inferredContentType = mimeFromExtension(attachment.name) ?? OCTET_STREAM;
     return this.downloadFromUrl(content.downloadUrl, inferredContentType);
   }
 
-  private async downloadFromUrl(url: string, fallbackContentType: string): Promise<DownloadedAttachment> {
-    this.log.debug({ url: redactSas(url) }, 'GET attachment');
-    const { statusCode, body, headers } = await request(url, { method: 'GET' });
+  private async downloadFromUrl(
+    url: string,
+    fallbackContentType: string,
+  ): Promise<DownloadedAttachment> {
+    // No URL in the log: it carries a SAS token and the tenant host.
+    this.log.debug('GET attachment');
+    const { statusCode, body, headers } = await this.fetcher(url, { method: 'GET' });
     if (statusCode < 200 || statusCode >= 300) {
       throw new Error(`Attachment download failed with HTTP ${statusCode}`);
     }
@@ -72,7 +102,7 @@ export class AttachmentDownloader {
 }
 
 /** Guess content-type from extension for the cases where headers lie. */
-function mimeFromExtension(filename: string | undefined): string | undefined {
+export function mimeFromExtension(filename: string | undefined): string | undefined {
   if (!filename) return undefined;
   const ext = filename.toLowerCase().split('.').pop();
   switch (ext) {
@@ -92,9 +122,4 @@ function mimeFromExtension(filename: string | undefined): string | undefined {
     default:
       return undefined;
   }
-}
-
-/** Replace SAS tokens with `***` for safe logging. */
-function redactSas(url: string): string {
-  return url.replace(/([?&])(sig|sv|st|se|tempauth|UniqueId)=[^&]+/gi, '$1$2=***');
 }
