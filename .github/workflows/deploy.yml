@@ -8,11 +8,13 @@ on:
         description: Target environment
         required: true
         options: [dev, qa, prod]
-  # No `push` trigger. "dev" serves a real client, and main.bicep has drifted
-  # from the app settings that are actually running (CLIENT_DIRECTORY_* and
-  # FALLBACK_* are set by hand and absent from the template), so an automatic
-  # deploy on merge would wipe them and take ingestion down at cold start.
-  # Deploys are manual until the Bicep drift fix lands.
+  # No `push` trigger, and a manual run against dev is refused too (first step
+  # below). "dev" serves a real client, and main.bicep has drifted from the app
+  # settings that are actually running (CLIENT_DIRECTORY_*, QUARANTINE_*,
+  # BOT_CALLER_APP_IDS, FORBIDDEN_TARGET_SITE_PATHS, BOT_GATE_MODE are set by
+  # hand and absent from the template). A Bicep deploy replaces every setting,
+  # so ingestion would fail at cold start. Until the drift fix (gate G1), dev
+  # is deployed as code-only zips: docs/operations/human-steps.md.
 
 permissions:
   id-token: write   # OIDC federation to Azure
@@ -28,6 +30,12 @@ jobs:
       ENV_NAME: ${{ inputs.environment || 'dev' }}
 
     steps:
+      - name: Refuse dev until the Bicep drift fix (G1)
+        if: env.ENV_NAME == 'dev'
+        run: |
+          echo "::error::dev is production (it serves a real client). Bicep deploys to it are blocked until the drift fix (G1): deploy code-only zips as in docs/operations/human-steps.md."
+          exit 1
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4

@@ -18,6 +18,16 @@ set -euo pipefail
 
 ENV_NAME="${1:?missing environment (dev|qa|prod)}"
 RG="${2:-rg-bcr-ledger-${ENV_NAME}}"
+
+# "dev" is production (it serves a real client), and main.bicep has drifted
+# from its hand-set app settings: this deploy would replace them all and
+# ingestion would fail at cold start. Until the drift fix (gate G1), deploy
+# dev as code-only zips (docs/operations/human-steps.md).
+if [[ "$ENV_NAME" == "dev" && "${ALLOW_DEV_BICEP:-}" != "i-have-fixed-the-drift" ]]; then
+  echo "Refusing: dev is production and main.bicep has drifted (gate G1)." >&2
+  echo "Deploy code-only zips as in docs/operations/human-steps.md." >&2
+  exit 1
+fi
 LOCATION="${AZURE_LOCATION:-westeurope}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 

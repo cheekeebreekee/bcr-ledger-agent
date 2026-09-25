@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 `bcr-ledger-agent` is one of several `bcr-*` repos (`bcr-onboarding-agent`, `bcr-website`).
-The [Conventions shared by all `bcr-*` repos](#conventions-shared-by-all-bcr-repos) section below
+The [Conventions shared by all `bcr-*` repos](#conventions-shared-by-all-bcr--repos) section below
 applies to all of them; everything else is specific to this repo.
 
 ---
