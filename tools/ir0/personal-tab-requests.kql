@@ -1,0 +1,41 @@
+// IR-0, W5: every call to the anonymous Personal Tab lookup before Phase 0.
+//
+// The bot's GET /api/mydocs?userObjectId=… took any user id without
+// authentication and asked ingestion's GET /api/user-target which client that
+// user belonged to. Purview cannot see these calls; App Insights `requests`
+// can, and requests are not sampled (both host.json files exclude Request
+// from sampling), so this export is the complete record of who called, when,
+// with which user id (in `url`), and what came back.
+//
+// client_IP is masked by App Insights by default (0.0.0.0); the geo columns
+// are still derived from the real address before masking.
+//
+// itemCount is kept so a reader can confirm nothing was sampled: every row
+// should be 1.
+//
+// export-appinsights.sh replaces @@START@@ and @@END@@ and always runs this
+// query, per chunk, next to routing-traces.kql.
+let windowStart = datetime(@@START@@);
+let windowEnd = datetime(@@END@@);
+requests
+| where timestamp between (windowStart .. windowEnd)
+| where url has "/api/mydocs" or url has "/api/user-target"
+| project
+    timestamp,
+    itemId,
+    itemCount,
+    id,
+    operation_Id,
+    name,
+    url,
+    resultCode,
+    success,
+    duration,
+    cloud_RoleName,
+    cloud_RoleInstance,
+    client_IP,
+    client_City,
+    client_StateOrProvince,
+    client_CountryOrRegion,
+    customDimensions
+| order by timestamp asc

@@ -11,6 +11,16 @@
 // Messages are the ones ingestDocument.ts and clientResolver.ts logged before
 // Phase 0, plus three that explain routing outcomes: a document naming several
 // clients, a duplicate directory key, and a failed directory refresh.
+//
+// W5 (the anonymous Personal Tab lookup) left three more: the bot's
+// /api/mydocs logged "personal tab resolved" (userObjectId, clientId, source)
+// and "user-target lookup failed", and ingestion's /api/user-target logged
+// "user target resolved" (userAadObjectId, clientId, source). The unsampled
+// `requests` rows for those routes are exported separately
+// (personal-tab-requests.kql).
+//
+// itemCount is kept: traces are sampled, and an itemCount above 1 means the
+// row stands for that many traces, so the export is not complete.
 // The raw `message` is kept on every row, so nothing a projection drops is lost.
 let windowStart = datetime(@@START@@);
 let windowEnd = datetime(@@END@@);
@@ -26,7 +36,10 @@ let routingMessages = dynamic([
     "batch document failed",
     "multiple Directory clients present in the document — keeping fallback",
     "duplicate directory key across clients — dropping to prevent mis-routing",
-    "directory refresh failed; using stale/empty snapshot"
+    "directory refresh failed; using stale/empty snapshot",
+    "personal tab resolved",
+    "user-target lookup failed",
+    "user target resolved"
 ]);
 traces
 | where timestamp between (windowStart .. windowEnd)
@@ -36,6 +49,7 @@ traces
 | project
     timestamp,
     itemId,
+    itemCount,
     operation_Id,
     cloud_RoleName,
     cloud_RoleInstance,
@@ -47,6 +61,8 @@ traces
     activityId = tostring(j.activityId),
     teamsChannelId = tostring(j.teamsChannelId),
     userAadObjectId = tostring(j.userAadObjectId),
+    userObjectId = tostring(j.userObjectId),
+    source = tostring(j.source),
     clientId = tostring(j.clientId),
     title = tostring(j.title),
     resolution = tostring(j.resolution),

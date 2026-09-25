@@ -8,16 +8,30 @@
     says who then opened it. Together they answer the GDPR question: did anyone
     who is not staff reach another client's documents?
 
-    Three exports, each a CSV with the raw AuditData JSON kept on every row:
+    Up to four exports, each a CSV with the raw AuditData JSON kept on every row:
 
       purview-file-operations.csv   SharePointFileOperation on the given sites:
-                                    FileUploaded, FileAccessed, FilePreviewed,
-                                    FileDownloaded, FileSyncDownloadedFull
+                                    read (FileAccessed, FilePreviewed,
+                                    FileDownloaded, FileSyncDownloadedFull,
+                                    FileSyncDownloadedPartial), written
+                                    (FileUploaded, FileModified), moved or
+                                    copied out (FileMoved, FileCopied,
+                                    FileRenamed) and deleted (FileDeleted,
+                                    FileRecycled, FileDeletedFirstStageRecycleBin,
+                                    FileDeletedSecondStageRecycleBin). The old
+                                    ingestion never moved, copied or deleted a
+                                    file, so every such event is a person's.
       purview-group-events.csv      Entra group and Teams membership and settings
                                     changes (member/owner added or removed,
                                     group updated, team settings such as
                                     visibility), tenant-wide in the window
       purview-sharing-events.csv    SharePointSharingOperation on the given sites
+      signins.csv                   with -SignInUpn only: UserLoggedIn and
+                                    UserLoginFailed (AzureActiveDirectoryStsLogon)
+                                    for those accounts. Without Entra ID P1 the
+                                    Entra sign-in log keeps 7 days and Graph
+                                    cannot read it; the unified audit log keeps
+                                    these events for the Audit (Standard) period.
 
     plus export-meta.txt and a SHA256SUMS manifest, with every hash printed.
 
@@ -48,11 +62,22 @@
 .PARAMETER OutDir
     Default: tools/out/ir0-purview-<UTC stamp>. Must be empty or absent.
 
+.PARAMETER FileOperations
+    SharePointFileOperation operations to export. The default covers reads,
+    writes, moves, copies, renames and deletions; narrow it only on purpose,
+    because what is not exported ages out of the audit log.
+
+.PARAMETER SignInUpn
+    Accounts whose sign-ins (UserLoggedIn, UserLoginFailed) are exported to
+    signins.csv. In the incident: the {NIP}@ accounts and any other account
+    whose use is in question. Omit it and no sign-in export is made.
+
 .EXAMPLE
     Connect-ExchangeOnline -UserPrincipalName auditor@contoso.example
     ./tools/ir0/export-purview.ps1 `
         -SiteUrl https://contoso.sharepoint.com/sites/BCRGROUP, https://contoso.sharepoint.com/sites/0001CLIENTA `
-        -StartDate 2026-06-01T00:00:00Z
+        -StartDate 2026-06-01T00:00:00Z `
+        -SignInUpn 0000000000@contoso.example, someone@contoso.example
 
 .NOTES
     Needs the ExchangeOnlineManagement module, a Connect-ExchangeOnline
@@ -66,7 +91,13 @@ param(
     [datetime] $EndDate = [datetime]::UtcNow,
     [ValidateRange(1, 168)] [int] $ChunkHours = 24,
     [string] $OutDir,
-    [string[]] $FileOperations = @('FileUploaded', 'FileAccessed', 'FilePreviewed', 'FileDownloaded', 'FileSyncDownloadedFull'),
+    [string[]] $FileOperations = @(
+        'FileUploaded', 'FileModified',
+        'FileAccessed', 'FilePreviewed', 'FileDownloaded', 'FileSyncDownloadedFull', 'FileSyncDownloadedPartial',
+        'FileMoved', 'FileCopied', 'FileRenamed',
+        'FileDeleted', 'FileRecycled', 'FileDeletedFirstStageRecycleBin', 'FileDeletedSecondStageRecycleBin'
+    ),
+    [string[]] $SignInUpn = @(),
     [switch] $SkipGroupEvents,
     [switch] $SkipSharingEvents
 )
@@ -110,6 +141,15 @@ function Protect-File([string] $Path) {
 $start = ConvertTo-Utc $StartDate
 $end = ConvertTo-Utc $EndDate
 if ($start -ge $end) { throw 'StartDate must be before EndDate.' }
+
+$signInUpns = @(@(
+        foreach ($u in $SignInUpn) {
+            $t = ([string]$u).Trim()
+            if (-not $t) { continue }
+            if ($t -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw "SignInUpn '$u' is not a user principal name." }
+            $t.ToLowerInvariant()
+        }
+    ) | Sort-Object -Unique)
 
 $sitePrefixes = @(
     foreach ($u in $SiteUrl) {
@@ -157,6 +197,12 @@ Write-Host ''
 Write-Host 'IR-0 Purview audit export (read-only)'
 Write-Host "  window    $(Format-AuditDate $start)Z .. $(Format-AuditDate $end)Z"
 Write-Host "  sites     $($sitePrefixes -join ', ')"
+Write-Host "  file ops  $($FileOperations -join ', ')"
+if ($signInUpns.Count -gt 0) {
+    Write-Host "  sign-ins  $($signInUpns -join ', ')"
+} else {
+    Write-Host '  sign-ins  not exported (no -SignInUpn)'
+}
 Write-Host "  operator  $operator"
 Write-Host "  out       $OutDir"
 Write-Host ''
@@ -164,8 +210,9 @@ Write-Host ''
 # --- search ------------------------------------------------------------------
 
 # One ReturnLargeSet session over [From, To). Returns the records and the
-# service's ResultCount, or throws after three failed sessions.
-function Invoke-AuditSession([datetime] $From, [datetime] $To, [string] $RecordType, [string[]] $Operations) {
+# service's ResultCount, or throws after three failed sessions. $UserIds, when
+# given, narrows the search to those accounts on the service side.
+function Invoke-AuditSession([datetime] $From, [datetime] $To, [string] $RecordType, [string[]] $Operations, [string[]] $UserIds) {
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         $session = [guid]::NewGuid().ToString()
         $records = [System.Collections.Generic.List[object]]::new()
@@ -181,6 +228,7 @@ function Invoke-AuditSession([datetime] $From, [datetime] $To, [string] $RecordT
                 ResultSize     = $PageSize
             }
             if ($Operations) { $search.Operations = $Operations }
+            if ($UserIds) { $search.UserIds = $UserIds }
             $page = @(Search-UnifiedAuditLog @search)
             if ($page.Count -eq 0) { break }
             if (@($page | Where-Object { $_.ResultIndex -eq -1 }).Count -gt 0) { $failed = $true; break }
@@ -196,16 +244,16 @@ function Invoke-AuditSession([datetime] $From, [datetime] $To, [string] $RecordT
 }
 
 # Every record in [From, To), splitting the window while a session hits the cap.
-function Get-AuditRecords([datetime] $From, [datetime] $To, [string] $RecordType, [string[]] $Operations) {
-    $result = Invoke-AuditSession $From $To $RecordType $Operations
+function Get-AuditRecords([datetime] $From, [datetime] $To, [string] $RecordType, [string[]] $Operations, [string[]] $UserIds) {
+    $result = Invoke-AuditSession $From $To $RecordType $Operations $UserIds
     if ($result.Total -lt $SessionCap) { return , $result.Records }
     if (($To - $From).TotalMinutes -le 30) {
         throw "More than $SessionCap $RecordType records in 30 minutes from $(Format-AuditDate $From); export that window by hand."
     }
     $mid = $From.AddTicks([long](($To - $From).Ticks / 2))
     Write-Host "  $RecordType $(Format-AuditDate $From): $($result.Total) records, splitting"
-    $left = Get-AuditRecords $From $mid $RecordType $Operations
-    $right = Get-AuditRecords $mid $To $RecordType $Operations
+    $left = Get-AuditRecords $From $mid $RecordType $Operations $UserIds
+    $right = Get-AuditRecords $mid $To $RecordType $Operations $UserIds
     $both = [System.Collections.Generic.List[object]]::new()
     $both.AddRange([object[]]$left)
     $both.AddRange([object[]]$right)
@@ -259,6 +307,31 @@ function ConvertTo-GroupRow($Record) {
         NewValue           = ConvertTo-Cell (Get-Prop $a 'NewValue')
         Identity           = [string]$Record.Identity
         AuditData          = [string]$Record.AuditData
+    }
+}
+
+function ConvertTo-SignInRow($Record, $a) {
+    $extended = @{}
+    foreach ($p in @(Get-Prop $a 'ExtendedProperties')) {
+        $n = Get-Prop $p 'Name'
+        if ($n) { $extended[[string]$n] = Get-Prop $p 'Value' }
+    }
+    [pscustomobject]@{
+        CreationTimeUtc = Get-Prop $a 'CreationTime'
+        RecordType      = [string]$Record.RecordType
+        Operation       = Get-Prop $a 'Operation'
+        UserId          = Get-Prop $a 'UserId'
+        ResultStatus    = Get-Prop $a 'ResultStatus'
+        LogonError      = Get-Prop $a 'LogonError'
+        ErrorNumber     = Get-Prop $a 'ErrorNumber'
+        ClientIP        = Get-Prop $a 'ClientIP'
+        ActorIpAddress  = Get-Prop $a 'ActorIpAddress'
+        ApplicationId   = Get-Prop $a 'ApplicationId'
+        UserAgent       = $extended['UserAgent']
+        RequestType     = $extended['RequestType']
+        ObjectId        = Get-Prop $a 'ObjectId'
+        Identity        = [string]$Record.Identity
+        AuditData       = [string]$Record.AuditData
     }
 }
 
@@ -320,6 +393,25 @@ if (-not $SkipSharingEvents) {
     $counts['sharing_events'] = Write-EvidenceCsv $sharingRows 'purview-sharing-events.csv'
 }
 
+# Sign-ins of the named accounts, narrowed on the service side by -UserIds.
+# Every row the service returns is kept: a UserId spelt differently from the
+# UPN asked for is still that account's evidence, and is only reported here.
+if ($signInUpns.Count -gt 0) {
+    $signInRows = [System.Collections.Generic.List[object]]::new()
+    $unexpected = 0
+    $records = Get-AuditRecords $start $end 'AzureActiveDirectoryStsLogon' @('UserLoggedIn', 'UserLoginFailed') $signInUpns
+    foreach ($r in (Select-New $records)) {
+        $a = $r.AuditData | ConvertFrom-Json
+        $who = ([string](Get-Prop $a 'UserId')).ToLowerInvariant()
+        if ($signInUpns -notcontains $who) { $unexpected++ }
+        $signInRows.Add((ConvertTo-SignInRow $r $a))
+    }
+    $counts['signins'] = Write-EvidenceCsv $signInRows 'signins.csv'
+    if ($unexpected -gt 0) {
+        Write-Warning "  $unexpected sign-in row(s) carry a UserId that is not one of the -SignInUpn values; kept, check them by hand."
+    }
+}
+
 # --- metadata and hashes -------------------------------------------------------
 $meta = @(
     'kind=bcr.ir0.purview-export'
@@ -329,6 +421,7 @@ $meta = @(
     "chunk_hours=$ChunkHours"
     "sites=$($sitePrefixes -join ' ')"
     "file_operations=$($FileOperations -join ' ')"
+    "sign_in_upns=$($signInUpns -join ' ')"
     "operator=$operator"
     "module=$((Get-Module ExchangeOnlineManagement | Select-Object -First 1).Version)"
 )
