@@ -32,18 +32,21 @@ Two rules follow from that, and they are the ones that were broken:
 1. **The bot's gate.** Only a 1:1 chat, from the BCR tenant, with a valid user object id,
    reaches ingestion at all. Ingestion checks the same three things again.
 2. **The uploader's id** is looked up in `UserAadObjectIds` across the `Active` rows.
-3. **Exactly one client row matches.** The document goes to that row's target:
-   `SiteHostname`, `SitePath`, `DriveName` and `RootFolder`. If the row has a `DriveId`, the
-   drive the path resolves to must have that id.
+3. **Exactly one client row matches, and it is bound.** Bound means `RootFolder`, `DriveId` and
+   `TeamId` are all set, which only the binding tool does. The document goes to that row's
+   target: `SiteHostname`, `SitePath`, `DriveName` and `RootFolder`. The drive the path resolves
+   to must have the row's `DriveId`, and the site Graph resolves must not be BCR GROUP or the
+   quarantine site.
 4. **Anything else goes to quarantine**, with a reason:
 
 | Reason | When |
 |---|---|
-| `unmapped` | The id is on no `Active` row. |
+| `unmapped` | The id is on no `Active` row. A newly onboarded client's guests are here until their row is bound, because onboarding writes no user ids. |
 | `staff` | The id is on an `IsAdmin` row. Staff are never routed to a client. |
-| `conflict` | The id is on two rows (a client row and an `IsAdmin` row count too), or its only row was excluded because its target is shared with another row (see [Duplicates and conflicts](#duplicates-and-conflicts)). |
+| `conflict` | The id is on two rows (a client row and an `IsAdmin` row count too), or its only row was excluded because it shares its site, its `DriveId` or its `TeamId` with another `Active` client row (see [Duplicates and conflicts](#duplicates-and-conflicts)). |
 | `stale_directory` | The list could not be refreshed for longer than the stale cap, or the row's `DriveId` does not match. |
-| `forbidden_target` | The id's only row was excluded because it points at a forbidden site: BCR GROUP, the quarantine site, or a SharePoint host other than the tenant's. |
+| `forbidden_target` | The id's only row was excluded because it points at a forbidden site: BCR GROUP, the quarantine site, a host other than the tenant's (`QUARANTINE_SITE_HOSTNAME`), or a `SitePath` that is not exactly `/sites/<name>` or `/teams/<name>`. Or the row's site, as Graph resolved it at upload time, is BCR GROUP or the quarantine site. |
+| `unbound_target` | The id's only row lacks `RootFolder`, `DriveId` or `TeamId`: the binding tool has not bound it. A row that is not bound routes nobody. |
 | `target_unwritable` | The client's site refused the write after retries, usually because the ingestion managed identity has no `write` grant there (or the grant went to the Ingestion API app registration instead). |
 
 5. **Content never changes the client.** After classification, the only thing content can change
@@ -100,12 +103,12 @@ grant is read-only, and ingestion can never write to BCR GROUP again.
 | `CompanyNameAliases` | Multi-line, plain | Onboarding | The first line is the name given to the classifier for this client. Nothing routes on it. |
 | `PersonNames` | Multi-line, plain | — | Not read any more. Leave it empty. |
 | `UserAadObjectIds` | Multi-line, plain | **The tool** | One id per line. **The client's guests only**, each a guest in this client's Team and in no other Team (the tool excludes anyone else as `guest_in_other_team`). **Never staff.** This is what routes uploads. |
-| `SiteHostname` | Single line | Onboarding | The tenant's SharePoint host. |
-| `SitePath` | Single line | Onboarding | e.g. `/sites/0002PESKOVOISp.zo.o.-Ksigowo`. Must start with `/`. Must not be BCR GROUP or the quarantine site. |
+| `SiteHostname` | Single line | Onboarding | The tenant's SharePoint host. It must equal the ingestion setting `QUARANTINE_SITE_HOSTNAME`, the only host a row may name; a row on any other host routes nobody (`forbidden_target`). |
+| `SitePath` | Single line | Onboarding | Exactly `/sites/<name>` or `/teams/<name>`, e.g. `/sites/0002PESKOVOISp.zo.o.-Ksigowo`. The Team's root site, never a sub-site. A leading or trailing `/`, doubled `/` and case do not matter; a third segment, a `.` or `..` segment, `%`, `\` or a space inside the name make the row `forbidden_target`. Must not be BCR GROUP or the quarantine site. |
 | `DriveName` | Single line | Onboarding | The library name. `Dokumenty` on this Polish tenant. |
-| `RootFolder` | Single line | **The tool** | The channel folder's name, exactly as Graph returns it for the "Dokumenty księgowe" channel (`GET /teams/{id}/channels/{id}/filesFolder`). Documents then appear in the channel's files tab. Empty means the library root, which is where the incident's documents went and where clients never look. |
-| `DriveId` | Single line | **The tool** | New. The id of the drive holding the channel folder. If set, ingestion checks that the path still resolves to this drive; if not, the upload goes to quarantine as `stale_directory`. This protects against a deleted Team whose site URL is later reused by a new Team. |
-| `TeamId` | Single line | **The tool** | New. The client's Team id. Logged and used by the tools and audits; routing does not read it. |
+| `RootFolder` | Single line | **The tool** | The channel folder's name, exactly as Graph returns it for the "Dokumenty księgowe" channel (`GET /teams/{id}/channels/{id}/filesFolder`). Documents then appear in the channel's files tab. **Required:** an empty `RootFolder` means the row is not bound, and it routes nobody (`unbound_target`). Before Phase 0, empty meant the library root, which is where the incident's documents went and where clients never look. |
+| `DriveId` | Single line | **The tool** | New, **required** (`unbound_target` without it). The id of the drive holding the channel folder. Ingestion checks that the path still resolves to this drive; if not, the upload goes to quarantine as `stale_directory`. This protects against a deleted Team whose site URL is later reused by a new Team. No two `Active` client rows may share it. |
+| `TeamId` | Single line | **The tool** | New, **required** (`unbound_target` without it). The client's Team id. No two `Active` client rows may share it. Logged as `teamId` when an upload is routed and filed, and used by the tools and audits. Routing does not check the uploader's Team membership against it; see [Onboarding a client](#onboarding-a-client-phase-0). |
 | `IsAdmin` | Yes/No | By hand | `Yes` only on the staff row. See [Staff](#staff). |
 | `Status` | `Active` / `Inactive` | By hand | Only `Active` rows route. |
 | `TeamsChannelId` | Single line | Onboarding | Written by onboarding, read by nothing. Channel uploads never reach a bot, so channels do not route. |
@@ -118,7 +121,8 @@ fail-closed: when in doubt, the upload goes to quarantine, never to a guess.
 | What is duplicated | Effect | Why |
 |---|---|---|
 | A user id on two rows (including an `IsAdmin` row and a client row) | That id is dropped from routing. The rows stay usable for everyone else. | One person cannot be bound to two clients by accident. |
-| A target (`SiteHostname`, `SitePath`, `DriveName` and `RootFolder` together) on two rows | **Both rows** are excluded. Their uploads go to quarantine as `conflict`. | Two rows claiming one folder means one of them is wrong, and nothing says which. |
+| Two `Active` client rows on the same site (`SiteHostname` + `SitePath`, compared as above), whatever `DriveName` or `RootFolder` each names | **Both rows** are excluded. Their users' uploads go to quarantine as `conflict`. | One Team site belongs to one client. Two rows on it means one of them is wrong, and nothing says which; two clients in one library is a leak by construction. |
+| Two `Active` client rows with the same `DriveId`, or the same `TeamId` (in any case) | **Both rows** are excluded, as above. | One drive and one Team belong to one client, whatever the rows' paths say. |
 | A `ClientId` or a `NIP` on two rows | An alert only (`directory.conflict`). Routing is not affected. `directory-bindings.mjs` refuses to change those rows until a person fixes them. | Neither routes anything any more, so excluding the rows would only quarantine a real client for no gain. |
 
 A `directory.conflict` log line names the kind of conflict and the list item ids. It never logs
@@ -137,15 +141,21 @@ the real one (the row whose `SitePath` is PESKOVOI's site), and the other is set
   and every upload goes to quarantine as `stale_directory`. Before Phase 0, a failed refresh kept
   an old snapshot forever, so a corrected row (a wrong id removed, say) might never take effect.
 - **Forbidden targets.** `FORBIDDEN_TARGET_SITE_PATHS` lists sites no row may ever route to: at
-  least BCR GROUP. The quarantine site is added automatically. A row pointing at one, or at
-  another SharePoint host, is excluded, and its users' uploads go to quarantine as
-  `forbidden_target`.
+  least BCR GROUP. The quarantine site is added automatically. Each entry must be a plain
+  `/sites/<name>` or `/teams/<name>`, or ingestion refuses to start. A row pointing at one, at a
+  host other than `QUARANTINE_SITE_HOSTNAME`, or at a `SitePath` that is not of that form, is
+  excluded, and its users' uploads go to quarantine as `forbidden_target`.
+- **The resolved site.** Paths are compared as text, so ingestion also checks what Graph
+  resolves: if a row's site turns out to be BCR GROUP or the quarantine site (another spelling,
+  a renamed site), the write is refused, `sharepoint.forbidden_site` is logged with ids only, and
+  the upload goes to quarantine as `forbidden_target`.
 
 ## Onboarding a client (Phase 0)
 
 Onboarding step 13 writes the row with an empty `RootFolder` and no user ids. Until the row is
-bound, the client's uploads go to quarantine as `unmapped`. That is safe but slow, so bind soon
-after onboarding:
+bound, the client's uploads go to quarantine as `unmapped`. A row that somehow carries user ids
+but no `RootFolder`, `DriveId` or `TeamId` routes nobody either (`unbound_target`). That is safe
+but slow, so bind soon after onboarding:
 
 1. **Grant the ingestion managed identity write on the client's site.** Use the onboarding
    repo's `Grant-TeamSiteAccess.ps1` runbook with `AppId` set to the **ingestion Function App's
@@ -180,9 +190,10 @@ after onboarding:
 ## Staff
 
 Staff never go on a client row. Staff ids go on one row with `IsAdmin = Yes`, no target, and a
-`Title`/`ClientId` for the logs. A staff upload goes to quarantine as `staff`, and staff file
-documents into client folders by hand in SharePoint. There is no staff routing in Phase 0: the
-old "admin → route by the document's NIP" path is what the incident was.
+`Title` and a `ClientId` such as `staff` for the logs. A row without a `ClientId` is ignored, so
+staff uploads would then show as `unmapped`. A staff upload goes to quarantine as `staff`, and
+staff file documents into client folders by hand in SharePoint. There is no staff routing in
+Phase 0: the old "admin → route by the document's NIP" path is what the incident was.
 
 Until the full implementation is done, staff do not upload through the bot at all.
 
@@ -212,7 +223,8 @@ longer matches. Uploads then go to quarantine instead of into the new Team.
   SharePoint target. No other client business data.
 - User ids are matched exactly, after lower-casing. Anything that is not a GUID (a UPN, an
   employee number) is ignored.
-- Log lines about the list carry list item ids and ClientIds, never NIPs, names or user ids.
+- Log lines about the list carry list item ids, ClientIds and Team ids, never NIPs, names or user
+  ids.
 
 ## Creating the list from scratch
 

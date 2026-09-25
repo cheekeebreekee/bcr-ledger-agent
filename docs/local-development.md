@@ -88,7 +88,10 @@ curl -X POST http://localhost:7071/api/ingest/batch \
 ```
 
 A user id that is on no row of your test Directory comes back as `quarantined`, with no result.
-That is the expected answer for an unbound uploader.
+That is the expected answer for an unbound uploader. To see a document filed, the test row must be
+bound (`RootFolder`, `DriveId` and `TeamId` set, `SitePath` exactly `/sites/<name>`, and
+`SiteHostname` equal to your local `QUARANTINE_SITE_HOSTNAME`); otherwise it is quarantined as
+`unbound_target` or `forbidden_target`.
 
 ## Useful Kusto
 

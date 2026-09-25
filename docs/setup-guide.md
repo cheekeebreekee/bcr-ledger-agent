@@ -518,16 +518,16 @@ for the design.
 | `INGESTION_APP_ID` | Ingestion app reg → **Overview → Application (client) ID** *(§2b)* |
 | `EXPECTED_AUDIENCE` | `api://<INGESTION_APP_ID>` (no `/.default` suffix) |
 | `EXPECTED_ROLES` | Comma-separated list. Default `Documents.Ingest`. Add new role names if you create more in step §2b. |
-| `CLIENT_DIRECTORY_SITE_ID` | Microsoft Graph site id (`<hostname>,<siteGuid>,<webGuid>`) of the SharePoint site that hosts the Client Directory list. `GET https://graph.microsoft.com/v1.0/sites/{hostname}:/{sitePath}` returns it. |
+| `CLIENT_DIRECTORY_SITE_ID` | Microsoft Graph site id (`<hostname>,<siteGuid>,<webGuid>`) of the SharePoint site that hosts the Client Directory list. `GET https://graph.microsoft.com/v1.0/sites/{hostname}:/{sitePath}` returns it. Must be exactly that three-part form: ingestion also uses it to refuse any write into this site, and the path form (`host:/sites/x:`) would switch that check off, so it fails at cold start. |
 | `CLIENT_DIRECTORY_LIST_ID` | GUID of the Client Directory list itself. Returned by `GET /sites/{id}/lists?$filter=displayName eq 'Client Directory'`. |
 | `CLIENT_DIRECTORY_CACHE_TTL_MS` | *(optional)* Directory snapshot cache TTL in milliseconds. Default `300000` (5 min). |
 | `CLIENT_DIRECTORY_MAX_STALE_MS` | *(optional)* Oldest snapshot still used when refreshes fail. Default `900000` (15 min). Past it, every upload goes to quarantine. |
-| `BOT_CALLER_APP_IDS` | **Required.** Comma-separated app ids allowed to call ingestion: the bot app reg's client id *(§2a)*. |
-| `QUARANTINE_SITE_HOSTNAME` | **Required.** SharePoint hostname of the quarantine site. |
-| `QUARANTINE_SITE_PATH` | **Required.** e.g. `/sites/BCRLedgerKwarantanna`. Must start with `/`. A communication site with no group and sharing disabled; see `docs/operations/human-steps.md` H-5. |
+| `BOT_CALLER_APP_IDS` | **Required.** Comma-separated app ids allowed to call ingestion: the bot app reg's client id *(§2a)*. Each entry must be a GUID. |
+| `QUARANTINE_SITE_HOSTNAME` | **Required.** `<tenant>.sharepoint.com`, lower case, with no `https://` and no path. The quarantine site's host, and also **the only host a Client Directory row may name**: a row whose `SiteHostname` differs routes nobody (`forbidden_target`). |
+| `QUARANTINE_SITE_PATH` | **Required.** e.g. `/sites/BCRLedgerKwarantanna`: exactly `/sites/<name>` or `/teams/<name>` ([canonical site path](../ARCHITECTURE.md#the-client-directory)). A communication site with no group and sharing disabled; see `docs/operations/human-steps.md` H-5. |
 | `QUARANTINE_DRIVE_NAME` | *(optional)* Default `Documents`. `Dokumenty` on Polish tenants. |
 | `QUARANTINE_ROOT_FOLDER` | *(optional)* Default `Kwarantanna`. |
-| `FORBIDDEN_TARGET_SITE_PATHS` | **Required.** Comma-separated site paths no Directory row may route to: at least the BCR GROUP site, e.g. `/sites/BCRGROUPSp.zo.o`. The quarantine path is added automatically. |
+| `FORBIDDEN_TARGET_SITE_PATHS` | **Required.** Comma-separated site paths no Directory row may route to: at least the site that holds the Client Directory, e.g. `/sites/BCRGROUP`. Each entry exactly `/sites/<name>` or `/teams/<name>`; a URL or a sub-site fails at cold start. The quarantine path is added automatically. |
 
 The `FALLBACK_*` settings were removed in Phase 0. The fallback bucket they described (the BCR
 GROUP library root, readable by the whole team) is replaced by the quarantine.
@@ -699,6 +699,8 @@ union requests, exceptions, traces
 | `+ Add a permission → My APIs` shows **No results** | Ingestion API has no *Application ID URI* and/or no *app role*, **or** you're signed in to a different tenant | Run the preflight in §2b (`az ad app show --id …`); fix whichever array is empty, then **Refresh** the *My APIs* tab |
 | `401 Unauthorized` from ingestion | Bot’s token has no `Documents.Ingest` role | Re-check §2c (Bot app reg → *API permissions* → application permission + admin consent) |
 | Ingestion logs `Token missing required role` but portal shows *✅ Granted* | CLI script used `az ad app permission admin-consent` (creates only delegated grants, **not** app-role assignments) | Run the `az rest --method POST … /appRoleAssignments` from §2c, then verify the GET returns one entry |
+| A client's uploads land in quarantine as `unbound_target` | The row lacks `RootFolder`, `DriveId` or `TeamId`: it was never bound, or someone cleared a field | Bind it with `tools/directory-bindings.mjs` (propose, review, apply), never by hand; see the [admin guide](client-directory-admin-guide.md#onboarding-a-client-phase-0) |
+| A client's uploads land in quarantine as `forbidden_target` or `conflict` | The row names a host other than `QUARANTINE_SITE_HOSTNAME`, a `SitePath` that is not exactly `/sites/<name>` or `/teams/<name>`, or a forbidden site; or it shares its site, `DriveId` or `TeamId` with another row | `directory-bindings.mjs check` names the row and the reason, and `directory.conflict` logs the list item ids of a conflict. Fix the rows as in the [admin guide](client-directory-admin-guide.md#duplicates-and-conflicts) |
 | A client's uploads land in quarantine as `target_unwritable`, or Graph answers `401`/`403` | The ingestion **managed identity** lacks the `Sites.Selected` app role or the site's `write` grant. Often the grant went to the Ingestion API app registration instead. | Check read-only as in §5 (**Verify**): the entry must name `INGEST_MI_APPID`. Then make the missing grant to the managed identity, never to the app registration |
 | Bot replies “⚠️ Could not file …” with `Folder traversal not allowed` | Tenant filename contains `..` or path separator | Rename the file or extend `pathBuilder.ts` rules |
 | Cards never render in Teams | The bot identity is wrong | Confirm `MICROSOFT_APP_ID` matches the Bot app reg, *and* the Teams `manifest.json` `id` + `bots[0].botId` use the same value |

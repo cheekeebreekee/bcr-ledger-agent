@@ -115,9 +115,10 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
    `userAadObjectId`, and the BCR tenant are accepted; filename has no path separators, base64
    shape, ≤25 docs per batch, ≤100 MiB decoded.
 3. **Resolve the client** — `services/clientResolver.ts#resolve()` maps `source.userAadObjectId` to
-   exactly one Client Directory row, else returns the **staff-only quarantine** with a reason
-   (`unmapped`, `staff`, `conflict`, `stale_directory`, …). Quarantined documents are never
-   classified.
+   exactly one bound Client Directory row, else returns the **staff-only quarantine** with a reason:
+   `unmapped`, `staff`, `conflict`, `stale_directory`, `forbidden_target` or `unbound_target` (the
+   row lacks `RootFolder`, `DriveId` or `TeamId`). The upload step adds `target_unwritable`.
+   Quarantined documents are never classified.
 4. **Classify** — `services/classificationService.ts` runs classifiers in order and returns the
    first result at/above 0.8 confidence, else the best one. Chain is
    `ClaudeClassifier → FallbackClassifier` (Claude only if `ANTHROPIC_ENABLED` + key). Only the
@@ -125,10 +126,16 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
 5. **Direction** — `resolvePostClassification()` flips sprzedaż ⇄ zakup from the bound client's own
    NIP. It never changes the client.
 6. **Upload** — `sharePointServiceFactory.ts` returns a per-target cached `SharePointService`, which
-   resolves site+drive ids (refusing a drive that differs from the row's `DriveId`), creates the
-   folder chain idempotently, then PUTs (≤4 MiB) or opens an upload session — both with
-   `conflictBehavior=fail`, taking the next free `_n` name on a 409. If the client's space can't be
-   written, the document goes to quarantine (`target_unwritable`), never anywhere else.
+   resolves site+drive ids (refusing a drive that differs from the row's `DriveId`, and a site
+   whose site-collection id is BCR GROUP's or the quarantine site's: `SharePointTargetError`
+   `forbidden_site` → quarantine as `forbidden_target`), creates the folder chain idempotently,
+   then PUTs (≤4 MiB) or opens an upload session — both with `conflictBehavior=fail`, taking the
+   next free `_n` name on a 409. If the client's space can't be written, the document goes to
+   quarantine (`target_unwritable`), never anywhere else. Its own retry (`withRetry`) covers only
+   network failures, 500 and 502; 429/503/504 belong to the Graph SDK's `RetryHandler` — never
+   stack the two. A batch starts no document after 150 s (the rest are `rejected`, generic retry
+   code), and a suffixed name taken after a retried network failure logs
+   `sharepoint.possible_duplicate`.
 
 ### Invariants — break these and documents mis-file
 
@@ -144,10 +151,26 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
 - **Directory lookups are fail-closed and order-independent.** `buildSnapshot` in
   `clientDirectoryReader.ts` works in two passes: collect every key's rows, then admit a user id only
   when exactly one trusted row holds it. A user id on two rows (or on a client and an admin row) routes
-  nowhere; rows sharing a target, or pointing at a forbidden site or another host, are excluded
-  entirely. A shared NIP or ClientId only raises `directory.conflict` — neither routes anything. A
-  snapshot older than `CLIENT_DIRECTORY_MAX_STALE_MS` is treated as unavailable (everything to
-  quarantine). BCR staff ids never belong on client rows.
+  nowhere. Client rows that share a site (host + canonical path, whatever drive or folder each
+  names), a `DriveId` or a `TeamId` (case-insensitive) are all excluded, their users `conflict`. A
+  row on a host other than `QUARANTINE_SITE_HOSTNAME`, on a forbidden site (BCR GROUP, the
+  quarantine site) or with a non-canonical `SitePath` is excluded as `forbidden_target`. A row
+  without `RootFolder`, `DriveId` or `TeamId` routes nobody (`unbound_target`); only
+  `tools/directory-bindings.mjs apply` binds a row, writing all three together. A shared NIP or
+  ClientId only raises `directory.conflict` — neither routes anything. A snapshot older than
+  `CLIENT_DIRECTORY_MAX_STALE_MS` is treated as unavailable (everything to quarantine). BCR staff
+  ids never belong on client rows.
+- **One canonical site path, on both sides.** Trim, split on `/`, drop empty segments; valid only as
+  exactly `sites|teams` + a name matching `^[A-Za-z0-9_-][A-Za-z0-9._-]*$` that does not end in `.`;
+  compare `/<seg0>/<seg1>` lower-cased. Sub-sites, `.`/`..`, `%`, `\` and whitespace are refused,
+  never normalised. `canonicalSitePath` (ingestion) and the site-path helpers in
+  `tools/lib/bindings.mjs` must agree exactly and share one edge-case table in their tests; change
+  both or neither. `QUARANTINE_SITE_PATH` and `FORBIDDEN_TARGET_SITE_PATHS` must pass it at cold
+  start.
+- **Nothing is written into BCR GROUP or the quarantine site as a client target, whatever a row
+  says.** The path checks compare spellings; `SharePointService` also compares the *resolved*
+  site-collection id with BCR GROUP's (from `CLIENT_DIRECTORY_SITE_ID`) and the quarantine site's
+  (resolved lazily and cached — failing to resolve it refuses the write). Keep both layers.
 - **`parsers/folderTaxonomy.ts` is the single source of truth for folder layout.** `categoryCatalog`
   drives the Claude system prompt *and* the tool-call enum *and* `buildFolderPath()`, so the model
   can never name a category the uploader can't build a path for. Add or rename a category there and
@@ -160,8 +183,8 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
   raced, and told a caller which names already existed).
 - **Responses and logs carry ids, not client data.** A quarantined row has no link, folder or name;
   the result card shows the taxonomy label, never the model's reasoning; logs carry `documentId`,
-  `clientId`, `listItemId`, `driveItemId` — file names, titles, NIPs and SharePoint locations are
-  redacted by the root logger (`shared/src/logger.ts`).
+  `clientId`, `listItemId`, `teamId`, `driveItemId` — file names, titles, NIPs and SharePoint
+  locations are redacted by the root logger (`shared/src/logger.ts`).
 - **Only 1:1 chats are processed.** Teams *channel* uploads never reach a bot (drag-drop bypasses
   Bot Framework; `@mention` activities carry only mention HTML), and group chats are refused. Every
   activity passes the bot gate (personal conversation, BCR tenant, GUID `aadObjectId`) before any

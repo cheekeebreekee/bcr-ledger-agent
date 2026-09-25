@@ -172,14 +172,14 @@ Bicep deploy replaces them all, and the template has drifted (lesson 20).
 | Setting | Notes |
 |---|---|
 | `AZURE_TENANT_ID`, `INGESTION_APP_ID`, `EXPECTED_AUDIENCE`, `EXPECTED_ROLES` | Token validation. `EXPECTED_ROLES` defaults to `Documents.Ingest`. |
-| `BOT_CALLER_APP_IDS` | **New, required.** Comma-separated app ids allowed to call; today the bot's only. |
-| `CLIENT_DIRECTORY_SITE_ID`, `CLIENT_DIRECTORY_LIST_ID` | Where the Client Directory is |
+| `BOT_CALLER_APP_IDS` | **New, required.** Comma-separated app ids allowed to call; today the bot's only. Each must be a GUID. |
+| `CLIENT_DIRECTORY_SITE_ID`, `CLIENT_DIRECTORY_LIST_ID` | Where the Client Directory is. The site id must be the three-part Graph id (`<host>,<guid>,<guid>`): it also names BCR GROUP for the resolved-site write guard. |
 | `CLIENT_DIRECTORY_CACHE_TTL_MS` | Default 300000 (5 min) |
 | `CLIENT_DIRECTORY_MAX_STALE_MS` | **New.** Default 900000 (15 min). An older snapshot routes nothing. |
-| `QUARANTINE_SITE_HOSTNAME`, `QUARANTINE_SITE_PATH` | **New, required.** The staff-only quarantine site |
+| `QUARANTINE_SITE_HOSTNAME`, `QUARANTINE_SITE_PATH` | **New, required.** The staff-only quarantine site. The host must be `<tenant>.sharepoint.com`, and it is also the only host a Directory row may name. The path must be exactly `/sites/<name>` or `/teams/<name>`. |
 | `QUARANTINE_DRIVE_NAME` | **New.** Default `Documents`; on this tenant, `Dokumenty` |
 | `QUARANTINE_ROOT_FOLDER` | **New.** Default `Kwarantanna` |
-| `FORBIDDEN_TARGET_SITE_PATHS` | **New, required.** Sites no row may route to: at least `/sites/BCRGROUPSp.zo.o`. The quarantine path is added automatically. |
+| `FORBIDDEN_TARGET_SITE_PATHS` | **New, required.** Sites no row may route to: at least `/sites/BCRGROUPSp.zo.o`. Each entry exactly `/sites/<name>` or `/teams/<name>`. The quarantine path is added automatically. |
 | `ANTHROPIC_ENABLED`, `ANTHROPIC_API_KEY` (Key Vault), `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_CONTENT_BYTES`, `ANTHROPIC_CONFIDENCE_THRESHOLD` | Classification. The threshold defaults to 0.6. |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING`, `LOG_LEVEL` | |
 
@@ -507,8 +507,10 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
 
 18. **Duplicate checks must not depend on row order.** The old single-pass dedupe deleted a key
     on the second duplicate and re-added it on the third, and merged rows sharing a ClientId. The
-    Directory is now read in two passes: collect every key's rows first, then decide. See the
-    [admin guide](docs/client-directory-admin-guide.md#duplicates-and-conflicts).
+    Directory is now read in two passes: collect every key's rows first, then decide. A target
+    conflict is keyed on the site, the `DriveId` and the `TeamId`, not on the folder: two rows in
+    one library with different `RootFolder` spellings are still two clients in one library. See
+    the [admin guide](docs/client-directory-admin-guide.md#duplicates-and-conflicts).
 
 19. **`config-zip` → blob workaround.** When the Kudu upload keeps timing out:
     - upload the zip directly to the storage account (`stbcrdev...`, container
