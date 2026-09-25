@@ -14,6 +14,8 @@
   "scripts": {
     "build": "yarn workspaces foreach -A -pt run build",
     "test": "yarn workspaces foreach -A -p run test",
+    "test:coverage": "yarn workspaces foreach -A -p run test:coverage",
+    "test:tools": "node --test \"tools/**/*.test.mjs\"",
     "lint": "eslint \"packages/**/src/**/*.ts\"",
     "format": "prettier --write \"packages/**/src/**/*.{ts,json}\" \"infrastructure/**/*.bicep\"",
     "type-check": "yarn workspaces foreach -A -p run type-check",

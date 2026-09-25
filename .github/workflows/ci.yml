@@ -32,10 +32,22 @@ jobs:
         run: yarn type-check
 
       - name: Build all workspaces
+        id: build
         run: yarn build
 
-      - name: Test
-        run: yarn test
+      # Coverage thresholds are per package (coverageThreshold in each
+      # packages/*/jest.config.js) and a package below its threshold fails this
+      # step, so a PR cannot quietly lower coverage. `test:coverage` runs the
+      # same Jest suites as `yarn test`, so there is no separate plain-test step.
+      - name: Test with coverage
+        run: yarn test:coverage
+
+      # node:test suites for the operator scripts (tools/**/*.test.mjs). Passes
+      # when there are none. Runs even if the coverage step failed, so one CI run
+      # reports both, but only once the build is green.
+      - name: Test tools
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: yarn test:tools
 
   bicep-validate:
     name: Validate Bicep
