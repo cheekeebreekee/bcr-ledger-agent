@@ -73,16 +73,17 @@ Graph and SharePoint tokens are set up as described in
 | H-0 | Automatic deploys stopped | Yahor | done, 25 Sep | — |
 | H-1 | GDPR: processor notice and breach register | Roman + IOD | by 26–28 Sep | — |
 | H-2 | IR-0: evidence export, stored immutably | Yahor, Global Admin, Roman | today | — |
-| H-3 | Optional: stop promotion today with a setting | Roman decides, Yahor runs | today | H-2 |
+| H-3 | **Mandatory:** stop promotion with a setting | Yahor | as soon as H-2 is stored | H-2 |
 | H-4 | Tenant hardening T-1 to T-9 | per step | today–tomorrow | T-4, T-5 before H-12 |
 | H-5 | Quarantine site | SharePoint Admin | day 1 | — |
 | H-6 | Ingestion identity write grant on quarantine | Global Admin | day 1 | H-5 |
-| H-7 | Directory check and new columns | Yahor | day 1 | — |
+| H-6b | Running build's fallback re-pointed at the quarantine | Yahor | day 1 | H-3, H-6 verified |
+| H-7 | Directory check and new columns (no new site grants) | Yahor | day 1 | — |
 | H-8 | New app settings, added | Yahor | day 1 | H-5 |
 | H-9 | Bot deploy, gate in `log` | Yahor | day 1 | H-2, H-8 |
 | H-10 | Manifest 0.2.0 and availability | Teams Admin | day 1 | H-9 |
 | H-11 | Gate to `enforce` | Yahor | day 2 | 24 h of clean logs |
-| H-12 | Change window: ingestion, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-6, H-7, H-11, T-4, T-5 |
+| H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-6, H-6b, H-7, H-11, T-4, T-5 |
 | H-13 | Ingestion grant on BCR GROUP to `read` | Global Admin | after H-12 | H-12 verified |
 | H-14 | `FALLBACK_*` settings removed | Yahor | ≥ 24 h after H-12 | H-12 verified |
 | H-15 | Exit criteria checked | Yahor, Roman | end of phase | all |
@@ -161,17 +162,22 @@ ROMAN_UPN=<roman> IOD_UPN=<iod> infrastructure/ir/evidence-store.sh \
 **Rollback.** None, on purpose: the evidence is immutable. If the retention period is wrong,
 the IOD sets the right one before the policy is locked.
 
-### H-3: Optional: stop promotion today, without a deploy
+### H-3: Stop promotion now, without a deploy
 
-**Owner:** Roman decides; Yahor runs it. **Not in the approved plan.** It is a proposal made
-while writing this checklist, and it needs Roman's yes.
+**Owner:** Yahor runs it; Roman is told. **When:** as soon as H-2 is stored, because IR-0 is
+copied before anything changes what the running build logs. **Mandatory.**
 
-Content promotion (root cause R3) needs the `parties[]` that only the Claude classifier
-extracts. With `ANTHROPIC_ENABLED=false`, the running ingestion uses only the deterministic
-fallback classifier. That classifier extracts no parties, so **nothing can be promoted into a
-client's site**, and no document content leaves Azure. The cost is that every new upload goes to
-`98_Nieposortowane/YYYY/MM/` for an accountant to sort. Today, unrouted uploads already land in
-the fallback bucket, so for real clients the loss is small.
+Until H-12 the running ingestion is the pre-Phase-0 build, and it still has content promotion
+(root cause R3): an upload it cannot route is filed into whichever client's NIP the document
+names. Promotion needs the `parties[]` that only the Claude classifier extracts. With
+`ANTHROPIC_ENABLED=false`, the running ingestion uses only the deterministic fallback classifier.
+That classifier extracts no parties, so **nothing can be promoted into a client's site**, and no
+document content leaves Azure.
+
+The cost is real, and accepted: every new upload is filed under `98_Nieposortowane/YYYY/MM/` for
+an accountant to sort, and uploads that promotion used to put in their own client's site (a
+PESKOVOI invoice sent by PESKOVOI's guest, say) now stay in the fallback target. H-6b points that
+target at the staff-only quarantine, so they wait there and not in BCR GROUP.
 
 ```bash
 az functionapp config appsettings set -g $RG -n $INGEST --settings ANTHROPIC_ENABLED=false -o none
@@ -181,8 +187,8 @@ az functionapp config appsettings set -g $RG -n $INGEST --settings ANTHROPIC_ENA
 reads `false`. After the restart, `aiq 'traces | where tostring(parse_json(message).msg) == "promoted fallback → directory client via content NIP match"' <time of the change>`
 stays empty.
 
-**Rollback.** Set it back to `true`. H-12 does that anyway, because the Phase-0 build has no
-promotion.
+**Rollback.** None while the pre-Phase-0 build runs. H-12 step 11 sets it back to `true` once
+the Phase-0 build, which has no promotion, is live.
 
 ### H-4: Tenant hardening
 
@@ -290,6 +296,57 @@ H-12.
 [`admin-sharepoint-grant.md`](../admin-sharepoint-grant.md)):
 `DELETE /sites/{Q_SITE}/permissions/{permissionId}`.
 
+### H-6b: Point the running build's fallback at the quarantine
+
+**Owner:** Yahor. **When:** day 1, after H-3, and as soon as H-6's grant is verified (the job
+reported `granted` or `exists`, and about 5 minutes have passed).
+
+Until H-12, the running ingestion is the pre-Phase-0 build. Every onboarded guest is unmapped
+(R1), so their uploads go to its fallback target, which is the BCR GROUP library root. T-4 locks
+the folders already there, but not the ingestion identity's write, so new files would keep
+landing in BCR GROUP. The old build reads its fallback target from the `FALLBACK_SITE_*`
+settings, so pointing them at the quarantine site from H-5 sends every unrouted upload to the
+staff-only quarantine instead, with no deploy. H-3 must already be in effect: promotion keys on
+"this upload fell back", not on where the fallback is, so the re-point alone does not stop it.
+
+**1. Record the current values.** The names go in the status table; the values hold site paths,
+so they go to the evidence store, not into the table or a chat.
+
+```bash
+H6B=tools/out/h6b-fallback-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p -m 700 "$H6B"
+az functionapp config appsettings list -g $RG -n $INGEST -o json \
+  --query "[?starts_with(name,'FALLBACK_')].{name:name,value:value}" > "$H6B/fallback-before.json"
+chmod 600 "$H6B/fallback-before.json"
+jq -r '.[].name' "$H6B/fallback-before.json"               # the names only
+```
+
+Upload `$H6B` to the evidence store as in H-2 step 3 (`--upload-dir "$H6B"`), then delete the
+local copy.
+
+**2. Re-point.** The same site, library and folder as `QUARANTINE_*` in H-8. `FALLBACK_CLIENT_ID`
+is only a label and stays as it is. `appsettings set` merges, so nothing else changes.
+
+```bash
+az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
+  "FALLBACK_SITE_HOSTNAME=$SP_HOST" \
+  "FALLBACK_SITE_PATH=/sites/BCRLedgerKwarantanna" \
+  "FALLBACK_DRIVE_NAME=Dokumenty" \
+  "FALLBACK_ROOT_FOLDER=Kwarantanna"
+```
+
+**Verify.** The canary guest from H-12 step 4 (a BCR-controlled outside account, bound to no
+row, in no client Team) uploads a synthetic PDF. It lands on the quarantine site under
+`Kwarantanna/`, and nothing new appears at the BCR GROUP library root.
+
+**Note for triage.** Until H-12 these files come from the old build, so they use its layout,
+`Kwarantanna/<category>/YYYY/MM/`, and have none of the four quarantine columns. Take the
+uploader from the IR-0-style log lines (`no directory match on user id…` carries the user id and
+the conversation), not from the content.
+
+**Rollback.** Prefer fixing the quarantine grant (H-6). Restoring the saved values sends
+unrouted uploads to BCR GROUP again; do it only if the quarantine cannot be written, and record
+why. H-14 deletes all `FALLBACK_*` settings once the Phase-0 build is live.
+
 ### H-7: Check the Directory before the deploy, and add the new columns
 
 **Owner:** Yahor, with Roman for the decisions. **When:** day 1. Read-only, except for the two
@@ -321,9 +378,11 @@ status table:
   `SitePath` is PESKOVOI's site. Set the other row to `Status = Inactive` by hand. Versioning (T-5)
   records the edit. Then run `check` again.
 - **Onboarded clients whose site has no ingestion grant.** Today the ingestion identity can write
-  only to TEST, BCR GROUP and PESKOVOI. For each other onboarded client, either grant it now
-  (H-6's runbook, with that client's site id) so the client can be bound in H-12, or record that
-  it stays quarantined, and why.
+  only to TEST, BCR GROUP and PESKOVOI. For each other onboarded client, record either that it
+  gets a grant in H-12 so it can be bound there, or that it stays quarantined, and why. **Do not
+  grant it now.** While the pre-Phase-0 build runs, every new write grant is one more site that
+  content promotion can write into; the incident's three-site bound depends on it. The grants
+  are made in H-12 step 3, once step 2 has shown the Phase-0 build is live.
 - **Anything else the check flags** (a non-standard channel, a guest in several teams): that row
   is not bound in Phase 0, and its uploads go to quarantine. Record the reason.
 
@@ -529,13 +588,14 @@ These steps go in **one** window because each fixes a failure the others would c
 
 - once the Phase-0 ingestion is live, every onboarded guest is unmapped and goes to quarantine
   until their row is bound;
-- binding a row is only safe once the code that encodes `Dokumenty księgowe` and never follows
-  content is live;
+- binding a row, or granting the ingestion identity another client site, is only safe once the
+  code that encodes `Dokumenty księgowe` and never follows content is live;
 - a canary proves each binding before real uploads use it.
 
 **Preconditions, all true:**
 
 - IR-0 is stored (H-2). This deploy changes the logs.
+- `ANTHROPIC_ENABLED=false` (H-3) and the fallback points at the quarantine (H-6b).
 - H-6's grant is in place.
 - H-8's settings are present.
 - The gate is in `enforce` (H-11).
@@ -563,21 +623,25 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    `"build":{"phase":"p0","routing":"identity-only"}`. The tool enforces this itself when you
    pass `--health-url https://$INGEST.azurewebsites.net/api/health --expect-health build.routing=identity-only`.
    `directory-bindings.mjs` refuses to apply until it does.
-3. **Negative canary: quarantine.** A canary guest bound to no row uploads a synthetic PDF. The
+3. **Grant the further client sites.** Only now, with the Phase-0 build live and content
+   promotion gone, grant the ingestion identity write on each client site that H-7 recorded for
+   binding: H-6's runbook, with that client's site id. Per-site grants take about 5 minutes to
+   take effect, so make them before step 4 and wait before that client's apply.
+4. **Negative canary: quarantine.** A canary guest bound to no row uploads a synthetic PDF. The
    canary guest is a BCR-controlled outside account, invited as a guest and in no client Team.
    Expect:
    - the card says "Dokument przekazano do weryfikacji przez zespół BCR", with no link;
    - the file is on the quarantine site under `Kwarantanna/YYYY/MM/<batchId>/`, with
      `UploaderOid`, `QuarantineReason = unmapped`, `OriginalFilename` and `DocumentId` filled in;
    - a `document.quarantined` log line appears.
-4. **Propose, and have it reviewed.** `node tools/directory-bindings.mjs propose` writes a plan
+5. **Propose, and have it reviewed.** `node tools/directory-bindings.mjs propose` writes a plan
    under `tools/out/`. The plan holds client data and never leaves that folder. Roman and Yahor
    read it row by row:
    - `UserAadObjectIds` holds only that Team's guests, and no staff;
    - `RootFolder` is the channel folder's name as Graph returns it;
    - `DriveId` and `TeamId` are set;
    - host, path and drive are unchanged.
-5. **Apply TEST first.** A dry run, then the same with `--apply`:
+6. **Apply TEST first.** A dry run, then the same with `--apply`:
 
    ```bash
    node tools/directory-bindings.mjs apply --plan tools/out/<plan>.json --only <TEST listItemId> \
@@ -587,13 +651,13 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
 
    The tool prints each row before and after, and writes a rollback log. It refuses a plan older
    than 24 hours, a row changed since `propose`, and a health endpoint that is not the P0 build.
-6. **Canary on TEST.** The TEST guest uploads a synthetic PDF. Expect:
+7. **Canary on TEST.** The TEST guest uploads a synthetic PDF. Expect:
    - it lands in TEST's `Dokumenty księgowe/…`, visible in the channel's files tab;
    - the card's link opens it there;
    - a `document.filed` line appears.
 
    Then delete the canary file.
-7. **Apply PESKOVOI, then canary.** This apply also takes Yahor's id off the row. For a real
+8. **Apply PESKOVOI, then canary.** This apply also takes Yahor's id off the row. For a real
    client, the canary must come from an identity bound to that client, and there are two ways:
    - by arrangement, the client's contact sends the synthetic canary file BCR gives them; or
    - BCR's canary guest joins that one client Team for the canary only. At that moment it is in
@@ -602,11 +666,13 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
 
    Never use a real client document, and never a staff account, because staff go to quarantine
    by design.
-8. **Each further client** with a grant (from H-7): apply, then canary, one at a time.
-9. **Staff.** If you want staff uploads recorded as `staff` rather than `unmapped`, add one
-   `IsAdmin = Yes` row with the staff ids and no target. Staff ids never go on a client row.
-10. **If H-3 was used:** `az functionapp config appsettings set -g $RG -n $INGEST --settings ANTHROPIC_ENABLED=true -o none`.
-11. **Watch for an hour:**
+9. **Each further client** granted in step 3: apply, then canary, one at a time.
+10. **Staff.** If you want staff uploads recorded as `staff` rather than `unmapped`, add one
+    `IsAdmin = Yes` row with the staff ids and no target. Staff ids never go on a client row.
+11. **Undo H-3.** The Phase-0 build has no promotion, so the classifier can run again, unless
+    Roman has decided otherwise on the Anthropic transfer ([`security.md` T16](../security.md#t16-transfer-of-document-content-to-anthropic)):
+    `az functionapp config appsettings set -g $RG -n $INGEST --settings ANTHROPIC_ENABLED=true -o none`.
+12. **Watch for an hour:**
 
 ```bash
 aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"

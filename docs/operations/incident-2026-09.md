@@ -73,7 +73,8 @@ wrong ones either.
 Only three sites could receive a write at all, because the ingestion identity holds a site
 grant on exactly three: TEST (`/sites/0000TESTSp.zo.o.-Ksigowo`), BCR GROUP and PESKOVOI
 (`/sites/0002PESKOVOISp.zo.o.-Ksigowo`). A promoted document for any other client would have
-been refused with 403 and not stored. That bounds the inventory.
+been refused with 403 and not stored. That bounds the inventory, and it is why the rollout
+grants the ingestion identity no further client site while the old build still runs (H-7).
 
 ---
 
@@ -120,11 +121,18 @@ item closes a named root cause. The human-run steps and their order are in
 | Bindings | `tools/directory-bindings.mjs` writes each row's guest ids, channel folder, `DriveId` and `TeamId` from Graph, and removes staff ids from client rows. | R1, R4, R5 |
 | Tenant | `{NIP}@` sign-in blocked and mailboxes unlicensed; ledger folders on BCR GROUP locked to Owners; the Directory list locked and versioned; guest and sharing defaults tightened. | R2, W2, W3, W7 |
 
-**Optional, today, without a deploy.** Promotion needs the parties that only the Claude
-classifier extracts. So setting `ANTHROPIC_ENABLED=false` on the running ingestion stops R3 at
-once, at the cost of every new upload going to `98_Nieposortowane` until the Phase-0 build is
-live. This is not in the approved plan. It is a proposal for Roman:
-[`human-steps.md` H-3](human-steps.md#h-3-optional-stop-promotion-today-without-a-deploy).
+**Until the Phase-0 build is live, without a deploy** (mandatory, from the day IR-0 is stored):
+
+- **Promotion off.** Promotion needs the parties that only the Claude classifier extracts, so
+  `ANTHROPIC_ENABLED=false` on the running ingestion stops R3 at once, at the cost of every new
+  upload going to `98_Nieposortowane` for an accountant
+  ([`human-steps.md` H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy)).
+- **The fallback re-pointed.** The running build's `FALLBACK_SITE_*` settings are pointed at the
+  staff-only quarantine site, so unrouted uploads stop landing in BCR GROUP
+  ([H-6b](human-steps.md#h-6b-point-the-running-builds-fallback-at-the-quarantine)).
+- **No new site grants.** The ingestion identity gets no write on a further client site until the
+  Phase-0 build is live (H-7, H-12), because each grant would be one more site promotion could
+  reach.
 
 Two things are **not** done in Phase 0, deliberately:
 
@@ -472,17 +480,18 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-2: IR-0 B, Purview export and audit-log state | Global Admin | todo | | `SHA256SUMS` |
 | H-2: IR-0 C, Directory export | Yahor | todo | | `SHA256SUMS` |
 | H-2: evidence store created, readers verified, laptop copies deleted | Roman, Yahor | todo | | |
-| H-3: optional `ANTHROPIC_ENABLED=false` | Roman decides | todo | | yes / no |
+| H-3: `ANTHROPIC_ENABLED=false` (mandatory) | Yahor | todo | | |
 | BCR GROUP made Private (time from Purview) | — | done | *record* | T-3 |
 | H-4: tenant hardening T-1 … T-9 | per step | todo | | [`tenant-hardening.md`](tenant-hardening.md#status) |
 | IR-1 inventory | Yahor | todo | | `SHA256SUMS` |
 | H-5, H-6: quarantine site and ingestion write grant | SharePoint Admin, Global Admin | todo | | |
-| H-7: Directory check; duplicate `0002` resolved; per-row decisions | Yahor, Roman | todo | | |
+| H-6b: running build's fallback re-pointed at the quarantine | Yahor | todo | | `FALLBACK_*` names; values in the evidence store (`SHA256SUMS`) |
+| H-7: Directory check; duplicate `0002` resolved; per-row decisions, incl. which sites get a grant in H-12 | Yahor, Roman | todo | | |
 | H-8: app settings added | Yahor | todo | | |
 | H-9: bot deploy, gate in `log` | Yahor | todo | | sha256 of the saved pre-Phase-0 bot package |
 | H-10: manifest 0.2.0 and availability (T-10) | Teams Admin | todo | | |
 | H-11: gate `enforce` after 24 h clean | Yahor | todo | | |
-| H-12: ingestion deploy, bindings, canaries | Yahor, Roman reviews | todo | | apply log hash; sha256 of the saved pre-Phase-0 ingestion package |
+| H-12: ingestion deploy, further site grants, bindings, canaries | Yahor, Roman reviews | todo | | apply log hash; sha256 of the saved pre-Phase-0 ingestion package |
 | H-13: ingestion grant on BCR GROUP downgraded to `read` | Global Admin | todo | | |
 | H-14: `FALLBACK_*` settings removed, pre-Phase-0 packages deleted | Yahor | todo | | |
 | IR-2 relocation complete, allow-lists issued | Roman + second person | todo | | |

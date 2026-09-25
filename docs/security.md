@@ -126,7 +126,9 @@ in A's space, whoever sent it. A crafted PDF, or a prompt injection that made th
 chosen NIP, could plant a file in any client's space. This was root cause R3 of the incident.
 **Now:** promotion is deleted. The client comes only from the uploader's identity. Content can
 only flip an invoice's direction inside that client. A source-scan test fails if a
-promote-by-NIP path comes back. **Status: Removed in P0.** It is a permanent invariant (I2) and
+promote-by-NIP path comes back. Until that build is live, promotion is switched off on the
+running build with `ANTHROPIC_ENABLED=false` (human steps H-3), and no further client site is
+granted to the ingestion identity. **Status: Removed in P0.** It is a permanent invariant (I2) and
 a `CLAUDE.md` rule.
 
 ### T9. Fallback commingling
@@ -135,7 +137,8 @@ a `CLAUDE.md` rule.
 at the root of the BCR GROUP team library. Every member of that team could read it, and while
 the team was Public, so could any internal account.
 **Now:** a staff-only quarantine site replaces the fallback. It has no group, unique
-permissions and sharing disabled. The documents already in BCR GROUP are locked to its Owners
+permissions and sharing disabled. Until the Phase-0 build is live, the running build's
+`FALLBACK_SITE_*` settings point at that site (human steps H-6b). The documents already in BCR GROUP are locked to its Owners
 (tenant step T-4) and are being moved one by one, with two people signing off (IR-2).
 **Status: Replaced by quarantine in P0.**
 

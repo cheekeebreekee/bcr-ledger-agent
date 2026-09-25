@@ -148,7 +148,8 @@ after onboarding:
 1. **Grant the ingestion identity write on the client's site.** Use the onboarding repo's
    `Grant-TeamSiteAccess.ps1` runbook with the ingestion identity's app id. The runbook call is
    in [human-steps H-6](operations/human-steps.md#h-6-grant-the-ingestion-identity-write-on-the-quarantine-site).
-   Without this grant the tool skips the row.
+   Without this grant the tool skips the row. Only once the Phase-0 ingestion is live: under the
+   old build, every new grant was one more site content promotion could write into.
 2. `node tools/directory-bindings.mjs check`: review what it reports for the row.
 3. `node tools/directory-bindings.mjs propose`: read the proposed `UserAadObjectIds`,
    `RootFolder`, `DriveId` and `TeamId`.
