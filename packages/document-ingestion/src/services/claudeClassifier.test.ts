@@ -1,4 +1,5 @@
-import { ClaudeClassifier } from './claudeClassifier';
+import type Anthropic from '@anthropic-ai/sdk';
+import { CLAUDE_MAX_RETRIES, CLAUDE_REQUEST_TIMEOUT_MS, ClaudeClassifier } from './claudeClassifier';
 import type { ClassifierContext } from '@bcr/shared';
 
 type CreateFn = jest.Mock;
@@ -26,6 +27,23 @@ const baseOpts = {
 };
 
 describe('ClaudeClassifier', () => {
+  it('bounds each API call well inside the batch deadline', () => {
+    const c = new ClaudeClassifier(baseOpts);
+    const client = (c as unknown as { client: Anthropic }).client;
+    expect(client.timeout).toBe(CLAUDE_REQUEST_TIMEOUT_MS);
+    expect(client.maxRetries).toBe(CLAUDE_MAX_RETRIES);
+    // Worst case: the first attempt and one retry both time out.
+    expect(CLAUDE_REQUEST_TIMEOUT_MS * (CLAUDE_MAX_RETRIES + 1)).toBeLessThan(150_000);
+  });
+
+  it('turns a timeout into null so the document goes to manual review', async () => {
+    const create: CreateFn = jest
+      .fn()
+      .mockRejectedValue(Object.assign(new Error('Request timed out.'), { name: 'APIConnectionTimeoutError' }));
+    const c = new ClaudeClassifier({ ...baseOpts, client: makeClient(create) });
+    await expect(c.classify(ctx())).resolves.toBeNull();
+  });
+
   it('classifies a sales invoice into a dated folder', async () => {
     const create: CreateFn = jest.fn().mockResolvedValue(
       toolMessage({

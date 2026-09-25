@@ -42,6 +42,14 @@ interface ClassifyToolInput {
 
 const TOOL_NAME = 'classify_document';
 const MAX_TOKENS = 1024;
+/**
+ * The SDK default is 10 minutes with 2 retries, far past the batch's 150 s
+ * deadline and the Functions front end's ~230 s: one slow call would fail the
+ * whole card while the invocation went on filing. A timeout is an API error
+ * like any other, so the document falls through to manual review.
+ */
+export const CLAUDE_REQUEST_TIMEOUT_MS = 45_000;
+export const CLAUDE_MAX_RETRIES = 1;
 
 /**
  * Content-based classifier backed by Anthropic Claude. Reads the actual
@@ -63,7 +71,13 @@ export class ClaudeClassifier implements Classifier {
   private readonly confidenceThreshold: number;
 
   constructor(opts: ClaudeClassifierOptions) {
-    this.client = opts.client ?? new Anthropic({ apiKey: opts.apiKey });
+    this.client =
+      opts.client ??
+      new Anthropic({
+        apiKey: opts.apiKey,
+        timeout: CLAUDE_REQUEST_TIMEOUT_MS,
+        maxRetries: CLAUDE_MAX_RETRIES,
+      });
     this.model = opts.model;
     this.maxContentBytes = opts.maxContentBytes;
     this.confidenceThreshold = opts.confidenceThreshold;
