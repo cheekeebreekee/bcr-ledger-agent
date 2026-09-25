@@ -397,7 +397,8 @@ run. The blob path is `ir0/<upload date>/<export folder>/`, as `evidence-store.s
 R=tools/out/ir0-restore; mkdir -p -m 700 "$R"
 az storage blob download-batch --auth-mode login --account-name <storage account> \
   -s ir0-evidence -d "$R" --pattern 'ir0/<upload date>/ir0-appinsights-<UTC>/*'
-(cd "$R/ir0/<upload date>/ir0-appinsights-<UTC>" && shasum -a 256 -c SHA256SUMS)   # every line OK
+# Every line must read OK.
+(cd "$R/ir0/<upload date>/ir0-appinsights-<UTC>" && shasum -a 256 -c SHA256SUMS)
 ```
 
 Never drop `--ir0` to get a run through. Without it the tool cannot tell a fallback or a
@@ -422,7 +423,8 @@ node tools/inventory-misfiled.mjs \
   --ingest-app-ids "$INGEST_MI_APPID" --fallback-site BCRGROUP \
   --ir0 tools/out/ir0-restore/ir0/<upload date>/ir0-appinsights-<UTC>/ \
   --bindings-plan tools/out/directory-bindings-plan-<UTC>.json
-rm -rf tools/out/ir0-restore                                    # once the run is checked
+# Once the run is checked:
+rm -rf tools/out/ir0-restore
 ```
 
 For each item it records:

@@ -8,6 +8,12 @@ that it worked, and how to undo it.
 The steps are in the order they must happen. Some wait on the previous step for a reason, and
 that reason is given. Skipping ahead is how an upload gets rejected, or filed in the wrong place.
 
+**Run every command in bash** (`bash -l`). In zsh, the macOS default, run
+`setopt interactivecomments` first. Without it, an interactive zsh does not treat `#` as the start
+of a comment: a pasted comment becomes a command, the variable set on the same line stays empty,
+or an apostrophe in the comment opens a quote that swallows the lines after it. For the same
+reason every comment in the blocks below sits on its own line.
+
 Today (25 September 2026) only Phase 0 is here. Later phases add their own sections.
 
 ---
@@ -48,16 +54,18 @@ database. The containment has three strands, and this checklist puts them in one
 ### Variables used below
 
 ```bash
-RG=rg-bcr-ledger-dev                      # "dev" is production: it serves PESKOVOI
-BOT=func-bcr-bot-dev-<suffix>             # names in PROJECT_OVERVIEW.md → Azure environment
+# "dev" is production: it serves PESKOVOI.
+RG=rg-bcr-ledger-dev
+# The names are in PROJECT_OVERVIEW.md → Azure environment.
+BOT=func-bcr-bot-dev-<suffix>
 INGEST=func-bcr-ingest-dev-<suffix>
 APPI=appi-bcr-dev-<suffix>
 SP_HOST=<tenant>.sharepoint.com
 BOT_APP_ID=$(az functionapp config appsettings list -g $RG -n $BOT \
   --query "[?name=='MICROSOFT_APP_ID'].value | [0]" -o tsv)
-# The ingestion Function App's managed identity, as an application id. Ingestion calls Graph
-# only as this identity, so every SharePoint grant and every grant check below uses it, never
-# the ingestion API app registration's client id (INGESTION_APP_ID in the setup guide).
+# The managed identity of the ingestion Function App, as an application id. Ingestion calls
+# Graph only as this identity, so every SharePoint grant and every grant check below uses it,
+# never the client id of the ingestion API app registration (INGESTION_APP_ID in the setup guide).
 INGEST_MI_APPID=$(az ad sp show --id "$(az functionapp identity show -g $RG -n $INGEST \
   --query principalId -o tsv)" --query appId -o tsv)
 
@@ -189,7 +197,8 @@ DIR_LIST=$(az functionapp config appsettings list -g $RG -n $INGEST \
   --query "[?name=='CLIENT_DIRECTORY_LIST_ID'].value | [0]" -o tsv)
 C=tools/out/ir0-directory-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p -m 700 "$C"
 url="$G/sites/$DIR_SITE/lists/$DIR_LIST/items?expand=fields&\$top=999"; n=0
-while [ -n "$url" ]; do                                    # follow @odata.nextLink
+# Follow @odata.nextLink until the last page.
+while [ -n "$url" ]; do
   g "$url" > "$C/items-$n.json"
   url=$(jq -r '."@odata.nextLink" // empty' "$C/items-$n.json"); n=$((n+1))
 done
@@ -197,7 +206,8 @@ for id in $(jq -r '.value[].id' "$C"/items-*.json); do
   g "$G/sites/$DIR_SITE/lists/$DIR_LIST/items/$id/versions?\$expand=fields" > "$C/versions-$id.json"
 done
 chmod 600 "$C"/*.json
-grep -l '"error"' "$C"/*.json                              # must print nothing
+# Must print nothing.
+grep -l '"error"' "$C"/*.json
 (cd "$C" && shasum -a 256 *.json > SHA256SUMS)
 ```
 
@@ -370,7 +380,8 @@ script prints the site id too, but never paste an id by hand:
 ```bash
 Q_SITE=$(g "$G/sites/$SP_HOST:/sites/BCRLedgerKwarantanna?\$select=id" | jq -r .id)
 Q_LIST=$(g "$G/sites/$Q_SITE/drive/list?\$select=id" | jq -r .id)
-g "$G/sites/$Q_SITE/drive?\$select=name"          # the library name; on this tenant, Dokumenty
+# The library name. On this tenant: Dokumenty.
+g "$G/sites/$Q_SITE/drive?\$select=name"
 ```
 
 **Library columns.** After each upload, ingestion writes four columns on the quarantined item, so
@@ -414,7 +425,8 @@ pasting one. The runbook writes to whatever site the id names, so check that it 
 quarantine site and not BCR GROUP:
 
 ```bash
-g "$G/sites/$Q_SITE?\$select=webUrl" | jq -r .webUrl       # must end in /sites/BCRLedgerKwarantanna
+# Must end in /sites/BCRLedgerKwarantanna.
+g "$G/sites/$Q_SITE?\$select=webUrl" | jq -r .webUrl
 DIR_SITE=$(az functionapp config appsettings list -g $RG -n $INGEST \
   --query "[?name=='CLIENT_DIRECTORY_SITE_ID'].value | [0]" -o tsv)
 [ "$(cut -d, -f2 <<<"$Q_SITE")" != "$(cut -d, -f2 <<<"$DIR_SITE")" ] \
@@ -462,7 +474,8 @@ H6B=tools/out/h6b-fallback-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p -m 700 "$H6B"
 az functionapp config appsettings list -g $RG -n $INGEST -o json \
   --query "[?starts_with(name,'FALLBACK_')].{name:name,value:value}" > "$H6B/fallback-before.json"
 chmod 600 "$H6B/fallback-before.json"
-jq -r '.[].name' "$H6B/fallback-before.json"               # the names only
+# The names only.
+jq -r '.[].name' "$H6B/fallback-before.json"
 ```
 
 Upload `$H6B` to the evidence store as in H-2 steps 5 and 6 (`--upload-dir "$H6B"`, then take
@@ -519,8 +532,10 @@ export DIRECTORY_LIST_ID=$(az functionapp config appsettings list -g $RG -n $ING
   --query "[?name=='CLIENT_DIRECTORY_LIST_ID'].value | [0]" -o tsv)
 export INGEST_APP_IDS=$INGEST_MI_APPID
 export FORBIDDEN_TARGET_SITE_PATHS=/sites/BCRGROUPSp.zo.o
-export QUARANTINE_SITE_PATH=/sites/BCRLedgerKwarantanna       # always forbidden to a client row
-export QUARANTINE_SITE_HOSTNAME=$SP_HOST                      # the only host a row may name
+# Always forbidden to a client row.
+export QUARANTINE_SITE_PATH=/sites/BCRLedgerKwarantanna
+# The only host a row may name.
+export QUARANTINE_SITE_HOSTNAME=$SP_HOST
 node tools/directory-bindings.mjs check
 ```
 
@@ -560,7 +575,8 @@ it at BCR GROUP, where it would undo H-13.
 [incident → IR-1](incident-2026-09.md#ir-1-inventory)).
 
 ```bash
-node tools/directory-bindings.mjs propose                  # → tools/out/directory-bindings-plan-<UTC>.json
+# Writes tools/out/directory-bindings-plan-<UTC>.json
+node tools/directory-bindings.mjs propose
 ```
 
 Decide what happens to each finding **before** H-12, and write the decisions in the incident's
@@ -586,7 +602,8 @@ Then add the two new columns, `DriveId` and `TeamId`. The code running today doe
 them.
 
 ```bash
-node tools/directory-bindings.mjs --add-columns           # dry run: says what it would create
+# A dry run: says what it would create.
+node tools/directory-bindings.mjs --add-columns
 node tools/directory-bindings.mjs --add-columns --apply
 ```
 
@@ -607,8 +624,9 @@ The running bot is different for one setting: the pre-Phase-0 bot already reads
 value:
 
 ```bash
+# Empty means not set.
 az functionapp config appsettings list -g $RG -n $BOT -o tsv \
-  --query "[?name=='MICROSOFT_APP_TYPE'].value | [0]"          # empty means not set
+  --query "[?name=='MICROSOFT_APP_TYPE'].value | [0]"
 ```
 
 If it reads `SingleTenant`, setting it below changes nothing. Anything else, or nothing, makes
@@ -689,8 +707,10 @@ credential: it goes into a variable and is never printed, pasted or logged (less
 `PROJECT_OVERVIEW.md`). Do not run this with `set -x`.
 
 ```bash
-mkdir -p tools/out/rollback && chmod 700 tools/out/rollback      # tools/out is git-ignored
-save_running() {   # $1 = app name, $2 = file name. Prints neither the URL nor its token.
+# tools/out is git-ignored.
+mkdir -p tools/out/rollback && chmod 700 tools/out/rollback
+# $1 = app name, $2 = file name. Prints neither the URL nor its token.
+save_running() {
   local url
   url=$(az functionapp config appsettings list -g $RG -n "$1" \
     --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'].value | [0]" -o tsv)
@@ -726,9 +746,11 @@ The zips are not in git (`artifacts/*.zip` is ignored), so a `git checkout`, `gi
 
 ```bash
 corepack yarn install --immutable
-rm -rf packages/*/node_modules/@bcr/shared                     # lesson 15
+# Lesson 15.
+rm -rf packages/*/node_modules/@bcr/shared
 corepack yarn build && corepack yarn test
-corepack yarn build && corepack yarn workspace @bcr/teams-bot package   # → artifacts/teams-bot.zip
+# Writes artifacts/teams-bot.zip
+corepack yarn build && corepack yarn workspace @bcr/teams-bot package
 ```
 
 **3. Check the zip before deploying it.** The count must be greater than 0:
@@ -864,10 +886,12 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
 
    ```bash
    # save_running is the function from H-9 step 1; define it again in a new shell.
-   save_running $INGEST document-ingestion-before-p0.zip     # prints no URL
+   # It prints no URL.
+   save_running $INGEST document-ingestion-before-p0.zip
    corepack yarn build && corepack yarn workspace @bcr/document-ingestion package
+   # Must print a count greater than 0.
    unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js \
-     | grep -c forbiddenTargetSitePaths                        # must be greater than 0
+     | grep -c forbiddenTargetSitePaths
    ```
 
    A count of `0` means a pre-Phase-0 `@bcr/shared`: that build fails at cold start, because the
@@ -912,7 +936,7 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    tool skips those rows, and step 8 cannot run.
 
    ```bash
-   # add --write-verified <sitePath> for each further site granted in step 3
+   # Add --write-verified <sitePath> for each further site granted in step 3.
    node tools/directory-bindings.mjs propose --confirm-remove-staff <PESKOVOI listItemId> \
      --write-verified <TEST sitePath> --write-verified <PESKOVOI sitePath>
    ```
@@ -935,8 +959,9 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
 6. **Apply TEST first.** A dry run, then the same with `--apply`:
 
    ```bash
+   # The dry run. Then run the same command again with --apply added.
    node tools/directory-bindings.mjs apply --plan tools/out/<plan>.json --only <TEST listItemId> \
-     --health-url https://$INGEST.azurewebsites.net/api/health   # then again with --apply
+     --health-url https://$INGEST.azurewebsites.net/api/health
    ```
 
    The tool prints each row before and after, and writes a rollback log. It refuses a plan older
@@ -965,8 +990,9 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
 
      ```bash
      node tools/directory-bindings.mjs propose --write-verified <PESKOVOI sitePath>
+     # The dry run. Then run the same command again with --apply added.
      node tools/directory-bindings.mjs apply --plan tools/out/<new plan>.json --only <PESKOVOI listItemId> \
-       --health-url https://$INGEST.azurewebsites.net/api/health      # then again with --apply
+       --health-url https://$INGEST.azurewebsites.net/api/health
      ```
 
      The printed after-state must no longer hold the canary's id, and step 4's `check | grep`

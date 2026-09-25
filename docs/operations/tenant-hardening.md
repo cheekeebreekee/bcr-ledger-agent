@@ -9,6 +9,12 @@ Each step gives the role that can run it, why it exists, the command to read the
 the command that changes it, how to verify it, and how to undo it. The order of these steps
 relative to the deploys is in [`human-steps.md`](human-steps.md#phase-0).
 
+**Run every command in bash** (`bash -l`). In zsh, the macOS default, run
+`setopt interactivecomments` first. Without it, an interactive zsh does not treat `#` as the start
+of a comment: a pasted comment becomes a command, or an apostrophe in it opens a quote that
+swallows the lines after it. For the same reason every comment in the blocks below sits on its
+own line.
+
 ⚠️ **Three rules for every step on this page.**
 
 - **BCR GROUP stays Private.** This page never changes its visibility or its channels.
@@ -29,13 +35,13 @@ relative to the deploys is in [`human-steps.md`](human-steps.md#phase-0).
 ## Tokens
 
 ```bash
-# Reads of users, groups and policies: the Azure CLI's token is enough.
+# Reads of users, groups and policies: a token of the Azure CLI is enough.
 az login --tenant <tenant-id>
 export GRAPH_TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
 
 # Writes to the directory, and anything in SharePoint: use a delegated token from an app
-# registration BCR owns. The Azure CLI's own app is not pre-authorised for those scopes
-# (AADSTS65002), and Microsoft will not change that per tenant. The helper lives in the
+# registration BCR owns. The first-party app of the Azure CLI is not pre-authorised for those
+# scopes (AADSTS65002), and Microsoft will not change that per tenant. The helper lives in the
 # onboarding repo; its header says how to set it up once.
 export GRAPH_TOKEN=$(node ../bcr-onboarding-agent/tools/graph-login.mjs)
 export SHAREPOINT_TOKEN=$(node ../bcr-onboarding-agent/tools/graph-login.mjs --sharepoint <tenant>.sharepoint.com)
@@ -80,7 +86,8 @@ GRAPH_TOKEN=$(node tools/graph-login.mjs) node tools/audit-client-access.mjs --a
 one account:
 
 ```bash
-az rest --url "$G/users/<nip>@bcr-group.pl?\$select=accountEnabled"     # "accountEnabled": false
+# Must read "accountEnabled": false
+az rest --url "$G/users/<nip>@bcr-group.pl?\$select=accountEnabled"
 ```
 
 **Rollback.** `g -X PATCH "$G/users/<nip>@bcr-group.pl" -d '{"accountEnabled":true}'`. You should
@@ -113,7 +120,8 @@ centre: **Users → Active users → the account → Licenses and apps**, untick
 Graph:
 
 ```bash
-az rest --url "$G/users/<nip>@bcr-group.pl/licenseDetails?\$select=skuId,skuPartNumber"   # note the skuId
+# Note the skuId.
+az rest --url "$G/users/<nip>@bcr-group.pl/licenseDetails?\$select=skuId,skuPartNumber"
 g -X POST "$G/users/<nip>@bcr-group.pl/assignLicense" -d '{"addLicenses":[],"removeLicenses":["<skuId>"]}'
 ```
 
@@ -197,7 +205,8 @@ ask; do not lock it.
 
 ```bash
 SITE_ID=$(g "$G/sites/<tenant>.sharepoint.com:/sites/BCRGROUPSp.zo.o?\$select=id" | jq -r .id)
-g "$G/sites/$SITE_ID/drive?\$select=name,webUrl"                          # the library's URL
+# The URL of the library.
+g "$G/sites/$SITE_ID/drive?\$select=name,webUrl"
 g "$G/sites/$SITE_ID/drive/root/children?\$select=name,folder" | jq -r '.value[].name'
 g "$G/teams/<bcr-group-id>/channels?\$select=displayName,membershipType" | jq -r '.value[].displayName'
 ```
@@ -220,12 +229,14 @@ LIB='/sites/BCRGROUPSp.zo.o/Shared Documents'
 MEMBERS=$(sp "$WEB/_api/web/AssociatedMemberGroup?\$select=Id" | jq .Id)
 VISITORS=$(sp "$WEB/_api/web/AssociatedVisitorGroup?\$select=Id" | jq .Id)
 
-item() {  # the folder's list item, with the path percent-encoded
+# The list item of a folder, with the path percent-encoded.
+item() {
   local p; p=$(jq -rn --arg p "$LIB/$1" '$p|@uri')
   echo "$WEB/_api/web/GetFolderByServerRelativePath(decodedurl='$p')/ListItemAllFields"
 }
 
-for F in 01_Faktury 02_Wyciągi_bankowe 98_Nieposortowane; do   # the taxonomy folders that exist
+# Name only the taxonomy folders that exist on this site.
+for F in 01_Faktury 02_Wyciągi_bankowe 98_Nieposortowane; do
   I=$(item "$F")
   sp -X POST "$I/breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)"
   sp -X POST "$I/roleassignments/getbyprincipalid($MEMBERS)/deleteobject()"
@@ -237,7 +248,8 @@ done
 
 ```bash
 I=$(item 01_Faktury)
-sp "$I?\$select=HasUniqueRoleAssignments"                                 # true
+# Must read true.
+sp "$I?\$select=HasUniqueRoleAssignments"
 sp "$I/roleassignments?\$expand=Member&\$select=Member/Title" | jq -r '.value[].Member.Title'
 ```
 
@@ -309,7 +321,8 @@ and ask; do not lock it.
 
 ```bash
 SITE_ID=$(g "$G/sites/<tenant>.sharepoint.com:/sites/<client-site>?\$select=id" | jq -r .id)
-g "$G/sites/$SITE_ID/drive?\$select=name,webUrl"                          # the library's URL
+# The URL of the library.
+g "$G/sites/$SITE_ID/drive?\$select=name,webUrl"
 g "$G/sites/$SITE_ID/drive/root/children?\$select=name,folder" | jq -r '.value[].name'
 g "$G/teams/<client-team-id>/channels?\$select=displayName" | jq -r '.value[].displayName'
 g "$G/groups/<client-team-id>/owners?\$select=userPrincipalName,userType" \
@@ -355,7 +368,8 @@ evidence store first, then stop inheritance and leave only the site's Owners gro
 inside a channel folder is locked this way too; the channel folder itself never is.
 
 ```bash
-file_item() {  # a file's list item, with the path percent-encoded
+# The list item of a file, with the path percent-encoded.
+file_item() {
   local p; p=$(jq -rn --arg p "$LIB/$1" '$p|@uri')
   echo "$WEB/_api/web/GetFileByServerRelativePath(decodedurl='$p')/ListItemAllFields"
 }
@@ -612,7 +626,8 @@ BOT_APP_ID=$(az functionapp config appsettings list -g $RG -n $BOT \
 T=$(mktemp -d)
 sed "s/REPLACE-WITH-BOT-APP-ID/$BOT_APP_ID/g" teams-app/manifest.json > "$T/manifest.json"
 cp teams-app/color.png teams-app/outline.png "$T/"
-grep -c REPLACE-WITH "$T/manifest.json"                        # must print 0
+# Must print 0.
+grep -c REPLACE-WITH "$T/manifest.json"
 OUT="$PWD/artifacts/teams-app.zip"; mkdir -p artifacts; rm -f "$OUT"
 (cd "$T" && zip -X "$OUT" manifest.json color.png outline.png)
 unzip -p "$OUT" manifest.json | jq -r \
