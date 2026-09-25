@@ -37,6 +37,22 @@ const csvList = (defaultValue: readonly string[]) =>
         : [...defaultValue],
     );
 
+/**
+ * A CSV list that must not be empty. For allow-lists (caller app ids, forbidden
+ * targets) an empty value is a misconfiguration, not "allow nothing" or
+ * "forbid nothing", so it fails at cold start like any required variable.
+ */
+const requiredCsvList = (message: string) =>
+  z
+    .string({ required_error: message })
+    .transform((v) =>
+      v
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    )
+    .refine((list) => list.length > 0, message);
+
 /** Optional string that collapses `""` → `undefined` so `.default("")` works. */
 const optionalStr = (defaultValue = '') =>
   z
@@ -78,12 +94,24 @@ export const botConfigSchema = z.object({
   microsoftAppId: z.string().uuid('MICROSOFT_APP_ID must be a UUID'),
   microsoftAppPassword: z.string().min(1, 'MICROSOFT_APP_PASSWORD is required'),
   microsoftAppTenantId: z.string().uuid('MICROSOFT_APP_TENANT_ID must be a UUID'),
-  microsoftAppType: z
-    .enum(['MultiTenant', 'SingleTenant', 'UserAssignedMSI'])
-    .optional()
-    .transform((v) => v ?? 'MultiTenant'),
+  // Required, with no default: the app registration is AzureADMyOrg, and the
+  // old `MultiTenant` default is a 401 at Bot Framework auth (lesson #12).
+  microsoftAppType: z.enum(['MultiTenant', 'SingleTenant', 'UserAssignedMSI'], {
+    required_error: 'MICROSOFT_APP_TYPE is required (SingleTenant for the BCR bot)',
+  }),
   ingestionBaseUrl: z.string().url('INGESTION_BASE_URL must be an absolute URL'),
   ingestionScope: z.string().min(1, 'INGESTION_SCOPE is required'),
+  /**
+   * What the bot does with an activity that fails the gate (not a 1:1 chat,
+   * not the BCR tenant, or no AAD object id). `log` records the rejection and
+   * lets the turn through; `enforce` refuses it before any download. `log`
+   * exists only for the first 24 h of the Phase-0 rollout, to prove real
+   * guest activities pass before anything is refused.
+   */
+  botGateMode: z
+    .enum(['log', 'enforce'])
+    .optional()
+    .transform((v) => v ?? 'enforce'),
   applicationInsightsConnectionString: optionalStr(),
   logLevel,
 });
@@ -99,6 +127,12 @@ export const ingestionConfigSchema = z.object({
   ingestionAppId: z.string().uuid('INGESTION_APP_ID must be a UUID'),
   expectedAudience: z.string().min(1, 'EXPECTED_AUDIENCE is required'),
   expectedRoles: csvList(['Documents.Ingest']),
+  /**
+   * App ids (`appid`/`azp` claim) allowed to call the ingestion API. The role
+   * alone is not enough: any app that holds `Documents.Ingest` could otherwise
+   * assert any user id.
+   */
+  botCallerAppIds: requiredCsvList('BOT_CALLER_APP_IDS must list at least one app id'),
   // --- Multi-tenant Client Directory (SharePoint list, see §4.2) ---
   /** Graph site id (`<hostname>,<siteGuid>,<webGuid>`) where the Client Directory list lives. */
   clientDirectorySiteId: z.string().min(1, 'CLIENT_DIRECTORY_SITE_ID is required'),
@@ -106,15 +140,31 @@ export const ingestionConfigSchema = z.object({
   clientDirectoryListId: z.string().uuid('CLIENT_DIRECTORY_LIST_ID must be a UUID'),
   /** How long the directory snapshot is cached in-process before refetching (ms). Default 5 min. */
   clientDirectoryCacheTtlMs: numeric(5 * 60 * 1000),
-  // --- Fallback SharePoint target (BCR Group) for unmapped uploads ---
-  fallbackClientId: optionalStr('bcr-group'),
-  fallbackSiteHostname: z.string().min(3, 'FALLBACK_SITE_HOSTNAME is required'),
-  fallbackSitePath: z
+  /**
+   * Oldest snapshot still used when refreshes keep failing (ms). Past this age
+   * the snapshot is treated as empty, so every upload goes to quarantine
+   * rather than routing on a directory that may have been corrected since.
+   * Default 15 min.
+   */
+  clientDirectoryMaxStaleMs: numeric(15 * 60 * 1000),
+  // --- Staff-only quarantine for uploads that cannot be tied to one client ---
+  // A dedicated communication site with no M365 group and sharing disabled.
+  // Never a client Team, never BCR GROUP.
+  quarantineSiteHostname: z.string().min(3, 'QUARANTINE_SITE_HOSTNAME is required'),
+  quarantineSitePath: z
     .string()
-    .min(1, 'FALLBACK_SITE_PATH is required')
-    .refine((p) => p.startsWith('/'), 'FALLBACK_SITE_PATH must start with /'),
-  fallbackDriveName: optionalStr('Documents'),
-  fallbackRootFolder: optionalStr(),
+    .min(1, 'QUARANTINE_SITE_PATH is required')
+    .refine((p) => p.startsWith('/'), 'QUARANTINE_SITE_PATH must start with /'),
+  quarantineDriveName: optionalStr('Documents'),
+  quarantineRootFolder: optionalStr('Kwarantanna'),
+  /**
+   * Site paths no Directory row may ever route to (BCR GROUP, at minimum).
+   * The quarantine site is added automatically. A row pointing at one of
+   * these is excluded from routing as `forbidden_target`.
+   */
+  forbiddenTargetSitePaths: requiredCsvList(
+    'FORBIDDEN_TARGET_SITE_PATHS must list at least the BCR GROUP site path',
+  ),
   // --- Claude (Anthropic) content classification ---
   anthropicEnabled: boolish(false),
   anthropicApiKey: optionalStr(),

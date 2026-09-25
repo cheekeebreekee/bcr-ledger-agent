@@ -60,6 +60,7 @@ export async function handleUserTarget(
       channelId: '',
       conversationId: '',
       activityId: '',
+      conversationType: undefined,
       teamsChannelId: undefined,
       userAadObjectId,
       userDisplayName: undefined,

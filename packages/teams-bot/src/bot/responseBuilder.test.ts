@@ -12,8 +12,8 @@ const uploaded: IngestionBatchItemResult = {
     classification: {
       documentType: 'Faktura zakupu',
       confidence: 0.95,
+      categoryId: 'faktury_zakupu',
       classifier: 'claude',
-      reasoning: 'Nabywcą jest klient, więc to faktura zakupu.',
     },
   },
 };
@@ -52,12 +52,12 @@ describe('buildBatchResultCard', () => {
     expect(rows).toHaveLength(3);
   });
 
-  it('shows the folder and reasoning for an uploaded document', () => {
+  it('shows the folder and the category label (never model reasoning) for an uploaded document', () => {
     const card = buildBatchResultCard([uploaded]) as Card;
     const [, dataRow] = findTable(card);
     const cellText = dataRow.cells.map((c) => c.items[0]?.text);
     expect(cellText).toContain('01_Faktury/02_Faktury_zakupu/2026/03');
-    expect(cellText).toContain('Nabywcą jest klient, więc to faktura zakupu.');
+    expect(cellText).toContain('Faktura zakupu');
   });
 
   it('surfaces the error message for a rejected document', () => {

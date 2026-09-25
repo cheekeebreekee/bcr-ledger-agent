@@ -7,6 +7,7 @@ const botEnvMap = {
   microsoftAppType: 'MICROSOFT_APP_TYPE',
   ingestionBaseUrl: 'INGESTION_BASE_URL',
   ingestionScope: 'INGESTION_SCOPE',
+  botGateMode: 'BOT_GATE_MODE',
   applicationInsightsConnectionString: 'APPLICATIONINSIGHTS_CONNECTION_STRING',
   logLevel: 'LOG_LEVEL',
 } as const;
@@ -16,14 +17,16 @@ const ingestionEnvMap = {
   ingestionAppId: 'INGESTION_APP_ID',
   expectedAudience: 'EXPECTED_AUDIENCE',
   expectedRoles: 'EXPECTED_ROLES',
+  botCallerAppIds: 'BOT_CALLER_APP_IDS',
   clientDirectorySiteId: 'CLIENT_DIRECTORY_SITE_ID',
   clientDirectoryListId: 'CLIENT_DIRECTORY_LIST_ID',
   clientDirectoryCacheTtlMs: 'CLIENT_DIRECTORY_CACHE_TTL_MS',
-  fallbackClientId: 'FALLBACK_CLIENT_ID',
-  fallbackSiteHostname: 'FALLBACK_SITE_HOSTNAME',
-  fallbackSitePath: 'FALLBACK_SITE_PATH',
-  fallbackDriveName: 'FALLBACK_DRIVE_NAME',
-  fallbackRootFolder: 'FALLBACK_ROOT_FOLDER',
+  clientDirectoryMaxStaleMs: 'CLIENT_DIRECTORY_MAX_STALE_MS',
+  quarantineSiteHostname: 'QUARANTINE_SITE_HOSTNAME',
+  quarantineSitePath: 'QUARANTINE_SITE_PATH',
+  quarantineDriveName: 'QUARANTINE_DRIVE_NAME',
+  quarantineRootFolder: 'QUARANTINE_ROOT_FOLDER',
+  forbiddenTargetSitePaths: 'FORBIDDEN_TARGET_SITE_PATHS',
   anthropicEnabled: 'ANTHROPIC_ENABLED',
   anthropicApiKey: 'ANTHROPIC_API_KEY',
   anthropicModel: 'ANTHROPIC_MODEL',
@@ -43,11 +46,41 @@ describe('botConfigSchema', () => {
       MICROSOFT_APP_TENANT_ID: validUuid,
       INGESTION_BASE_URL: 'http://localhost:7071',
       INGESTION_SCOPE: 'api://app/.default',
+      MICROSOFT_APP_TYPE: 'SingleTenant',
     } as NodeJS.ProcessEnv;
     const cfg = loadConfig(botConfigSchema, botEnvMap, env);
     expect(cfg.microsoftAppId).toBe(validUuid);
-    expect(cfg.microsoftAppType).toBe('MultiTenant');
+    expect(cfg.microsoftAppType).toBe('SingleTenant');
+    expect(cfg.botGateMode).toBe('enforce');
     expect(cfg.logLevel).toBe('info');
+  });
+
+  it('requires MICROSOFT_APP_TYPE rather than defaulting to MultiTenant', () => {
+    const env = {
+      MICROSOFT_APP_ID: validUuid,
+      MICROSOFT_APP_PASSWORD: 'secret',
+      MICROSOFT_APP_TENANT_ID: validUuid,
+      INGESTION_BASE_URL: 'http://localhost:7071',
+      INGESTION_SCOPE: 'api://app/.default',
+    } as NodeJS.ProcessEnv;
+    expect(() => loadConfig(botConfigSchema, botEnvMap, env)).toThrow(/MICROSOFT_APP_TYPE/);
+  });
+
+  it('accepts BOT_GATE_MODE=log and rejects anything else', () => {
+    const base = {
+      MICROSOFT_APP_ID: validUuid,
+      MICROSOFT_APP_PASSWORD: 'secret',
+      MICROSOFT_APP_TENANT_ID: validUuid,
+      INGESTION_BASE_URL: 'http://localhost:7071',
+      INGESTION_SCOPE: 'api://app/.default',
+      MICROSOFT_APP_TYPE: 'SingleTenant',
+    } as NodeJS.ProcessEnv;
+    expect(loadConfig(botConfigSchema, botEnvMap, { ...base, BOT_GATE_MODE: 'log' }).botGateMode).toBe(
+      'log',
+    );
+    expect(() => loadConfig(botConfigSchema, botEnvMap, { ...base, BOT_GATE_MODE: 'off' })).toThrow(
+      /BOT_GATE_MODE/,
+    );
   });
 
   it('rejects a non-UUID app id with a helpful message', () => {
@@ -57,6 +90,7 @@ describe('botConfigSchema', () => {
       MICROSOFT_APP_TENANT_ID: validUuid,
       INGESTION_BASE_URL: 'http://localhost:7071',
       INGESTION_SCOPE: 'api://app/.default',
+      MICROSOFT_APP_TYPE: 'SingleTenant',
     } as NodeJS.ProcessEnv;
     expect(() => loadConfig(botConfigSchema, botEnvMap, env)).toThrow(/MICROSOFT_APP_ID/);
   });
@@ -70,15 +104,20 @@ describe('ingestionConfigSchema', () => {
     EXPECTED_AUDIENCE: 'api://ingestion-app',
     CLIENT_DIRECTORY_SITE_ID: 'contoso.sharepoint.com,site-guid,web-guid',
     CLIENT_DIRECTORY_LIST_ID: validListUuid,
-    FALLBACK_SITE_HOSTNAME: 'contoso.sharepoint.com',
-    FALLBACK_SITE_PATH: '/sites/BCR',
+    BOT_CALLER_APP_IDS: validUuid,
+    QUARANTINE_SITE_HOSTNAME: 'contoso.sharepoint.com',
+    QUARANTINE_SITE_PATH: '/sites/BCRLedgerKwarantanna',
+    FORBIDDEN_TARGET_SITE_PATHS: '/sites/BCRGROUP',
   };
 
   it('parses defaults correctly', () => {
     const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, baseEnv);
-    expect(cfg.fallbackDriveName).toBe('Documents');
-    expect(cfg.fallbackClientId).toBe('bcr-group');
+    expect(cfg.quarantineDriveName).toBe('Documents');
+    expect(cfg.quarantineRootFolder).toBe('Kwarantanna');
+    expect(cfg.botCallerAppIds).toEqual([validUuid]);
+    expect(cfg.forbiddenTargetSitePaths).toEqual(['/sites/BCRGROUP']);
     expect(cfg.clientDirectoryCacheTtlMs).toBe(5 * 60 * 1000);
+    expect(cfg.clientDirectoryMaxStaleMs).toBe(15 * 60 * 1000);
     expect(cfg.expectedRoles).toEqual(['Documents.Ingest']);
     expect(cfg.anthropicEnabled).toBe(false);
     expect(cfg.anthropicModel).toBe('claude-opus-4-5-20251101');
@@ -123,13 +162,25 @@ describe('ingestionConfigSchema', () => {
     ).toThrow(/ANTHROPIC_CONFIDENCE_THRESHOLD/);
   });
 
-  it('rejects a fallback site path that does not start with /', () => {
+  it('rejects a quarantine site path that does not start with /', () => {
     expect(() =>
       loadConfig(ingestionConfigSchema, ingestionEnvMap, {
         ...baseEnv,
-        FALLBACK_SITE_PATH: 'sites/BCR',
+        QUARANTINE_SITE_PATH: 'sites/BCR',
       }),
-    ).toThrow(/start with \//);
+    ).toThrow(/QUARANTINE_SITE_PATH/);
+  });
+
+  it.each([
+    ['BOT_CALLER_APP_IDS', /BOT_CALLER_APP_IDS/],
+    ['FORBIDDEN_TARGET_SITE_PATHS', /FORBIDDEN_TARGET_SITE_PATHS/],
+  ])('fails at cold start when the %s allow-list is missing or empty', (name, pattern) => {
+    const missing: NodeJS.ProcessEnv = { ...baseEnv };
+    delete missing[name];
+    expect(() => loadConfig(ingestionConfigSchema, ingestionEnvMap, missing)).toThrow(pattern);
+    expect(() =>
+      loadConfig(ingestionConfigSchema, ingestionEnvMap, { ...baseEnv, [name]: ' , ' }),
+    ).toThrow(pattern);
   });
 
   it('rejects a non-UUID Client Directory list id', () => {

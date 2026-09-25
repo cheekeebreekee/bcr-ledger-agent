@@ -242,11 +242,9 @@ async function ingest(
     finalFilename: item.name,
     classification: {
       documentType: post.classification.documentType,
+      categoryId: String(post.classification.fields.category ?? ''),
       confidence: post.classification.confidence,
       classifier: post.classification.classifier,
-      ...(typeof post.classification.fields.reasoning === 'string'
-        ? { reasoning: post.classification.fields.reasoning }
-        : {}),
     },
   };
 }

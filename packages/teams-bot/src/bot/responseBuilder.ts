@@ -84,17 +84,6 @@ export function buildSuccessCard(
           { title: 'Sklasyfikowano przez', value: result.classification.classifier },
         ],
       },
-      ...(result.classification.reasoning
-        ? [
-            {
-              type: 'TextBlock',
-              text: `**Uzasadnienie:** ${result.classification.reasoning}`,
-              wrap: true,
-              isSubtle: true,
-              spacing: 'Medium',
-            },
-          ]
-        : []),
     ],
     actions: [
       {
@@ -140,7 +129,7 @@ export function buildBatchResultCard(results: readonly IngestionBatchItemResult[
           cell([
             {
               type: 'TextBlock',
-              text: result.classification.reasoning ?? '—',
+              text: result.classification.documentType,
               wrap: true,
               isSubtle: true,
             },

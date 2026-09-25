@@ -32,6 +32,13 @@ export interface IngestionSource {
   readonly conversationId: string;
   readonly activityId: string;
   /**
+   * `activity.conversation.conversationType`: `personal` for a 1:1 chat with
+   * the bot, `groupChat` or `channel` otherwise. Only `personal` is ever
+   * processed; the bot refuses anything else before downloading, and the
+   * ingestion API re-checks it.
+   */
+  readonly conversationType: string | undefined;
+  /**
    * The Teams channel id (`activity.channelData.channel.id`), format
    * `19:<hash>@thread.tacv2`. Present only for messages posted inside a
    * team channel — undefined for 1:1 personal chats and group chats.
@@ -60,18 +67,24 @@ export interface IngestionRequestPayload extends IngestionDocument {
   readonly source: IngestionSource;
 }
 
-/** Successful classification + upload outcome for one document. */
+/**
+ * Successful classification + upload outcome for one document, filed inside
+ * the uploader's own client space. Carries no model free text: the card
+ * renders a fixed Polish label per category, never the model's reasoning.
+ */
 export interface IngestionUploadResult {
   readonly driveItemId: string;
+  /** Link into the uploader's own client space only. */
   readonly webUrl: string;
   readonly folderPath: string;
   readonly finalFilename: string;
   readonly classification: {
+    /** Polish label of the category (from the taxonomy, not the model). */
     readonly documentType: string;
+    /** `folderTaxonomy` category id, e.g. `faktury_zakupu`. */
+    readonly categoryId: string;
     readonly confidence: number;
     readonly classifier: string;
-    /** Short justification (in Polish) for why this folder was chosen. */
-    readonly reasoning?: string;
   };
 }
 
@@ -94,10 +107,20 @@ export interface IngestionBatchRequestPayload {
   readonly source: IngestionSource;
 }
 
-/** Per-document outcome inside a batch response. */
+/**
+ * Per-document outcome inside a batch response.
+ *
+ *  - `uploaded`: filed in the uploader's client space; `result` is set.
+ *  - `quarantined`: held in the staff-only quarantine because the upload could
+ *    not be tied to exactly one client. Deliberately carries no link, folder,
+ *    stored name or client name — the uploader learns nothing about where it
+ *    went or which clients exist.
+ *  - `rejected`: not stored; `error` explains why (generic, Polish-rendered by
+ *    the bot).
+ */
 export interface IngestionBatchItemResult {
   readonly filename: string;
-  readonly status: 'uploaded' | 'rejected';
+  readonly status: 'uploaded' | 'quarantined' | 'rejected';
   readonly result?: IngestionUploadResult;
   readonly error?: {
     readonly code: string;

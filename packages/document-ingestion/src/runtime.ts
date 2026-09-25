@@ -31,17 +31,17 @@ export const clientDirectory = new ClientDirectoryReader(graph, {
   cacheTtlMs: config.clientDirectoryCacheTtlMs,
 });
 
-export const fallbackTarget = {
-  siteHostname: config.fallbackSiteHostname,
-  sitePath: config.fallbackSitePath,
-  driveName: config.fallbackDriveName,
-  ...(config.fallbackRootFolder ? { rootFolder: config.fallbackRootFolder } : {}),
+export const quarantineTarget = {
+  siteHostname: config.quarantineSiteHostname,
+  sitePath: config.quarantineSitePath,
+  driveName: config.quarantineDriveName,
+  ...(config.quarantineRootFolder ? { rootFolder: config.quarantineRootFolder } : {}),
 };
 
 export const clientResolver = new ClientResolver(clientDirectory, {
-  fallbackTarget,
-  fallbackClientId: config.fallbackClientId,
-  fallbackTitle: 'BCR Group (fallback)',
+  fallbackTarget: quarantineTarget,
+  fallbackClientId: 'quarantine',
+  fallbackTitle: 'BCR quarantine',
 });
 
 export const classification = new ClassificationService([

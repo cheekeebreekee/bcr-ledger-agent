@@ -141,6 +141,7 @@ export class LedgerBot extends ActivityHandler {
             channelId: activity.channelId ?? 'msteams',
             conversationId: activity.conversation?.id ?? '',
             activityId: activity.id ?? '',
+            conversationType: activity.conversation?.conversationType,
             // Present for team-channel messages, undefined for 1:1 personal chats.
             teamsChannelId: activity.channelData?.channel?.id,
             userAadObjectId: activity.from?.aadObjectId,
