@@ -148,12 +148,22 @@ describe('ClientResolver.resolve', () => {
     expect(resolved).toMatchObject({ source: 'quarantine', reason: 'conflict' });
   });
 
+  it('quarantines a user whose only row points at BCR GROUP as forbidden_target', async () => {
+    const r = new ClientResolver(
+      makeReader([{ ...clientA, target: { ...clientA.target, sitePath: '/sites/x/../BCRGROUP' } }]),
+      { quarantineTarget },
+    );
+    const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
+    expect(resolved).toEqual({ source: 'quarantine', reason: 'forbidden_target', target: quarantineTarget });
+  });
+
   it('quarantines everything when the directory is unavailable', async () => {
     const unavailable: ClientDirectorySnapshot = {
       entries: [],
       byUserAadObjectId: new Map(),
       staffUserIds: new Set(),
       conflictedUserIds: new Set(),
+      forbiddenUserIds: new Set(),
       excludedRows: new Map(),
       health: 'unavailable',
       fetchedAt: 0,

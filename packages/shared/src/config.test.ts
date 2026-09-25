@@ -183,6 +183,38 @@ describe('ingestionConfigSchema', () => {
     ).toThrow(pattern);
   });
 
+  it.each([
+    'https://contoso.sharepoint.com/sites/BCRGROUP',
+    'sites/BCRGROUP',
+    '/sites/BCRGROUP/Shared Documents',
+    '/personal/someone',
+  ])('rejects the FORBIDDEN_TARGET_SITE_PATHS entry %j, which would never match a row', (entry) => {
+    expect(() =>
+      loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+        ...baseEnv,
+        FORBIDDEN_TARGET_SITE_PATHS: `/sites/Kwarantanna,${entry}`,
+      }),
+    ).toThrow(/FORBIDDEN_TARGET_SITE_PATHS/);
+  });
+
+  it('accepts /sites and /teams paths, with or without a trailing slash', () => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      FORBIDDEN_TARGET_SITE_PATHS: '/sites/BCRGROUP/, /teams/Other',
+    });
+    expect(cfg.forbiddenTargetSitePaths).toEqual(['/sites/BCRGROUP/', '/teams/Other']);
+  });
+
+  it('uses the default for an optional setting left empty or blank in app settings', () => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      QUARANTINE_DRIVE_NAME: '',
+      QUARANTINE_ROOT_FOLDER: '   ',
+    });
+    expect(cfg.quarantineDriveName).toBe('Documents');
+    expect(cfg.quarantineRootFolder).toBe('Kwarantanna');
+  });
+
   it('rejects a non-UUID Client Directory list id', () => {
     expect(() =>
       loadConfig(ingestionConfigSchema, ingestionEnvMap, {

@@ -2,10 +2,11 @@ import type { Client } from '@microsoft/microsoft-graph-client';
 import type { ClientDirectoryEntry } from '@bcr/shared';
 import {
   buildSnapshot,
+  canonicalSitePath,
   ClientDirectoryReader,
   normalizeAadId,
   normalizeNip,
-  normalizeTarget,
+  siteKey,
   toEntry,
   type ClientDirectoryReaderOptions,
   type ConflictKind,
@@ -104,22 +105,34 @@ describe('normalizers', () => {
     expect(normalizeAadId('user@example.com')).toBe('');
   });
 
-  it('treats targets differing only in case, slashes and whitespace as the same place', () => {
-    expect(
-      normalizeTarget({
-        siteHostname: 'Contoso.SharePoint.com',
-        sitePath: '/sites/ClientA/',
-        driveName: 'Dokumenty',
-        rootFolder: '/Dokumenty księgowe/',
-      }),
-    ).toBe(
-      normalizeTarget({
-        siteHostname: HOST,
-        sitePath: 'sites/clienta',
-        driveName: 'dokumenty',
-        rootFolder: 'Dokumenty księgowe',
-      }),
-    );
+  it.each([
+    ['/sites/ClientA', '/sites/ClientA'],
+    ['/sites/ClientA/', '/sites/ClientA'],
+    ['sites/ClientA', '/sites/ClientA'],
+    ['//sites//ClientA', '/sites/ClientA'],
+    [' /teams/ClientA ', '/teams/ClientA'],
+  ])('canonicalises the site path %j', (input, expected) => {
+    expect(canonicalSitePath(input)).toBe(expected);
+  });
+
+  it.each(['/sites/./ClientA', '/sites/x/../BCRGROUP', '/sites', '/', '', '/personal/someone', '/ClientA'])(
+    'refuses the site path %j',
+    (input) => {
+      expect(canonicalSitePath(input)).toBeNull();
+    },
+  );
+
+  it('keys a site by host and path only: case, slashes, drive and folder do not matter', () => {
+    const a = siteKey({
+      siteHostname: 'Contoso.SharePoint.com',
+      sitePath: '//sites/ClientA/',
+      driveName: 'Dokumenty',
+      rootFolder: 'Dokumenty księgowe',
+    });
+    const b = siteKey({ siteHostname: HOST, sitePath: 'sites/clienta', driveName: 'Documents' });
+    expect(a).toBe(`${HOST}/sites/clienta`);
+    expect(b).toBe(a);
+    expect(siteKey({ siteHostname: HOST, sitePath: '/sites/../x', driveName: 'Documents' })).toBeNull();
   });
 });
 
@@ -225,6 +238,24 @@ describe('buildSnapshot', () => {
     expect(snapshot.byUserAadObjectId.get(OID_1)?.listItemId).toBe('1');
   });
 
+  it('treats two rows on the same site as a conflict even with different folders or drives', () => {
+    const { snapshot } = build([
+      row({
+        listItemId: '1',
+        target: { siteHostname: HOST, sitePath: '/sites/Shared', driveName: 'Dokumenty', rootFolder: 'A' },
+        userAadObjectIds: [OID_1],
+      }),
+      row({
+        listItemId: '2',
+        target: { siteHostname: HOST, sitePath: '/sites//shared', driveName: 'Documents', rootFolder: 'B' },
+        userAadObjectIds: [OID_2],
+      }),
+    ]);
+    expect(snapshot.excludedRows.get('1')).toBe('target_conflict');
+    expect(snapshot.excludedRows.get('2')).toBe('target_conflict');
+    expect(snapshot.byUserAadObjectId.size).toBe(0);
+  });
+
   it('excludes every row that shares a target, and their users become conflicts', () => {
     const shared = { siteHostname: HOST, sitePath: '/sites/Shared', driveName: 'Dokumenty' };
     const { snapshot, conflicts } = build([
@@ -242,6 +273,9 @@ describe('buildSnapshot', () => {
 
   it.each([
     ['BCR GROUP', { sitePath: '/sites/BCRGROUP' }],
+    ['BCR GROUP with a doubled slash', { sitePath: '//sites//BCRGROUP' }],
+    ['BCR GROUP through a dot segment', { sitePath: '/sites/./BCRGROUP' }],
+    ['BCR GROUP through a parent segment', { sitePath: '/sites/x/../BCRGROUP' }],
     ['the quarantine site', { sitePath: '/sites/kwarantanna/' }],
     ['another SharePoint host', { siteHostname: 'evil.sharepoint.com' }],
   ])('excludes a row pointing at %s', (_label, targetOverride) => {
@@ -253,6 +287,20 @@ describe('buildSnapshot', () => {
       }),
     ]);
     expect(snapshot.excludedRows.get('1')).toBe('forbidden_target');
+    expect(snapshot.byUserAadObjectId.has(OID_1)).toBe(false);
+    expect(snapshot.forbiddenUserIds.has(OID_1)).toBe(true);
+    expect(snapshot.conflictedUserIds.has(OID_1)).toBe(false);
+  });
+
+  it('keeps a user on a forbidden row and a good row out of routing, as a conflict', () => {
+    const { snapshot } = build([
+      row({ listItemId: '1', userAadObjectIds: [OID_1] }),
+      row({
+        listItemId: '2',
+        userAadObjectIds: [OID_1],
+        target: { siteHostname: HOST, sitePath: '/sites/BCRGROUP', driveName: 'Dokumenty' },
+      }),
+    ]);
     expect(snapshot.byUserAadObjectId.has(OID_1)).toBe(false);
     expect(snapshot.conflictedUserIds.has(OID_1)).toBe(true);
   });

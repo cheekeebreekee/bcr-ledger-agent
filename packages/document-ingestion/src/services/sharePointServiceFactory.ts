@@ -1,6 +1,6 @@
 import type { Client } from '@microsoft/microsoft-graph-client';
 import type { SharePointTarget } from '@bcr/shared';
-import { SharePointService } from './sharePointService';
+import { SharePointService, type SharePointServiceOptions } from './sharePointService';
 
 /**
  * Caches one `SharePointService` per unique target so we amortize the
@@ -15,13 +15,16 @@ import { SharePointService } from './sharePointService';
 export class SharePointServiceFactory {
   private readonly cache = new Map<string, SharePointService>();
 
-  constructor(private readonly graph: Client) {}
+  constructor(
+    private readonly graph: Client,
+    private readonly serviceOptions: SharePointServiceOptions = {},
+  ) {}
 
   forTarget(target: SharePointTarget): SharePointService {
     const key = cacheKey(target);
     const cached = this.cache.get(key);
     if (cached) return cached;
-    const service = new SharePointService(this.graph, target);
+    const service = new SharePointService(this.graph, target, this.serviceOptions);
     this.cache.set(key, service);
     return service;
   }

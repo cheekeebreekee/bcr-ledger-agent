@@ -53,12 +53,12 @@ const requiredCsvList = (message: string) =>
     )
     .refine((list) => list.length > 0, message);
 
-/** Optional string that collapses `""` → `undefined` so `.default("")` works. */
+/** Optional string: missing, empty or whitespace-only all give the default. */
 const optionalStr = (defaultValue = '') =>
   z
     .string()
     .optional()
-    .transform((v) => v ?? defaultValue);
+    .transform((v) => (v === undefined || v.trim() === '' ? defaultValue : v));
 
 /**
  * Numeric env var with a default. Empty/undefined → default. Rejects values
@@ -162,8 +162,13 @@ export const ingestionConfigSchema = z.object({
    * The quarantine site is added automatically. A row pointing at one of
    * these is excluded from routing as `forbidden_target`.
    */
+  // Each entry is a server-relative site path. A pasted URL would never match
+  // a row and would silently disable the guard, so it fails at cold start.
   forbiddenTargetSitePaths: requiredCsvList(
     'FORBIDDEN_TARGET_SITE_PATHS must list at least the BCR GROUP site path',
+  ).refine(
+    (list) => list.every((p) => /^\/(sites|teams)\/[^/]+\/?$/i.test(p)),
+    'FORBIDDEN_TARGET_SITE_PATHS entries must be site paths like /sites/BCRGROUP, not URLs',
   ),
   // --- Claude (Anthropic) content classification ---
   anthropicEnabled: boolish(false),

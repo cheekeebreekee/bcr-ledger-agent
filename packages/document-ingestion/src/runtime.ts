@@ -23,7 +23,11 @@ export const auth = new AuthMiddleware({
 
 export const graph = createGraphClient();
 
-export const sharePointFactory = new SharePointServiceFactory(graph);
+// The Client Directory lives on the BCR GROUP site, so its site id is BCR
+// GROUP's: whatever a Directory row's path says, nothing is ever written there.
+export const sharePointFactory = new SharePointServiceFactory(graph, {
+  forbiddenSiteIds: [config.clientDirectorySiteId],
+});
 
 /**
  * The staff-only quarantine. Its own site path is always forbidden as a

@@ -52,6 +52,11 @@ export class SharePointTargetError extends SharePointError {
 export interface SharePointServiceOptions {
   /** Retry policy for transient Graph failures. Injected short in tests. */
   readonly retry?: RetryOptions;
+  /**
+   * Graph site ids nothing may be written to (BCR GROUP). Checked on the
+   * RESOLVED site, so no spelling of a Directory path can reach them.
+   */
+  readonly forbiddenSiteIds?: readonly string[];
   /** Injected in tests; defaults to global `fetch` (upload-session chunks). */
   readonly fetch?: typeof fetch;
 }
@@ -71,6 +76,7 @@ export class SharePointService {
   private readonly log = createLogger('ingestion/sharePointService');
   private readonly retryOptions: RetryOptions;
   private readonly fetchFn: typeof fetch;
+  private readonly forbiddenSiteIds: ReadonlySet<string>;
   private resolvedTarget: Promise<ResolvedSharePointTarget> | undefined;
 
   constructor(
@@ -80,6 +86,7 @@ export class SharePointService {
   ) {
     this.retryOptions = opts.retry ?? { retries: 3, minTimeoutMs: 250, factor: 2 };
     this.fetchFn = opts.fetch ?? fetch;
+    this.forbiddenSiteIds = new Set((opts.forbiddenSiteIds ?? []).map(siteCollectionKey));
   }
 
   async uploadDocument(args: UploadDocumentArgs): Promise<DriveItemRef> {
@@ -147,15 +154,20 @@ export class SharePointService {
     const sitePath = encodeGraphPath(this.target.sitePath);
     let site: { id: string };
     try {
-      site = (await this.graph
-        .api(`/sites/${this.target.siteHostname}:/${sitePath}`)
-        .get()) as { id: string };
+      site = (await this.withRetry(() =>
+        this.graph.api(`/sites/${this.target.siteHostname}:/${sitePath}`).get(),
+      )) as { id: string };
     } catch (err) {
       throw classifyTargetError(err, 'site_not_found', 'Site could not be resolved');
     }
+    if (this.forbiddenSiteIds.has(siteCollectionKey(site.id))) {
+      throw new SharePointTargetError('forbidden', 'The target resolves to a site nothing may be filed to');
+    }
     let drives: { value: { id: string; name: string }[] };
     try {
-      drives = (await this.graph.api(`/sites/${site.id}/drives`).get()) as typeof drives;
+      drives = (await this.withRetry(() =>
+        this.graph.api(`/sites/${site.id}/drives`).get(),
+      )) as typeof drives;
     } catch (err) {
       throw classifyTargetError(err, 'drive_not_found', 'Drives could not be listed');
     }
@@ -183,11 +195,13 @@ export class SharePointService {
 
     for (const segment of segments) {
       try {
-        await this.graph.api(`/drives/${driveId}/items/${parent}/children`).post({
-          name: segment,
-          folder: {},
-          '@microsoft.graph.conflictBehavior': 'fail',
-        });
+        await this.withRetry(() =>
+          this.graph.api(`/drives/${driveId}/items/${parent}/children`).post({
+            name: segment,
+            folder: {},
+            '@microsoft.graph.conflictBehavior': 'fail',
+          }),
+        );
       } catch (err) {
         if (graphStatus(err) === 403) {
           throw new SharePointTargetError('forbidden', 'No write access to the target drive', err);
@@ -197,9 +211,17 @@ export class SharePointService {
         }
       }
       // Re-fetch parent id (whether we created it or it already existed).
-      const item = (await this.graph
-        .api(`/drives/${driveId}/items/${parent}:/${encodeURIComponent(segment)}`)
-        .get()) as { id: string };
+      let item: { id: string };
+      try {
+        item = (await this.withRetry(() =>
+          this.graph.api(`/drives/${driveId}/items/${parent}:/${encodeURIComponent(segment)}`).get(),
+        )) as { id: string };
+      } catch (err) {
+        if (graphStatus(err) === 403) {
+          throw new SharePointTargetError('forbidden', 'No access to the target drive', err);
+        }
+        throw new SharePointError('Failed to read a folder', 502, err);
+      }
       parent = item.id;
     }
   }
@@ -242,9 +264,11 @@ export class SharePointService {
   ): Promise<DriveItemRef | 'conflict'> {
     let session: { uploadUrl: string };
     try {
-      session = (await this.graph
-        .api(`/drives/${driveId}/root:/${encodedPath}:/createUploadSession`)
-        .post({ item: { '@microsoft.graph.conflictBehavior': 'fail' } })) as { uploadUrl: string };
+      session = (await this.withRetry(() =>
+        this.graph
+          .api(`/drives/${driveId}/root:/${encodedPath}:/createUploadSession`)
+          .post({ item: { '@microsoft.graph.conflictBehavior': 'fail' } }),
+      )) as { uploadUrl: string };
     } catch (err) {
       if (graphStatus(err) === 409) return 'conflict';
       if (graphStatus(err) === 403) {
@@ -260,28 +284,54 @@ export class SharePointService {
       const chunk = content.subarray(offset, end);
       const rangeHeader = `bytes ${offset}-${end - 1}/${content.length}`;
 
-      const outcome = await retry(async () => {
-        const res = await this.fetchFn(session.uploadUrl, {
-          method: 'PUT',
-          headers: { 'Content-Length': String(chunk.length), 'Content-Range': rangeHeader },
-          body: chunk,
-        });
-        if (res.status === 202 || res.status === 200 || res.status === 201) {
-          return (await res.json()) as unknown;
-        }
-        // A name taken while the session was open is reported on the last chunk.
-        if (res.status === 409) return 'conflict' as const;
-        if (res.status >= 500 || res.status === 429) {
-          throw new Error(`Chunk upload HTTP ${res.status}`);
-        }
-        throw new AbortRetryError(`Chunk upload HTTP ${res.status}`);
-      }, this.retryOptions);
+      let outcome: unknown;
+      try {
+        outcome = await retry(async () => {
+          const res = await this.fetchFn(session.uploadUrl, {
+            method: 'PUT',
+            headers: { 'Content-Length': String(chunk.length), 'Content-Range': rangeHeader },
+            body: chunk,
+          });
+          if (res.status === 202 || res.status === 200 || res.status === 201) {
+            return (await res.json()) as unknown;
+          }
+          // A name taken while the session was open is reported on the last chunk.
+          if (res.status === 409) return 'conflict' as const;
+          if (res.status >= 500 || res.status === 429) {
+            throw new Error(`Chunk upload HTTP ${res.status}`);
+          }
+          throw new AbortRetryError(`Chunk upload HTTP ${res.status}`);
+        }, this.retryOptions);
+      } catch (err) {
+        // After retries, like the simple PUT: a SharePointError, which the
+        // pipeline turns into a quarantine, never a bare rejection.
+        throw new SharePointError('Upload failed', 502, err);
+      }
 
       if (outcome === 'conflict') return 'conflict';
       lastResponse = outcome;
       offset = end;
     }
     return lastResponse as DriveItemRef;
+  }
+
+  /**
+   * Retry a Graph call on 429/5xx and network failures only; any other error
+   * stops at once with its status intact (see {@link StatusAbort}).
+   */
+  private async withRetry<T>(call: () => Promise<T>): Promise<T> {
+    try {
+      return await retry(async () => {
+        try {
+          return await call();
+        } catch (err) {
+          if (isRetryableError(err)) throw err;
+          throw new StatusAbort(err);
+        }
+      }, this.retryOptions);
+    } catch (err) {
+      throw err instanceof StatusAbort ? err.original : err;
+    }
   }
 
   /**
@@ -328,9 +378,19 @@ function classifyTargetError(
   return new SharePointError(message, 502, err);
 }
 
+/**
+ * Graph site ids are `hostname,siteCollectionGuid,webGuid`; a setting may hold
+ * the full id or the GUID alone. Both compare by the site collection GUID.
+ */
+function siteCollectionKey(id: string): string {
+  const parts = id.trim().toLowerCase().split(',');
+  return (parts.length === 3 ? parts[1] : parts[0]) ?? '';
+}
+
 function isRetryableError(err: unknown): boolean {
   const status = graphStatus(err);
-  if (status === undefined) return true; // network blip
+  // The Graph SDK reports a failed fetch (reset, DNS, timeout) as statusCode -1.
+  if (status === undefined || status <= 0) return true;
   return status === 429 || (status >= 500 && status < 600);
 }
 

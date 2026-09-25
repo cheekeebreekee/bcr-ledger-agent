@@ -66,6 +66,7 @@ export class ClientResolver {
     if (!oid) return this.quarantine('unmapped');
 
     if (snapshot.conflictedUserIds.has(oid)) return this.quarantine('conflict');
+    if (snapshot.forbiddenUserIds.has(oid)) return this.quarantine('forbidden_target');
     if (snapshot.staffUserIds.has(oid)) return this.quarantine('staff');
 
     const row = snapshot.byUserAadObjectId.get(oid);

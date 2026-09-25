@@ -52,10 +52,16 @@ export interface ClientDirectorySnapshot {
   /** AAD object ids that appear only on admin (staff) rows. */
   readonly staffUserIds: ReadonlySet<string>;
   /**
-   * AAD object ids that appear on more than one row, or on a row excluded for
-   * a target conflict. These users are quarantined as `conflict`.
+   * AAD object ids that appear on more than one row, or whose one row was
+   * excluded for a target conflict. These users are quarantined as `conflict`.
    */
   readonly conflictedUserIds: ReadonlySet<string>;
+  /**
+   * AAD object ids whose one row points at a forbidden site (BCR GROUP, the
+   * quarantine, another host) or at a site path that is not canonical. These
+   * users are quarantined as `forbidden_target`.
+   */
+  readonly forbiddenUserIds: ReadonlySet<string>;
   /** List item id → why that row routes nobody. */
   readonly excludedRows: ReadonlyMap<string, ExcludedRowReason>;
   /**
@@ -242,9 +248,12 @@ export function toEntry(item: GraphListItem): ClientDirectoryEntry | null {
   const rootFolder = strOrEmpty(f.RootFolder).trim();
   const expectedDriveId = strOrEmpty(f.DriveId).trim();
   const teamId = strOrEmpty(f.TeamId).trim();
+  // The path that is checked must be the path that is requested: store the
+  // canonical form when there is one. A non-canonical path is kept as typed
+  // and excluded by buildSnapshot, so it routes nobody.
   const target: SharePointTarget = {
     siteHostname,
-    sitePath,
+    sitePath: canonicalSitePath(sitePath) ?? sitePath,
     driveName,
     ...(rootFolder ? { rootFolder } : {}),
     ...(expectedDriveId ? { expectedDriveId } : {}),
@@ -282,23 +291,30 @@ export function normalizeAadId(input: string): string {
 }
 
 /**
- * Canonical form of a routing target, so two rows naming the same place in
- * different spellings are recognised as the same target. Hostnames are
- * case-insensitive; SharePoint site and folder paths are compared
- * case-insensitively too, because two rows differing only in case would
- * still write into the same library.
+ * The one canonical spelling of a SharePoint site path, or `null` when the
+ * path cannot be trusted. Graph and the HTTP layer drop empty segments and
+ * resolve `.`/`..`, so `/sites//X`, `/sites/./X` and `/sites/y/../X` all reach
+ * site X — a check that compared spellings let such a row through to BCR
+ * GROUP. Anything with a dot segment, or not under `/sites/` or `/teams/`, is
+ * refused outright.
  */
-export function normalizeTarget(t: SharePointTarget): string {
-  return [
-    t.siteHostname.trim().toLowerCase(),
-    normalizeSitePath(t.sitePath),
-    t.driveName.trim().toLowerCase(),
-    (t.rootFolder ?? '').trim().replace(/^\/+|\/+$/g, '').toLowerCase(),
-  ].join('|');
+export function canonicalSitePath(p: string): string | null {
+  const segments = p.trim().split('/').filter(Boolean);
+  if (segments.length < 2) return null;
+  if (segments.some((s) => s === '.' || s === '..')) return null;
+  if (!/^(sites|teams)$/i.test(segments[0] ?? '')) return null;
+  return `/${segments.join('/')}`;
 }
 
-export function normalizeSitePath(p: string): string {
-  return `/${p.trim().replace(/^\/+|\/+$/g, '')}`.toLowerCase();
+/**
+ * The key two rows are compared on for a target conflict: the site itself.
+ * One Team site belongs to one client, so two rows on the same site conflict
+ * whatever drive or folder each names — a per-folder key let a second client
+ * into the same library through a different RootFolder spelling.
+ */
+export function siteKey(t: SharePointTarget): string | null {
+  const path = canonicalSitePath(t.sitePath);
+  return path ? `${t.siteHostname.trim().toLowerCase()}${path.toLowerCase()}` : null;
 }
 
 export interface BuildSnapshotOptions {
@@ -314,10 +330,11 @@ export type ConflictKind = 'userAadObjectId' | 'target' | 'nip' | 'clientId';
  * same maps in any order.
  *
  * Rules:
- *  - A row pointing at a forbidden site or another host is excluded
- *    (`forbidden_target`).
- *  - Rows sharing a normalized target are all excluded (`target_conflict`):
- *    two clients in one library is a leak by construction.
+ *  - A row pointing at a forbidden site, another host, or a site path that is
+ *    not canonical is excluded (`forbidden_target`).
+ *  - Rows on the same site are all excluded (`target_conflict`), whatever
+ *    drive or folder each names: two clients in one library is a leak by
+ *    construction.
  *  - A user id on exactly one row routes: to that row if it is a client row,
  *    to "staff" if it is an admin row. On two or more rows — two clients, or
  *    a client and an admin row — it routes nowhere (`conflict`). A user id on
@@ -331,7 +348,11 @@ export function buildSnapshot(
   fetchedAt: number,
   opts: BuildSnapshotOptions,
 ): ClientDirectorySnapshot {
-  const forbidden = new Set(opts.forbiddenSitePaths.map(normalizeSitePath));
+  const forbidden = new Set(
+    opts.forbiddenSitePaths
+      .map((p) => canonicalSitePath(p)?.toLowerCase())
+      .filter((p): p is string => Boolean(p)),
+  );
   const allowedHost = opts.allowedSiteHostname.trim().toLowerCase();
   const excludedRows = new Map<string, ExcludedRowReason>();
 
@@ -344,10 +365,12 @@ export function buildSnapshot(
   for (const e of entries) {
     if (!e.isAdmin) {
       const host = e.target.siteHostname.trim().toLowerCase();
-      if (host !== allowedHost || forbidden.has(normalizeSitePath(e.target.sitePath))) {
+      const path = canonicalSitePath(e.target.sitePath)?.toLowerCase();
+      const key = siteKey(e.target);
+      if (host !== allowedHost || !path || !key || forbidden.has(path)) {
         excludedRows.set(e.listItemId, 'forbidden_target');
       } else {
-        push(rowsByTarget, normalizeTarget(e.target), e.listItemId);
+        push(rowsByTarget, key, e.listItemId);
       }
       if (e.nip) push(rowsByNip, e.nip, e.listItemId);
     }
@@ -374,6 +397,7 @@ export function buildSnapshot(
   const byUserAadObjectId = new Map<string, ClientDirectoryEntry>();
   const staffUserIds = new Set<string>();
   const conflictedUserIds = new Set<string>();
+  const forbiddenUserIds = new Set<string>();
 
   for (const [oid, rows] of rowsByUser) {
     if (rows.length > 1) {
@@ -388,6 +412,8 @@ export function buildSnapshot(
     if (!row) continue;
     if (row.isAdmin) {
       staffUserIds.add(oid);
+    } else if (excludedRows.get(row.listItemId) === 'forbidden_target') {
+      forbiddenUserIds.add(oid);
     } else if (excludedRows.has(row.listItemId)) {
       conflictedUserIds.add(oid);
     } else {
@@ -400,6 +426,7 @@ export function buildSnapshot(
     byUserAadObjectId,
     staffUserIds,
     conflictedUserIds,
+    forbiddenUserIds,
     excludedRows,
     health: 'fresh',
     fetchedAt,
@@ -412,6 +439,7 @@ function unavailableSnapshot(fetchedAt: number): ClientDirectorySnapshot {
     byUserAadObjectId: new Map(),
     staffUserIds: new Set(),
     conflictedUserIds: new Set(),
+    forbiddenUserIds: new Set(),
     excludedRows: new Map(),
     health: 'unavailable',
     fetchedAt,

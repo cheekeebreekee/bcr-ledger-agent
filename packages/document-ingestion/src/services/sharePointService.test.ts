@@ -217,6 +217,68 @@ describe('SharePointService target resolution', () => {
   });
 });
 
+describe('SharePointService transient failures and forbidden sites', () => {
+  const network = () => Object.assign(new Error('fetch failed'), { statusCode: -1 });
+
+  it('retries a network failure on every Graph call before the upload', async () => {
+    const failed = new Set<string>();
+    const flaky = (h: Handler): Handler => (c) => {
+      const key = `${c.method} ${c.path}`;
+      if (!failed.has(key)) {
+        failed.add(key);
+        throw network();
+      }
+      return h(c);
+    };
+    const { client } = fakeGraph([
+      ...siteAndDrive.map(([re, h]): [RegExp, Handler] => [re, flaky(h)]),
+      [/^PUT /, () => ({ id: 'i', name: 'n', webUrl: 'u' })],
+    ]);
+    const svc = new SharePointService(client, target, { retry: { retries: 1, minTimeoutMs: 0 } });
+    await expect(svc.uploadDocument(doc)).resolves.toMatchObject({ id: 'i' });
+    expect(failed.size).toBeGreaterThanOrEqual(4);
+  });
+
+  it('turns a folder read that keeps failing into a SharePointError', async () => {
+    const { client } = fakeGraph([
+      siteAndDrive[0]!,
+      siteAndDrive[1]!,
+      siteAndDrive[2]!,
+      [/^GET \/drives\/drive-1\/items\//, () => { throw graphError(503); }],
+    ]);
+    const err = await new SharePointService(client, target, noRetry).uploadDocument(doc).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SharePointError);
+    expect(err).not.toBeInstanceOf(SharePointTargetError);
+  });
+
+  it('reports a 403 on a folder read as a missing grant', async () => {
+    const { client } = fakeGraph([
+      siteAndDrive[0]!,
+      siteAndDrive[1]!,
+      siteAndDrive[2]!,
+      [/^GET \/drives\/drive-1\/items\//, () => { throw graphError(403); }],
+    ]);
+    await expect(new SharePointService(client, target, noRetry).uploadDocument(doc)).rejects.toMatchObject({
+      kind: 'forbidden',
+    });
+  });
+
+  it.each([
+    ['the same full id', 'contoso.sharepoint.com,AAAA-1,web-1'],
+    ['the site collection GUID alone', 'aaaa-1'],
+    ['the same collection with another web', 'contoso.sharepoint.com,aaaa-1,web-2'],
+  ])('refuses to write to a forbidden site given as %s, whatever path led there', async (_label, forbidden) => {
+    const { client, calls } = fakeGraph([
+      [/^GET \/sites\/contoso\.sharepoint\.com:\/sites\/ClientA$/, () => ({ id: 'contoso.sharepoint.com,aaaa-1,web-1' })],
+      [/^GET /, () => ({ value: [] })],
+      [/^PUT /, () => ({ id: 'i', name: 'n', webUrl: 'u' })],
+    ]);
+    const svc = new SharePointService(client, target, { ...noRetry, forbiddenSiteIds: [forbidden] });
+    await expect(svc.uploadDocument(doc)).rejects.toMatchObject({ kind: 'forbidden' });
+    expect(calls.map((c) => c.method)).toEqual(['get']);
+  });
+});
+
 describe('SharePointService chunked upload', () => {
   const big = Buffer.alloc(5 * 1024 * 1024, 1); // > 4 MiB simple-upload limit
 
@@ -274,10 +336,12 @@ describe('SharePointService chunked upload', () => {
     expect(sessions).toBe(2);
   });
 
-  it('stops on a non-retryable chunk failure', async () => {
+  it('stops on a non-retryable chunk failure with a SharePointError the pipeline can quarantine', async () => {
     const { client } = fakeGraph([...siteAndDrive, [/createUploadSession$/, () => ({ uploadUrl: 'https://upload.example/s' })]]);
     const svc = new SharePointService(client, target, { ...noRetry, fetch: fetchReturning([400]) });
-    await expect(svc.uploadDocument({ ...doc, content: big })).rejects.toThrow(/Chunk upload HTTP 400/);
+    const err = await svc.uploadDocument({ ...doc, content: big }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SharePointError);
+    expect(err).toMatchObject({ httpStatus: 502 });
   });
 
   it('reports a 403 on session creation as a missing write grant', async () => {
