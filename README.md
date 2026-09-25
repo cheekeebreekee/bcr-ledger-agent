@@ -6,21 +6,24 @@ and uploads it to the correct folder in the user's client's SharePoint Online
 space — all hosted on Microsoft Azure and written in Node.js + TypeScript.
 
 > Example  
-> A PESKOVOI employee DMs the bot with `8652567240-20260217-FD.pdf` (a KSeF
-> purchase invoice).  
-> The bot replies with an adaptive card:  
-> *“✅ Zarchiwizowano → `01_Faktury/02_Faktury_zakupu/2026/02/` in PESKOVOI's SharePoint.”*
+> A client's contact person sends the bot a KSeF purchase invoice in a 1:1 chat.  
+> The bot replies with an adaptive card: the document, its category, and the folder
+> `01_Faktury/02_Faktury_zakupu/2026/02/` in that client's "Dokumenty księgowe" channel.
 
-**One deployment routes for many clients.** Which SharePoint site a
-document lands in is decided per-upload by a *Client Directory*
-SharePoint list — no per-client deployment, no channel setup. See
+**One deployment serves many clients.** Which client a document belongs to is decided
+per upload from **the uploader's identity only**, looked up in a *Client Directory*
+SharePoint list. The document's content chooses the folder, never the client. An
+uploader who cannot be tied to exactly one client goes to a staff-only quarantine. See
 [`docs/client-directory-admin-guide.md`](./docs/client-directory-admin-guide.md).
 
-**Users interact via 1:1 DM.** Teams channel uploads don't reliably
-reach bots (drag-drop bypasses Bot Framework; `@mentions` don't carry
-attachments) — the app manifest ships a *Personal Tab* (“Moje
-dokumenty”) that deep-links each user into their SharePoint document
-library from inside Teams.
+**Users interact in a 1:1 chat.** Teams channel uploads do not reach bots (drag-drop
+bypasses Bot Framework; `@mentions` carry no attachments), so the app is personal scope
+only. Clients find their files in their own Team, in the "Dokumenty księgowe" channel.
+
+> **September 2026:** incident `IR-2026-09` found documents filed outside their client's
+> space. Phase 0 of v2 contains it; start with
+> [`docs/operations/incident-2026-09.md`](./docs/operations/incident-2026-09.md) and
+> [`docs/operations/human-steps.md`](./docs/operations/human-steps.md).
 
 ---
 
@@ -98,7 +101,7 @@ cp packages/document-ingestion/local.settings.json.example packages/document-ing
 
 # 4. Run both functions side-by-side
 yarn start:bot           # http://localhost:3978/api/messages
-yarn start:ingestion     # http://localhost:7071/api/ingest
+yarn start:ingestion     # http://localhost:7071/api/ingest/batch
 ```
 
 Then point the **Bot Framework Emulator** at `http://localhost:3978/api/messages`
@@ -115,25 +118,27 @@ and drag any file named like `Invoice_03_2026.pdf` into the chat.
 | `yarn lint` | ESLint over the whole repo |
 | `yarn start:bot` | Start the Teams-bot Function App locally |
 | `yarn start:ingestion` | Start the document-ingestion Function App locally |
-| `yarn deploy:dev` | Deploy infra + code to the `dev` environment |
+| `yarn deploy:dev` | Deploy infra + code to the `dev` environment. **Not during Phase 0:** it deploys Bicep, which has drifted from what runs. Use the code-only steps in [`human-steps.md`](./docs/operations/human-steps.md#phase-0). |
 | `yarn deploy:prod` | Deploy infra + code to the `prod` environment |
 
 ---
 
 ## Security model (TL;DR)
 
-1. **Teams → Bot Function** is authenticated by the Bot Framework JWT
-   (signed by `login.botframework.com`); validated by the SDK middleware.
-2. **Bot Function → Ingestion Function** uses **Azure AD client-credentials**
-   (MSAL) — the bot gets a token for the ingestion App Registration scope
-   `api://<ingestion-app-id>/.default` and sends it as a `Bearer` token.
-3. **Ingestion Function → Microsoft Graph** uses the Function App’s
-   **system-assigned managed identity** + a federated credential, with the
-   Graph application permission `Sites.Selected` scoped to the target site.
-4. **Secrets** live in **Key Vault** and are referenced from Function App
-   settings (`@Microsoft.KeyVault(SecretUri=...)`) — never in source.
-5. All requests and uploads are logged to **Application Insights** with
-   correlation IDs so a single Teams message can be traced end to end.
+1. **Teams → Bot Function** is authenticated by the Bot Framework JWT (signed by
+   `login.botframework.com`). Then a gate on every activity lets through only a 1:1 chat, from
+   the BCR tenant, with a valid user id.
+2. **Bot Function → Ingestion Function** uses **Entra ID client credentials** (MSAL). The bot
+   gets a token for `api://<ingestion-app-id>/.default`. Ingestion checks the role, and that the
+   caller's app id is the bot's (`BOT_CALLER_APP_IDS`).
+3. **Ingestion Function → Microsoft Graph** uses the Function App's **system-assigned managed
+   identity** with `Sites.Selected`. There is a per-site grant on every client site it files
+   into, so it can write to all of them by design. Routing by identity only is what keeps
+   clients apart.
+4. **Secrets** live in **Key Vault** and are referenced from Function App settings
+   (`@Microsoft.KeyVault(SecretUri=...)`), never in source.
+5. Uploads are logged to **Application Insights** as ids and codes (`document.filed`,
+   `document.quarantined`), never file names or client names.
 
 See [`docs/security.md`](./docs/security.md) for the full threat model.
 
@@ -147,3 +152,5 @@ See [`docs/security.md`](./docs/security.md) for the full threat model.
   and Teams app sideload.
 - [`docs/deployment.md`](./docs/deployment.md) — concise deploy commands.
 - [`docs/local-development.md`](./docs/local-development.md) — local dev loop.
+- [`docs/operations/`](./docs/operations/) — the September 2026 incident, the ordered human
+  steps for Phase 0, tenant hardening, and draft GDPR notices.
