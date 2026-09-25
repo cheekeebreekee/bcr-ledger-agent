@@ -206,6 +206,30 @@ describe('indexIr0', () => {
     const rows = buildRegister({ walked: [], ir0: idx, ingestAppIds: new Set() });
     for (const r of rows) assert.ok(r.flags.includes('ir0_filename_repeated_in_batch'), r.driveItemId);
   });
+
+  test('a same-named sibling that was classified and promoted, then failed, lends A nothing (R14)', () => {
+    const batch = [
+      line(0, M.noDirectoryMatch, { conversationId: 'c', userAadObjectId: U1 }),
+      line(2, M.clientResolved, { invocationId: 'i', conversationId: 'c', resolution: 'fallback', clientId: 'FALLBACK', sitePath: '/sites/BCRGROUP' }),
+      // A: classified, uploaded to the fallback bucket.
+      line(100, M.classified, { invocationId: 'i', filename: 'attachment.bin', documentType: 'Inne', folderPath: '98_Nieposortowane/2026/09' }),
+      line(200, M.uploaded, { invocationId: 'i', filename: 'attachment.bin', driveItemId: 'A', webUrl: `${HOST}/sites/BCRGROUP/x/attachment.bin` }),
+      // B: classified, promoted into client 0002, then its upload failed.
+      line(300, M.classified, { invocationId: 'i', filename: 'attachment.bin', documentType: 'Faktura', folderPath: '01_Faktury/x' }),
+      line(310, M.refined, { invocationId: 'i', filename: 'attachment.bin', clientId: '0002', sitePath: '/sites/0002CLIENTB', promotedFromFallback: true }),
+      line(400, M.batchFailed, { invocationId: 'i', filename: 'attachment.bin' }),
+    ];
+    const a = indexIr0(parseIr0Export(batch)).byDriveItemId.get('A');
+    assert.equal(a.filenameRepeatedInBatch, true);
+    assert.equal(a.refined, false);
+    assert.equal(a.promotedFromFallback, false);
+    assert.equal(a.finalClientId, 'FALLBACK', "the batch's client, not the sibling's");
+    assert.equal(a.finalSitePath, '/sites/BCRGROUP');
+    assert.equal(a.documentType, '');
+    const [row] = buildRegister({ walked: [], ir0: new Map([['A', a]]), ingestAppIds: new Set() });
+    assert.ok(row.flags.includes('ir0_filename_repeated_in_batch'));
+    assert.ok(!row.flags.includes('promoted_by_content'), 'A was never promoted');
+  });
 });
 
 describe('guests of each site', () => {

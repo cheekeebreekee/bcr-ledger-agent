@@ -251,6 +251,7 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
   const batchesByInvocation = new Map();
   const refined = new Map();
   const classified = new Map();
+  const classifiedPerName = new Map();
   const routed = [];
   const noMatch = [];
   const admin = [];
@@ -269,9 +270,12 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
       case m.refined:
         refined.set(`${r.invocationId}|${r.filename}`, r);
         break;
-      case m.classified:
-        classified.set(`${r.invocationId}|${r.filename}`, r);
+      case m.classified: {
+        const key = `${r.invocationId}|${r.filename}`;
+        classified.set(key, r);
+        classifiedPerName.set(key, (classifiedPerName.get(key) ?? 0) + 1);
         break;
+      }
       case m.routedByUser:
         routed.push(r);
         break;
@@ -320,9 +324,13 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
   }
 
   // `classified` and `refined` lines are found by invocationId + filename.
-  // Two uploads of one name in one batch (the legacy bot named every unnamed
-  // attachment "attachment.bin") make that lookup pick a sibling's line, so
-  // neither upload takes one, and both are flagged.
+  // Two documents of one name in one batch (the legacy bot named every
+  // unnamed attachment "attachment.bin") make that lookup pick a sibling's
+  // line, so none of them takes one, and all are flagged. The sibling need
+  // not have been uploaded: one classified (and perhaps promoted) that then
+  // failed ("batch document failed") logged its lines all the same. Every
+  // processed document logs "classified" before any refined or upload line,
+  // so counting those catches every sibling that could lend its lines.
   const perNameInBatch = new Map();
   for (const u of uploads) {
     const key = `${u.invocationId}|${u.filename}`;
@@ -336,7 +344,8 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
     const batch = batchFor(u);
     if (!batch) withoutBatch += 1;
     const key = `${u.invocationId}|${u.filename}`;
-    const repeated = Boolean(u.invocationId) && perNameInBatch.get(key) > 1;
+    const repeated =
+      Boolean(u.invocationId) && (perNameInBatch.get(key) > 1 || (classifiedPerName.get(key) ?? 0) > 1);
     const ref = repeated ? undefined : refined.get(key);
     const cls = repeated ? undefined : classified.get(key);
     const { oids, source } = uploaderFor(batch);
