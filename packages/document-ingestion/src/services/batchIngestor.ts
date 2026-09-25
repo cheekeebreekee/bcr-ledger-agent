@@ -16,6 +16,17 @@ import {
 import type { ClientResolver } from './clientResolver';
 import { SharePointTargetError, type SharePointService } from './sharePointService';
 
+/**
+ * How long a batch may run before the documents not yet started are handed
+ * back for a retry. Below the ~230 s the Functions front end allows an HTTP
+ * request, so the bot gets an answer for every document instead of a 5xx
+ * while the invocation goes on filing behind it (and a resend duplicates).
+ */
+export const BATCH_DEADLINE_MS = 150_000;
+
+/** The code of a document returned unprocessed because the batch ran out of time. */
+export const RETRY_LATER = 'RetryLater';
+
 /** Where documents are written, as a narrow interface so tests can supply fakes. */
 export interface SharePointFactoryLike {
   forTarget(
@@ -39,6 +50,8 @@ export interface BatchIngestorDeps {
   readonly quarantineSharePointFactory: SharePointFactoryLike;
   readonly now?: () => Date;
   readonly newId?: () => string;
+  /** Defaults to {@link BATCH_DEADLINE_MS}. */
+  readonly batchDeadlineMs?: number;
 }
 
 /**
@@ -53,21 +66,25 @@ export interface BatchIngestorDeps {
  *    response for them carries no link, folder or name.
  *
  * A failure on one document is captured as that document's row, so a bad file
- * never blocks the rest.
+ * never blocks the rest. A document not started within the batch deadline is
+ * returned `rejected` with {@link RETRY_LATER}, never filed late.
  */
 export class BatchIngestor {
   private readonly now: () => Date;
   private readonly newId: () => string;
+  private readonly deadlineMs: number;
 
   constructor(private readonly deps: BatchIngestorDeps) {
     this.now = deps.now ?? (() => new Date());
     this.newId = deps.newId ?? randomUUID;
+    this.deadlineMs = deps.batchDeadlineMs ?? BATCH_DEADLINE_MS;
   }
 
   async ingestBatch(
     payload: IngestionBatchRequestPayload,
     log: Logger,
   ): Promise<IngestionBatchItemResult[]> {
+    const startedAt = this.now().getTime();
     const resolved = await this.deps.resolver.resolve(payload.source);
     const batch: BatchContext = {
       batchId: this.newId(),
@@ -87,8 +104,28 @@ export class BatchIngestor {
     );
 
     const results: IngestionBatchItemResult[] = [];
+    let notStarted = 0;
     for (const document of payload.documents) {
+      if (this.now().getTime() - startedAt >= this.deadlineMs) {
+        notStarted += 1;
+        results.push({
+          filename: document.filename,
+          status: 'rejected',
+          error: { code: RETRY_LATER, message: rejectionMessage(RETRY_LATER) },
+        });
+        continue;
+      }
       results.push(await this.ingestOne(document, resolved, batch));
+    }
+    if (notStarted > 0) {
+      log.warn(
+        {
+          event: 'batch.deadline_exceeded',
+          notStartedCount: notStarted,
+          documentCount: payload.documents.length,
+        },
+        'batch.deadline_exceeded',
+      );
     }
     return results;
   }
@@ -300,6 +337,8 @@ function rejectionMessage(code: string): string {
     case 'QuarantineFailed':
     case 'SharePointError':
       return 'The document could not be stored; try again later';
+    case RETRY_LATER:
+      return 'The document was not processed in time; send it again';
     default:
       return 'The document could not be processed';
   }

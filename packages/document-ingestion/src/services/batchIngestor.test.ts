@@ -12,7 +12,7 @@ import {
   type ResolvedClient,
   type SharePointTarget,
 } from '@bcr/shared';
-import { BatchIngestor, type BatchIngestorDeps } from './batchIngestor';
+import { BatchIngestor, RETRY_LATER, type BatchIngestorDeps } from './batchIngestor';
 import {
   cachedSiteIdLookup,
   SharePointTargetError,
@@ -101,7 +101,10 @@ interface FakeSharePoint {
   failFor: Map<SharePointTarget, unknown>;
 }
 
-function setup(resolved: ResolvedClient, opts: { classify?: jest.Mock } = {}) {
+function setup(
+  resolved: ResolvedClient,
+  opts: { classify?: jest.Mock; now?: () => Date; batchDeadlineMs?: number } = {},
+) {
   const sp: FakeSharePoint = { uploads: [], fields: [], failFor: new Map() };
   let n = 0;
   const classify =
@@ -137,8 +140,9 @@ function setup(resolved: ResolvedClient, opts: { classify?: jest.Mock } = {}) {
     classification: { classify },
     clientSharePointFactory: factory('client'),
     quarantineSharePointFactory: factory('quarantine'),
-    now: () => new Date('2026-09-25T10:00:00Z'),
+    now: opts.now ?? (() => new Date('2026-09-25T10:00:00Z')),
     newId: () => `id-${++n}`,
+    ...(opts.batchDeadlineMs !== undefined ? { batchDeadlineMs: opts.batchDeadlineMs } : {}),
   };
   return { ingestor: new BatchIngestor(deps), deps, sp, classify };
 }
@@ -309,6 +313,73 @@ describe('BatchIngestor — quarantine', () => {
     expect(result).toMatchObject({ status: 'rejected', error: { code: 'QuarantineFailed' } });
     expect(sp.uploads).toHaveLength(0);
     expect(lines.some((l) => l['event'] === 'document.quarantine_failed')).toBe(true);
+  });
+});
+
+describe('BatchIngestor — batch deadline', () => {
+  /** A clock that moves forward by `stepMs` every time it is read. */
+  function steppingClock(stepMs: number): () => Date {
+    let t = Date.parse('2026-09-25T10:00:00Z');
+    return () => {
+      const d = new Date(t);
+      t += stepMs;
+      return d;
+    };
+  }
+
+  it('hands back the documents not started by the deadline for a retry, never filing them late', async () => {
+    // The clock is read at the start and once before each document: 0, 60, 120, 180, 240 s.
+    const { ingestor, sp, classify } = setup(clientA, {
+      now: steppingClock(60_000),
+      batchDeadlineMs: 150_000,
+    });
+    const { log, lines } = recordingLogger();
+    const results = await ingestor.ingestBatch(payload(['a.pdf', 'b.pdf', 'c.pdf', 'd.pdf']), log);
+
+    expect(results.map((r) => r.status)).toEqual(['uploaded', 'uploaded', 'rejected', 'rejected']);
+    expect(results[2]).toEqual({
+      filename: 'c.pdf',
+      status: 'rejected',
+      error: { code: RETRY_LATER, message: 'The document was not processed in time; send it again' },
+    });
+    expect(sp.uploads.map((u) => u.args.filename)).toEqual(['a.pdf', 'b.pdf']);
+    expect(classify).toHaveBeenCalledTimes(2);
+    expect(lines.find((l) => l['event'] === 'batch.deadline_exceeded')).toMatchObject({
+      notStartedCount: 2,
+      documentCount: 4,
+    });
+  });
+
+  it('finishes a document it started before the deadline, even past it', async () => {
+    let t = Date.parse('2026-09-25T10:00:00Z');
+    const classify = jest.fn(async (): Promise<Classification> => {
+      t += 200_000; // a slow model call
+      return invoice;
+    });
+    const { ingestor, sp } = setup(clientA, { classify, now: () => new Date(t) });
+    const results = await ingestor.ingestBatch(payload(['a.pdf', 'b.pdf']), recordingLogger().log);
+    expect(results.map((r) => r.status)).toEqual(['uploaded', 'rejected']);
+    expect(sp.uploads).toHaveLength(1);
+  });
+
+  it('applies to quarantined batches too, and defaults to 150 s', async () => {
+    const unmapped: ResolvedClient = { source: 'quarantine', reason: 'unmapped', target: quarantineTarget };
+    let t = Date.parse('2026-09-25T10:00:00Z');
+    const { ingestor, sp, deps } = setup(unmapped, { now: () => new Date(t) });
+    (deps.resolver.resolve as jest.Mock).mockImplementation(async () => {
+      t += 149_999;
+      return unmapped;
+    });
+    const first = await ingestor.ingestBatch(payload(['a.pdf']), recordingLogger().log);
+    expect(first.map((r) => r.status)).toEqual(['quarantined']);
+
+    (deps.resolver.resolve as jest.Mock).mockImplementation(async () => {
+      t += 150_000;
+      return unmapped;
+    });
+    const second = await ingestor.ingestBatch(payload(['b.pdf']), recordingLogger().log);
+    expect(second.map((r) => r.error?.code)).toEqual([RETRY_LATER]);
+    expect(sp.uploads.map((u) => u.args.filename)).toEqual(['a.pdf']);
   });
 });
 

@@ -111,6 +111,12 @@ export interface SharePointServiceOptions {
  *    the next free `_n` name on a 409 — no existence probes, so no race and
  *    no oracle telling a caller which names already exist
  *  - set list-item columns on an uploaded file (quarantine metadata)
+ *
+ * Accepted trade-off: a PUT that SharePoint committed but whose response was
+ * lost on the network is retried, the retry gets 409, and the file is stored
+ * again under the next `_n` name — in the same client folder. Checking the
+ * first name would be an existence probe, so instead the upload is logged as
+ * `sharepoint.possible_duplicate` (ids only) for staff to de-duplicate.
  */
 export class SharePointService {
   private readonly log: Logger;
@@ -140,20 +146,32 @@ export class SharePointService {
 
     await this.ensureFolderPath(target.driveId, cleanFolder);
 
+    // Set once a name is found taken right after a network failure on it:
+    // that earlier attempt may have been stored after all.
+    let mayBeStoredAlready = false;
     for (let n = 0; n <= MAX_NAME_SUFFIX; n++) {
       const candidate = n === 0 ? cleanFilename : `${name}_${n}${ext}`;
       const encodedPath = encodeGraphPath(`${cleanFolder}/${candidate}`);
-      const item =
+      const outcome =
         args.content.length <= SIMPLE_UPLOAD_LIMIT_BYTES
           ? await this.simpleUpload(target.driveId, encodedPath, args.content, args.contentType)
           : await this.chunkedUpload(target.driveId, encodedPath, args.content);
-      if (item === 'conflict') continue;
-      this.assertSameDrive(item, target.driveId);
+      if (isNameTaken(outcome)) {
+        mayBeStoredAlready ||= outcome.afterNetworkFailure;
+        continue;
+      }
+      this.assertSameDrive(outcome, target.driveId);
       this.log.info(
-        { driveItemId: item.id, sizeBytes: args.content.length, nameSuffix: n },
+        { driveItemId: outcome.id, sizeBytes: args.content.length, nameSuffix: n },
         'uploaded to SharePoint',
       );
-      return item;
+      if (mayBeStoredAlready) {
+        this.log.warn(
+          { event: 'sharepoint.possible_duplicate', driveItemId: outcome.id, nameSuffix: n },
+          'sharepoint.possible_duplicate',
+        );
+      }
+      return outcome;
     }
     throw new SharePointError('Too many filename collisions', 409);
   }
@@ -169,12 +187,11 @@ export class SharePointService {
   ): Promise<boolean> {
     const target = await this.getResolvedTarget();
     try {
-      await retry(
+      await this.withRetry(
         () =>
           this.graph
             .api(`/drives/${target.driveId}/items/${driveItemId}/listItem/fields`)
             .patch(fields) as Promise<unknown>,
-        this.retryOptions,
       );
       return true;
     } catch (err) {
@@ -312,13 +329,17 @@ export class SharePointService {
     }
   }
 
-  /** PUT that never overwrites. Returns `'conflict'` when the name is taken. */
+  /** PUT that never overwrites. */
   private async simpleUpload(
     driveId: string,
     encodedPath: string,
     content: Buffer,
     contentType: string,
-  ): Promise<DriveItemRef | 'conflict'> {
+  ): Promise<DriveItemRef | NameTaken> {
+    // The SDK's RetryHandler does not retry a PUT whose body it treats as a
+    // stream (`application/octet-stream`), so only then are 429/503/504 ours.
+    const sdkRetries = contentType !== 'application/octet-stream';
+    let networkFailed = false;
     try {
       return await retry(async () => {
         try {
@@ -328,13 +349,16 @@ export class SharePointService {
             .header('Content-Type', contentType)
             .put(content)) as DriveItemRef;
         } catch (err) {
-          if (isRetryableError(err)) throw err;
+          if (isNetworkFailure(err)) networkFailed = true;
+          if (isRetryableError(err, { sdkRetries })) throw err;
           throw new StatusAbort(err);
         }
       }, this.retryOptions);
     } catch (err) {
       const cause = err instanceof StatusAbort ? err.original : err;
-      if (graphStatus(cause) === 409) return 'conflict';
+      if (graphStatus(cause) === 409) {
+        return { nameTaken: true, afterNetworkFailure: networkFailed };
+      }
       if (graphStatus(cause) === 403) {
         throw new SharePointTargetError('forbidden', 'No write access to the target drive', cause);
       }
@@ -342,12 +366,12 @@ export class SharePointService {
     }
   }
 
-  /** Upload session that never overwrites. Returns `'conflict'` when the name is taken. */
+  /** Upload session that never overwrites. */
   private async chunkedUpload(
     driveId: string,
     encodedPath: string,
     content: Buffer,
-  ): Promise<DriveItemRef | 'conflict'> {
+  ): Promise<DriveItemRef | NameTaken> {
     let session: { uploadUrl: string };
     try {
       session = (await this.withRetry(() =>
@@ -356,7 +380,8 @@ export class SharePointService {
           .post({ item: { '@microsoft.graph.conflictBehavior': 'fail' } }),
       )) as { uploadUrl: string };
     } catch (err) {
-      if (graphStatus(err) === 409) return 'conflict';
+      // Creating a session stores nothing, so a 409 here is someone else's file.
+      if (graphStatus(err) === 409) return { nameTaken: true, afterNetworkFailure: false };
       if (graphStatus(err) === 403) {
         throw new SharePointTargetError('forbidden', 'No write access to the target drive', err);
       }
@@ -370,19 +395,27 @@ export class SharePointService {
       const chunk = content.subarray(offset, end);
       const rangeHeader = `bytes ${offset}-${end - 1}/${content.length}`;
 
+      let chunkNetworkFailed = false;
       let outcome: unknown;
       try {
         outcome = await retry(async () => {
-          const res = await this.fetchFn(session.uploadUrl, {
-            method: 'PUT',
-            headers: { 'Content-Length': String(chunk.length), 'Content-Range': rangeHeader },
-            body: chunk,
-          });
+          let res: Response;
+          try {
+            res = await this.fetchFn(session.uploadUrl, {
+              method: 'PUT',
+              headers: { 'Content-Length': String(chunk.length), 'Content-Range': rangeHeader },
+              body: chunk,
+            });
+          } catch (err) {
+            chunkNetworkFailed = true;
+            throw err;
+          }
           if (res.status === 202 || res.status === 200 || res.status === 201) {
             return (await res.json()) as unknown;
           }
           // A name taken while the session was open is reported on the last chunk.
           if (res.status === 409) return 'conflict' as const;
+          // No SDK middleware on this raw fetch: its throttling is ours to retry.
           if (res.status >= 500 || res.status === 429) {
             throw new Error(`Chunk upload HTTP ${res.status}`);
           }
@@ -394,7 +427,9 @@ export class SharePointService {
         throw new SharePointError('Upload failed', 502, err);
       }
 
-      if (outcome === 'conflict') return 'conflict';
+      if (outcome === 'conflict') {
+        return { nameTaken: true, afterNetworkFailure: chunkNetworkFailed };
+      }
       lastResponse = outcome;
       offset = end;
     }
@@ -461,6 +496,16 @@ export function splitExtension(filename: string): { name: string; ext: string } 
   return { name: filename.slice(0, i), ext: filename.slice(i) };
 }
 
+/** The name is taken. `afterNetworkFailure`: an earlier try at it may have been stored. */
+interface NameTaken {
+  readonly nameTaken: true;
+  readonly afterNetworkFailure: boolean;
+}
+
+function isNameTaken(outcome: DriveItemRef | NameTaken): outcome is NameTaken {
+  return 'nameTaken' in outcome;
+}
+
 /** Wraps a non-retryable Graph error so `retry` stops but the status survives. */
 class StatusAbort extends AbortRetryError {
   constructor(public readonly original: unknown) {
@@ -469,7 +514,7 @@ class StatusAbort extends AbortRetryError {
 }
 
 /**
- * Retry a Graph SDK call on 429/5xx and network failures only; any other
+ * Retry a Graph SDK call on network failures, 500 and 502 only; any other
  * error stops at once with its status intact (see {@link StatusAbort}).
  */
 async function withGraphRetry<T>(call: () => Promise<T>, opts: RetryOptions): Promise<T> {
@@ -527,11 +572,28 @@ export function forbiddenSiteKeys(ids: readonly string[]): ReadonlySet<string> {
   return keys;
 }
 
-function isRetryableError(err: unknown): boolean {
+/** The Graph SDK reports a failed fetch (reset, DNS, timeout) as statusCode -1. */
+function isNetworkFailure(err: unknown): boolean {
   const status = graphStatus(err);
-  // The Graph SDK reports a failed fetch (reset, DNS, timeout) as statusCode -1.
-  if (status === undefined || status <= 0) return true;
-  return status === 429 || (status >= 500 && status < 600);
+  return status === undefined || status <= 0;
+}
+
+/**
+ * Whether an app-level retry is worth it. The Graph SDK's RetryHandler
+ * already retries 429, 503 and 504 (up to three times, honouring
+ * Retry-After), so repeating those here multiplied a brownout past the
+ * Functions HTTP limit. Only failures the SDK does not retry are ours:
+ * network failures, 500 and 502 — plus 429/503/504 on a request the SDK
+ * would not retry (`sdkRetries: false`).
+ */
+function isRetryableError(
+  err: unknown,
+  opts: { readonly sdkRetries: boolean } = { sdkRetries: true },
+): boolean {
+  if (isNetworkFailure(err)) return true;
+  const status = graphStatus(err);
+  if (status === 500 || status === 502) return true;
+  return !opts.sdkRetries && (status === 429 || status === 503 || status === 504);
 }
 
 export function graphStatus(err: unknown): number | undefined {

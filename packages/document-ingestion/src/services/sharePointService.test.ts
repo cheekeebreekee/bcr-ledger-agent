@@ -134,7 +134,42 @@ describe('SharePointService.uploadDocument', () => {
     expect(put.path.endsWith('/FV%20%2312%20100%25.pdf:/content')).toBe(true);
   });
 
-  it('retries transient failures and succeeds', async () => {
+  it.each([
+    ['a network failure', network],
+    ['a 500', () => graphError(500)],
+    ['a 502', () => graphError(502)],
+  ])('retries %s on the PUT and succeeds', async (_label, failure) => {
+    let puts = 0;
+    const { client } = fakeGraph([
+      ...siteAndDrive,
+      [/^PUT /, () => {
+        puts += 1;
+        if (puts === 1) throw failure();
+        return { id: 'i', name: 'n', webUrl: 'u' };
+      }],
+    ]);
+    const svc = new SharePointService(client, target, { retry: { retries: 2, minTimeoutMs: 0 } });
+    await expect(svc.uploadDocument(doc)).resolves.toMatchObject({ id: 'i' });
+    expect(puts).toBe(2);
+  });
+
+  // The Graph SDK's RetryHandler already retried these; retrying them again
+  // multiplied a brownout past the Functions HTTP limit.
+  it.each([429, 503, 504])('leaves a %i on a PUT the SDK retries to the SDK', async (status) => {
+    let puts = 0;
+    const { client } = fakeGraph([
+      ...siteAndDrive,
+      [/^PUT /, () => {
+        puts += 1;
+        throw graphError(status);
+      }],
+    ]);
+    const svc = new SharePointService(client, target, { retry: { retries: 3, minTimeoutMs: 0 } });
+    await expect(svc.uploadDocument(doc)).rejects.toBeInstanceOf(SharePointError);
+    expect(puts).toBe(1);
+  });
+
+  it('retries a 503 on an octet-stream PUT, which the SDK does not retry', async () => {
     let puts = 0;
     const { client } = fakeGraph([
       ...siteAndDrive,
@@ -145,7 +180,9 @@ describe('SharePointService.uploadDocument', () => {
       }],
     ]);
     const svc = new SharePointService(client, target, { retry: { retries: 2, minTimeoutMs: 0 } });
-    await expect(svc.uploadDocument(doc)).resolves.toMatchObject({ id: 'i' });
+    await expect(
+      svc.uploadDocument({ ...doc, contentType: 'application/octet-stream' }),
+    ).resolves.toMatchObject({ id: 'i' });
     expect(puts).toBe(2);
   });
 
@@ -279,6 +316,24 @@ describe('SharePointService transient failures', () => {
     });
   });
 
+  it.each([
+    [503, 1],
+    [429, 1],
+    [504, 1],
+    [500, 3],
+    [502, 3],
+  ])('tries a site lookup that gets %i %i time(s): the SDK retries 429/503/504', async (status, expected) => {
+    let gets = 0;
+    const { client } = fakeGraph([
+      [/^GET \/sites\/contoso/, () => {
+        gets += 1;
+        throw graphError(status);
+      }],
+    ]);
+    const svc = new SharePointService(client, target, { retry: { retries: 2, minTimeoutMs: 0 } });
+    await expect(svc.uploadDocument(doc)).rejects.toBeInstanceOf(SharePointError);
+    expect(gets).toBe(expected);
+  });
 });
 
 const BCR_GROUP = '11111111-1111-1111-1111-111111111111';
@@ -419,6 +474,48 @@ describe('cachedSiteIdLookup', () => {
   });
 });
 
+describe('SharePointService possible duplicates', () => {
+  it('logs a possible duplicate when a name is taken right after a network failure on it', async () => {
+    let puts = 0;
+    const { client } = fakeGraph([
+      ...siteAndDrive,
+      [/^PUT /, () => {
+        puts += 1;
+        // SharePoint stored the first PUT, but its response was lost.
+        if (puts === 1) throw network();
+        if (puts === 2) throw graphError(409);
+        return { id: 'item-2', name: 'faktura_1.pdf', webUrl: 'u' };
+      }],
+    ]);
+    const { log, lines } = recordingLogger();
+    const svc = new SharePointService(client, target, { retry: { retries: 1, minTimeoutMs: 0 }, log });
+    await expect(svc.uploadDocument(doc)).resolves.toMatchObject({ name: 'faktura_1.pdf' });
+    expect(lines.filter((l) => l['event'] === 'sharepoint.possible_duplicate')).toEqual([
+      {
+        event: 'sharepoint.possible_duplicate',
+        driveItemId: 'item-2',
+        nameSuffix: 1,
+        msg: 'sharepoint.possible_duplicate',
+      },
+    ]);
+  });
+
+  it('does not log one for an ordinary name conflict', async () => {
+    let puts = 0;
+    const { client } = fakeGraph([
+      ...siteAndDrive,
+      [/^PUT /, () => {
+        puts += 1;
+        if (puts === 1) throw graphError(409);
+        return { id: 'item-2', name: 'faktura_1.pdf', webUrl: 'u' };
+      }],
+    ]);
+    const { log, lines } = recordingLogger();
+    await new SharePointService(client, target, { ...noRetry, log }).uploadDocument(doc);
+    expect(lines.some((l) => l['event'] === 'sharepoint.possible_duplicate')).toBe(false);
+  });
+});
+
 describe('SharePointService chunked upload', () => {
   const big = Buffer.alloc(5 * 1024 * 1024, 1); // > 4 MiB simple-upload limit
 
@@ -476,6 +573,32 @@ describe('SharePointService chunked upload', () => {
     expect(sessions).toBe(2);
   });
 
+  it('logs a possible duplicate when the last chunk is taken after a network failure on it', async () => {
+    let sessions = 0;
+    const { client } = fakeGraph([
+      ...siteAndDrive,
+      [/createUploadSession$/, () => {
+        sessions += 1;
+        return { uploadUrl: `https://upload.example/s${sessions}` };
+      }],
+    ]);
+    // Session 1: the last chunk is stored but its response is lost; the retry gets 409.
+    const outcomes: (number | Error)[] = [202, 202, 202, new TypeError('fetch failed'), 409];
+    outcomes.push(202, 202, 202, 201); // session 2, under the next name
+    const fetchFn = jest.fn(async () => {
+      const next = outcomes.shift() ?? 500;
+      if (next instanceof Error) throw next;
+      const json = async () => ({ id: 'big-item', name: 'big_1.pdf', webUrl: 'u' });
+      return { status: next, json } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const { log, lines } = recordingLogger();
+    const retry = { retries: 1, minTimeoutMs: 0 };
+    const svc = new SharePointService(client, target, { retry, fetch: fetchFn, log });
+    await expect(svc.uploadDocument({ ...doc, content: big })).resolves.toMatchObject({ id: 'big-item' });
+    expect(sessions).toBe(2);
+    expect(lines.filter((l) => l['event'] === 'sharepoint.possible_duplicate')).toHaveLength(1);
+  });
+
   it('stops on a non-retryable chunk failure with a SharePointError the pipeline can quarantine', async () => {
     const { client } = fakeGraph([...siteAndDrive, [/createUploadSession$/, () => ({ uploadUrl: 'https://upload.example/s' })]]);
     const svc = new SharePointService(client, target, { ...noRetry, fetch: fetchReturning([400]) });
@@ -501,13 +624,27 @@ describe('SharePointService.setListItemFields', () => {
     expect(patch.body).toEqual({ QuarantineReason: 'unmapped' });
   });
 
-  it('returns false instead of failing the upload', async () => {
-    const { client } = fakeGraph([...siteAndDrive, [/^PATCH /, () => { throw graphError(400); }]]);
-    await expect(
-      new SharePointService(client, target, noRetry).setListItemFields('item-9', { a: 'b' }),
-    ).resolves.toBe(false);
+  it('returns false instead of failing the upload, without retrying a 400', async () => {
+    const { client, calls } = fakeGraph([...siteAndDrive, [/^PATCH /, () => { throw graphError(400); }]]);
+    const svc = new SharePointService(client, target, { retry: { retries: 3, minTimeoutMs: 0 } });
+    await expect(svc.setListItemFields('item-9', { a: 'b' })).resolves.toBe(false);
+    expect(calls.filter((c) => c.method === 'patch')).toHaveLength(1);
   });
 
+  it('retries a network failure', async () => {
+    let patches = 0;
+    const { client } = fakeGraph([
+      ...siteAndDrive,
+      [/^PATCH /, () => {
+        patches += 1;
+        if (patches === 1) throw network();
+        return {};
+      }],
+    ]);
+    const svc = new SharePointService(client, target, { retry: { retries: 1, minTimeoutMs: 0 } });
+    await expect(svc.setListItemFields('item-9', { a: 'b' })).resolves.toBe(true);
+    expect(patches).toBe(2);
+  });
 });
 
 describe('helpers', () => {
