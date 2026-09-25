@@ -2,7 +2,9 @@ import type { Client } from '@microsoft/microsoft-graph-client';
 import {
   createLogger,
   SharePointError,
+  ValidationError,
   type DriveItemRef,
+  type Logger,
   type ResolvedSharePointTarget,
   type SharePointTarget,
 } from '@bcr/shared';
@@ -26,6 +28,8 @@ const CHUNK_SIZE_BYTES = 5 * 320 * 1024; // ~1.5 MiB
 /** Name attempts per upload: the original, then `_1` … `_10`. */
 const MAX_NAME_SUFFIX = 10;
 
+const DEFAULT_RETRY: RetryOptions = { retries: 3, minTimeoutMs: 250, factor: 2 };
+
 export interface UploadDocumentArgs {
   readonly folderPath: string;
   readonly filename: string;
@@ -36,36 +40,72 @@ export interface UploadDocumentArgs {
 /**
  * A target that cannot be used, as opposed to a transient write failure.
  * The ingestion pipeline sends the document to quarantine instead:
- * `drive_mismatch` means the path now resolves to a different drive than
- * the one recorded for the client (a recreated Team can take the same URL).
+ *
+ *  - `drive_mismatch`: the path now resolves to a different drive than the
+ *    one recorded for the client (a recreated Team can take the same URL).
+ *  - `forbidden_site`: the path resolves to a site nothing may be filed to
+ *    (BCR GROUP, or the quarantine for a client target). An incident
+ *    indicator, not a grant problem — it is logged as
+ *    `sharepoint.forbidden_site` and quarantined as `forbidden_target`.
+ *  - `forbidden`: Graph refused access (401/403) — a missing or
+ *    not-yet-propagated grant.
+ *  - `site_not_found` / `drive_not_found`: the site or drive is gone.
  */
 export class SharePointTargetError extends SharePointError {
   constructor(
-    public readonly kind: 'drive_mismatch' | 'site_not_found' | 'drive_not_found' | 'forbidden',
+    public readonly kind:
+      | 'drive_mismatch'
+      | 'site_not_found'
+      | 'drive_not_found'
+      | 'forbidden'
+      | 'forbidden_site',
     message: string,
     cause?: unknown,
   ) {
-    super(message, kind === 'forbidden' ? 403 : kind === 'drive_mismatch' ? 409 : 404, cause);
+    super(
+      message,
+      kind === 'forbidden' || kind === 'forbidden_site'
+        ? 403
+        : kind === 'drive_mismatch'
+          ? 409
+          : 404,
+      cause,
+    );
   }
 }
+
+/** Resolves the Graph id of a site nothing may be filed to. May reject. */
+export type SiteIdLookup = () => Promise<string>;
 
 export interface SharePointServiceOptions {
   /** Retry policy for transient Graph failures. Injected short in tests. */
   readonly retry?: RetryOptions;
   /**
-   * Graph site ids nothing may be written to (BCR GROUP). Checked on the
-   * RESOLVED site, so no spelling of a Directory path can reach them.
+   * Graph site ids (`host,siteCollectionGuid,webGuid`, or the GUID alone)
+   * nothing may be written to: BCR GROUP. Checked on the RESOLVED site's
+   * collection, so no spelling of a Directory path — and no subweb — can
+   * reach them. An id that is not in one of those forms is refused at
+   * construction: a guard that can never match would guard nothing.
    */
   readonly forbiddenSiteIds?: readonly string[];
+  /**
+   * Further forbidden sites whose ids are looked up rather than configured:
+   * the quarantine, for client targets. A lookup that fails refuses the
+   * target (fail closed) — it can't be shown not to be the forbidden site.
+   */
+  readonly forbiddenSiteLookups?: readonly SiteIdLookup[];
   /** Injected in tests; defaults to global `fetch` (upload-session chunks). */
   readonly fetch?: typeof fetch;
+  /** Injected in tests; defaults to the `ingestion/sharePointService` logger. */
+  readonly log?: Logger;
 }
 
 /**
  * Thin SharePoint façade over Microsoft Graph. Exposes only the operations
  * the ingestion API actually needs:
  *
- *  - resolve site + drive ids (cached), checking the recorded drive id
+ *  - resolve site + drive ids (cached), refusing a forbidden site and
+ *    checking the recorded drive id
  *  - ensure a folder hierarchy exists
  *  - upload a file without ever overwriting (`conflictBehavior=fail`), taking
  *    the next free `_n` name on a 409 — no existence probes, so no race and
@@ -73,10 +113,11 @@ export interface SharePointServiceOptions {
  *  - set list-item columns on an uploaded file (quarantine metadata)
  */
 export class SharePointService {
-  private readonly log = createLogger('ingestion/sharePointService');
+  private readonly log: Logger;
   private readonly retryOptions: RetryOptions;
   private readonly fetchFn: typeof fetch;
-  private readonly forbiddenSiteIds: ReadonlySet<string>;
+  private readonly forbiddenSiteKeys: ReadonlySet<string>;
+  private readonly forbiddenSiteLookups: readonly SiteIdLookup[];
   private resolvedTarget: Promise<ResolvedSharePointTarget> | undefined;
 
   constructor(
@@ -84,9 +125,11 @@ export class SharePointService {
     private readonly target: SharePointTarget,
     opts: SharePointServiceOptions = {},
   ) {
-    this.retryOptions = opts.retry ?? { retries: 3, minTimeoutMs: 250, factor: 2 };
+    this.log = opts.log ?? createLogger('ingestion/sharePointService');
+    this.retryOptions = opts.retry ?? DEFAULT_RETRY;
     this.fetchFn = opts.fetch ?? fetch;
-    this.forbiddenSiteIds = new Set((opts.forbiddenSiteIds ?? []).map(siteCollectionKey));
+    this.forbiddenSiteKeys = forbiddenSiteKeys(opts.forbiddenSiteIds ?? []);
+    this.forbiddenSiteLookups = opts.forbiddenSiteLookups ?? [];
   }
 
   async uploadDocument(args: UploadDocumentArgs): Promise<DriveItemRef> {
@@ -120,7 +163,10 @@ export class SharePointService {
    * `UploaderOid` / `QuarantineReason`. Best-effort: the upload already
    * happened, and the same facts are in the audit log event.
    */
-  async setListItemFields(driveItemId: string, fields: Readonly<Record<string, string>>): Promise<boolean> {
+  async setListItemFields(
+    driveItemId: string,
+    fields: Readonly<Record<string, string>>,
+  ): Promise<boolean> {
     const target = await this.getResolvedTarget();
     try {
       await retry(
@@ -132,7 +178,10 @@ export class SharePointService {
       );
       return true;
     } catch (err) {
-      this.log.warn({ err: describeGraphError(err), driveItemId }, 'setting list-item fields failed');
+      this.log.warn(
+        { err: describeGraphError(err), driveItemId },
+        'setting list-item fields failed',
+      );
       return false;
     }
   }
@@ -160,9 +209,7 @@ export class SharePointService {
     } catch (err) {
       throw classifyTargetError(err, 'site_not_found', 'Site could not be resolved');
     }
-    if (this.forbiddenSiteIds.has(siteCollectionKey(site.id))) {
-      throw new SharePointTargetError('forbidden', 'The target resolves to a site nothing may be filed to');
-    }
+    await this.assertSiteAllowed(site.id);
     let drives: { value: { id: string; name: string }[] };
     try {
       drives = (await this.withRetry(() =>
@@ -182,6 +229,43 @@ export class SharePointService {
       );
     }
     return { ...this.target, siteId: site.id, driveId: drive.id };
+  }
+
+  /**
+   * Refuse a resolved site in a forbidden site collection, before anything
+   * is listed or written there. Anything that cannot be compared — a site id
+   * in an unexpected form, a forbidden site that cannot be looked up — is
+   * refused too: the guard fails closed.
+   */
+  private async assertSiteAllowed(siteId: string): Promise<void> {
+    if (this.forbiddenSiteKeys.size === 0 && this.forbiddenSiteLookups.length === 0) return;
+    const key = siteCollectionKey(siteId);
+    if (!key) throw new SharePointError('The resolved site id could not be checked', 502);
+    if (this.forbiddenSiteKeys.has(key)) throw this.forbiddenSite(key);
+    for (const lookup of this.forbiddenSiteLookups) {
+      let forbiddenId: string;
+      try {
+        forbiddenId = await lookup();
+      } catch (err) {
+        throw new SharePointError('A forbidden site could not be looked up', 502, err);
+      }
+      const forbiddenKey = siteCollectionKey(forbiddenId);
+      if (!forbiddenKey) throw new SharePointError('A forbidden site id could not be checked', 502);
+      if (forbiddenKey === key) throw this.forbiddenSite(key);
+    }
+  }
+
+  private forbiddenSite(siteCollectionId: string): SharePointTargetError {
+    // Ids only: the collection GUID says which guarded site it was, and the
+    // pipeline's own line carries the client and Directory row.
+    this.log.error(
+      { event: 'sharepoint.forbidden_site', siteCollectionId },
+      'sharepoint.forbidden_site',
+    );
+    return new SharePointTargetError(
+      'forbidden_site',
+      'The target resolves to a site nothing may be filed to',
+    );
   }
 
   /**
@@ -214,7 +298,9 @@ export class SharePointService {
       let item: { id: string };
       try {
         item = (await this.withRetry(() =>
-          this.graph.api(`/drives/${driveId}/items/${parent}:/${encodeURIComponent(segment)}`).get(),
+          this.graph
+            .api(`/drives/${driveId}/items/${parent}:/${encodeURIComponent(segment)}`)
+            .get(),
         )) as { id: string };
       } catch (err) {
         if (graphStatus(err) === 403) {
@@ -315,23 +401,8 @@ export class SharePointService {
     return lastResponse as DriveItemRef;
   }
 
-  /**
-   * Retry a Graph call on 429/5xx and network failures only; any other error
-   * stops at once with its status intact (see {@link StatusAbort}).
-   */
-  private async withRetry<T>(call: () => Promise<T>): Promise<T> {
-    try {
-      return await retry(async () => {
-        try {
-          return await call();
-        } catch (err) {
-          if (isRetryableError(err)) throw err;
-          throw new StatusAbort(err);
-        }
-      }, this.retryOptions);
-    } catch (err) {
-      throw err instanceof StatusAbort ? err.original : err;
-    }
+  private withRetry<T>(call: () => Promise<T>): Promise<T> {
+    return withGraphRetry(call, this.retryOptions);
   }
 
   /**
@@ -345,9 +416,39 @@ export class SharePointService {
         { event: 'sharepoint.drive_mismatch', driveItemId: item.id },
         'uploaded item is not in the addressed drive',
       );
-      throw new SharePointTargetError('drive_mismatch', 'Uploaded item landed in an unexpected drive');
+      throw new SharePointTargetError(
+        'drive_mismatch',
+        'Uploaded item landed in an unexpected drive',
+      );
     }
   }
+}
+
+/**
+ * A lookup of one site's Graph id (`GET /sites/{host}:/{path}`), for
+ * {@link SharePointServiceOptions.forbiddenSiteLookups}. The first success is
+ * kept for the life of the process; a failure is not, so the next upload asks
+ * again — and is refused meanwhile.
+ */
+export function cachedSiteIdLookup(
+  graph: Client,
+  site: Pick<SharePointTarget, 'siteHostname' | 'sitePath'>,
+  opts: { readonly retry?: RetryOptions } = {},
+): SiteIdLookup {
+  const path = `/sites/${site.siteHostname}:/${encodeGraphPath(site.sitePath)}`;
+  let pending: Promise<string> | undefined;
+  return () => {
+    if (!pending) {
+      const get = () => graph.api(path).get() as Promise<{ id: string }>;
+      pending = withGraphRetry(get, opts.retry ?? DEFAULT_RETRY)
+        .then((found) => found.id)
+        .catch((err: unknown) => {
+          pending = undefined;
+          throw err;
+        });
+    }
+    return pending;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +468,25 @@ class StatusAbort extends AbortRetryError {
   }
 }
 
+/**
+ * Retry a Graph SDK call on 429/5xx and network failures only; any other
+ * error stops at once with its status intact (see {@link StatusAbort}).
+ */
+async function withGraphRetry<T>(call: () => Promise<T>, opts: RetryOptions): Promise<T> {
+  try {
+    return await retry(async () => {
+      try {
+        return await call();
+      } catch (err) {
+        if (isRetryableError(err)) throw err;
+        throw new StatusAbort(err);
+      }
+    }, opts);
+  } catch (err) {
+    throw err instanceof StatusAbort ? err.original : err;
+  }
+}
+
 function classifyTargetError(
   err: unknown,
   notFoundKind: 'site_not_found' | 'drive_not_found',
@@ -378,13 +498,33 @@ function classifyTargetError(
   return new SharePointError(message, 502, err);
 }
 
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 /**
- * Graph site ids are `hostname,siteCollectionGuid,webGuid`; a setting may hold
- * the full id or the GUID alone. Both compare by the site collection GUID.
+ * The site-collection GUID (lower-case) of a Graph site id
+ * (`hostname,siteCollectionGuid,webGuid`) or of a bare GUID; `null` for
+ * anything else — Graph's path form `host:/sites/X:` or a two-part id would
+ * never equal a resolved site's collection, so they are not guessed at.
  */
-function siteCollectionKey(id: string): string {
+export function siteCollectionKey(id: string): string | null {
   const parts = id.trim().toLowerCase().split(',');
-  return (parts.length === 3 ? parts[1] : parts[0]) ?? '';
+  const guid = parts.length === 3 ? parts[1] : parts.length === 1 ? parts[0] : undefined;
+  return guid && GUID.test(guid) ? guid : null;
+}
+
+/** The collection keys of the configured forbidden sites; refuses any it can't read. */
+export function forbiddenSiteKeys(ids: readonly string[]): ReadonlySet<string> {
+  const keys = new Set<string>();
+  for (const id of ids) {
+    const key = siteCollectionKey(id);
+    if (!key) {
+      throw new ValidationError(
+        'A forbidden site id is not a Graph site id (host,siteGuid,webGuid)',
+      );
+    }
+    keys.add(key);
+  }
+  return keys;
 }
 
 function isRetryableError(err: unknown): boolean {
@@ -405,8 +545,10 @@ export function graphStatus(err: unknown): number | undefined {
 }
 
 /** Status and Graph error code only — never the request URL (it contains paths). */
-function describeGraphError(err: unknown): { status: number | undefined; code: string | undefined } {
-  const code =
-    err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+function describeGraphError(err: unknown): {
+  status: number | undefined;
+  code: string | undefined;
+} {
+  const code = err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
   return { status: graphStatus(err), code: typeof code === 'string' ? code : undefined };
 }

@@ -16,13 +16,27 @@ import {
 import type { ClientResolver } from './clientResolver';
 import { SharePointTargetError, type SharePointService } from './sharePointService';
 
+/** Where documents are written, as a narrow interface so tests can supply fakes. */
+export interface SharePointFactoryLike {
+  forTarget(
+    target: SharePointTarget,
+  ): Pick<SharePointService, 'uploadDocument' | 'setListItemFields'>;
+}
+
 /** The collaborators, as narrow interfaces so tests can supply fakes. */
 export interface BatchIngestorDeps {
   readonly resolver: Pick<ClientResolver, 'resolve' | 'resolvePostClassification' | 'quarantine'>;
   readonly classification: { classify(ctx: ClassifierContext): Promise<Classification> };
-  readonly sharePointFactory: {
-    forTarget(target: SharePointTarget): Pick<SharePointService, 'uploadDocument' | 'setListItemFields'>;
-  };
+  /**
+   * For client targets. Refuses a target that resolves to BCR GROUP or to
+   * the quarantine site (`forbidden_site`).
+   */
+  readonly clientSharePointFactory: SharePointFactoryLike;
+  /**
+   * For the quarantine target only. It must not share the client factory's
+   * guard, which would refuse the quarantine site itself.
+   */
+  readonly quarantineSharePointFactory: SharePointFactoryLike;
   readonly now?: () => Date;
   readonly newId?: () => string;
 }
@@ -62,7 +76,12 @@ export class BatchIngestor {
     };
     log.info(
       resolved.source === 'directory'
-        ? { resolution: 'directory', clientId: resolved.clientId, listItemId: resolved.listItemId }
+        ? {
+            resolution: 'directory',
+            clientId: resolved.clientId,
+            listItemId: resolved.listItemId,
+            teamId: resolved.teamId,
+          }
         : { resolution: 'quarantine', quarantineReason: resolved.reason },
       'client resolved',
     );
@@ -86,7 +105,14 @@ export class BatchIngestor {
       docLog.info({ sizeBytes: content.length }, 'document received');
 
       if (resolved.source === 'quarantine') {
-        return await this.quarantineOne(document, content, resolved.reason, documentId, batch, docLog);
+        return await this.quarantineOne(
+          document,
+          content,
+          resolved.reason,
+          documentId,
+          batch,
+          docLog,
+        );
       }
       try {
         return await this.fileForClient(document, content, resolved, documentId, docLog);
@@ -94,12 +120,16 @@ export class BatchIngestor {
         // A client whose space can't be written must not lose the document,
         // and must not have it written anywhere else. Hold it for staff.
         if (err instanceof SharePointTargetError || isSharePointFailure(err)) {
-          const reason: QuarantineReason =
-            err instanceof SharePointTargetError && err.kind === 'drive_mismatch'
-              ? 'stale_directory'
-              : 'target_unwritable';
+          const kind = err instanceof SharePointTargetError ? err.kind : undefined;
+          const reason = quarantineReasonFor(kind);
           docLog.warn(
-            { clientId: resolved.clientId, listItemId: resolved.listItemId, quarantineReason: reason },
+            {
+              clientId: resolved.clientId,
+              listItemId: resolved.listItemId,
+              teamId: resolved.teamId,
+              quarantineReason: reason,
+              ...(kind ? { targetErrorKind: kind } : {}),
+            },
             'client target unusable — holding document in quarantine',
           );
           return await this.quarantineOne(document, content, reason, documentId, batch, docLog);
@@ -137,7 +167,7 @@ export class BatchIngestor {
     const post = this.deps.resolver.resolvePostClassification(client, classified);
     const category = String(post.classification.fields.category ?? '');
 
-    const item = await this.deps.sharePointFactory.forTarget(client.target).uploadDocument({
+    const item = await this.deps.clientSharePointFactory.forTarget(client.target).uploadDocument({
       folderPath: post.classification.folderPath,
       filename: document.filename,
       contentType: document.contentType,
@@ -149,6 +179,7 @@ export class BatchIngestor {
         documentId,
         clientId: client.clientId,
         listItemId: client.listItemId,
+        teamId: client.teamId,
         category,
         driveItemId: item.id,
         ...(post.directionCorrection ? { directionCorrection: post.directionCorrection } : {}),
@@ -190,7 +221,7 @@ export class BatchIngestor {
       batch.batchId,
     ].join('/');
 
-    const sharePoint = this.deps.sharePointFactory.forTarget(target);
+    const sharePoint = this.deps.quarantineSharePointFactory.forTarget(target);
     let item;
     try {
       item = await sharePoint.uploadDocument({
@@ -234,6 +265,23 @@ interface BatchContext {
   readonly batchId: string;
   readonly uploaderOid: string;
   readonly log: Logger;
+}
+
+/**
+ * Why a client document is held when its target fails. A resolved site that
+ * is BCR GROUP or the quarantine is an incident indicator, kept apart from a
+ * missing grant; a drive that no longer matches the row means the Directory
+ * is out of date.
+ */
+function quarantineReasonFor(kind: SharePointTargetError['kind'] | undefined): QuarantineReason {
+  switch (kind) {
+    case 'forbidden_site':
+      return 'forbidden_target';
+    case 'drive_mismatch':
+      return 'stale_directory';
+    default:
+      return 'target_unwritable';
+  }
 }
 
 function isSharePointFailure(err: unknown): boolean {

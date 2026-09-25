@@ -1,6 +1,14 @@
 import type { Client } from '@microsoft/microsoft-graph-client';
-import { SharePointError, type SharePointTarget } from '@bcr/shared';
-import { SharePointService, SharePointTargetError, graphStatus, splitExtension } from './sharePointService';
+import { SharePointError, ValidationError, type Logger, type SharePointTarget } from '@bcr/shared';
+import {
+  cachedSiteIdLookup,
+  forbiddenSiteKeys,
+  graphStatus,
+  SharePointService,
+  SharePointTargetError,
+  siteCollectionKey,
+  splitExtension,
+} from './sharePointService';
 
 const target: SharePointTarget = {
   siteHostname: 'contoso.sharepoint.com',
@@ -49,6 +57,16 @@ function fakeGraph(handlers: [RegExp, Handler][]): { client: Client; calls: Call
 }
 
 const graphError = (statusCode: number) => Object.assign(new Error(`HTTP ${statusCode}`), { statusCode });
+const network = () => Object.assign(new Error('fetch failed'), { statusCode: -1 });
+
+/** A logger that records every call, so tests can assert what reaches the logs. */
+function recordingLogger(): { log: Logger; lines: Record<string, unknown>[] } {
+  const lines: Record<string, unknown>[] = [];
+  const write = (obj: unknown, msg?: string) =>
+    lines.push({ ...(typeof obj === 'object' && obj ? obj : { msg: obj }), msg });
+  const log = { info: write, warn: write, error: write, debug: write } as unknown as Logger;
+  return { log, lines };
+}
 
 const siteAndDrive: [RegExp, Handler][] = [
   [/^GET \/sites\/contoso\.sharepoint\.com:\/sites\/ClientA$/, () => ({ id: 'site-1' })],
@@ -217,9 +235,7 @@ describe('SharePointService target resolution', () => {
   });
 });
 
-describe('SharePointService transient failures and forbidden sites', () => {
-  const network = () => Object.assign(new Error('fetch failed'), { statusCode: -1 });
-
+describe('SharePointService transient failures', () => {
   it('retries a network failure on every Graph call before the upload', async () => {
     const failed = new Set<string>();
     const flaky = (h: Handler): Handler => (c) => {
@@ -263,19 +279,143 @@ describe('SharePointService transient failures and forbidden sites', () => {
     });
   });
 
+});
+
+const BCR_GROUP = '11111111-1111-1111-1111-111111111111';
+const QUARANTINE = '22222222-2222-2222-2222-222222222222';
+const WEB = '33333333-3333-3333-3333-333333333333';
+const OTHER_WEB = '44444444-4444-4444-4444-444444444444';
+const CLIENT_SITE = '55555555-5555-5555-5555-555555555555';
+const siteId = (collection: string, web = WEB) => `contoso.sharepoint.com,${collection},${web}`;
+
+/** Graph where the client's path resolves to `resolvedSiteId`; everything else would succeed. */
+function graphResolvingTo(resolvedSiteId: string) {
+  return fakeGraph([
+    [/^GET \/sites\/contoso\.sharepoint\.com:\/sites\/ClientA$/, () => ({ id: resolvedSiteId })],
+    [/^GET \/sites\/[^/]+\/drives$/, () => ({ value: [{ id: 'drive-1', name: 'Dokumenty' }] })],
+    [/^POST /, () => ({})],
+    [/^GET \/drives\//, () => ({ id: 'folder' })],
+    [/^PUT /, () => ({ id: 'i', name: 'n', webUrl: 'u' })],
+  ]);
+}
+
+describe('SharePointService forbidden sites', () => {
   it.each([
-    ['the same full id', 'contoso.sharepoint.com,AAAA-1,web-1'],
-    ['the site collection GUID alone', 'aaaa-1'],
-    ['the same collection with another web', 'contoso.sharepoint.com,aaaa-1,web-2'],
+    ['the same full id', siteId(BCR_GROUP)],
+    ['the site collection GUID alone', BCR_GROUP],
+    ['the same collection with another web (a subweb)', siteId(BCR_GROUP, OTHER_WEB)],
+    ['upper case', siteId(BCR_GROUP).toUpperCase()],
   ])('refuses to write to a forbidden site given as %s, whatever path led there', async (_label, forbidden) => {
-    const { client, calls } = fakeGraph([
-      [/^GET \/sites\/contoso\.sharepoint\.com:\/sites\/ClientA$/, () => ({ id: 'contoso.sharepoint.com,aaaa-1,web-1' })],
-      [/^GET /, () => ({ value: [] })],
-      [/^PUT /, () => ({ id: 'i', name: 'n', webUrl: 'u' })],
-    ]);
-    const svc = new SharePointService(client, target, { ...noRetry, forbiddenSiteIds: [forbidden] });
-    await expect(svc.uploadDocument(doc)).rejects.toMatchObject({ kind: 'forbidden' });
+    const { client, calls } = graphResolvingTo(siteId(BCR_GROUP));
+    const { log, lines } = recordingLogger();
+    const svc = new SharePointService(client, target, { ...noRetry, forbiddenSiteIds: [forbidden], log });
+    await expect(svc.uploadDocument(doc)).rejects.toMatchObject({ kind: 'forbidden_site', httpStatus: 403 });
     expect(calls.map((c) => c.method)).toEqual(['get']);
+    expect(lines.filter((l) => l['event'] === 'sharepoint.forbidden_site')).toEqual([
+      { event: 'sharepoint.forbidden_site', siteCollectionId: BCR_GROUP, msg: 'sharepoint.forbidden_site' },
+    ]);
+  });
+
+  it('refuses a client target that resolves into the looked-up quarantine collection', async () => {
+    const { client, calls } = graphResolvingTo(siteId(QUARANTINE, OTHER_WEB));
+    const lookup = jest.fn(async () => siteId(QUARANTINE));
+    const svc = new SharePointService(client, target, {
+      ...noRetry,
+      forbiddenSiteIds: [siteId(BCR_GROUP)],
+      forbiddenSiteLookups: [lookup],
+      log: recordingLogger().log,
+    });
+    await expect(svc.uploadDocument(doc)).rejects.toMatchObject({ kind: 'forbidden_site' });
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'get /sites/contoso.sharepoint.com:/sites/ClientA',
+    ]);
+  });
+
+  it('files into an allowed site and looks the quarantine up once for the life of the service', async () => {
+    const { client } = graphResolvingTo(siteId(CLIENT_SITE));
+    const lookup = jest.fn(async () => siteId(QUARANTINE));
+    const svc = new SharePointService(client, target, {
+      ...noRetry,
+      forbiddenSiteIds: [siteId(BCR_GROUP)],
+      forbiddenSiteLookups: [lookup],
+    });
+    await expect(svc.uploadDocument(doc)).resolves.toMatchObject({ id: 'i' });
+    await expect(svc.uploadDocument(doc)).resolves.toMatchObject({ id: 'i' });
+    expect(lookup).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['cannot be looked up', () => Promise.reject(graphError(503))],
+    ['comes back in a form that cannot be compared', async () => 'contoso.sharepoint.com:/sites/Q:'],
+  ])('refuses the target (fail closed) when the quarantine site %s', async (_label, lookup) => {
+    const { client, calls } = graphResolvingTo(siteId(CLIENT_SITE));
+    const svc = new SharePointService(client, target, { ...noRetry, forbiddenSiteLookups: [lookup] });
+    const err = await svc.uploadDocument(doc).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SharePointError);
+    expect(err).not.toBeInstanceOf(SharePointTargetError);
+    expect(calls.map((c) => c.method)).toEqual(['get']);
+  });
+
+  it('refuses a resolved site id it cannot compare', async () => {
+    const { client, calls } = graphResolvingTo('contoso.sharepoint.com,not-a-guid');
+    const svc = new SharePointService(client, target, { ...noRetry, forbiddenSiteIds: [siteId(BCR_GROUP)] });
+    const err = await svc.uploadDocument(doc).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SharePointError);
+    expect(err).not.toBeInstanceOf(SharePointTargetError);
+    expect(calls.map((c) => c.method)).toEqual(['get']);
+  });
+
+  it.each([
+    ["Graph's path form", 'contoso.sharepoint.com:/sites/BCRGROUP:'],
+    ['a two-part id', `contoso.sharepoint.com,${BCR_GROUP}`],
+    ['placeholder GUIDs', 'contoso.sharepoint.com,site-guid,web-guid'],
+  ])('will not be built with a forbidden site id in %s, which could never match', (_label, id) => {
+    const { client } = fakeGraph([]);
+    expect(() => new SharePointService(client, target, { forbiddenSiteIds: [id] })).toThrow(ValidationError);
+  });
+});
+
+describe('cachedSiteIdLookup', () => {
+  const quarantineSite = { siteHostname: 'contoso.sharepoint.com', sitePath: '/sites/Kwarantanna' };
+
+  it('looks the site up by host and path, once', async () => {
+    const { client, calls } = fakeGraph([[/^GET \/sites\//, () => ({ id: siteId(QUARANTINE) })]]);
+    const lookup = cachedSiteIdLookup(client, quarantineSite, noRetry);
+    await expect(lookup()).resolves.toBe(siteId(QUARANTINE));
+    await expect(lookup()).resolves.toBe(siteId(QUARANTINE));
+    expect(calls.map((c) => c.path)).toEqual(['/sites/contoso.sharepoint.com:/sites/Kwarantanna']);
+  });
+
+  it('does not keep a failure, so the next upload asks again', async () => {
+    let first = true;
+    const { client, calls } = fakeGraph([
+      [/^GET \/sites\//, () => {
+        if (first) {
+          first = false;
+          throw graphError(503);
+        }
+        return { id: siteId(QUARANTINE) };
+      }],
+    ]);
+    const lookup = cachedSiteIdLookup(client, quarantineSite, noRetry);
+    await expect(lookup()).rejects.toMatchObject({ statusCode: 503 });
+    await expect(lookup()).resolves.toBe(siteId(QUARANTINE));
+    expect(calls).toHaveLength(2);
+  });
+
+  it('retries a network failure', async () => {
+    let first = true;
+    const { client } = fakeGraph([
+      [/^GET \/sites\//, () => {
+        if (first) {
+          first = false;
+          throw network();
+        }
+        return { id: siteId(QUARANTINE) };
+      }],
+    ]);
+    const lookup = cachedSiteIdLookup(client, quarantineSite, { retry: { retries: 1, minTimeoutMs: 0 } });
+    await expect(lookup()).resolves.toBe(siteId(QUARANTINE));
   });
 });
 
@@ -367,6 +507,7 @@ describe('SharePointService.setListItemFields', () => {
       new SharePointService(client, target, noRetry).setListItemFields('item-9', { a: 'b' }),
     ).resolves.toBe(false);
   });
+
 });
 
 describe('helpers', () => {
@@ -374,6 +515,15 @@ describe('helpers', () => {
     expect(splitExtension('a.b.pdf')).toEqual({ name: 'a.b', ext: '.pdf' });
     expect(splitExtension('.hidden')).toEqual({ name: '.hidden', ext: '' });
     expect(splitExtension('noext')).toEqual({ name: 'noext', ext: '' });
+  });
+
+  it('keys a site id by its site collection GUID, and refuses forms it cannot compare', () => {
+    expect(siteCollectionKey(`Contoso.SharePoint.com,${BCR_GROUP.toUpperCase()},${WEB}`)).toBe(BCR_GROUP);
+    expect(siteCollectionKey(` ${BCR_GROUP} `)).toBe(BCR_GROUP);
+    expect(siteCollectionKey('contoso.sharepoint.com:/sites/BCRGROUP:')).toBeNull();
+    expect(siteCollectionKey(`contoso.sharepoint.com,${BCR_GROUP}`)).toBeNull();
+    expect(siteCollectionKey('')).toBeNull();
+    expect([...forbiddenSiteKeys([siteId(BCR_GROUP), QUARANTINE])]).toEqual([BCR_GROUP, QUARANTINE]);
   });
 
   it('reads a status from statusCode or status', () => {
