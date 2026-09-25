@@ -4,13 +4,14 @@ This walks through getting the bcr-ledger-agent into a brand-new Azure
 subscription and Microsoft 365 tenant.
 
 > Total time budget: ~45 minutes the first time. A later code-only deploy takes ~3 minutes:
-> `yarn build && yarn workspace @bcr/<pkg> package`, then `config-zip` (see
+> `yarn workspace @bcr/<pkg> package`, then `config-zip` (see
 > [`PROJECT_OVERVIEW.md` → Build and deploy](../PROJECT_OVERVIEW.md#build-and-deploy)).
 
-> ⚠️ **This guide is for a brand-new environment. Do not run it against "dev" today.** "dev"
-> serves a real client, and `main.bicep` has drifted from the app settings running there.
-> `yarn deploy:dev` deploys Bicep first, which replaces every setting and takes ingestion down.
-> Until the Bicep drift fix, deploy code only, in the order given in
+> ⚠️ **This guide is for a brand-new environment. Never run it against "dev".** "dev" is
+> production: it serves a real client, and `main.bicep` has drifted from the app settings running
+> there. A Bicep deploy replaces every setting and takes ingestion down, so
+> `infrastructure/deploy.sh` refuses `dev` in any spelling, and the `rg-bcr-ledger-dev` resource
+> group. Until the Bicep drift fix (gate G1), "dev" gets code only, in the order given in
 > [`operations/human-steps.md`](operations/human-steps.md#phase-0).
 
 ---
@@ -69,14 +70,17 @@ app-only.
 
 ---
 
-## 2. Fill in parameter files
+## 2. Fill in the parameter file
 
-Edit `infrastructure/main.dev.parameters.json` (and the prod copy) with:
+The new environment is named `<env>` below (for example `qa`, or `prod`). Fill in
+`infrastructure/main.<env>.parameters.json`; for any name but `prod`, copy it from
+`main.prod.parameters.json` first. Never edit `main.dev.parameters.json`.
 
 - `botAppId`
 - `ingestionAppId`
-- `sharePointSiteHostname`
-- `sharePointSitePath`
+- `sharePointSiteHostname` and `sharePointSitePath`: the template still requires them, but they
+  only feed settings nothing reads any more, so any placeholder will do
+  ([`setup-guide.md` §3a](setup-guide.md#3a-fill-in-parameter-file)).
 
 ---
 
@@ -87,24 +91,33 @@ az login
 az account set --subscription <subscription-id>
 
 cd bcr-ledger-agent
-yarn install
-yarn build
-yarn deploy:dev
+corepack enable
+corepack yarn deploy:prod                # a new prod environment
+./infrastructure/deploy.sh <env>         # any other new environment: the same script
 ```
 
-The script will:
-1. Create the resource group if missing
-2. Deploy `infrastructure/main.bicep`
-3. Build all packages
-4. Zip and deploy both Function Apps
+The script:
+1. creates the resource group `rg-bcr-ledger-<env>` if it is missing;
+2. deploys `infrastructure/main.bicep`;
+3. builds all packages, and packages each Function App afresh (see
+   [`PROJECT_OVERVIEW.md` → Build and deploy](../PROJECT_OVERVIEW.md#build-and-deploy));
+4. zip-deploys both Function Apps.
+
+### 3a. Add the settings the template lacks
+
+`main.bicep` does not yet set the Phase-0 ingestion settings (`BOT_CALLER_APP_IDS`,
+`CLIENT_DIRECTORY_*`, `QUARANTINE_*`, `FORBIDDEN_TARGET_SITE_PATHS`), so after the deploy
+ingestion refuses to start, naming the first one missing. Add them once, with
+`az functionapp config appsettings set … -o none`, exactly as in
+[`setup-guide.md` §3d](setup-guide.md#3d-add-the-phase-0-settings-the-template-lacks). Never add
+them by re-running a Bicep deploy: until the drift fix, the template does not carry them.
 
 ---
 
 ## 4. Seed secrets in Key Vault
 
 ```bash
-KV=$(az deployment group show -g rg-bcr-ledger-dev -n bcr-ledger-dev-... \
-  --query "properties.outputs.keyVaultName.value" -o tsv)
+KV=$(az keyvault list -g rg-bcr-ledger-<env> --query "[].name" -o tsv)
 
 az keyvault secret set --vault-name "$KV" --name bot-app-password \
   --value "<paste-the-bot-client-secret-here>"
@@ -117,8 +130,8 @@ az keyvault secret set --vault-name "$KV" --name anthropic-api-key \
 Then restart both Function Apps so the new Key Vault references are picked up:
 
 ```bash
-az functionapp restart -g rg-bcr-ledger-dev -n func-bcr-bot-dev-...
-az functionapp restart -g rg-bcr-ledger-dev -n func-bcr-ingest-dev-...
+az functionapp restart -g rg-bcr-ledger-<env> -n func-bcr-bot-<env>-...
+az functionapp restart -g rg-bcr-ledger-<env> -n func-bcr-ingest-<env>-...
 ```
 
 ---
@@ -140,7 +153,9 @@ per-site grants, not a single-site scope (see `security.md`, T3).
 
 ## 6. Sideload the Teams app
 
-See [`teams-app/README.md`](../teams-app/README.md).
+Build the package from a staging copy of the manifest, with the placeholders replaced and
+checked, as in [`setup-guide.md` §7](setup-guide.md#7-register-the-bot-in-microsoft-teams). See also
+[`teams-app/README.md`](../teams-app/README.md).
 
 ---
 
@@ -148,10 +163,10 @@ See [`teams-app/README.md`](../teams-app/README.md).
 
 ```bash
 # Health endpoint (no auth)
-curl https://func-bcr-ingest-dev-XXXX.azurewebsites.net/api/health
+curl https://func-bcr-ingest-<env>-XXXX.azurewebsites.net/api/health
 
 # Bot messaging endpoint should return 405 to a GET (proves it's wired up)
-curl -i https://func-bcr-bot-dev-XXXX.azurewebsites.net/api/messages
+curl -i https://func-bcr-bot-<env>-XXXX.azurewebsites.net/api/messages
 ```
 
 Then, as a test guest bound to a test client, send a synthetic PDF to the bot in a 1:1 chat.

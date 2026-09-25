@@ -441,21 +441,24 @@ traces
 
 ## 7. Deployment topology
 
-A single Azure resource group per environment:
+A single Azure resource group per environment. `<sfx>` is a suffix the template derives from
+the resource group's id:
 
 ```
 rg-bcr-ledger-<env>
-├── stbcrledger<env>          (Storage – Functions runtime)
-├── plan-bcr-ledger-<env>     (Linux consumption plan, Node 22)
-├── func-bcr-bot-<env>
-├── func-bcr-ingest-<env>
-├── bot-bcr-ledger-<env>      (Azure Bot, Teams channel enabled)
-├── kv-bcr-ledger-<env>       (Key Vault, RBAC mode)
-├── appi-bcr-ledger-<env>     (Application Insights)
-└── log-bcr-ledger-<env>      (Log Analytics workspace)
+├── stbcr<env><sfx>           (Storage – Functions runtime)
+├── plan-bcr-<env>-<sfx>      (Linux consumption plan, Node 22)
+├── func-bcr-bot-<env>-<sfx>
+├── func-bcr-ingest-<env>-<sfx>
+├── bot-bcr-<env>-<sfx>       (Azure Bot, Teams channel enabled)
+├── kv-bcr-<env>-<sfx>        (Key Vault, RBAC mode)
+├── appi-bcr-<env>-<sfx>      (Application Insights)
+└── log-bcr-<env>-<sfx>       (Log Analytics workspace)
 ```
 
-All of it is declared in [`infrastructure/main.bicep`](./infrastructure/main.bicep).
+All of it is declared in [`infrastructure/main.bicep`](./infrastructure/main.bicep), except the
+Phase-0 ingestion settings: a new environment gets those once, after its first deploy
+([`docs/setup-guide.md` §3d](./docs/setup-guide.md#3d-add-the-phase-0-settings-the-template-lacks)).
 
 ⚠️ **The template has drifted from what runs in "dev"**, which is production: it serves
 PESKOVOI. The routing settings were set by hand and are missing from the template. Until the

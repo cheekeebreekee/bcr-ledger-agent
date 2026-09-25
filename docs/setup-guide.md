@@ -261,12 +261,15 @@ and creates everything in one resource group:
 
 ### 3a. Fill in parameter file
 
-Edit [`infrastructure/main.dev.parameters.json`](../infrastructure/main.dev.parameters.json):
+This guide builds a **new** environment, named here `<env>` (for example `qa`, or `prod`, which
+does not exist yet). Fill in `infrastructure/main.<env>.parameters.json`; for any name but
+`prod`, copy it from [`main.prod.parameters.json`](../infrastructure/main.prod.parameters.json)
+first. Never edit or deploy the `dev` file: "dev" is production.
 
 ```jsonc
 {
   "parameters": {
-    "environmentName":            { "value": "dev" },
+    "environmentName":            { "value": "<env>" },
     "location":                   { "value": "westeurope" },
     "botAppId":                   { "value": "<Bot App ID from §2a>" },
     "ingestionAppId":             { "value": "<Ingestion App ID from §2b>" },
@@ -277,51 +280,110 @@ Edit [`infrastructure/main.dev.parameters.json`](../infrastructure/main.dev.para
     "enableAnthropic":            { "value": true },
     "anthropicModel":             { "value": "claude-opus-4-5-20251101" },
     "anthropicConfidenceThreshold": { "value": "0.6" },
-    "clientCompanyName":          { "value": "0000 TEST Sp. z o.o." },
+    "clientCompanyName":          { "value": "" },
     "clientNip":                  { "value": "" }
   }
 }
 ```
 
+The `sharePoint*`, `clientCompanyName` and `clientNip` parameters only feed app settings that
+nothing reads any more (see `PROJECT_OVERVIEW.md` → Configuration). The template still requires
+the first two; any placeholder will do. They go with the Bicep drift fix (gate G1).
+
 ### 3b. Deploy
 
-> ⚠️ **For a brand-new environment only. Never run this against "dev" before the Bicep drift
-> fix (gate G1).** "dev" is production: it serves a real client. `yarn deploy:dev` deploys
-> `main.bicep` first, which replaces every app setting with the template's, and the template
-> lacks the settings set by hand, so ingestion fails at cold start. To ship code to "dev",
-> deploy code only, in the order in
-> [`operations/human-steps.md`](operations/human-steps.md#phase-0).
+> ⚠️ **For a brand-new environment only. Never deploy "dev" this way before the Bicep drift
+> fix (gate G1).** "dev" is production: it serves a real client. A template deploy replaces
+> every app setting with the template's, and the template lacks the settings set by hand there,
+> so ingestion would fail at cold start. `infrastructure/deploy.sh` refuses `dev` in any
+> spelling, and the `rg-bcr-ledger-dev` resource group. To ship code to "dev", deploy code only,
+> in the order in [`operations/human-steps.md`](operations/human-steps.md#phase-0).
 
 ```bash
 az login
 az account set --subscription <Subscription ID>
 
 cd bcr-ledger-agent
-yarn install
-yarn build
-yarn deploy:dev
+corepack enable                          # deploy.sh calls yarn, which must be Yarn 4.3.1
+corepack yarn deploy:prod                # a new prod environment
+./infrastructure/deploy.sh <env>         # any other new environment: the same script
 ```
 
-The script will print the final Function App names — note them:
+The script deploys the template, then builds, packages and zip-deploys both Function Apps
+(see [`PROJECT_OVERVIEW.md` → Build and deploy](../PROJECT_OVERVIEW.md#build-and-deploy) for what
+packaging checks). It prints the two Function App names. Note them, with the other names the
+template gave (`XXXX` is a suffix derived from the resource group):
 
-| Output | Use later as |
+| Resource | Use later as |
 |---|---|
-| `func-bcr-bot-dev-XXXX` | bot messaging endpoint host |
-| `func-bcr-ingest-dev-XXXX` | ingestion API host |
-| `kv-bcr-ledger-dev-XXXX` | Key Vault name for secrets |
-| `appi-bcr-ledger-dev-XXXX` | App Insights resource |
+| `func-bcr-bot-<env>-XXXX` | bot messaging endpoint host |
+| `func-bcr-ingest-<env>-XXXX` | ingestion API host, and the managed identity that gets the SharePoint grants (§5) |
+| `kv-bcr-<env>-XXXX` | Key Vault for the secrets (§4): `az keyvault list -g rg-bcr-ledger-<env> --query "[].name" -o tsv` |
+| `appi-bcr-<env>-XXXX` | Application Insights |
+
+Nothing works yet. Ingestion refuses to start until it has the settings in §3d, both apps need
+the secrets in §4, and ingestion can reach no SharePoint site until §5.
 
 ### 3c. Bot messaging endpoint
 
 After deployment, set the Bot Service’s messaging endpoint to:
 
 ```
-https://func-bcr-bot-dev-XXXX.azurewebsites.net/api/messages
+https://func-bcr-bot-<env>-XXXX.azurewebsites.net/api/messages
 ```
 
 UI path: **Azure Portal → Azure Bot resource → *Configuration* → *Messaging endpoint***.
 
 The Bicep template attempts this automatically — verify the field is set.
+
+### 3d. Add the Phase-0 settings the template lacks
+
+`main.bicep` does not set the Phase-0 ingestion settings yet (gate G1). Until they are set,
+ingestion refuses to start, and its cold-start error names the first missing or malformed
+setting. Add them once, before any traffic. `appsettings set` merges and never removes a
+setting, and `-o none` keeps the storage account key out of your terminal.
+
+They need three things to exist first: the quarantine site
+([`infrastructure/quarantine/README.md`](../infrastructure/quarantine/README.md)), the Client
+Directory list ([admin guide → Creating the list from scratch](client-directory-admin-guide.md#creating-the-list-from-scratch)),
+and the bot's app id from §2a. What each value must look like is in §6c; ingestion checks every
+shape at cold start.
+
+```bash
+RG=rg-bcr-ledger-<env>
+INGEST=func-bcr-ingest-<env>-XXXX                 # from §3b
+SP_HOST=<tenant>.sharepoint.com                   # lower case: no https://, no path
+
+az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
+  "BOT_CALLER_APP_IDS=<Bot App ID from §2a>" \
+  "CLIENT_DIRECTORY_SITE_ID=<hostname>,<siteGuid>,<webGuid>" \
+  "CLIENT_DIRECTORY_LIST_ID=<Client Directory list id>" \
+  "QUARANTINE_SITE_HOSTNAME=$SP_HOST" \
+  "QUARANTINE_SITE_PATH=/sites/<quarantine site name>" \
+  "QUARANTINE_DRIVE_NAME=<the quarantine site's library name>" \
+  "QUARANTINE_ROOT_FOLDER=Kwarantanna" \
+  "FORBIDDEN_TARGET_SITE_PATHS=/sites/<site that holds the Client Directory>" \
+  "CLIENT_DIRECTORY_MAX_STALE_MS=900000"
+```
+
+`QUARANTINE_SITE_HOSTNAME` is also the only SharePoint host a Client Directory row may name: a
+row on any other host routes nobody. `FORBIDDEN_TARGET_SITE_PATHS` must name the site that holds
+the Client Directory; the quarantine path is added to it automatically.
+
+The bot needs nothing extra: the template sets `MICROSOFT_APP_TYPE=SingleTenant`, and an unset
+`BOT_GATE_MODE` means `enforce`.
+
+**Verify.** List only the settings you set, never every setting (the list includes the storage
+account key):
+
+```bash
+az functionapp config appsettings list -g $RG -n $INGEST -o table --query \
+  "[?starts_with(name,'QUARANTINE_') || starts_with(name,'CLIENT_DIRECTORY_') || name=='BOT_CALLER_APP_IDS' || name=='FORBIDDEN_TARGET_SITE_PATHS'].{name:name,value:value}"
+```
+
+Then restart ingestion (§4 does). `GET https://$INGEST.azurewebsites.net/api/health` must answer
+200, and Application Insights `exceptions` must hold no `ValidationError`, whose message names
+the setting it refused.
 
 ---
 
@@ -332,7 +394,7 @@ Both Function Apps are configured to read these via
 *Configuration* blade after deployment).
 
 ```bash
-KV=kv-bcr-ledger-dev-XXXX   # from §3b output
+KV=kv-bcr-<env>-XXXX   # from §3b
 
 # Bot client secret (required)
 az keyvault secret set --vault-name "$KV" \
@@ -345,8 +407,8 @@ az keyvault secret set --vault-name "$KV" \
   --value "<ANTHROPIC_API_KEY — sk-ant-…>"
 
 # Restart the function apps so they pick up the references
-az functionapp restart -g rg-bcr-ledger-dev -n func-bcr-bot-dev-XXXX
-az functionapp restart -g rg-bcr-ledger-dev -n func-bcr-ingest-dev-XXXX
+az functionapp restart -g rg-bcr-ledger-<env> -n func-bcr-bot-<env>-XXXX
+az functionapp restart -g rg-bcr-ledger-<env> -n func-bcr-ingest-<env>-XXXX
 ```
 
 ---
@@ -379,8 +441,10 @@ creates a grant that silently protects nothing.
 1. **The Graph app role `Sites.Selected`**, once for this identity. It needs Global
    Administrator or Privileged Role Administrator, and the Azure CLI cannot make it in this
    tenant (`AADSTS65002`). Use Graph Explorer, as in
-   [`admin-sharepoint-grant.md`](admin-sharepoint-grant.md), Step 1, with `$INGEST_MI_OID` as the
-   principal.
+   [`admin-sharepoint-grant.md`](admin-sharepoint-grant.md), Step 1, with `$INGEST_MI_OID` as
+   both the URL's service principal and `principalId`. That page's `resourceId` is the Microsoft
+   Graph service principal of the BCR tenant; in any other tenant, use that tenant's
+   (`az ad sp show --id 00000003-0000-0000-c000-000000000000 --query id -o tsv`).
 2. **A per-site permission** for `$INGEST_MI_APPID`, on each site the identity touches:
 
    | Site | Role | When |
@@ -507,42 +571,50 @@ Even though the Azure Bot resource has the Teams channel enabled, Teams
 users won’t see anything until you sideload (or publish) the Teams app
 package built from [`teams-app/manifest.json`](../teams-app/manifest.json).
 
-### 7a. Prepare the manifest
+### 7a. Build the package
+
+The committed `teams-app/manifest.json` (version 0.2.0: personal scope only, no tab) holds two
+`REPLACE-WITH-BOT-APP-ID` placeholders, `id` and `bots[0].botId`. Replace them in a staging copy,
+so no real id lands in the tracked file, check the result, then zip. The icons
+(`color.png` 192×192, `outline.png` 32×32) are already in `teams-app/`.
 
 ```bash
-cd teams-app
-# Replace the two REPLACE-WITH-BOT-APP-ID placeholders
-sed -i.bak "s/REPLACE-WITH-BOT-APP-ID/<MICROSOFT_APP_ID>/g" manifest.json && rm manifest.json.bak
+cd bcr-ledger-agent
+BOT_APP_ID=<MICROSOFT_APP_ID from §2a>
+STAGE=$(mktemp -d)
+ZIP="$PWD/artifacts/teams-app.zip"
+cp teams-app/manifest.json teams-app/color.png teams-app/outline.png "$STAGE"/
+sed -i.bak "s/REPLACE-WITH-BOT-APP-ID/$BOT_APP_ID/g" "$STAGE/manifest.json" && rm "$STAGE/manifest.json.bak"
+
+grep -c REPLACE-WITH "$STAGE/manifest.json"                         # 0
+jq -r '.id, .bots[0].botId' "$STAGE/manifest.json"                  # $BOT_APP_ID, twice
+jq -r '.version' "$STAGE/manifest.json"                             # 0.2.0
+jq -c '[.. | .scopes? // empty | .[]] | unique' "$STAGE/manifest.json"   # ["personal"]
+jq 'has("staticTabs")' "$STAGE/manifest.json"                       # false
+
+mkdir -p artifacts && rm -f "$ZIP"
+(cd "$STAGE" && zip -X "$ZIP" manifest.json color.png outline.png)
 ```
 
-Add the required icons (one-time):
+If any check prints something else, stop: the zip would be refused, or would ship the wrong app.
+To update the tenant's existing "Asystent BCR" app, the id must be that app's id, which is the
+bot's `MICROSOFT_APP_ID`; a different id creates a second app. `artifacts/*.zip` are git-ignored
+build output: never commit `teams-app.zip`, or a `manifest.json` with a real id in it.
 
-- **`color.png`** — 192×192, full colour
-- **`outline.png`** — 32×32, transparent + white outline
-
-### 7b. Build the .zip
-
-```bash
-mkdir -p ../artifacts
-zip ../artifacts/teams-app.zip manifest.json color.png outline.png
-```
-
-### 7c. Sideload for a single user (fastest)
+### 7b. Sideload for a single user (fastest)
 
 1. Open Teams desktop or web.
 2. Left rail → **Apps → Manage your apps → Upload an app → Upload a custom app**.
 3. Pick `artifacts/teams-app.zip`.
 4. Click **Add**.
-5. Open a 1:1 chat with the bot. Drop in a file named e.g.
-   `Invoice_03_2026.pdf`.
+5. Open a 1:1 chat with the bot, as a guest bound to a test client, and send a synthetic
+   document, never a real one.
 
-You should see a card like:
+You should see one card with a row for the file: **Dokument · Kategoria · Folder** and an
+"Otwórz" link into that client's space. An uploader who is not bound to exactly one client gets
+"Dokument przekazano do weryfikacji przez zespół BCR." instead, with no link.
 
-> ✅ Filed **Invoice_03_2026.pdf**
-> Type: Invoice · Confidence: 95% · Folder: `Invoices/2026/03`
-> [Open in SharePoint]
-
-### 7d. Publish org-wide (Teams admin)
+### 7c. Publish org-wide (Teams admin)
 
 1. **Teams admin center → Teams apps → Manage apps → + Upload new app →
    Upload** the same `teams-app.zip`.
@@ -558,10 +630,10 @@ You should see a card like:
 
 ```bash
 # 1. Ingestion is alive and unauthenticated /health works
-curl https://func-bcr-ingest-dev-XXXX.azurewebsites.net/api/health
+curl https://func-bcr-ingest-<env>-XXXX.azurewebsites.net/api/health
 
 # 2. Bot endpoint exists (returns 405 to a GET — that's expected)
-curl -i https://func-bcr-bot-dev-XXXX.azurewebsites.net/api/messages
+curl -i https://func-bcr-bot-<env>-XXXX.azurewebsites.net/api/messages
 
 # 3. End to end: the TEST guest sends a synthetic document to the bot in a 1:1 chat.
 ```
@@ -622,6 +694,8 @@ union requests, exceptions, traces
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Bot times out in Teams, no logs | Messaging endpoint wrong on Bot resource | Set it to `https://func-bcr-bot-<env>-XXXX.azurewebsites.net/api/messages` |
+| Ingestion's `/api/health` fails after a deploy, and `exceptions` hold a `ValidationError` | A setting the template does not set is missing or malformed; the message names it | Set it as in §3d, with `-o none`. Never with a Bicep deploy |
+| `deploy.sh` refuses to deploy `dev` (or `rg-bcr-ledger-dev`) | Deliberate: "dev" serves a real client, and a template deploy replaces its hand-set settings | Deploy code only, as in [`operations/human-steps.md`](operations/human-steps.md#phase-0) |
 | `+ Add a permission → My APIs` shows **No results** | Ingestion API has no *Application ID URI* and/or no *app role*, **or** you're signed in to a different tenant | Run the preflight in §2b (`az ad app show --id …`); fix whichever array is empty, then **Refresh** the *My APIs* tab |
 | `401 Unauthorized` from ingestion | Bot’s token has no `Documents.Ingest` role | Re-check §2c (Bot app reg → *API permissions* → application permission + admin consent) |
 | Ingestion logs `Token missing required role` but portal shows *✅ Granted* | CLI script used `az ad app permission admin-consent` (creates only delegated grants, **not** app-role assignments) | Run the `az rest --method POST … /appRoleAssignments` from §2c, then verify the GET returns one entry |

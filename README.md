@@ -118,8 +118,8 @@ and drag any file named like `Invoice_03_2026.pdf` into the chat.
 | `yarn lint` | ESLint over the whole repo |
 | `yarn start:bot` | Start the Teams-bot Function App locally |
 | `yarn start:ingestion` | Start the document-ingestion Function App locally |
-| `yarn deploy:dev` | Deploy infra + code to the `dev` environment. **Not during Phase 0:** it deploys Bicep, which has drifted from what runs. Use the code-only steps in [`human-steps.md`](./docs/operations/human-steps.md#phase-0). |
-| `yarn deploy:prod` | Deploy infra + code to the `prod` environment |
+| `yarn deploy:dev` | **Refused.** "dev" is production, and `infrastructure/deploy.sh` refuses it until the Bicep drift fix: a template deploy would replace the settings set by hand there. Deploy code only, as in [`human-steps.md`](./docs/operations/human-steps.md#phase-0). |
+| `yarn deploy:prod` | Deploy infra + code to a **new** `prod` environment. Then add the settings the template lacks ([`setup-guide.md` §3d](./docs/setup-guide.md#3d-add-the-phase-0-settings-the-template-lacks)), or ingestion will not start. |
 
 ---
 

@@ -60,8 +60,11 @@ yarn start:bot            # http://localhost:3978/api/messages  (point Bot Frame
 yarn start:ingestion      # http://localhost:7071/api/ingest/batch
 ```
 
-Deploy: `yarn deploy:dev` / `yarn deploy:prod` run `infrastructure/deploy.sh <env>` (Bicep, then
-zip-deploy of both Function Apps); `deploy.yml` does the same via Azure OIDC.
+Deploy: `infrastructure/deploy.sh <env>` (`yarn deploy:prod`) deploys Bicep, then zip-deploys both
+Function Apps; `deploy.yml` does the same via Azure OIDC. Both are for a **new** environment only,
+and both refuse `dev` (`deploy.sh` in any spelling, and `rg-bcr-ledger-dev`). A new environment
+then needs the Phase-0 ingestion settings the template lacks, set once with `appsettings set`
+(`docs/setup-guide.md` §3d); until then ingestion refuses to start.
 
 > ⚠️ **"dev" is production: it serves PESKOVOI.** Until the Bicep drift fix (gate G1), never run
 > `yarn deploy:*`, `infrastructure/deploy.sh` or the Deploy workflow against it. `main.bicep`
