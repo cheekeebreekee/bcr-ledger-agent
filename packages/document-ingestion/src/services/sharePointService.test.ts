@@ -1,4 +1,4 @@
-import type { Client } from '@microsoft/microsoft-graph-client';
+import { RetryHandlerOptions, type Client } from '@microsoft/microsoft-graph-client';
 import { SharePointError, ValidationError, type Logger, type SharePointTarget } from '@bcr/shared';
 import {
   cachedSiteIdLookup,
@@ -22,6 +22,8 @@ interface Call {
   path: string;
   query: Record<string, string>;
   body: unknown;
+  /** Per-request middleware options, e.g. RetryHandlerOptions. */
+  middleware: unknown[];
 }
 
 type Handler = (call: Call) => unknown;
@@ -31,6 +33,7 @@ function fakeGraph(handlers: [RegExp, Handler][]): { client: Client; calls: Call
   const calls: Call[] = [];
   const api = (path: string) => {
     const query: Record<string, string> = {};
+    const middleware: unknown[] = [];
     const request = {
       query(q: Record<string, string>) {
         Object.assign(query, q);
@@ -39,13 +42,17 @@ function fakeGraph(handlers: [RegExp, Handler][]): { client: Client; calls: Call
       header() {
         return request;
       },
+      middlewareOptions(options: unknown[]) {
+        middleware.push(...options);
+        return request;
+      },
       get: () => respond('get'),
       post: (body: unknown) => respond('post', body),
       put: (body: unknown) => respond('put', body),
       patch: (body: unknown) => respond('patch', body),
     };
     const respond = async (method: Call['method'], body?: unknown) => {
-      const call: Call = { method, path, query, body };
+      const call: Call = { method, path, query, body, middleware };
       calls.push(call);
       const handler = handlers.find(([pattern]) => pattern.test(`${method.toUpperCase()} ${path}`));
       if (!handler) throw Object.assign(new Error(`unhandled ${method} ${path}`), { statusCode: 500 });
@@ -153,9 +160,9 @@ describe('SharePointService.uploadDocument', () => {
     expect(puts).toBe(2);
   });
 
-  // The Graph SDK's RetryHandler already retried these; retrying them again
-  // multiplied a brownout past the Functions HTTP limit.
-  it.each([429, 503, 504])('leaves a %i on a PUT the SDK retries to the SDK', async (status) => {
+  // The content PUT runs with the SDK's retries off, so throttling and
+  // brownouts are retried here, once per app-level attempt, never stacked.
+  it.each([429, 503, 504])('retries a %i on the PUT itself, then gives up with a SharePointError', async (status) => {
     let puts = 0;
     const { client } = fakeGraph([
       ...siteAndDrive,
@@ -166,25 +173,29 @@ describe('SharePointService.uploadDocument', () => {
     ]);
     const svc = new SharePointService(client, target, { retry: { retries: 3, minTimeoutMs: 0 } });
     await expect(svc.uploadDocument(doc)).rejects.toBeInstanceOf(SharePointError);
-    expect(puts).toBe(1);
+    expect(puts).toBe(4);
   });
 
-  it('retries a 503 on an octet-stream PUT, which the SDK does not retry', async () => {
-    let puts = 0;
-    const { client } = fakeGraph([
-      ...siteAndDrive,
-      [/^PUT /, () => {
-        puts += 1;
-        if (puts === 1) throw graphError(503);
-        return { id: 'i', name: 'n', webUrl: 'u' };
-      }],
-    ]);
-    const svc = new SharePointService(client, target, { retry: { retries: 2, minTimeoutMs: 0 } });
-    await expect(
-      svc.uploadDocument({ ...doc, contentType: 'application/octet-stream' }),
-    ).resolves.toMatchObject({ id: 'i' });
-    expect(puts).toBe(2);
-  });
+  it.each(['application/octet-stream', 'application/pdf'])(
+    'owns every retry of a %s PUT: the SDK retries are off and a 503 is retried here',
+    async (contentType) => {
+      let puts = 0;
+      const { client, calls } = fakeGraph([
+        ...siteAndDrive,
+        [/^PUT /, () => {
+          puts += 1;
+          if (puts === 1) throw graphError(503);
+          return { id: 'i', name: 'n', webUrl: 'u' };
+        }],
+      ]);
+      const svc = new SharePointService(client, target, { retry: { retries: 2, minTimeoutMs: 0 } });
+      await expect(svc.uploadDocument({ ...doc, contentType })).resolves.toMatchObject({ id: 'i' });
+      expect(puts).toBe(2);
+      const put = calls.find((c) => c.method === 'put')!;
+      expect(put.middleware).toEqual([expect.any(RetryHandlerOptions)]);
+      expect((put.middleware[0] as RetryHandlerOptions).maxRetries).toBe(0);
+    },
+  );
 
   it('reports a missing write grant as a target error', async () => {
     const { client } = fakeGraph([...siteAndDrive, [/^PUT /, () => { throw graphError(403); }]]);
@@ -498,6 +509,43 @@ describe('SharePointService possible duplicates', () => {
         msg: 'sharepoint.possible_duplicate',
       },
     ]);
+  });
+
+  it.each([500, 502, 503, 504])(
+    'logs a possible duplicate when a name is taken after a %i on it (the write may have landed)',
+    async (status) => {
+      let puts = 0;
+      const { client } = fakeGraph([
+        ...siteAndDrive,
+        [/^PUT /, () => {
+          puts += 1;
+          if (puts === 1) throw graphError(status);
+          if (puts === 2) throw graphError(409);
+          return { id: 'item-2', name: 'faktura_1.pdf', webUrl: 'u' };
+        }],
+      ]);
+      const { log, lines } = recordingLogger();
+      const svc = new SharePointService(client, target, { retry: { retries: 1, minTimeoutMs: 0 }, log });
+      await expect(svc.uploadDocument(doc)).resolves.toMatchObject({ name: 'faktura_1.pdf' });
+      expect(lines.filter((l) => l['event'] === 'sharepoint.possible_duplicate')).toHaveLength(1);
+    },
+  );
+
+  it('does not log one after a 429, which SharePoint never commits', async () => {
+    let puts = 0;
+    const { client } = fakeGraph([
+      ...siteAndDrive,
+      [/^PUT /, () => {
+        puts += 1;
+        if (puts === 1) throw graphError(429);
+        if (puts === 2) throw graphError(409);
+        return { id: 'item-2', name: 'faktura_1.pdf', webUrl: 'u' };
+      }],
+    ]);
+    const { log, lines } = recordingLogger();
+    const svc = new SharePointService(client, target, { retry: { retries: 1, minTimeoutMs: 0 }, log });
+    await svc.uploadDocument(doc);
+    expect(lines.some((l) => l['event'] === 'sharepoint.possible_duplicate')).toBe(false);
   });
 
   it('does not log one for an ordinary name conflict', async () => {

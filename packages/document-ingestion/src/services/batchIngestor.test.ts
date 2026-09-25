@@ -414,6 +414,7 @@ describe('BatchIngestor — real SharePoint services and forbidden sites', () =>
       const request = {
         query: () => request,
         header: () => request,
+        middlewareOptions: () => request,
         get: () => respond('get'),
         post: (body: unknown) => respond('post', body),
         put: (body: unknown) => respond('put', body),
