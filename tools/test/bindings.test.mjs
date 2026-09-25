@@ -14,6 +14,7 @@ import {
   forbiddenTargetReasons,
   healthExpectations,
   healthSatisfies,
+  idsRollbackAdds,
   isSiteCollectionPath,
   isTeamGroup,
   mapSitesToTeams,
@@ -763,6 +764,17 @@ describe('apply and rollback helpers', () => {
       'RootFolder',
       'SitePath',
     ]);
+  });
+
+  test('idsRollbackAdds names the GUIDs a restore puts back, as the ingestion reads them', () => {
+    const current = { UserAadObjectIds: GUEST_A };
+    assert.deepEqual(
+      idsRollbackAdds({ UserAadObjectIds: `${GUEST_A}\n ${GUEST_2.toUpperCase()} \njunk\n${GUEST_2}` }, current),
+      [GUEST_2],
+    );
+    assert.deepEqual(idsRollbackAdds({ UserAadObjectIds: '' }, current), []);
+    assert.deepEqual(idsRollbackAdds({ RootFolder: '' }, current), [], 'ids not restored');
+    assert.deepEqual(idsRollbackAdds({ UserAadObjectIds: STAFF }, {}), [STAFF]);
   });
 
   test('rollbackPatch restores the before-state of patched fields only', () => {

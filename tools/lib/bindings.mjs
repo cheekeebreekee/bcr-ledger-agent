@@ -1219,6 +1219,19 @@ export function rollbackPatch(logRow) {
   return patch;
 }
 
+/**
+ * The user ids a rollback patch would put back on a row: in the restored
+ * `UserAadObjectIds`, not on the row now. GUIDs only, lower-cased, as the
+ * ingestion reads them (anything else routes nobody). Each one would route
+ * to that row again, so rollback re-checks it as apply does.
+ */
+export function idsRollbackAdds(patch, currentFields) {
+  if (!('UserAadObjectIds' in (patch ?? {}))) return [];
+  const guids = (text) => splitLines(fieldString(text)).map(normalizeGuid).filter(Boolean);
+  const now = new Set(guids(currentFields?.UserAadObjectIds));
+  return [...new Set(guids(patch.UserAadObjectIds))].filter((id) => !now.has(id));
+}
+
 /** Fields of a logged row that changed since it was applied. */
 export function changedSinceApply(logRow, currentFields) {
   return Object.keys(logRow.patch ?? {}).filter(

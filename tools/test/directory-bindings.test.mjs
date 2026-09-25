@@ -58,6 +58,23 @@ async function proposePlan(h, extra = []) {
   return { file, plan: JSON.parse(readFileSync(file, 'utf8')) };
 }
 
+/** A fresh output path in the harness's directory. */
+const fresh = (h, name) => join(h.outDir, `${name}-${Math.random().toString(16).slice(2)}.json`);
+
+/** Propose and apply the whole plan with --apply; returns the apply log path. */
+async function bind(h, extra = []) {
+  if (!h.tenant.state.columns.some((c) => c.name === 'DriveId')) {
+    h.tenant.state.columns.push({ name: 'DriveId', text: {} }, { name: 'TeamId', text: {} });
+  }
+  const { file } = await proposePlan(h, extra);
+  const log = fresh(h, 'apply-log');
+  assert.equal(await h.run(['apply', '--plan', file, '--apply', ...HEALTH_ARGS, '--out', log]), 0);
+  return log;
+}
+
+const denied = () => jsonResponse(403, { error: { code: 'accessDenied', message: 'Access denied' } });
+const pathOf = (url) => decodeURIComponent(new URL(url).pathname.replace(/^\/v1\.0/, ''));
+
 describe('directory-bindings check', () => {
   test('reports each Active row read-only, and never prints the token', async () => {
     const h = harness();
@@ -552,6 +569,66 @@ describe('directory-bindings rollback', () => {
     const f = join(h.outDir, 'not-a-log.json');
     writeFileSync(f, JSON.stringify({ kind: 'bcr.directory-bindings.apply-log', mode: 'dry-run', rows: [] }));
     await assert.rejects(h.run(['rollback', '--log', f, '--apply']), /not an apply log/);
+  });
+
+  test('never puts back a guest who is now in another Team, and restores them once they qualify again', async () => {
+    const h = harness();
+    await bind(h);
+    // R46: guest A joins company C's Team; the whole plan takes them off row 1.
+    h.tenant.state.members.get(IDS.teamC).push(IDS.guestA);
+    const removal = await bind(h);
+    assert.equal(h.tenant.state.items.get('1').UserAadObjectIds, '');
+    const patches = () => h.writes().filter((c) => c.method === 'PATCH').length;
+    const before = patches();
+
+    assert.equal(await h.run(['rollback', '--log', removal]), 2, 'the dry run refuses too');
+    const rb = fresh(h, 'rollback-log');
+    assert.equal(await h.run(['rollback', '--log', removal, '--apply', '--out', rb]), 2);
+    assert.equal(patches(), before, 'nothing written');
+    assert.equal(h.tenant.state.items.get('1').UserAadObjectIds, '', 'guest A routes to client A again');
+    const [row] = JSON.parse(readFileSync(rb, 'utf8')).rows;
+    assert.equal(row.result, 'guest_recheck_failed');
+    assert.deepEqual(row.readdedUserIds, [IDS.guestA]);
+    assert.match(row.recheckReasons.join(' | '), new RegExp(`${IDS.guestA} is also in Team\\(s\\) ${IDS.teamC}`));
+    assert.match(h.out.text(), /refused.*it would put back id\(s\) that must not route here/);
+
+    // Guest A leaves Team C: a guest of Team A alone again, so the restore may add them.
+    h.tenant.state.members.set(IDS.teamC, h.tenant.state.members.get(IDS.teamC).filter((id) => id !== IDS.guestA));
+    const rb2 = fresh(h, 'rollback-log');
+    assert.equal(await h.run(['rollback', '--log', removal, '--apply', '--out', rb2]), 0);
+    assert.equal(h.tenant.state.items.get('1').UserAadObjectIds, IDS.guestA);
+    const [row2] = JSON.parse(readFileSync(rb2, 'utf8')).rows;
+    assert.deepEqual([row2.result, row2.readdedUserIds], ['restored', [IDS.guestA]]);
+  });
+
+  test('never puts back a staff id, and --only limits the rollback to the rows named', async () => {
+    const h = harness();
+    // Row 2's staff id comes off as confirmed; row 1 is bound from nothing.
+    const log = await bind(h, ['--confirm-remove-staff', '2', '--write-verified', '/sites/0002CLIENTB']);
+    assert.equal(h.tenant.state.items.get('2').UserAadObjectIds, IDS.guestB);
+    const patchedItems = () => h.writes().filter((c) => c.method === 'PATCH').map((c) => c.path.match(/items\/(\d+)/)[1]);
+    const before = patchedItems().length;
+
+    await assert.rejects(h.run(['rollback', '--log', log, '--only', '9']), /--only 9: the log records no write/);
+
+    // Row 1's restore adds no id: it is restored, and row 2 is not touched.
+    const rb1 = fresh(h, 'rollback-log');
+    assert.equal(await h.run(['rollback', '--log', log, '--only', '1', '--apply', '--out', rb1]), 0);
+    assert.deepEqual(patchedItems().slice(before), ['1']);
+    assert.equal(h.tenant.state.items.get('1').TeamId, '');
+    assert.equal(h.tenant.state.items.get('2').TeamId, IDS.teamB, 'row 2 still bound');
+    const out1 = JSON.parse(readFileSync(rb1, 'utf8'));
+    assert.deepEqual(out1.only, ['1']);
+    assert.deepEqual(out1.rows.map((r) => [r.listItemId, r.result]), [['1', 'restored']]);
+
+    // Row 2's restore would put the staff (Member) id back: refused.
+    const rb2 = fresh(h, 'rollback-log');
+    assert.equal(await h.run(['rollback', '--log', log, '--only', '2', '--apply', '--out', rb2]), 2);
+    assert.deepEqual(patchedItems().slice(before), ['1'], 'row 2 not written');
+    const [row2] = JSON.parse(readFileSync(rb2, 'utf8')).rows;
+    assert.equal(row2.result, 'guest_recheck_failed');
+    assert.match(row2.recheckReasons.join(' | '), new RegExp(`${IDS.staff} is a Member`));
+    assert.equal(h.tenant.state.items.get('2').UserAadObjectIds, IDS.guestB);
   });
 });
 

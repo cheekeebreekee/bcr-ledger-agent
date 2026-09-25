@@ -17,7 +17,7 @@ without `yarn install`.
 ## Safety model (every tool)
 
 - **Read-only by default.** A change needs `--apply` (`-Apply` in PowerShell). Without it, a tool prints the change it would make, as the exact request or command.
-- **Before and after.** Every tool that writes prints the state it found and the state it left. `directory-bindings.mjs apply` also writes a log of both, which `rollback` restores from.
+- **Before and after.** Every tool that writes prints the state it found and the state it left. `directory-bindings.mjs apply` also writes a log of both, which `rollback` restores from, after re-checking every id it would put back on a row.
 - **Ambiguity is skipped, never guessed.** A duplicate key (a site, `DriveId` or `TeamId` shared with another row included), a SitePath that is not canonical, a Public team, a non-standard or missing channel, a drive mismatch, an unknown write grant, a fact that could not be read: each one makes the row **SKIP**, with the reason. A guest who is also in any other Team is never bound. This follows invariant I3 of the plan.
 - **Never BCR GROUP, never the quarantine.** `directory-bindings.mjs` requires the forbidden list, as the ingestion does, and skips a row on BCR GROUP's site collection whatever the list says. No tool here creates a site permission. A grant goes to the ingestion Function App's managed identity through [H-6/H-12](../docs/operations/human-steps.md), and checking one is a read.
 - **No real data leaves the tenant or reaches git.**
@@ -274,17 +274,48 @@ Exit codes:
 
 ### `rollback`
 
-Restores the before-state of every row that an apply log says it wrote. A row
-someone has changed since the apply is refused, not overwritten.
+Restores the before-state of the rows that an apply log says it wrote: every
+one, or with `--only <listItemId>` (repeatable) only those. `--only` naming a
+row the log records no write to is refused.
+
+**Rolling back is not safe by default.** It is safe when the apply only bound
+rows that were unbound: the restore unbinds them, and they route nobody. It is
+not when the apply took ids **off** a row (a guest now in a second Team, staff
+removed with `--confirm-remove-staff`, a canary guest): the restore would put
+them back, and a guest in two Teams would route the second company's
+documents into the first client's channel again. So rollback re-checks every
+id the restore would **add** to `UserAadObjectIds` (the restored list minus
+the ids on the row now), as `apply` re-checks the guests it binds, against the
+`TeamId` the row will have after the restore: each must still be a `Guest`,
+and the Teams in its `memberOf` must be exactly that `TeamId`. A Member (staff)
+never passes, and neither does any id when the restore leaves the row without
+a `TeamId`. If one fails, the row is refused as **`guest_recheck_failed`**
+(with `readdedUserIds` and `recheckReasons` in the rollback log), nothing is
+written to it, and the run exits 2. A row whose restore adds no id is
+restored as before.
+
+To undo an apply that took ids off a row, **prefer re-running `propose` and
+applying the whole plan** over a rollback: the new plan binds exactly the
+guests of each Team alone. Never put a refused id back by hand.
+
+For each row, rollback also refuses:
+- a row someone has changed since the apply (`changed_since_apply`), rather than overwrite it;
+- a `writing` or `write_unknown` row with no before-state in the log (`no_before_state`).
 
 A `writing` or `write_unknown` row is checked against the live row:
 - if the live row still holds its before-state, the PATCH never landed. It is recorded as `not_written` and left alone;
-- if the live row holds the planned values, it is restored;
+- if the live row holds the planned values, it is restored (after the re-check above);
 - anything else is refused.
 
-Without `--apply` it is a dry run. With `--apply` it writes its own log
+Without `--apply` it is a dry run: it does every read and check, the guest
+re-check included, and writes nothing. With `--apply` it writes its own log
 (`--out` must not exist yet), also flushed before each PATCH, in the same
 crash-safe way.
+
+Exit codes:
+- `0`: every selected row was restored or found `not_written`.
+- `1`: refused before any write (not an apply log, `--only` naming a row the log did not write, an `--out` file that exists).
+- `2`: some rows were refused (`guest_recheck_failed`, `changed_since_apply`, `no_before_state`), failed, read back differently, or ended `write_unknown`. See the log.
 
 ### `--add-columns`
 
