@@ -11,7 +11,8 @@ it with the commands below and check it before uploading.**
 
 ## Build the package
 
-Run from the repository root, in bash or zsh.
+Run from the repository root, in bash (`bash -l`). In zsh, run `setopt interactivecomments`
+first, or a `#` comment is passed to the command as arguments.
 
 **1. The bot's app id.** `manifest.json` keeps the placeholder
 `REPLACE-WITH-BOT-APP-ID` in two places, `id` and `bots[0].botId`; both must be
@@ -33,7 +34,8 @@ BUILD="$(mktemp -d)"
 cp teams-app/manifest.json teams-app/color.png teams-app/outline.png "$BUILD/"
 sed -i.bak "s/REPLACE-WITH-BOT-APP-ID/$MICROSOFT_APP_ID/g" "$BUILD/manifest.json"
 rm "$BUILD/manifest.json.bak"
-grep -c REPLACE-WITH "$BUILD/manifest.json"    # must print 0
+# must print 0
+grep -c REPLACE-WITH "$BUILD/manifest.json"
 ```
 
 If it prints anything but `0`, stop: a placeholder is left and the upload
@@ -52,7 +54,8 @@ rm -rf "$BUILD"
 **4. Check the archive** before anyone uploads it:
 
 ```bash
-unzip -p artifacts/teams-app.zip manifest.json | grep -c REPLACE-WITH       # must print 0
+# must print 0
+unzip -p artifacts/teams-app.zip manifest.json | grep -c REPLACE-WITH
 unzip -p artifacts/teams-app.zip manifest.json | jq -r '
   [ .version,
     (.bots | map(.scopes | join(",")) | join(";")),
