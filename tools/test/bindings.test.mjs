@@ -575,6 +575,21 @@ describe('assessRow', () => {
     assert.ok(!codes(assessRow(rowA({ IsAdmin: true }), {}, ctxA())).includes('warn:unbound_target'));
   });
 
+  test('an id on the row that is no longer a guest of this Team alone is named as drift (R46)', () => {
+    const users = new Map([
+      [GUEST_A, { id: GUEST_A, userType: 'Guest' }],
+      [GUEST_2, { id: GUEST_2, userType: 'Guest' }],
+      [STAFF, { id: STAFF, userType: 'Member' }],
+    ]);
+    const row = rowA({ UserAadObjectIds: `${GUEST_A}\n${GUEST_2}\n${STAFF}` });
+    const a = assessRow(row, factsA({ usersById: users }), ctxA({ confirmRemoveStaff: new Set(['1']) }));
+    const drift = a.problems.find((p) => p.code === 'bound_guest_ineligible');
+    assert.equal(drift.severity, 'warn', 'the PATCH that removes it must still be proposed');
+    assert.match(drift.detail, new RegExp(`^1 id\\(s\\)[\\s\\S]*${GUEST_2} \\(not a member of this Team\\)`));
+    assert.doesNotMatch(drift.detail, new RegExp(STAFF), 'staff have their own code');
+    assert.equal(a.proposed.UserAadObjectIds, GUEST_A);
+  });
+
   test('a duplicate key skips; a duplicate user id only warns', () => {
     const dups = [
       { kind: 'nip', key: '0000000001', listItemIds: ['1', '7'] },

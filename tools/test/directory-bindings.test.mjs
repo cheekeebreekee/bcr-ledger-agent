@@ -61,8 +61,10 @@ async function proposePlan(h, extra = []) {
 describe('directory-bindings check', () => {
   test('reports each Active row read-only, and never prints the token', async () => {
     const h = harness();
-    assert.equal(await h.run(['check', ...DIR_ARGS]), 0);
+    // 3: row 2 holds a staff id, which routes that person's uploads to client B.
+    assert.equal(await h.run(['check', ...DIR_ARGS]), 3);
     const text = h.out.text();
+    assert.match(text, /ACTION: row\(s\) 2 hold an id that routes there and should not/);
     assert.match(text, /Row 1 · ClientId 0001[\s\S]*ready for propose/);
     assert.match(text, /Row 2 · ClientId 0002[\s\S]*SKIP staff_ids/);
     assert.match(text, /Row 2 · ClientId 0002[\s\S]*WARN team_not_bcr[\s\S]*Row 3/);
@@ -99,8 +101,8 @@ describe('directory-bindings check', () => {
     await assert.rejects(h.run(['apply', '--plan', file, ...HEALTH_ARGS]), /--forbidden-site-paths is required/);
     await assert.rejects(h.run(['check', ...DIR_ARGS, '--quarantine-site-path', '/sites/Q/sub']), /--quarantine-site-path/);
     await assert.rejects(h.run(['check', ...DIR_ARGS, '--tenant-host', 'contoso.example']), /--tenant-host/);
-    // The environment counts as the flag does.
-    assert.equal(await withList.run(['check', ...DIR_ONLY]), 0);
+    // The environment counts as the flag does (3: row 2's staff id).
+    assert.equal(await withList.run(['check', ...DIR_ONLY]), 3);
     assert.deepEqual([...h.writes(), ...withList.writes()], []);
   });
 
@@ -155,6 +157,31 @@ describe('directory-bindings check', () => {
     });
     assert.match(h.out.text(), /site collection \S+ \(the Client Directory's\) is never bound/);
     assert.deepEqual(h.writes(), []);
+  });
+
+  test('a bound guest later added to another Team is named, and check exits 3 until the plan is applied', async () => {
+    const h = harness();
+    h.tenant.state.columns.push({ name: 'DriveId', text: {} }, { name: 'TeamId', text: {} });
+    // Row 2's staff id would also count; take it off so only the drift remains.
+    h.tenant.state.items.get('2').UserAadObjectIds = IDS.guestB;
+    const { file } = await proposePlan(h);
+    assert.equal(await h.run(['apply', '--plan', file, '--apply', ...HEALTH_ARGS, '--out', join(h.outDir, 'l.json')]), 0);
+    assert.equal(await h.run(['check', ...DIR_ARGS]), 0, 'bound and clean');
+
+    // Onboarding reuses guest A for company C's Team (R46).
+    h.tenant.state.members.get(IDS.teamC).push(IDS.guestA);
+    const report = join(h.outDir, 'report.json');
+    assert.equal(await h.run(['check', ...DIR_ARGS, '--out', report]), 3);
+    assert.match(
+      h.out.text(),
+      new RegExp(`WARN bound_guest_ineligible — 1 id\\(s\\) on the row[\\s\\S]*guest_in_other_team: also in ${IDS.teamC}`),
+    );
+    assert.deepEqual(JSON.parse(readFileSync(report, 'utf8')).routingDrift, ['1']);
+    // The plan takes the guest off row 1.
+    const again = await proposePlan(h);
+    const r1 = again.plan.rows.find((r) => r.listItemId === '1');
+    assert.equal(r1.action, 'PATCH');
+    assert.equal(r1.patch.UserAadObjectIds, '');
   });
 
   test('refuses flags that belong to another command', async () => {

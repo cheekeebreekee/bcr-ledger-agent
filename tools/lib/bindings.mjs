@@ -67,6 +67,14 @@ export const GUARD_FIELDS = Object.freeze([
   'IsAdmin',
 ]);
 
+/**
+ * Problems that mean an id on an Active client row routes where it should
+ * not, today: staff on a client row, or a bound guest who is no longer a
+ * guest of that row's Team alone. `check` exits 3 when any row has one, so a
+ * scheduled run can raise it (C12).
+ */
+export const ROUTING_DRIFT_CODES = Object.freeze(['staff_ids', 'staff_ids_removed', 'bound_guest_ineligible']);
+
 /** Columns `--add-columns` creates (single line of text). */
 export const NEW_COLUMNS = Object.freeze(['DriveId', 'TeamId']);
 
@@ -854,6 +862,35 @@ export function assessRow(row, facts = {}, ctx = {}) {
           'no_eligible_guest',
           'warn',
           "no guest belongs to this Team alone; the client's uploads go to quarantine",
+        );
+      }
+      // Ids already on the row that this Team no longer vouches for: a guest
+      // since added to another Team, or dropped from this one (R46). They
+      // route here until a PATCH takes them off. Staff and unknown ids have
+      // their own codes.
+      const eligibleIds = new Set(people.eligible.map((p) => p.id));
+      const excludedById = new Map(people.excluded.map((e) => [e.id, e]));
+      const drifted = row.isAdmin
+        ? []
+        : row.userIds.filter((id) => {
+            const user = usersById.get(id);
+            if (user === null || (user && !isError(user) && user.userType === 'Member')) return false;
+            return !eligibleIds.has(id);
+          });
+      if (drifted.length) {
+        const list = drifted
+          .map((id) => {
+            const e = excludedById.get(id);
+            if (!e) return `${id} (not a member of this Team)`;
+            const teams = e.otherTeams?.length ? `: also in ${e.otherTeams.map(describeTeam).join(', ')}` : '';
+            return `${e.userPrincipalName || id} (${e.reason}${teams})`;
+          })
+          .join('; ');
+        add(
+          'bound_guest_ineligible',
+          'warn',
+          `${drifted.length} id(s) on the row are not guests of this Team alone, and route here until ` +
+            `the plan's PATCH takes them off. Run propose and apply the whole plan: ${list}`,
         );
       }
     }

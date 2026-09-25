@@ -89,6 +89,7 @@ import {
   normalizeGuid,
   normalizeSitePath,
   P0_HEALTH_EXPECTATION,
+  ROUTING_DRIFT_CODES,
   TENANT_HOST,
   parseDirectoryRow,
   pickAccountingChannel,
@@ -721,10 +722,19 @@ async function runCheck(ctx) {
     printRowCheck(print, row, a, gathered.factsByRow.get(a.listItemId), gathered.usersById);
   }
   const ready = assessments.filter((a) => !a.problems.some((p) => p.severity === 'skip'));
+  const drift = assessments.filter((a) => a.problems.some((p) => ROUTING_DRIFT_CODES.includes(p.code)));
   print('');
   print(bold('Summary'));
   print(`  ${assessments.length} Active row(s): ${ok(`${ready.length} ready`)}, ${bad(`${assessments.length - ready.length} skipped`)}`);
   print(`  ${gathered.rows.length - gathered.active.length} inactive row(s) not examined`);
+  if (drift.length) {
+    print(
+      bad(
+        `  ACTION: row(s) ${drift.map((a) => a.listItemId).join(', ')} hold an id that routes there and ` +
+          `should not (${ROUTING_DRIFT_CODES.join(' / ')}). Run propose and apply the whole plan.`,
+      ),
+    );
+  }
 
   if (values.out) {
     const report = {
@@ -735,13 +745,14 @@ async function runCheck(ctx) {
       guards: opts.guards,
       duplicates: gathered.duplicates,
       unreadableTeamSites: gathered.teamIndex.unreadable,
+      routingDrift: drift.map((a) => a.listItemId),
       rows: assessments,
     };
     const written = writeJsonFile(values.out, report);
     print(`  report     ${written.path}  sha256 ${written.sha256}`);
   }
   print('');
-  return 0;
+  return drift.length ? 3 : 0;
 }
 
 // ---------------------------------------------------------------------------
