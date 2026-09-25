@@ -8,6 +8,12 @@ that it worked, and how to undo it.
 The steps are in the order they must happen. Some wait on the previous step for a reason, and
 that reason is given. Skipping ahead is how an upload gets rejected, or filed in the wrong place.
 
+**Run every command in bash** (`bash -l`). In zsh, the macOS default, run
+`setopt interactivecomments` first. Without it, an interactive zsh does not treat `#` as the start
+of a comment: a pasted comment becomes a command, the variable set on the same line stays empty,
+or an apostrophe in the comment opens a quote that swallows the lines after it. For the same
+reason every comment in the blocks below sits on its own line.
+
 Today (25 September 2026) only Phase 0 is here. Later phases add their own sections.
 
 ---
@@ -33,6 +39,11 @@ database. The containment has three strands, and this checklist puts them in one
   the cross-client write path. A rollback reverts individual commits and is deployed as a new
   build. For an emergency there is a stop switch that files nothing anywhere
   ([H-12](#h-12-the-change-window-ingestion-deploy-bindings-canaries)).
+- **BCR GROUP stays Private.** No step changes its visibility, its membership or its channels;
+  T-3 only reads them, and T-7 at most blocks one account's sign-in. Inside its site, T-4 locks
+  (and may create, empty) the ledger's own folders, T-5 locks the Client Directory list, and
+  H-13 lowers the ingestion identity's own grant to `read`
+  ([`tenant-hardening.md`](tenant-hardening.md)).
 - **Yahor does not upload through the bot** until the full implementation is done. His id stays
   on PESKOVOI's Directory row until the binding tool removes it in H-12.
 - **Secret rotation is deferred** until Roman provides new credentials. It is an accepted risk
@@ -48,22 +59,36 @@ database. The containment has three strands, and this checklist puts them in one
 ### Variables used below
 
 ```bash
-RG=rg-bcr-ledger-dev                      # "dev" is production: it serves PESKOVOI
-BOT=func-bcr-bot-dev-<suffix>             # names in PROJECT_OVERVIEW.md → Azure environment
+# "dev" is production: it serves PESKOVOI.
+RG=rg-bcr-ledger-dev
+# The names are in PROJECT_OVERVIEW.md → Azure environment.
+BOT=func-bcr-bot-dev-<suffix>
 INGEST=func-bcr-ingest-dev-<suffix>
 APPI=appi-bcr-dev-<suffix>
 SP_HOST=<tenant>.sharepoint.com
 BOT_APP_ID=$(az functionapp config appsettings list -g $RG -n $BOT \
   --query "[?name=='MICROSOFT_APP_ID'].value | [0]" -o tsv)
-# The ingestion Function App's managed identity, as an application id. Ingestion calls Graph
-# only as this identity, so every SharePoint grant and every grant check below uses it, never
-# the ingestion API app registration's client id (INGESTION_APP_ID in the setup guide).
+# The managed identity of the ingestion Function App, as an application id. Ingestion calls
+# Graph only as this identity, so every SharePoint grant and every grant check below uses it,
+# never the client id of the ingestion API app registration (INGESTION_APP_ID in the setup guide).
 INGEST_MI_APPID=$(az ad sp show --id "$(az functionapp identity show -g $RG -n $INGEST \
   --query principalId -o tsv)" --query appId -o tsv)
 
 # App Insights: ALWAYS pass both times. With only a start, the CLI queries one hour.
 aiq() { az monitor app-insights query -g $RG --app $APPI --analytics-query "$1" \
   --start-time "$2" --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o table; }
+```
+
+**Check the two ids, in every new shell, right after the variables.** An empty or malformed value
+means `RG`, `BOT` or `INGEST` is wrong (or a comment was pasted into zsh), and the steps below
+would write it into a setting or a grant: an empty `BOT_CALLER_APP_IDS` stops the Phase-0
+ingestion at cold start. This must print nothing:
+
+```bash
+[[ $BOT_APP_ID =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+  || echo 'STOP: BOT_APP_ID is not a GUID. Check RG and BOT, then set the variables again.'
+[[ $INGEST_MI_APPID =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+  || echo 'STOP: INGEST_MI_APPID is not a GUID. Check RG and INGEST, then set the variables again.'
 ```
 
 Graph and SharePoint tokens are set up as described in
@@ -75,18 +100,20 @@ Graph and SharePoint tokens are set up as described in
 |---|---|---|---|---|
 | H-0 | Automatic deploys stopped | Yahor | done, 25 Sep | — |
 | H-1 | GDPR: processor notice and breach register | Roman + IOD | by 26–28 Sep | — |
-| H-2 | IR-0: evidence export, stored immutably | Yahor, Global Admin, Roman | today | — |
-| H-3 | **Mandatory:** stop promotion with a setting | Yahor | as soon as H-2 is stored; H-5, H-6 and H-6b follow **the same working day** ([the bound](#h-3-stop-promotion-now-without-a-deploy)) | H-2 |
-| H-4 | Tenant hardening T-1 to T-9, T-4b included | per step | today–tomorrow | T-4, T-4b, T-5 before H-12; T-4 the day of H-3, checked again after H-6b; T-4b after H-3 is verified, before IR-2; T-1 before H-10 |
+| H-2 | IR-0: evidence export, stored immutably | Yahor, Global Admin, Roman | today; step 1 starts in parallel with H-3 | — |
+| H-3 | **Mandatory:** stop promotion with a setting | Yahor | **immediately, day 0**, without waiting for H-2; H-5, H-6 and H-6b follow **the same working day** ([the bound](#h-3-stop-promotion-now-without-a-deploy)) | — |
+| H-4a | Graph permissions for the operator tools, admin-consented | Global Admin | day 0, before H-4 | — |
+| H-4 | Tenant hardening T-1 to T-9, T-4b included | per step | today–tomorrow | H-4a; T-4, T-4b, T-5 before H-12; T-4 the day of H-3, checked again after H-6b; T-4b after H-3 is verified, before IR-2; T-1 before H-10 |
 | H-5 | Quarantine site | SharePoint Admin | the working day of H-3 | — |
+| H-5b | Canary guest invited, in no Team; its object id recorded | Global Admin | the working day of H-3 | H-4a; needed by H-6b and H-12 |
 | H-6 | Ingestion identity write grant on quarantine | Global Admin | the working day of H-3 | H-5 |
-| H-6b | Running build's fallback re-pointed at the quarantine | Yahor | the working day of H-3 | H-3, H-6 verified |
-| H-7 | Directory check and new columns (no new site grants) | Yahor | day 1 | H-2 (IR-0 C stored), T-5 |
+| H-6b | Running build's fallback re-pointed at the quarantine | Yahor | the working day of H-3 | H-3, H-5b, H-6 verified |
+| H-7 | Directory check and new columns (no new site grants) | Yahor | day 1 | H-2 (IR-0 C stored), H-4a, T-5 |
 | H-8 | New app settings, added | Yahor | day 1 | H-5 |
 | H-9 | Bot deploy, gate in `log` | Yahor | day 1 | H-2, H-8 |
 | H-10 | Manifest 0.2.0, availability *Everyone* | Teams Admin | day 1 | H-9, T-1 |
 | H-11 | Gate to `enforce` | Yahor | day 2 | 24 h of clean logs |
-| H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-6, H-6b, H-7, H-11, T-4, T-4b, T-5 |
+| H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-5b, H-6, H-6b, H-7, H-11, T-4, T-4b, T-5 |
 | H-13 | Ingestion grant on BCR GROUP to `read` | Global Admin | after H-12 | H-12 verified |
 | H-14 | `FALLBACK_*` settings and saved pre-Phase-0 packages removed | Yahor | ≥ 24 h after H-12 | H-12 verified |
 | H-15 | Exit criteria checked | Yahor, Roman | end of phase | all |
@@ -133,7 +160,8 @@ never withdraws one.
 **Owner:** Roman (creates the store, as subscription Owner), Yahor (trace and Directory
 exports), Global Admin (Purview export and the Entra sign-in log). **When:** today. App Insights
 keeps 30 days, and each day of delay deletes a day of evidence. This must also happen **before
-H-9 and H-12**, because the Phase-0 code changes what is logged.
+H-9 and H-12**, because the Phase-0 code changes what is logged. H-3 does not wait for it: it
+deletes no past data, so it runs at once, and step 1 starts in parallel.
 
 What to export, and why each join works, is in
 [incident → IR-0](incident-2026-09.md#ir-0-preserve-the-evidence-first). Every script is
@@ -189,7 +217,8 @@ DIR_LIST=$(az functionapp config appsettings list -g $RG -n $INGEST \
   --query "[?name=='CLIENT_DIRECTORY_LIST_ID'].value | [0]" -o tsv)
 C=tools/out/ir0-directory-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p -m 700 "$C"
 url="$G/sites/$DIR_SITE/lists/$DIR_LIST/items?expand=fields&\$top=999"; n=0
-while [ -n "$url" ]; do                                    # follow @odata.nextLink
+# Follow @odata.nextLink until the last page.
+while [ -n "$url" ]; do
   g "$url" > "$C/items-$n.json"
   url=$(jq -r '."@odata.nextLink" // empty' "$C/items-$n.json"); n=$((n+1))
 done
@@ -197,7 +226,8 @@ for id in $(jq -r '.value[].id' "$C"/items-*.json); do
   g "$G/sites/$DIR_SITE/lists/$DIR_LIST/items/$id/versions?\$expand=fields" > "$C/versions-$id.json"
 done
 chmod 600 "$C"/*.json
-grep -l '"error"' "$C"/*.json                              # must print nothing
+# Must print nothing.
+grep -l '"error"' "$C"/*.json
 (cd "$C" && shasum -a 256 *.json > SHA256SUMS)
 ```
 
@@ -258,8 +288,11 @@ the IOD sets the right one before the policy is locked.
 
 ### H-3: Stop promotion now, without a deploy
 
-**Owner:** Yahor runs it; Roman is told. **When:** as soon as H-2 is stored, because IR-0 is
-copied before anything changes what the running build logs. **Mandatory.**
+**Owner:** Yahor runs it; Roman is told. **When:** immediately, on day 0, **without waiting for
+H-2**. It changes one setting and restarts the app. It deletes no past App Insights, Purview,
+Entra or Directory data, and every IR-0 export covers past data only, so it costs the evidence
+nothing; start H-2 step 1 (the trace export) in parallel. Every hour it waits, the running build
+can still file a document into another client's site. **Mandatory.**
 
 Until H-12 the running ingestion is the pre-Phase-0 build, and it still has content promotion
 (root cause R3): an upload it cannot route is filed into whichever client's NIP the document
@@ -299,10 +332,54 @@ stays empty.
 **Rollback.** None while the pre-Phase-0 build runs. H-12 step 11 sets it back to `true` once
 the Phase-0 build, which has no promotion, is live.
 
+### H-4a: Consent the permissions the operator tools need
+
+**Owner:** Global Admin. **When:** day 0, before H-4, and before the reads in H-5b, H-6b and H-7.
+It changes no data; it lets the operator's own token do what this runbook asks of it.
+
+Every `g` and `sp` call and every `tools/*.mjs` run below uses a delegated token from one app
+registration BCR owns: the one the onboarding repo's `tools/graph-login.mjs` signs in with (its
+client id is `GRAPH_CLIENT_ID`; see [`tenant-hardening.md` → Tokens](tenant-hardening.md#tokens)).
+The onboarding setup consented only `Sites.Manage.All` on it, plus SharePoint `AllSites.Read`.
+A token from it carries every delegated permission admin-consented on the registration, so the
+rest is added there, once. Without them `check` and `propose` stop with a 403 at their first read
+of the Teams, and T-1's `--apply` cannot block a sign-in.
+
+In the Entra admin centre: **App registrations → All applications →** that registration **→ API
+permissions → Add a permission → Microsoft Graph → Delegated permissions**. Add these, then
+**Grant admin consent for** the tenant:
+
+| Delegated Graph permission | Needed by |
+|---|---|
+| `User.Read.All`, `GroupMember.Read.All`, `Group.Read.All`, `Channel.ReadBasic.All` | `directory-bindings.mjs` `check`, `propose` and `apply` (apply re-reads every guest it binds); H-5b's check |
+| `Sites.Read.All` | H-2 step 4 (the Directory export), `check`, `propose`, IR-1 |
+| `Sites.ReadWrite.All` | `directory-bindings.mjs apply` and `rollback`: they write the Directory rows |
+| `Sites.Manage.All` (already there) | `--add-columns`; H-5's four columns |
+| `User.ReadWrite.All`, `Directory.Read.All` | T-1's `audit-client-access.mjs --apply` (it blocks sign-in); T-2's licence removal; T-7's sign-in block |
+
+Do **not** add SharePoint `AllSites.FullControl`. Only the scripted SharePoint changes in
+tenant-hardening (T-4, T-4b, T-5) need it, and each of them has a browser path, which needs none
+of this: use the browser. T-8's `Policy.ReadWrite.Authorization` is the same: its browser path
+is the one to use.
+
+The permissions are delegated, so a token never does more than the signed-in person could do in
+the browser. A **403** from a tool, from `g` or from `sp` therefore means one of two things:
+the permission is not consented here, or that person lacks the right on that site or object.
+The `Scopes:` line below tells the two apart.
+
+**Verify.** `node ../bcr-onboarding-agent/tools/graph-login.mjs > /dev/null` signs in and prints
+`Scopes: …` on stderr, which lists every permission in the table. The token itself goes to
+`/dev/null`, never to the screen.
+
+**Rollback.** Remove the added permissions on the same page (**⋯ → Remove permission**) once
+nothing needs them. The read permissions stay for the [standing checks](#standing-checks) until
+Phase 2.
+
 ### H-4: Tenant hardening
 
-**Owner:** per step. **When:** today and tomorrow. Run T-1 to T-9 from
-[`tenant-hardening.md`](tenant-hardening.md), T-4b included. T-10 comes with H-10.
+**Owner:** per step. **When:** today and tomorrow, after H-4a (T-1's `--apply` needs its
+permissions). Run T-1 to T-9 from [`tenant-hardening.md`](tenant-hardening.md), T-4b included,
+using the browser path wherever a step offers one. T-10 comes with H-10.
 
 These must be done before H-12:
 
@@ -370,7 +447,8 @@ script prints the site id too, but never paste an id by hand:
 ```bash
 Q_SITE=$(g "$G/sites/$SP_HOST:/sites/BCRLedgerKwarantanna?\$select=id" | jq -r .id)
 Q_LIST=$(g "$G/sites/$Q_SITE/drive/list?\$select=id" | jq -r .id)
-g "$G/sites/$Q_SITE/drive?\$select=name"          # the library name; on this tenant, Dokumenty
+# The library name. On this tenant: Dokumenty.
+g "$G/sites/$Q_SITE/drive?\$select=name"
 ```
 
 **Library columns.** After each upload, ingestion writes four columns on the quarantined item, so
@@ -398,6 +476,40 @@ documents and is not deleted.
 **Retention.** Quarantined items are kept 90 days after triage. That is the plan's default, for
 Roman and the lawyer to confirm.
 
+### H-5b: Invite the canary guest
+
+**Owner:** Global Admin. **When:** day 0, the working day of H-3, after H-4a and before H-6b.
+H-6b's check, H-12 steps 4 and 8, the [standing checks](#standing-checks) and H-15 all use it.
+
+The canary guest is BCR's test identity for uploads that must be quarantined: an account outside
+the tenant that BCR controls and keeps for testing. Never a client's address, and never a staff
+member's own. It is a guest in no Team, so it is bound to no row, and every upload it makes must
+end in the quarantine. T-8 lets only admin roles invite guests, so the Global Admin invites it.
+
+1. **Invite it.** Entra admin centre: **Users → All users → New user → Invite external user**,
+   with the canary's address. Add it to no group and no Team.
+2. **Record its object id**, and only the id (no address, no name), in the incident's
+   [status table](incident-2026-09.md#status). It is BCR's own test account, the one object id
+   that table holds, because every negative canary checks against it. Below it is `<canary id>`.
+3. **Check that it reaches the bot today.** Sign in as the canary, accept the invitation, switch
+   to the BCR organisation in Teams, find "Asystent BCR" and send `pomoc`: the help card comes
+   back. Before H-10 makes the app available to *Everyone*, today's availability may keep a
+   guest in no Team out. If it does, H-6b's Verify uses the TEST guest instead (see there), and
+   the canary is first used in H-12.
+
+**Verify.** It is a guest, in no group and no Team:
+
+```bash
+CANARY=<canary id>
+# Must read Guest.
+g "$G/users/$CANARY?\$select=userType" | jq -r .userType
+# Must print 0.
+g "$G/users/$CANARY/memberOf?\$select=id" | jq '.value | length'
+```
+
+**Rollback.** Delete the guest in the Entra admin centre, and record it. Only once no canary
+needs it any more: the standing checks use it until Phase 2.
+
 ### H-6: Grant the ingestion identity write on the quarantine site
 
 **Owner:** Global Admin (or anyone who may start jobs on the onboarding Automation account).
@@ -414,7 +526,8 @@ pasting one. The runbook writes to whatever site the id names, so check that it 
 quarantine site and not BCR GROUP:
 
 ```bash
-g "$G/sites/$Q_SITE?\$select=webUrl" | jq -r .webUrl       # must end in /sites/BCRLedgerKwarantanna
+# Must end in /sites/BCRLedgerKwarantanna.
+g "$G/sites/$Q_SITE?\$select=webUrl" | jq -r .webUrl
 DIR_SITE=$(az functionapp config appsettings list -g $RG -n $INGEST \
   --query "[?name=='CLIENT_DIRECTORY_SITE_ID'].value | [0]" -o tsv)
 [ "$(cut -d, -f2 <<<"$Q_SITE")" != "$(cut -d, -f2 <<<"$DIR_SITE")" ] \
@@ -462,11 +575,15 @@ H6B=tools/out/h6b-fallback-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p -m 700 "$H6B"
 az functionapp config appsettings list -g $RG -n $INGEST -o json \
   --query "[?starts_with(name,'FALLBACK_')].{name:name,value:value}" > "$H6B/fallback-before.json"
 chmod 600 "$H6B/fallback-before.json"
-jq -r '.[].name' "$H6B/fallback-before.json"               # the names only
+# The names only.
+jq -r '.[].name' "$H6B/fallback-before.json"
 ```
 
 Upload `$H6B` to the evidence store as in H-2 steps 5 and 6 (`--upload-dir "$H6B"`, then take
-the write access away again), and delete the local copy.
+the write access away again), and delete the local copy. H-3 does not wait for H-2, so the store
+may not exist yet. Then keep `$H6B` where it is, under the git-ignored `tools/out/` with the
+folder at mode 700 and the file at 600 (as created above), and go on with step 2. Upload it once
+H-2 step 5 has created the store, and only then delete the local copy.
 
 **2. Re-point.** The same site, library and folder as `QUARANTINE_*` in H-8. `FALLBACK_CLIENT_ID`
 is only a label and stays as it is. `appsettings set` merges, so nothing else changes.
@@ -479,9 +596,22 @@ az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
   "FALLBACK_ROOT_FOLDER=Kwarantanna"
 ```
 
-**Verify.** The canary guest from H-12 step 4 (a BCR-controlled outside account, bound to no
-row, in no client Team) uploads a synthetic PDF. It lands on the quarantine site under
-`Kwarantanna/`, and nothing new appears at the BCR GROUP library root.
+**Verify.** The canary guest from [H-5b](#h-5b-invite-the-canary-guest) (bound to no row, in no
+Team) uploads a synthetic PDF. It lands on the quarantine site under `Kwarantanna/`, and nothing
+new appears at the BCR GROUP library root.
+
+If H-5b found that the canary cannot reach the bot yet, the TEST guest uploads it instead, but
+only once its id is shown to be on no Directory row. Before H-12 an onboarded guest is on no row
+(R1), and with H-3 in effect its upload then takes the fallback like any other. On a row, the
+running build would route it to that row's site instead, and the check would prove nothing.
+With H-7's variables set (and, after T-5, as a BCR GROUP site owner, as in H-2 step 4), this
+reads every row, Active or not, and must print `0`. A grep of `check` would not do here: `check`
+also lists each Team's guests, the TEST guest among them.
+
+```bash
+g "$G/sites/$DIRECTORY_SITE_ID/lists/$DIRECTORY_LIST_ID/items?expand=fields(select=UserAadObjectIds)&\$top=999" \
+  | jq -r '.value[].fields.UserAadObjectIds // empty' | grep -ci '<TEST guest id>'
+```
 
 **Note for triage.** Until H-12 these files come from the old build, so they use its layout,
 `Kwarantanna/<category>/YYYY/MM/`, and have none of the four quarantine columns. Take the
@@ -502,7 +632,9 @@ below. Both change the Directory, so both wait for that export and that versioni
 `tools/directory-bindings.mjs` runs with a delegated Graph token. By default it reads and
 changes nothing. The flags below match [`tools/README.md`](../../tools/README.md);
 `node tools/directory-bindings.mjs --help` is authoritative. For the token, see that README's
-"Authentication" section: the `az` token has no SharePoint scopes.
+"Authentication" section: the `az` token has no SharePoint scopes. H-4a consents what the token
+needs; a **403** from the tool means a permission is still missing there, or the signed-in person
+cannot read that site. It is never a reason to use another token or to skip the row by hand.
 
 The tool needs the Directory's ids, the ingestion managed identity's app id, the forbidden
 sites, the quarantine site and the tenant's SharePoint host: the same values ingestion is given
@@ -519,8 +651,10 @@ export DIRECTORY_LIST_ID=$(az functionapp config appsettings list -g $RG -n $ING
   --query "[?name=='CLIENT_DIRECTORY_LIST_ID'].value | [0]" -o tsv)
 export INGEST_APP_IDS=$INGEST_MI_APPID
 export FORBIDDEN_TARGET_SITE_PATHS=/sites/BCRGROUPSp.zo.o
-export QUARANTINE_SITE_PATH=/sites/BCRLedgerKwarantanna       # always forbidden to a client row
-export QUARANTINE_SITE_HOSTNAME=$SP_HOST                      # the only host a row may name
+# Always forbidden to a client row.
+export QUARANTINE_SITE_PATH=/sites/BCRLedgerKwarantanna
+# The only host a row may name.
+export QUARANTINE_SITE_HOSTNAME=$SP_HOST
 node tools/directory-bindings.mjs check
 ```
 
@@ -531,7 +665,8 @@ For every row, `check` reports:
   Directory's own site collection (BCR GROUP) however the path is spelled. A `SitePath` that is
   not exactly `/sites/<name>` or `/teams/<name>` is skipped as `site_path_not_canonical`.
   Ingestion excludes the same rows;
-- staff ids on client rows;
+- staff ids on client rows. On a row that is not bound yet (see the exit codes below) they are
+  reported as `not routing (unbound)`: ingestion quarantines those uploads as `unbound_target`;
 - duplicate ClientIds and NIPs, and rows sharing a site, a `DriveId` or a `TeamId` (ingestion
   excludes every such row as a conflict);
 - whether the client's Team is Private and its channel is standard;
@@ -542,6 +677,25 @@ For every row, `check` reports:
 - whether each guest is in this client's Team and **in no other Team**. A guest who is also in
   any other Team, marked or not, is excluded (`guest_in_other_team`) and is never bound; their
   uploads go to quarantine.
+
+**Its exit code.** A row is *bound* when it is Active, not `IsAdmin`, and has `RootFolder`,
+`DriveId` and `TeamId` all set: the only rows ingestion routes to.
+
+- `0`: every bound row was assessed, and nothing routes where it should not.
+- `3`: **routing drift on a bound row.** It holds a staff id, or a guest who is no longer a guest
+  of that row's Team alone. An `ACTION` line says to run `propose` and apply the whole plan.
+- `4`: **incomplete.** No drift was found, but at least one bound row that holds user ids could
+  not be fully assessed (`site_unresolved`, `no_team`, `team_lookup_failed`,
+  `membership_lookup_failed` or `guest_memberships_unreadable`). Those rows are listed as
+  `incomplete`, in the report and on an `ACTION` line. Act on each: usually a 403 (H-4a) or a
+  site the signed-in person cannot read. Then run `check` again.
+- `1`: refused (a missing or malformed input, an expired token).
+
+3 wins over 4. **At H-7, expect `0`**, or `4` with the `incomplete` rows listed, to act on as
+above. Nothing is bound yet (`DriveId` and `TeamId` stay empty until H-12), so Yahor's staff id
+on PESKOVOI's row, and any staff id on TEST's, is `not routing (unbound)` and does not make it
+exit 3. It is still a finding to decide on below; H-12 removes it (steps 5 and 8). An exit 3
+at H-7 would mean a row is already bound and routes someone it should not: stop and tell Roman.
 
 **Write grants read "unknown" with this token,** because reading site permissions needs
 `Sites.FullControl.All`. Verify each one **read-only**: in Graph Explorer, with
@@ -560,7 +714,8 @@ it at BCR GROUP, where it would undo H-13.
 [incident → IR-1](incident-2026-09.md#ir-1-inventory)).
 
 ```bash
-node tools/directory-bindings.mjs propose                  # → tools/out/directory-bindings-plan-<UTC>.json
+# Writes tools/out/directory-bindings-plan-<UTC>.json
+node tools/directory-bindings.mjs propose
 ```
 
 Decide what happens to each finding **before** H-12, and write the decisions in the incident's
@@ -586,7 +741,8 @@ Then add the two new columns, `DriveId` and `TeamId`. The code running today doe
 them.
 
 ```bash
-node tools/directory-bindings.mjs --add-columns           # dry run: says what it would create
+# A dry run: says what it would create.
+node tools/directory-bindings.mjs --add-columns
 node tools/directory-bindings.mjs --add-columns --apply
 ```
 
@@ -607,8 +763,9 @@ The running bot is different for one setting: the pre-Phase-0 bot already reads
 value:
 
 ```bash
+# Empty means not set.
 az functionapp config appsettings list -g $RG -n $BOT -o tsv \
-  --query "[?name=='MICROSOFT_APP_TYPE'].value | [0]"          # empty means not set
+  --query "[?name=='MICROSOFT_APP_TYPE'].value | [0]"
 ```
 
 If it reads `SingleTenant`, setting it below changes nothing. Anything else, or nothing, makes
@@ -616,19 +773,25 @@ the set below a live change to the running bot's Bot Framework authentication: r
 the TEST guest sends `pomoc` and the help card must come back. If it does not, restore the noted
 value (or delete the setting, if it was not set) and stop.
 
-```bash
-az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
-  "BOT_CALLER_APP_IDS=$BOT_APP_ID" \
-  "QUARANTINE_SITE_HOSTNAME=$SP_HOST" \
-  "QUARANTINE_SITE_PATH=/sites/BCRLedgerKwarantanna" \
-  "QUARANTINE_DRIVE_NAME=Dokumenty" \
-  "QUARANTINE_ROOT_FOLDER=Kwarantanna" \
-  "FORBIDDEN_TARGET_SITE_PATHS=/sites/BCRGROUPSp.zo.o" \
-  "CLIENT_DIRECTORY_MAX_STALE_MS=900000"
+The set runs only if `BOT_APP_ID` is a GUID (the guard after the Variables), so a lost variable
+cannot write an empty `BOT_CALLER_APP_IDS`:
 
-az functionapp config appsettings set -g $RG -n $BOT -o none --settings \
-  "BOT_GATE_MODE=log" \
-  "MICROSOFT_APP_TYPE=SingleTenant"
+```bash
+if [[ $BOT_APP_ID =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+  az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
+    "BOT_CALLER_APP_IDS=$BOT_APP_ID" \
+    "QUARANTINE_SITE_HOSTNAME=$SP_HOST" \
+    "QUARANTINE_SITE_PATH=/sites/BCRLedgerKwarantanna" \
+    "QUARANTINE_DRIVE_NAME=Dokumenty" \
+    "QUARANTINE_ROOT_FOLDER=Kwarantanna" \
+    "FORBIDDEN_TARGET_SITE_PATHS=/sites/BCRGROUPSp.zo.o" \
+    "CLIENT_DIRECTORY_MAX_STALE_MS=900000"
+  az functionapp config appsettings set -g $RG -n $BOT -o none --settings \
+    "BOT_GATE_MODE=log" \
+    "MICROSOFT_APP_TYPE=SingleTenant"
+else
+  echo 'STOP: BOT_APP_ID is not a GUID, so nothing was set. Set the variables again.'
+fi
 ```
 
 | Setting | Why this value |
@@ -651,22 +814,41 @@ az functionapp config appsettings list -g $RG -n $BOT -o table --query \
   "[?name=='BOT_GATE_MODE' || name=='MICROSOFT_APP_TYPE'].{name:name,value:value}"
 ```
 
-The shapes the Phase-0 build checks at cold start, checked now, while a wrong value costs
-nothing. This must print nothing:
+The settings the Phase-0 build requires at cold start, checked now, while a wrong value costs
+nothing. Each must be present, not empty, and in the shape the table gives: the two paths exactly
+`/sites/<name>` or `/teams/<name>`, every `BOT_CALLER_APP_IDS` entry a GUID. A setting that is
+missing prints `missing or empty`, one in the wrong shape `wrong shape`. This must print nothing:
 
 ```bash
 az functionapp config appsettings list -g $RG -n $INGEST -o json --query \
-  "[?name=='CLIENT_DIRECTORY_SITE_ID' || name=='QUARANTINE_SITE_HOSTNAME' || name=='BOT_CALLER_APP_IDS'].{name:name,value:value}" \
-  | jq -r '.[] | select(
-      (.name == "CLIENT_DIRECTORY_SITE_ID"
-        and (.value | test("^[a-z0-9.-]+,[0-9a-f-]{36},[0-9a-f-]{36}$"; "i") | not))
-      or (.name == "QUARANTINE_SITE_HOSTNAME"
-        and (.value | test("^[a-z0-9-]+\\.sharepoint\\.com$"; "i") | not))
-      or (.name == "BOT_CALLER_APP_IDS"
-        and (.value | split(",") | map(gsub("^\\s+|\\s+$"; ""))
-             | all(test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"; "i")) | not))
-    ) | "wrong shape: \(.name)"'
+  "[?name=='CLIENT_DIRECTORY_SITE_ID' || name=='QUARANTINE_SITE_HOSTNAME' || name=='QUARANTINE_SITE_PATH' || name=='BOT_CALLER_APP_IDS' || name=='FORBIDDEN_TARGET_SITE_PATHS'].{name:name,value:value}" \
+  | jq -r '
+    def t: sub("^\\s+"; "") | sub("\\s+$"; "");
+    def list: split(",") | map(t) | map(select(. != ""));
+    def guid: test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"; "i");
+    def site_path: test("^/(sites|teams)/[A-Za-z0-9_-]([A-Za-z0-9._-]*[A-Za-z0-9_-])?$");
+    def ok($n):
+      if   $n == "CLIENT_DIRECTORY_SITE_ID" then test("^[a-z0-9.-]+,[0-9a-f-]{36},[0-9a-f-]{36}$"; "i")
+      elif $n == "QUARANTINE_SITE_HOSTNAME" then test("^[a-z0-9-]+\\.sharepoint\\.com$"; "i")
+      elif $n == "QUARANTINE_SITE_PATH"     then site_path
+      elif $n == "BOT_CALLER_APP_IDS"       then list | length > 0 and all(guid)
+      else                                       list | length > 0 and all(site_path) end;
+    (map({(.name): (.value // "" | t)}) | add // {}) as $s
+    | ("CLIENT_DIRECTORY_SITE_ID", "QUARANTINE_SITE_HOSTNAME", "QUARANTINE_SITE_PATH",
+       "BOT_CALLER_APP_IDS", "FORBIDDEN_TARGET_SITE_PATHS") as $n
+    | ($s[$n] // "") as $v
+    | if $v == "" then "missing or empty: \($n)"
+      elif ($v | ok($n)) then empty
+      else "wrong shape: \($n)" end'
 ```
+
+If it prints anything, correct that setting now with a merge-only
+`az functionapp config appsettings set … -o none`, and run the check again. At H-12 the same
+mistake would stop the new build at cold start. The running ingestion ignores the new settings,
+so correcting them is harmless. It does read `CLIENT_DIRECTORY_SITE_ID`: if that one is reported,
+set it to the same site's three-part id,
+`g "$G/sites/$SP_HOST:/sites/BCRGROUPSp.zo.o?\$select=id" | jq -r .id`, and run T-5's
+`directory refresh failed` query for the next 15 minutes.
 
 If you changed `MICROSOFT_APP_TYPE`, the TEST guest's `pomoc` came back.
 
@@ -689,8 +871,10 @@ credential: it goes into a variable and is never printed, pasted or logged (less
 `PROJECT_OVERVIEW.md`). Do not run this with `set -x`.
 
 ```bash
-mkdir -p tools/out/rollback && chmod 700 tools/out/rollback      # tools/out is git-ignored
-save_running() {   # $1 = app name, $2 = file name. Prints neither the URL nor its token.
+# tools/out is git-ignored.
+mkdir -p tools/out/rollback && chmod 700 tools/out/rollback
+# $1 = app name, $2 = file name. Prints neither the URL nor its token.
+save_running() {
   local url
   url=$(az functionapp config appsettings list -g $RG -n "$1" \
     --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'].value | [0]" -o tsv)
@@ -726,9 +910,11 @@ The zips are not in git (`artifacts/*.zip` is ignored), so a `git checkout`, `gi
 
 ```bash
 corepack yarn install --immutable
-rm -rf packages/*/node_modules/@bcr/shared                     # lesson 15
+# Lesson 15.
+rm -rf packages/*/node_modules/@bcr/shared
 corepack yarn build && corepack yarn test
-corepack yarn build && corepack yarn workspace @bcr/teams-bot package   # → artifacts/teams-bot.zip
+# Writes artifacts/teams-bot.zip
+corepack yarn build && corepack yarn workspace @bcr/teams-bot package
 ```
 
 **3. Check the zip before deploying it.** The count must be greater than 0:
@@ -852,7 +1038,7 @@ These steps go in **one** window because each fixes a failure the others would c
 - IR-0 is stored (H-2). This deploy changes the logs.
 - `ANTHROPIC_ENABLED=false` (H-3) and the fallback points at the quarantine (H-6b).
 - H-6's grant is in place.
-- H-8's settings are present.
+- H-8's settings are present, and H-8's check of them, run again now, prints nothing.
 - The gate is in `enforce` (H-11).
 - T-4 (and its check after H-6b), T-4b and T-5 are done.
 - Every H-7 finding has a decision.
@@ -864,10 +1050,12 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
 
    ```bash
    # save_running is the function from H-9 step 1; define it again in a new shell.
-   save_running $INGEST document-ingestion-before-p0.zip     # prints no URL
+   # It prints no URL.
+   save_running $INGEST document-ingestion-before-p0.zip
    corepack yarn build && corepack yarn workspace @bcr/document-ingestion package
+   # Must print a count greater than 0.
    unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js \
-     | grep -c forbiddenTargetSitePaths                        # must be greater than 0
+     | grep -c forbiddenTargetSitePaths
    ```
 
    A count of `0` means a pre-Phase-0 `@bcr/shared`: that build fails at cold start, because the
@@ -880,6 +1068,23 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    `"build":{"phase":"p0","routing":"identity-only"}`. `directory-bindings.mjs apply` checks
    this itself: it refuses to write unless the `--health-url` it is given reports
    `build.routing=identity-only`. `--expect-health` only adds further checks.
+
+   **If `/api/health` does not answer within a few minutes** of the deploy, the new build did not
+   start. It checks its settings when it loads, and one missing or malformed setting stops every
+   function, `/api/health` included. Never answer this with the pre-Phase-0 zip. Instead:
+   1. run the emergency stop, `az functionapp stop -g $RG -n $INGEST`;
+   2. find the setting it names. The message lists each failing setting by name, never its value:
+
+      ```bash
+      aiq 'union exceptions, traces | where cloud_RoleName startswith "func-bcr-ingest"
+        | where outerMessage has "Invalid configuration" or message has "Invalid configuration"
+        | project timestamp, text = coalesce(outerMessage, message)' <time of the deploy>
+      ```
+
+   3. fix that setting with a merge-only
+      `az functionapp config appsettings set -g $RG -n $INGEST -o none --settings "<NAME>=<value>"`,
+      and run H-8's check again until it prints nothing;
+   4. `az functionapp start -g $RG -n $INGEST`, and check `/api/health` again.
 
    **The window, from here until each row's apply.** A client row routes nobody until it holds
    `RootFolder`, `DriveId` and `TeamId`, and only `apply` writes those, all three together. So
@@ -895,10 +1100,10 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    confirm each grant read-only, as in H-7 (`GET /sites/{site-id}/permissions` shows `write` for
    `$INGEST_MI_APPID`). Per-site grants take about 5 minutes to take effect, so make them before
    step 5 and wait before that client's apply.
-4. **Negative canary: quarantine.** A canary guest bound to no row uploads a synthetic PDF. The
-   canary guest is a BCR-controlled outside account, invited as a guest and in no client Team.
-   Before this and **every later negative canary**, confirm that with the tool (H-7's variables
-   set): `node tools/directory-bindings.mjs check | grep -ci <canary guest's object id>` prints
+4. **Negative canary: quarantine.** The canary guest from [H-5b](#h-5b-invite-the-canary-guest)
+   uploads a synthetic PDF. It is a BCR-controlled outside account, bound to no row and in no
+   Team. Before this and **every later negative canary**, confirm that with the tool (H-7's
+   variables set): `node tools/directory-bindings.mjs check | grep -ci <canary id>` prints
    `0`, so the id is on no row and in no Team's guest list. Otherwise stop: the upload would be
    filed into a client's channel instead of quarantined. Expect:
    - the card says "Dokument przekazano do weryfikacji przez zespół BCR", with no link;
@@ -912,7 +1117,7 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    tool skips those rows, and step 8 cannot run.
 
    ```bash
-   # add --write-verified <sitePath> for each further site granted in step 3
+   # Add --write-verified <sitePath> for each further site granted in step 3.
    node tools/directory-bindings.mjs propose --confirm-remove-staff <PESKOVOI listItemId> \
      --write-verified <TEST sitePath> --write-verified <PESKOVOI sitePath>
    ```
@@ -935,8 +1140,9 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
 6. **Apply TEST first.** A dry run, then the same with `--apply`:
 
    ```bash
+   # The dry run. Then run the same command again with --apply added.
    node tools/directory-bindings.mjs apply --plan tools/out/<plan>.json --only <TEST listItemId> \
-     --health-url https://$INGEST.azurewebsites.net/api/health   # then again with --apply
+     --health-url https://$INGEST.azurewebsites.net/api/health
    ```
 
    The tool prints each row before and after, and writes a rollback log. It refuses a plan older
@@ -944,8 +1150,13 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    `propose`, and a health endpoint that does not report `build.routing=identity-only`. Before
    each PATCH it reads every guest it is about to bind again: the user must still be a `Guest`,
    and the Teams in their `memberOf` must be exactly the row's Team. Otherwise the row is
-   `stale` and skipped: run `propose` again. The apply log is a new file every run (an `--out`
-   that exists is refused), written safely before each PATCH; keep every one until H-15.
+   `stale` and skipped: run `propose` again. A plan changed after `propose`, its `createdAt`
+   included, is refused too: an old plan is never edited, it is proposed again. The apply log is
+   a new file every run (an `--out` that exists is refused, as it is for `check` and `propose`,
+   so no report can replace an apply log), written safely before each PATCH; keep every one until
+   H-15. A 403 from `propose` or `apply` means a permission from H-4a is missing
+   (`Sites.ReadWrite.All` for the write), or the signed-in person cannot edit the Client
+   Directory list (Owners only, T-5).
 7. **Canary on TEST.** The TEST guest uploads a synthetic PDF. Expect:
    - it lands in TEST's `Dokumenty księgowe/…`, visible in the channel's files tab;
    - the card's link opens it there;
@@ -957,21 +1168,45 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    that row; check that the printed after-state no longer holds it. For a real client, the
    canary must come from an identity bound to that client, and there are two ways:
    - by arrangement, the client's contact sends the synthetic canary file BCR gives them; or
-   - BCR's canary guest joins that one client Team for the canary only. At that moment it is in
-     no other Team at all, or the tool excludes it (`guest_in_other_team`). Afterwards it
-     leaves the Team, and its id comes off the row the same way it went on. A plain `propose`
-     is not enough: without `--write-verified` the row is SKIP `write_grant_unknown`, and
-     `apply` refuses a SKIP row. So:
+   - BCR's canary guest ([H-5b](#h-5b-invite-the-canary-guest)) joins that one client Team for
+     the canary only. While its id is on the row, every upload it makes is filed into
+     PESKOVOI's channel, where the client sees it, so run these in one go, in this order:
+     1. A BCR owner of PESKOVOI's Team adds the canary guest to it. It must be in no other Team
+        at all, or the tool excludes it (`guest_in_other_team`).
+     2. `propose --write-verified <PESKOVOI sitePath>`. A plain `propose` is not enough: without
+        `--write-verified` the row is SKIP `write_grant_unknown`, and `apply` refuses a SKIP
+        row. The plan adds the canary's id to PESKOVOI's row.
+     3. `apply` that plan with `--only <PESKOVOI listItemId>`, a dry run and then `--apply`. The
+        printed after-state holds the canary's id.
+     4. The canary upload: the canary guest sends the synthetic PDF. Expect what the TEST canary
+        (H-12 step 7) expects, in PESKOVOI's channel, then delete the canary file.
+     5. The canary guest leaves PESKOVOI's Team.
+     6. `propose` again, with `--write-verified` for the TEST and PESKOVOI sites only (the rows
+        already applied, so no further client is bound before its own canary). Review it as in
+        H-12 step 5, and apply that plan **whole**, without `--only`: a dry run, then `--apply`.
+        PESKOVOI's printed after-state no longer holds the canary's id.
+     7. H-12 step 4's `node tools/directory-bindings.mjs check | grep -ci <canary id>` prints `0`.
+
+     Sub-steps 2 and 3, once the canary guest is in the Team:
 
      ```bash
      node tools/directory-bindings.mjs propose --write-verified <PESKOVOI sitePath>
-     node tools/directory-bindings.mjs apply --plan tools/out/<new plan>.json --only <PESKOVOI listItemId> \
-       --health-url https://$INGEST.azurewebsites.net/api/health      # then again with --apply
+     # The dry run. Then run the same command again with --apply added.
+     node tools/directory-bindings.mjs apply --plan tools/out/<plan from 2>.json --only <PESKOVOI listItemId> \
+       --health-url https://$INGEST.azurewebsites.net/api/health
      ```
 
-     The printed after-state must no longer hold the canary's id, and step 4's `check | grep`
-     prints `0` again. Until then, an upload by the canary guest is filed into PESKOVOI's
-     channel, where the client sees it.
+     Sub-steps 6 and 7, only after the upload and after the canary guest has left the Team:
+
+     ```bash
+     node tools/directory-bindings.mjs propose \
+       --write-verified <TEST sitePath> --write-verified <PESKOVOI sitePath>
+     # The dry run. Then run the same command again with --apply added.
+     node tools/directory-bindings.mjs apply --plan tools/out/<plan from 6>.json \
+       --health-url https://$INGEST.azurewebsites.net/api/health
+     # Must print 0.
+     node tools/directory-bindings.mjs check | grep -ci <canary id>
+     ```
 
    Never use a real client document, and never a staff account, because staff go to quarantine
    by design.
@@ -987,8 +1222,8 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
     more with the same flags as step 5 and apply that plan **without `--only`** (a dry run, then
     `--apply`). Every PATCH in it is applied, including one that takes an id off another row. The
     dry run should show no PATCH at all; any it shows is reviewed as in step 5 before it is
-    applied, never skipped. Then run `check`. From now on the
-    [standing checks](#standing-checks) apply.
+    applied, never skipped. Then run `check`: it must exit `0` (a `3` or `4` is acted on as in
+    the [standing checks](#standing-checks)). From now on the standing checks apply.
 13. **Watch for an hour:**
 
 ```bash
@@ -1033,8 +1268,25 @@ Phase 1. Until then the [standing checks](#standing-checks) stand in for it.
 
 **Rollback.**
 
-- A binding: `node tools/directory-bindings.mjs rollback --log tools/out/<apply-log>.json --apply`
-  (a dry run without `--apply`) restores the before-state it printed. That row's guests then go to quarantine, which is safe.
+- A binding: `node tools/directory-bindings.mjs rollback --log tools/out/<apply-log>.json` is a
+  dry run; the same with `--apply` restores the before-state that `apply` printed, for every row
+  in the log, or only for the rows named with `--only <listItemId>` (repeatable). What that
+  means depends on what the apply did:
+  - **It only bound the row and took no id off it** (TEST's apply in step 6, if TEST's row held
+    no staff id): the rollback unbinds it, and that row's guests go to quarantine again. Safe.
+  - **It took ids off the row** (a staff id, a guest now in another Team, the canary): the
+    rollback would put them back, so it is **not safe by default**. Prefer running `propose`
+    again and applying the whole plan. Before each PATCH, `rollback` re-checks every id it
+    would add back exactly as `apply` re-checks a guest (a `Guest` whose Teams are exactly the
+    row's `TeamId`). If any fails it refuses that row (`guest_recheck_failed`) and exits 2, so
+    it never re-creates cross-client routing and never puts a staff id back. Step 8 is such a
+    case: PESKOVOI's before-state holds Yahor's staff id, so its rollback is refused.
+
+  To make a bound row route nobody at once, when its rollback is refused, set its `Status` to
+  `Inactive` by hand (T-5's versioning records it). Within the Directory refresh (5 minutes;
+  the emergency stop covers that time if needed) its guests' uploads go to quarantine as
+  `unmapped`. Roman and Yahor then decide, and `check` shows the row before it is set `Active`
+  again.
 - The ingestion build: stop the app, revert the offending commit, rebuild, check the zip as in
   step 1 and deploy it. **Never redeploy a pre-Phase-0 ingestion zip**, including the one saved
   in step 1.
@@ -1124,7 +1376,7 @@ Bicep drift fix (gate G1), not here.
 | The IR-0 export is stored | H-2 verification |
 | The taxonomy folders at the library root of every client site the ingestion identity could write to are Owners-only | T-4b's status row lists every such site (PESKOVOI, TEST and each site IR-1 added); **Check permissions** for each client's guest returns *None*; T-4b's check of the items outside those folders, after IR-1, is recorded for each site |
 | The BCR GROUP root folders are Owners-only, including any created after the first lock | T-4's status row records the lock and the check after H-6b |
-| The canary guest is bound to no row | `check \| grep -ci <canary guest's object id>` prints `0` (H-12 step 4), after the last canary |
+| The canary guest (H-5b) is bound to no row | `check \| grep -ci <canary id>` prints `0` (H-12 step 4), after the last canary |
 | The whole binding plan is applied, and the standing checks run | A `propose` at exit shows no PATCH row (every row NOOP, or SKIP with a recorded decision); the first weekly `check` is recorded in the incident's status table ([standing checks](#standing-checks)) |
 | `CLAUDE.md` is updated | Merged with the promotion removal |
 | CI runs coverage, green | The CI run on `main` |
@@ -1136,18 +1388,22 @@ Bicep drift fix (gate G1), not here.
 Phase 0 checks a guest's Team membership only when `propose` and `apply` bind a row, and it has
 no alert rule. Ingestion routes on the Directory row alone. So a bound guest who is later added
 to a second client's Team keeps routing everything, the second company's documents included,
-into the first client's channel, and nothing notices. That is an ordinary business event: one
-person running two companies. Onboarding invites the same email, gets the same guest back, adds
-it to the new Team, and writes the new row with no user ids, so no conflict is raised either.
-These checks close that gap by schedule until the robust fix, a runtime `memberOf` check (or a
-membership registry kept in sync), lands in Phase 2. Onboarding writing the guest's id into the
-new row itself (R1) waits on Roman's re-ruling of Q21.
+into the first client's channel, until the next `check` and apply of the whole plan take the id
+off. That is an ordinary business event: one person running two companies. Onboarding invites
+the same email, gets the same guest back, adds it to the new Team, and writes the new row with
+no user ids, so no conflict is raised either.
+
+**This is an accepted residual risk of Phase 0.** The mitigation is the schedule below: `check`
+and an apply of the **whole** plan after **every** onboarding, a `check` at least weekly, and
+action the same day whenever `check` exits `3` or `4`. The robust fix, a runtime `memberOf` check
+at upload time (or a membership registry kept in sync), is Phase 2. Onboarding writing the
+guest's id into the new row itself (R1) waits on Roman's re-ruling of Q21.
 
 | When | What | Why |
 |---|---|---|
-| After **any** onboarding | `propose` with H-12 step 5's flags, reviewed, then `apply` of the **whole** plan (a dry run, then `--apply`): never `--only <new row>` | The whole plan carries the PATCH that takes a reused guest's id off the first client's row. A guest in two Teams is then bound to neither, and their uploads go to quarantine until a person decides |
-| **Weekly**, and after any onboarding that reuses an existing guest | `check`. A row id marked *not eligible* (now in another Team, or no longer in the row's Team), or a guest reported as `guest_in_other_team`, means: `propose` and apply the whole plan the same day | Catches Team changes made outside onboarding, and a guest who left their client's Team but can still file into its channel |
-| Before any negative canary | H-12 step 4's `check \| grep -ci <canary guest's object id>` prints `0` | A canary guest left on a row files into that client's channel |
+| After **any** onboarding | `propose` with H-12 step 5's flags, reviewed, then `apply` of the **whole** plan (a dry run, then `--apply`): never `--only <new row>`. Then `check`, acted on as in the next row | The whole plan carries the PATCH that takes a reused guest's id off the first client's row. A guest in two Teams is then bound to neither, and their uploads go to quarantine until a person decides |
+| **Weekly**, and after any onboarding that reuses an existing guest | `check`. **Exit `3` and exit `4` both need action, the same day.** `3` is drift on a bound row: a row id marked *not eligible* (now in another Team, or no longer in the row's Team) or a staff id; `propose` and apply the whole plan. `4` is incomplete: a bound row could not be fully assessed, and the `incomplete` rows are listed; fix what stopped the read (a 403 is a missing permission, H-4a; or a site the signed-in person cannot read) and run `check` again until it exits `0`, or `3` and is acted on. A guest reported as `guest_in_other_team` also means: `propose` and apply the whole plan the same day | Catches Team changes made outside onboarding, and a guest who left their client's Team but can still file into its channel. An exit `4` hides whether that happened on the rows it lists |
+| Before any negative canary | H-12 step 4's `check \| grep -ci <canary id>` prints `0` | A canary guest left on a row files into that client's channel |
 | Every working day | The query below. A `document.quarantine_failed` row means: check H-6's grant and the quarantine library name first. A `sharepoint.forbidden_site` row is an incident indicator (H-12 step 13) | A failed quarantine write is fail-closed (the user gets "spróbuj ponownie", nothing is written anywhere else), but if the quarantine grant or `QUARANTINE_DRIVE_NAME` breaks, every unbound, staff and stale upload is refused and nobody is told |
 
 ```bash

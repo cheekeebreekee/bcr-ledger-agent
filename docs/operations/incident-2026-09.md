@@ -16,7 +16,10 @@ documents already filed in the wrong place are found and moved back.
 export, the inventory and the relocation register contain file names, client names and user
 ids. They live in the IR evidence store (see [IR-0](#ir-0-preserve-the-evidence-first)), readable by
 Roman, the IOD and `yahor.simak@bcr-group.pl` only. Nothing from them is pasted here, and no
-NIP, object id or file name should ever be added to this page.
+NIP, object id or file name should ever be added to this page. The one exception is the canary
+guest's object id ([H-5b](human-steps.md#h-5b-invite-the-canary-guest)): a BCR-controlled test
+account, not a client's or a person's, recorded in the status table because every negative
+canary checks against it.
 
 ---
 
@@ -38,7 +41,7 @@ broken; the audit confirmed it and found the mechanism.
 |---|---|
 | 23 Sep | Roman asked whether onboarded clients could reach the `Onboarding klientów` channel. The tenant audit (`bcr-onboarding-agent/docs/operations/client-access.md`) found the three `{NIP}@` client addresses enabled and licensed, and the BCR GROUP and Bricore teams Public. |
 | 23–25 Sep | A read-only audit of both repos: 33 security findings, each re-checked by an independent reviewer, all 33 held. They reduce to the six root causes below. |
-| between 23 and 25 Sep | BCR GROUP was made Private. **Record the exact time here from the Purview `Update group` event** once IR-0 is exported. It stays Private; this response never changes it. |
+| between 23 and 25 Sep | BCR GROUP was made Private. **Record the exact time here from the Purview `Update group` event** once IR-0 is exported. It stays Private; this response never changes its visibility, its membership or its channels. |
 | 25 Sep | Automatic deploys to "dev" (which is production: it serves PESKOVOI, `0002`) were stopped, commit `f5a2bd4` (gate G0). The Phase-0 contract was committed, `21b0883`. Roman agreed the GDPR option in [IR-3](#ir-3-gdpr). |
 
 **Awareness**, for the GDPR clock, arguably began with the 23–25 September audit. The 72-hour
@@ -124,7 +127,8 @@ item closes a named root cause. The human-run steps and their order are in
 | Bindings | `tools/directory-bindings.mjs` writes each row's guest ids, channel folder, `DriveId` and `TeamId` from Graph, and removes staff ids from client rows. | R1, R4, R5 |
 | Tenant | `{NIP}@` sign-in blocked and mailboxes unlicensed; ledger folders on BCR GROUP locked to Owners (T-4); the same folders at the library root of every client site the ingestion identity could write to locked to Owners (T-4b); the Directory list locked and versioned; guest and sharing defaults tightened. | R2, W2, W3, W4 (items already moved), W7 |
 
-**Until the Phase-0 build is live, without a deploy** (mandatory, from the day IR-0 is stored):
+**Until the Phase-0 build is live, without a deploy** (mandatory, from day 0; promotion is stopped
+at once, without waiting for IR-0, because stopping it deletes no past log data):
 
 - **Promotion off.** Promotion needs the parties that only the Claude classifier extracts, so
   `ANTHROPIC_ENABLED=false` on the running ingestion stops R3 at once, at the cost of every new
@@ -397,7 +401,8 @@ run. The blob path is `ir0/<upload date>/<export folder>/`, as `evidence-store.s
 R=tools/out/ir0-restore; mkdir -p -m 700 "$R"
 az storage blob download-batch --auth-mode login --account-name <storage account> \
   -s ir0-evidence -d "$R" --pattern 'ir0/<upload date>/ir0-appinsights-<UTC>/*'
-(cd "$R/ir0/<upload date>/ir0-appinsights-<UTC>" && shasum -a 256 -c SHA256SUMS)   # every line OK
+# Every line must read OK.
+(cd "$R/ir0/<upload date>/ir0-appinsights-<UTC>" && shasum -a 256 -c SHA256SUMS)
 ```
 
 Never drop `--ir0` to get a run through. Without it the tool cannot tell a fallback or a
@@ -422,7 +427,8 @@ node tools/inventory-misfiled.mjs \
   --ingest-app-ids "$INGEST_MI_APPID" --fallback-site BCRGROUP \
   --ir0 tools/out/ir0-restore/ir0/<upload date>/ir0-appinsights-<UTC>/ \
   --bindings-plan tools/out/directory-bindings-plan-<UTC>.json
-rm -rf tools/out/ir0-restore                                    # once the run is checked
+# Once the run is checked:
+rm -rf tools/out/ir0-restore
 ```
 
 For each item it records:
@@ -624,7 +630,8 @@ The per-client list of affected documents is sent separately, over a secure chan
 
 ## Status
 
-Update this table as steps complete. Evidence columns hold hashes, commit ids and dates only.
+Update this table as steps complete. Evidence columns hold hashes, commit ids and dates only,
+plus the canary guest's object id (H-5b).
 
 The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 
@@ -647,7 +654,8 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | IR-1 inventory: run with an Owner's or site collection admin's token and `--expect-root-folders` for every site; `--ir0` restored from the store; exit 0 | Yahor, or an Owner of each site | todo | | `SHA256SUMS`; any temporary site collection admin added and removed |
 | T-4b: items outside the locked folders checked after IR-1, and locked one by one | SharePoint Admin | todo | | per site: done, and the number of items locked (the items themselves in the evidence store) |
 | H-5, H-6: quarantine site and ingestion write grant | SharePoint Admin, Global Admin | todo | | |
-| H-6b: running build's fallback re-pointed at the quarantine | Yahor | todo | | `FALLBACK_*` names; values in the evidence store (`SHA256SUMS`) |
+| H-5b: canary guest invited, in no Team; whether it reached the bot before H-10 | Global Admin | todo | | the canary guest's object id (the one object id this page holds; see the top) |
+| H-6b: running build's fallback re-pointed at the quarantine | Yahor | todo | | `FALLBACK_*` names; values in the evidence store (`SHA256SUMS`); which guest verified it (canary or TEST) |
 | H-7: Directory check; duplicate `0002` resolved; per-row decisions, incl. which sites get a grant in H-12 | Yahor, Roman | todo | | |
 | H-8: app settings added | Yahor | todo | | |
 | H-9: bot deploy, gate in `log` | Yahor | todo | | sha256 of the saved pre-Phase-0 bot package |

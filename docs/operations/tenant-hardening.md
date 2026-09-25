@@ -9,18 +9,23 @@ Each step gives the role that can run it, why it exists, the command to read the
 the command that changes it, how to verify it, and how to undo it. The order of these steps
 relative to the deploys is in [`human-steps.md`](human-steps.md#phase-0).
 
+**Run every command in bash** (`bash -l`). In zsh, the macOS default, run
+`setopt interactivecomments` first. Without it, an interactive zsh does not treat `#` as the start
+of a comment: a pasted comment becomes a command, or an apostrophe in it opens a quote that
+swallows the lines after it. For the same reason every comment in the blocks below sits on its
+own line.
+
 ⚠️ **Three rules for every step on this page.**
 
-- **BCR GROUP stays Private.** This page never changes its visibility or its channels.
-  [T-3](#t-3-confirm-bcr-group-is-private-read-only) only reads.
+- **BCR GROUP stays Private, and its visibility, membership and channels never change.**
+  [T-3](#t-3-confirm-bcr-group-is-private-read-only) only reads them.
   [T-4](#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root) and
   [T-5](#t-5-lock-and-version-the-client-directory-list) change permissions on two things *inside*
   its site: the ledger's own folders, and the routing list. T-4 may also create one of the
   ledger's own folders, `98_Nieposortowane`, empty, so that it is locked before anything is filed
-  in it. The only change to its membership is
-  in [T-7](#t-7-explain-or-remove-authoriseme), which takes `AuthoriseMe@` out of the team, and
-  only if Roman decides the account is not needed. Nothing else on this page, T-4b included,
-  touches BCR GROUP.
+  in it. [T-7](#t-7-explain-authoriseme-or-block-its-sign-in) at most blocks the sign-in of
+  `AuthoriseMe@`, which leaves the team's membership as it is. Nothing else on this page, T-4b
+  included, touches BCR GROUP.
 - **Nothing here deletes or moves a client document.** Documents stay where IR-1 finds them, and
   IR-2 moves them later, with two people signing off.
 - **Save every "before" output.** The rollback needs it. Save it in the IR evidence store with the
@@ -29,24 +34,34 @@ relative to the deploys is in [`human-steps.md`](human-steps.md#phase-0).
 ## Tokens
 
 ```bash
-# Reads of users, groups and policies: the Azure CLI's token is enough.
+# Reads of users, groups and policies: a token of the Azure CLI is enough.
 az login --tenant <tenant-id>
 export GRAPH_TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
 
 # Writes to the directory, and anything in SharePoint: use a delegated token from an app
-# registration BCR owns. The Azure CLI's own app is not pre-authorised for those scopes
-# (AADSTS65002), and Microsoft will not change that per tenant. The helper lives in the
+# registration BCR owns. The first-party app of the Azure CLI is not pre-authorised for those
+# scopes (AADSTS65002), and Microsoft will not change that per tenant. The helper lives in the
 # onboarding repo; its header says how to set it up once.
 export GRAPH_TOKEN=$(node ../bcr-onboarding-agent/tools/graph-login.mjs)
 export SHAREPOINT_TOKEN=$(node ../bcr-onboarding-agent/tools/graph-login.mjs --sharepoint <tenant>.sharepoint.com)
 
 g()  { curl -sS -H "Authorization: Bearer $GRAPH_TOKEN" -H 'Content-Type: application/json' "$@"; }
-sp() { curl -sS -H "Authorization: Bearer $SHAREPOINT_TOKEN" -H 'Accept: application/json;odata=nometadata' "$@"; }
+# With -f an HTTP error fails the call and names its status, instead of printing an error body.
+sp() { curl -sSf -H "Authorization: Bearer $SHAREPOINT_TOKEN" -H 'Accept: application/json;odata=nometadata' "$@"; }
 G=https://graph.microsoft.com/v1.0
 ```
 
 `<tenant>` is the SharePoint tenant name and `<tenant-id>` the Entra tenant id. Both are in
 `PROJECT_OVERVIEW.md`. Tokens expire after about an hour, and they never go in a file.
+
+**Permissions.** The Graph permissions this page and the tools need are added and consented once
+on that app registration, by the Global Admin, in
+[`human-steps.md` H-4a](human-steps.md#h-4a-consent-the-permissions-the-operator-tools-need). Its
+SharePoint token carries `AllSites.Read`, enough for every SharePoint **read** on this page.
+The **scripted** SharePoint changes (in T-4, T-4b and T-5) need `AllSites.FullControl`, which
+H-4a deliberately does not add: use the browser path those steps give. A `403` from `g`, `sp` or
+a tool means a missing permission on the registration, or a right the signed-in person lacks;
+`sp` stops on it (`curl: (22) … 403`) rather than printing an error that reads like a result.
 
 ---
 
@@ -73,6 +88,7 @@ GRAPH_TOKEN=$(az account get-access-token --resource https://graph.microsoft.com
   node tools/audit-client-access.mjs > t1-before.txt
 
 # Apply: blocks sign-in on the accounts it marked RESTRICT, and nothing else.
+# Needs User.ReadWrite.All on the sign-in app, see human-steps H-4a. A 403 means it is missing.
 GRAPH_TOKEN=$(node tools/graph-login.mjs) node tools/audit-client-access.mjs --apply
 ```
 
@@ -80,7 +96,8 @@ GRAPH_TOKEN=$(node tools/graph-login.mjs) node tools/audit-client-access.mjs --a
 one account:
 
 ```bash
-az rest --url "$G/users/<nip>@bcr-group.pl?\$select=accountEnabled"     # "accountEnabled": false
+# Must read "accountEnabled": false
+az rest --url "$G/users/<nip>@bcr-group.pl?\$select=accountEnabled"
 ```
 
 **Rollback.** `g -X PATCH "$G/users/<nip>@bcr-group.pl" -d '{"accountEnabled":true}'`. You should
@@ -113,7 +130,8 @@ centre: **Users → Active users → the account → Licenses and apps**, untick
 Graph:
 
 ```bash
-az rest --url "$G/users/<nip>@bcr-group.pl/licenseDetails?\$select=skuId,skuPartNumber"   # note the skuId
+# Note the skuId.
+az rest --url "$G/users/<nip>@bcr-group.pl/licenseDetails?\$select=skuId,skuPartNumber"
 g -X POST "$G/users/<nip>@bcr-group.pl/assignLicense" -d '{"addLicenses":[],"removeLicenses":["<skuId>"]}'
 ```
 
@@ -155,9 +173,9 @@ Do not change it from here. Take the exact time it became Private from the Purvi
 
 **Why.** Every upload the ledger could not route went to the root of the BCR GROUP team library,
 in the ledger's own taxonomy folders. Those folders hold documents from every client, and every
-member of the team can read them: `AuthoriseMe@` today, and any accountant added to BCR GROUP
-later. Stopping inheritance and leaving only the Owners closes that. The documents stay exactly
-where IR-1 finds them.
+member of the team can read them: `AuthoriseMe@` today, and anyone who becomes a member later.
+Stopping inheritance and leaving only the Owners closes that. The documents stay exactly where
+IR-1 finds them.
 
 **When.** Day 0, the day of [H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy), and
 before H-12. **Then again after
@@ -197,7 +215,8 @@ ask; do not lock it.
 
 ```bash
 SITE_ID=$(g "$G/sites/<tenant>.sharepoint.com:/sites/BCRGROUPSp.zo.o?\$select=id" | jq -r .id)
-g "$G/sites/$SITE_ID/drive?\$select=name,webUrl"                          # the library's URL
+# The URL of the library.
+g "$G/sites/$SITE_ID/drive?\$select=name,webUrl"
 g "$G/sites/$SITE_ID/drive/root/children?\$select=name,folder" | jq -r '.value[].name'
 g "$G/teams/<bcr-group-id>/channels?\$select=displayName,membershipType" | jq -r '.value[].displayName'
 ```
@@ -206,13 +225,15 @@ Save the list of root folders, and mark which are taxonomy folders and which are
 The taxonomy folders on it, plus `98_Nieposortowane` if you create it (see **When**), are IR-1's
 `--expect-root-folders` for this site.
 
-**Change: in the browser.** This is the clearest way, and there are at most 14 folders. On the
-BCR GROUP site, open the document library. For each taxonomy folder: **⋯ → Manage access →
-Advanced settings → Stop Inheriting Permissions**. Then tick the site's **Members** and
-**Visitors** groups and click **Remove User Permissions**. The site's **Owners** group stays.
+**Change: in the browser.** This is the clearest way, there are at most 14 folders, and it needs
+no extra permission, so it is the path to use. On the BCR GROUP site, open the document library.
+For each taxonomy folder: **⋯ → Manage access → Advanced settings → Stop Inheriting
+Permissions**. Then tick the site's **Members** and **Visitors** groups and click **Remove User
+Permissions**. The site's **Owners** group stays.
 
-**Change: scripted,** with the same effect. `LIB` is the library path from `webUrl` above,
-decoded, for example `/sites/BCRGROUPSp.zo.o/Shared Documents`.
+**Helpers, for Verify and for the scripted change.** These only read, so set them whichever path
+made the change. `LIB` is the library path from `webUrl` above, decoded, for example
+`/sites/BCRGROUPSp.zo.o/Shared Documents`.
 
 ```bash
 WEB=https://<tenant>.sharepoint.com/sites/BCRGROUPSp.zo.o
@@ -220,12 +241,21 @@ LIB='/sites/BCRGROUPSp.zo.o/Shared Documents'
 MEMBERS=$(sp "$WEB/_api/web/AssociatedMemberGroup?\$select=Id" | jq .Id)
 VISITORS=$(sp "$WEB/_api/web/AssociatedVisitorGroup?\$select=Id" | jq .Id)
 
-item() {  # the folder's list item, with the path percent-encoded
+# The list item of a folder, with the path percent-encoded.
+item() {
   local p; p=$(jq -rn --arg p "$LIB/$1" '$p|@uri')
   echo "$WEB/_api/web/GetFolderByServerRelativePath(decodedurl='$p')/ListItemAllFields"
 }
+```
 
-for F in 01_Faktury 02_Wyciągi_bankowe 98_Nieposortowane; do   # the taxonomy folders that exist
+**Change: scripted,** with the same effect. ⚠️ **It needs SharePoint `AllSites.FullControl`** on
+the sign-in app, which [H-4a](human-steps.md#h-4a-consent-the-permissions-the-operator-tools-need)
+deliberately leaves out. With only `AllSites.Read`, every POST below fails with 403 and nothing
+changes. Prefer the browser.
+
+```bash
+# Name only the taxonomy folders that exist on this site.
+for F in 01_Faktury 02_Wyciągi_bankowe 98_Nieposortowane; do
   I=$(item "$F")
   sp -X POST "$I/breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)"
   sp -X POST "$I/roleassignments/getbyprincipalid($MEMBERS)/deleteobject()"
@@ -237,7 +267,8 @@ done
 
 ```bash
 I=$(item 01_Faktury)
-sp "$I?\$select=HasUniqueRoleAssignments"                                 # true
+# Must read true.
+sp "$I?\$select=HasUniqueRoleAssignments"
 sp "$I/roleassignments?\$expand=Member&\$select=Member/Title" | jq -r '.value[].Member.Title'
 ```
 
@@ -255,12 +286,15 @@ item's sharing links and direct grants. The live permissions of an item therefor
 show a link that existed before the lock; IR-2 takes that history from the IR-0 Purview export
 (`purview-sharing-events.csv`) instead.
 
-**Rollback.** `sp -X POST "$(item <folder>)/resetroleinheritance()"`. This exposes the folder to
-every member again, so only do it if the lock broke something essential, and record why.
+**Rollback.** In the browser, the folder's **⋯ → Manage access → Advanced settings → Delete
+unique permissions**; scripted (needs `AllSites.FullControl`),
+`sp -X POST "$(item <folder>)/resetroleinheritance()"`. This exposes the folder to every member
+again, so only do it if the lock broke something essential, and record why.
 
-**Before anyone joins BCR GROUP.** No accountant is added to BCR GROUP, and the planned
-"Weryfikacja dokumentów" channel is not created, until this step and
-[T-7](#t-7-explain-or-remove-authoriseme) are done.
+**Out of scope for Phase 0: new members or channels in BCR GROUP.** Adding accountants to BCR
+GROUP, and creating the planned "Weryfikacja dokumentów" channel, would change its membership
+and its channels, which no Phase-0 step does. Both are later decisions, and even then not before
+this step and [T-7](#t-7-explain-authoriseme-or-block-its-sign-in) are done.
 
 ## T-4b: Lock the ledger folders at the library root of the client sites
 
@@ -309,7 +343,8 @@ and ask; do not lock it.
 
 ```bash
 SITE_ID=$(g "$G/sites/<tenant>.sharepoint.com:/sites/<client-site>?\$select=id" | jq -r .id)
-g "$G/sites/$SITE_ID/drive?\$select=name,webUrl"                          # the library's URL
+# The URL of the library.
+g "$G/sites/$SITE_ID/drive?\$select=name,webUrl"
 g "$G/sites/$SITE_ID/drive/root/children?\$select=name,folder" | jq -r '.value[].name'
 g "$G/teams/<client-team-id>/channels?\$select=displayName" | jq -r '.value[].displayName'
 g "$G/groups/<client-team-id>/owners?\$select=userPrincipalName,userType" \
@@ -321,11 +356,13 @@ The taxonomy folders are IR-1's `--expect-root-folders` for this site. The Team'
 the site's Owners group, which keeps access: every owner must read `Member`. **If a guest is an
 owner, stop and tell Roman**; locking would leave that guest with access.
 
-**Change.** Exactly as in T-4, in the browser or scripted, with `WEB` and `LIB` pointing at this
-client site, for example `WEB=https://<tenant>.sharepoint.com/sites/<client-site>` and
+**Change.** Exactly as in T-4: in the browser (the path to use), or scripted only if
+`AllSites.FullControl` is consented (H-4a leaves it out). Either way, set T-4's helpers again for
+this client site, because Verify reads through them: `WEB` and `LIB` pointing at it, for example
+`WEB=https://<tenant>.sharepoint.com/sites/<client-site>` and
 `LIB='/sites/<client-site>/Shared Documents'`, and `MEMBERS` and `VISITORS` read again from that
-`WEB` (they are this site's groups, not BCR GROUP's). Pass only the taxonomy folders that exist
-on this site to the `for` loop: `breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)`,
+`WEB` (they are this site's groups, not BCR GROUP's). Scripted, pass only the taxonomy folders
+that exist on this site to the `for` loop: `breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)`,
 then remove the site's Members and Visitors groups. The Owners group stays. Nothing is created
 on a client site.
 
@@ -352,17 +389,23 @@ register and the IR-0 Purview export (`purview-file-operations.csv`, or the manu
 
 Lock each of them on its own: save its `GET /drives/{driveId}/items/{itemId}/permissions` to the
 evidence store first, then stop inheritance and leave only the site's Owners group. A file
-inside a channel folder is locked this way too; the channel folder itself never is.
+inside a channel folder is locked this way too; the channel folder itself never is. In the
+browser, as for a folder: the file's **⋯ → Manage access → Advanced settings → Stop Inheriting
+Permissions**, then remove **Members** and **Visitors**. The helper and the check below only
+read; the three POSTs are the scripted change, and need `AllSites.FullControl` (see T-4).
 
 ```bash
-file_item() {  # a file's list item, with the path percent-encoded
+# The list item of a file, with the path percent-encoded.
+file_item() {
   local p; p=$(jq -rn --arg p "$LIB/$1" '$p|@uri')
   echo "$WEB/_api/web/GetFileByServerRelativePath(decodedurl='$p')/ListItemAllFields"
 }
 I=$(file_item '<path under the library>')
+# The scripted change only. Skip these three when the browser made it.
 sp -X POST "$I/breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)"
 sp -X POST "$I/roleassignments/getbyprincipalid($MEMBERS)/deleteobject()"
 sp -X POST "$I/roleassignments/getbyprincipalid($VISITORS)/deleteobject()"
+# The check.
 sp "$I/roleassignments?\$expand=Member&\$select=Member/Title" | jq -r '.value[].Member.Title'
 ```
 
@@ -373,8 +416,10 @@ evidence store, not here: for that item, W4 ends at that time. The processor not
 breach register say that the receiving team's members can no longer open the moved documents
 only once this check is done for the site and leaves nothing unlocked.
 
-**Rollback.** `sp -X POST "$(item <folder>)/resetroleinheritance()"`. This gives the client's
-guest access to another client's documents again, so only with Roman's decision, and recorded.
+**Rollback.** As in T-4: **Delete unique permissions** in the browser, or scripted (needs
+`AllSites.FullControl`) `sp -X POST "$(item <folder>)/resetroleinheritance()"`. This gives the
+client's guest access to another client's documents again, so only with Roman's decision, and
+recorded.
 
 ## T-5: Lock and version the Client Directory list
 
@@ -401,9 +446,10 @@ sp "$L?\$select=HasUniqueRoleAssignments,EnableVersioning,MajorVersionLimit"
 sp "$L/roleassignments?\$expand=Member&\$select=Member/Title" | jq -r '.value[].Member.Title'
 ```
 
-**Change.** In the browser: **List settings → Permissions for this list → Stop Inheriting
-Permissions**, then remove Members and Visitors. Then **List settings → Versioning settings →
-Create a version each time you edit an item: Yes**, and keep 500 versions. Scripted:
+**Change.** In the browser, the path to use: **List settings → Permissions for this list → Stop
+Inheriting Permissions**, then remove Members and Visitors. Then **List settings → Versioning
+settings → Create a version each time you edit an item: Yes**, and keep 500 versions.
+Scripted, only if `AllSites.FullControl` is consented (H-4a leaves it out; see T-4):
 
 ```bash
 sp -X POST "$L/breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)"
@@ -422,7 +468,9 @@ traces
 | where tostring(parse_json(message).msg) startswith "directory refresh failed"
 ```
 
-**Rollback.** `sp -X POST "$L/resetroleinheritance()"`. Leave versioning on; it costs nothing.
+**Rollback.** In the browser, **List settings → Permissions for this list → Delete unique
+permissions**; scripted (needs `AllSites.FullControl`), `sp -X POST "$L/resetroleinheritance()"`.
+Leave versioning on; it costs nothing.
 
 ⚠️ **The row edits themselves do not happen here.** Taking Yahor's id off PESKOVOI's row, adding
 guest ids and setting `RootFolder` all happen with `tools/directory-bindings.mjs`, in the same
@@ -456,7 +504,7 @@ needed. The ledger never wrote there, because it has no grant on that site. Then
 **Rollback.** Private: PATCH back to `Public`, which reopens the window. Deleted:
 `g -X POST "$G/directory/deletedItems/<bricore-id>/restore"` within 30 days.
 
-## T-7: Explain or remove AuthoriseMe@
+## T-7: Explain AuthoriseMe@, or block its sign-in
 
 | Runs it | Decides | Closes |
 |---|---|---|
@@ -464,8 +512,7 @@ needed. The ledger never wrote there, because it has no grant on that site. Then
 
 **Why.** `AuthoriseMe@bcr-group.pl` is the third member of BCR GROUP, beside Roman and Yahor,
 and nobody has written down what it is for. It could read the fallback bucket (W1), so the
-incident has to account for it. It also has to be settled before any accountant is added to
-BCR GROUP.
+incident has to account for it.
 
 **Read.**
 
@@ -481,12 +528,19 @@ Any file access by it in the fallback bucket is evidence for IR-3.
 
 - **Explained and needed:** record the reason in the incident's status table. Check that it is
   in no client Team.
-- **Not needed:** block sign-in (`g -X PATCH "$G/users/<id>" -d '{"accountEnabled":false}'`) and
-  take it out of BCR GROUP (`g -X DELETE "$G/groups/<bcr-group-id>/members/<id>/\$ref"`). This
-  changes who is in the team. It does not change the team's visibility or its channels.
+- **Not needed:** block its sign-in, and nothing more: **Block sign-in** on the account in the
+  Entra admin centre, or `g -X PATCH "$G/users/<id>" -d '{"accountEnabled":false}'`
+  (`User.ReadWrite.All`, H-4a). A blocked account can no longer read the fallback bucket, and
+  BCR GROUP's membership, visibility and channels stay exactly as they are.
 
-**Verify.** Read the account again. **Rollback.** Enable it, and add it back with
-`POST /groups/<bcr-group-id>/members/$ref`.
+**Blocking sign-in is the whole of the Phase-0 action.** Taking `AuthoriseMe@` out of BCR GROUP,
+or any other change to who is in the team, is not part of Phase 0. If it is wanted, it is a
+separate, explicit decision by Roman and the team's owner, made and recorded outside this
+runbook.
+
+**Verify.** Read the account again: `accountEnabled` is `false` if it was blocked, and `memberOf`
+still lists BCR GROUP. **Rollback.** Enable it again:
+`g -X PATCH "$G/users/<id>" -d '{"accountEnabled":true}'`.
 
 ## T-8: Entra external collaboration
 
@@ -517,7 +571,8 @@ settings**.
 - Guest invite settings: **"Only users assigned to specific admin roles can invite guest
   users"**.
 
-The same change with Graph, using a token that holds `Policy.ReadWrite.Authorization`:
+The same change with Graph, using a token that holds `Policy.ReadWrite.Authorization` (H-4a
+does not consent it; prefer the admin centre above):
 
 ```bash
 g -X PATCH "$G/policies/authorizationPolicy" \
@@ -609,18 +664,23 @@ app. The build works on a copy, so the tracked manifest keeps its placeholders.
 # RG and BOT as in human-steps.md → Variables
 BOT_APP_ID=$(az functionapp config appsettings list -g $RG -n $BOT \
   --query "[?name=='MICROSOFT_APP_ID'].value | [0]" -o tsv)
+# Must print nothing.
+[[ $BOT_APP_ID =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+  || echo 'STOP: BOT_APP_ID is not a GUID. Check RG and BOT, and do not upload what follows.'
 T=$(mktemp -d)
 sed "s/REPLACE-WITH-BOT-APP-ID/$BOT_APP_ID/g" teams-app/manifest.json > "$T/manifest.json"
 cp teams-app/color.png teams-app/outline.png "$T/"
-grep -c REPLACE-WITH "$T/manifest.json"                        # must print 0
+# Must print 0.
+grep -c REPLACE-WITH "$T/manifest.json"
 OUT="$PWD/artifacts/teams-app.zip"; mkdir -p artifacts; rm -f "$OUT"
 (cd "$T" && zip -X "$OUT" manifest.json color.png outline.png)
 unzip -p "$OUT" manifest.json | jq -r \
-  '.version, (.bots[0].scopes | join(",")), (.staticTabs // [] | length), (.id == .bots[0].botId)'
+  '.version, (.bots[0].scopes | join(",")), (.staticTabs // [] | length),
+   (.id == .bots[0].botId and (.id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"; "i")))'
 ```
 
-The last command must print `0.2.0`, `personal`, `0` and `true`, one per line. Anything else:
-do not upload it.
+The last command must print `0.2.0`, `personal`, `0` and `true`, one per line: `true` only when
+`id` and `botId` are the same GUID. Anything else: do not upload it.
 
 **Change.** In the Teams admin centre:
 
@@ -678,7 +738,7 @@ laptops (`.env`) are an accepted risk, recorded in
 | T-4b | | | | Per client site: folders locked and the time of the lock; H-3's time; any re-check after H-3; the check after IR-1 of the items outside the locked folders, done or not, and how many it locked (each item and its lock time are in the evidence store). W4 ends, for items already moved, at the latest of these that applies to the item |
 | T-5 | | | | |
 | T-6 | Roman decides | | | Private / deleted |
-| T-7 | Roman decides | | | Explained / removed |
+| T-7 | Roman decides | | | Explained / sign-in blocked (membership unchanged) |
 | T-8 | | | | TEST invite checked |
 | T-9 | Roman confirms tenant level | | | TEST guest checked |
 | T-10 | | | | Everyone (Phase 0); version 0.2.0 shown; sha256 of the uploaded zip |

@@ -188,6 +188,16 @@ but slow, so bind soon after onboarding:
    plan's other PATCHes unapplied, so a guest now in two Teams keeps routing everything, the new
    client's documents included, into the first client's space. The tool re-reads each guest
    before writing, prints every row before and after, and writes a rollback log.
+
+   **That rollback is not a safe undo after an onboarding.** It restores each row's before-state,
+   and after an onboarding the plan has usually taken ids off other rows (a guest the new client
+   shares with an existing one). Putting them back would file the new client's documents into
+   the first client's space again. So `rollback` re-checks every id it would add back, as `apply`
+   does, and refuses such a row (`guest_recheck_failed`); it never re-creates that routing, but
+   it cannot undo that row either. If the apply went wrong, fix the cause, then run `propose`
+   and apply the whole plan again. `--only <listItemId>` limits a rollback to named rows, for
+   example the new client's own, which was unbound before
+   ([human-steps H-12 → Rollback](operations/human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries)).
 5. **Canary:** a synthetic document, never a real one, uploaded by an identity bound to that
    client, lands in the client's `Dokumenty księgowe` channel folder. Then delete the canary
    file.
@@ -219,11 +229,14 @@ So:
    already a guest in the tenant. A guest in two Teams is excluded by the next plan and
    quarantined; nothing is filed on a guess.
 3. When `check` reports `guest_in_other_team` on a bound row, run `propose` and apply the whole
-   plan the same day.
+   plan the same day. The same goes for its exit code: `3` (drift on a bound row) and `4` (a
+   bound row could not be fully assessed; the `incomplete` rows are listed) both need action that
+   day ([human-steps → Standing checks](operations/human-steps.md#standing-checks)).
 
-The robust fix, a Team-membership check at upload time (or a registry that keeps memberships in
-sync), is Phase 2. Onboarding writing the new guest's id onto the new row, which would make a
-shared guest a Directory conflict at once, waits on Roman's re-ruling of Q21.
+Until then this is an accepted residual risk of Phase 0, and the three rules above are its
+mitigation. The robust fix, a Team-membership check at upload time (or a registry that keeps
+memberships in sync), is Phase 2. Onboarding writing the new guest's id onto the new row, which
+would make a shared guest a Directory conflict at once, waits on Roman's re-ruling of Q21.
 
 ## Staff
 
