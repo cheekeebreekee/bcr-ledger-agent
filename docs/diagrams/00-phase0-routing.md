@@ -9,7 +9,7 @@ What changes compared with [D1](01-as-is.md):
 - An upload that cannot be tied to exactly one client goes to a staff-only quarantine site, not
   to the BCR GROUP library.
 - Every write goes into the client's channel folder, because the Directory row's `RootFolder` is
-  set to it.
+  set to it. A row without `RootFolder`, `DriveId` or `TeamId` routes nobody.
 
 Colours and conventions are in the [README](README.md).
 
@@ -34,18 +34,19 @@ flowchart TB
     REJ["Refused before any work<br/>401 or 403 caller, 400 source"]:::gate
     SNAP{"Directory snapshot younger than<br/>CLIENT_DIRECTORY_MAX_STALE_MS?"}:::gate
     PASS["Two-pass snapshot<br/>pass 1 collects every key per row,<br/>pass 2 admits clean keys and rows only"]:::system
-    RULES["Pass 2 rules<br/>user-id conflict: drop only that key<br/>shared target host, path, drive, rootFolder:<br/>exclude every row sharing it<br/>SitePath in FORBIDDEN_TARGET_SITE_PATHS:<br/>exclude the row<br/>NIP or ClientId duplicate: alert only<br/>no alias or person-name maps"]:::system
+    RULES["Pass 2 rules<br/>user-id conflict: drop only that key<br/>same site host + canonical path, same DriveId<br/>or same TeamId: exclude every row sharing it<br/>SitePath not exactly /sites or /teams + name,<br/>host not QUARANTINE_SITE_HOSTNAME,<br/>forbidden or quarantine site: exclude the row<br/>NIP or ClientId duplicate: alert only<br/>no alias or person-name maps"]:::system
     WHO{"Uploader AAD id on exactly<br/>one admitted client row?"}:::gate
-    BOUND["Bound client target from that row<br/>site, drive, RootFolder = channel folder"]:::client
+    BOUND["Bound client target from that row<br/>site, drive, RootFolder = channel folder<br/>RootFolder, DriveId and TeamId all set"]:::client
     CLS["Claude classifies, primed with the<br/>bound client only. Below the threshold<br/>or on failure: 98_Nieposortowane/YYYY/MM"]:::agent
     FLIP["After classification: invoice direction<br/>flip inside the same client only<br/>no promotion, parties never pick a client"]:::gate
-    DRV{"Resolved drive equals the<br/>row's DriveId, where set?"}:::gate
-    UPC["PUT into the client folder<br/>conflictBehavior=fail, retry _1 to _10<br/>segments sanitised, then encoded"]:::system
+    SITE{"Resolved site collection is<br/>BCR GROUP or the quarantine site?"}:::gate
+    DRV{"Resolved drive equals the<br/>row's DriveId?"}:::gate
+    UPC["PUT into the client folder<br/>conflictBehavior=fail, retry _1 to _10<br/>segments sanitised, then encoded<br/>own retry: network, 500, 502 only"]:::system
     WOK{"Written after retries?"}:::gate
     QR["Quarantine, with one reason<br/>the folder never depends on content"]:::gate
     UPQ["PUT Kwarantanna/YYYY/MM/{batchId}/<br/>sanitised original filename, conflictBehavior=fail<br/>then PATCH UploaderOid, QuarantineReason,<br/>OriginalFilename, DocumentId"]:::system
     QFAIL["Quarantine write failed<br/>rejected row, spróbuj ponownie<br/>error log document.quarantine_failed<br/>never written anywhere else"]:::gate
-    LOG["Logs, ids only: document.filed,<br/>document.quarantined, directory.conflict,<br/>document.quarantine_failed"]:::system
+    LOG["Logs, ids only: document.filed with teamId,<br/>document.quarantined, directory.conflict,<br/>document.quarantine_failed,<br/>sharepoint.forbidden_site,<br/>sharepoint.possible_duplicate"]:::system
   end
   ANT["Anthropic API"]:::external
   subgraph M365["Microsoft 365 tenant BCR"]
@@ -86,10 +87,13 @@ flowchart TB
   WHO -->|"IsAdmin row: staff"| QR
   WHO -->|"key dropped: conflict"| QR
   WHO -->|"row on a forbidden site: forbidden_target"| QR
+  WHO -->|"row not bound: unbound_target"| QR
   BOUND --> CLS
   CLS -->|"bytes of client X only"| ANT
   CLS --> FLIP
-  FLIP --> DRV
+  FLIP --> SITE
+  SITE -->|"no"| DRV
+  SITE -->|"yes: forbidden_target"| QR
   DRV -->|"yes"| UPC
   DRV -->|"no: stale_directory"| QR
   UPC --> WOK
@@ -118,9 +122,10 @@ quarantine library and in the `document.quarantined` log event.
 |---|---|
 | `unmapped` | The uploader's AAD object id is on no admitted Directory row. |
 | `staff` | The id is on a row marked `IsAdmin`. Staff are never routed to a client by the bot in Phase 0; they file by hand in SharePoint. |
-| `conflict` | Pass 2 dropped what would have matched: the id was on two rows, or the uploader's row shares its target with another row. |
-| `stale_directory` | The snapshot is older than `CLIENT_DIRECTORY_MAX_STALE_MS`, so it counts as empty. Or the row has a `DriveId` and the resolved drive is a different one. |
-| `forbidden_target` | The row's `SitePath` is in `FORBIDDEN_TARGET_SITE_PATHS`. BCR GROUP is always on the list, and the quarantine site is added automatically. |
+| `conflict` | Pass 2 dropped what would have matched: the id was on two rows, or the uploader's row shares its site (host + canonical path, whatever drive or folder), its `DriveId` or its `TeamId` with another active client row. |
+| `stale_directory` | The snapshot is older than `CLIENT_DIRECTORY_MAX_STALE_MS`, so it counts as empty. Or the resolved drive is not the row's `DriveId`. |
+| `forbidden_target` | The row's `SitePath` is in `FORBIDDEN_TARGET_SITE_PATHS` (BCR GROUP is always on the list, and the quarantine site is added automatically), is not exactly `/sites/<name>` or `/teams/<name>`, or its host is not `QUARANTINE_SITE_HOSTNAME`. Or, at upload time, the site Graph resolved is BCR GROUP or the quarantine site (`sharepoint.forbidden_site`). |
+| `unbound_target` | The uploader's only row lacks `RootFolder`, `DriveId` or `TeamId`. Only `directory-bindings.mjs apply` binds a row, and it writes all three together. |
 | `target_unwritable` | The client target could not be written after retries. |
 
 If the quarantine write itself fails, the user gets a rejected row asking them to try again, a
@@ -133,15 +138,17 @@ the watch query and "After the window").
 ## Directory snapshot
 
 - **Pass 1** reads every active row and records, for each key, the set of rows that carry it.
-  The keys are the uploader AAD ids, the NIP, the ClientId and the normalised target (host, path,
-  drive, rootFolder).
+  The keys are the uploader AAD ids, the NIP, the ClientId, the site (host + canonical path), the
+  `DriveId` and the `TeamId`. Two client rows on one site conflict whatever drive or folder each
+  names.
 - **Pass 2** admits rows and keys under the rules in the `RULES` node. The result does not depend
   on row order. A third duplicate cannot win, which was defect X6 in D1.
 - A conflict is logged once per refresh as `directory.conflict{kind, listItemIds}`, without key
   values.
 - The alias and person-name maps are deleted. Content never feeds routing.
-- The optional `TeamId` column is only logged. The optional `DriveId` column is checked at upload
-  time.
+- `RootFolder`, `DriveId` and `TeamId` are required for a row to route. `TeamId` is a conflict key
+  and is logged; `DriveId` is a conflict key and is checked at upload time. Neither checks the
+  uploader's Team membership: the binding tool does that when it runs.
 
 ## Deploy order
 

@@ -199,9 +199,13 @@ flowchart TD
   B -- no --> C{id on an Active row<br/>after the two-pass checks?}
   C -- no --> Q2[quarantine: unmapped / conflict]
   C -- IsAdmin row --> Q3[quarantine: staff]
-  C -- one client row --> D{row's site is a<br/>forbidden target?}
+  C -- one client row --> D{row on a forbidden site,<br/>another host, or a path<br/>that is not canonical?}
   D -- yes --> Q4[quarantine: forbidden_target]
-  D -- no --> E{path resolves to the<br/>row's DriveId, write succeeds?}
+  D -- no --> U{row bound: RootFolder,<br/>DriveId and TeamId all set?}
+  U -- no --> Q6[quarantine: unbound_target]
+  U -- yes --> G{resolved site is BCR GROUP<br/>or the quarantine site?}
+  G -- yes --> Q4
+  G -- no --> E{path resolves to the<br/>row's DriveId, write succeeds?}
   E -- drive differs --> Q1
   E -- write refused after retries --> Q5[quarantine: target_unwritable]
   E -- yes --> F[filed in the client's<br/>Dokumenty księgowe folder]
@@ -216,27 +220,63 @@ columns and the rules for maintaining them. What matters for routing:
 - **`UserAadObjectIds`** holds the client's own guests only, and never staff.
 - The target is **`SiteHostname`**, **`SitePath`**, **`DriveName`** and **`RootFolder`**.
   `RootFolder` is the "Dokumenty księgowe" channel folder, as Graph's `filesFolder` names it.
-- **`DriveId`** is optional. If it is set, the resolved drive must have this id.
-- **`TeamId`** is logged only.
+  `SiteHostname` must equal `QUARANTINE_SITE_HOSTNAME`, the tenant's only SharePoint host, and
+  `SitePath` must be canonical (below).
+- **`DriveId`**: the resolved drive must have this id.
+- **`TeamId`**: the client's Team. Two rows may not share it, and it is logged (`teamId`) on the
+  routing line and on `document.filed`.
+- **A row routes only once it is bound**: `RootFolder`, `DriveId` and `TeamId` all set. A user
+  whose only row lacks any of them is quarantined as `unbound_target`. Only
+  `tools/directory-bindings.mjs apply` binds a row, and it always writes the three together, so a
+  row that onboarding wrote, or that somebody filled in by hand, routes nobody until the tool has
+  bound it after a person's review. Before this rule, a row with no `RootFolder` filed into the
+  library root (incident root cause R5).
 - **`IsAdmin`** marks the staff row, and **`Status`** must be `Active` for a row to route.
 
 The routing fields are written by `tools/directory-bindings.mjs` from Graph, not typed by hand.
 `NIP` is used only to decide invoice direction inside the bound client.
+
+The tool binds a guest only if the row's Team is the only Team they belong to, but it checks that
+when it runs. Ingestion does not re-check Team membership at upload time, so a binding is only as
+current as the last applied plan: a guest later added to a second client's Team keeps routing to
+the first until the whole plan is applied again. The operating rule (apply the whole plan after
+every onboarding, `check` at least weekly) is in the admin guide's
+[Keeping the bindings current](./docs/client-directory-admin-guide.md#keeping-the-bindings-current).
+A membership check at upload time is Phase 2.
+
+**Canonical site path.** A `SitePath`, `QUARANTINE_SITE_PATH` and every
+`FORBIDDEN_TARGET_SITE_PATHS` entry are read the same way: trim the string, split it on `/`, and
+drop empty segments. The path is canonical only if exactly two segments remain: `sites` or `teams`
+(any case), then a name that starts with a letter, digit, `_` or `-`, continues with those or `.`,
+and does not end with `.`. Its canonical form is `/<first>/<second>`, and every comparison is in
+lower case. So `/sites/A/`, `sites/A` and `//sites//A` all mean `/sites/a`. A sub-site
+(`/sites/A/x`), a `.` or `..` segment, `%`, `\`, or whitespace inside the name is **not**
+canonical: such a row is excluded as `forbidden_target`, and such a setting fails at cold start.
+Graph and the HTTP layer resolve spellings that a string comparison does not, so anything
+ambiguous is refused rather than normalised. `canonicalSitePath` in ingestion and the site-path
+check in `tools/lib/bindings.mjs` (`site_path_not_canonical`) implement the same rule, against
+the same table of edge cases in their tests.
 
 [`ClientDirectoryReader`](./packages/document-ingestion/src/services/clientDirectoryReader.ts)
 reads the list, follows pagination, and caches the snapshot for `CLIENT_DIRECTORY_CACHE_TTL_MS`
 (default 5 minutes). It builds the snapshot in **two passes**, so the result does not depend on
 row order:
 
-- **Pass 1** collects, for each key, every row that has it. The keys are the user id, the
-  normalised target (`host|path|drive|rootFolder`), the ClientId and the NIP.
+- **Pass 1** collects, for each key, every row that has it. The keys are the user id, the site
+  (host + canonical path), the `DriveId`, the `TeamId`, the ClientId and the NIP.
 - **Pass 2** applies these rules:
-  - a user id on two rows is dropped from routing. The rows stay usable for everyone else;
-  - a target on two rows excludes **every** row that shares it;
+  - a user id on two rows is dropped from routing (`conflict`). The rows stay usable for everyone
+    else;
+  - two Active client rows on the same site, whatever `DriveName` or `RootFolder` each names, or
+    with the same `DriveId` or the same `TeamId` (compared case-insensitively), are **all**
+    excluded, and their users are quarantined as `conflict`. One Team, its site and its drive
+    belong to one client;
   - a ClientId or NIP on two rows only raises `directory.conflict`, because neither routes
     anything;
-  - a row whose `SitePath` is in `FORBIDDEN_TARGET_SITE_PATHS` (BCR GROUP, plus the quarantine
-    site, added automatically) is excluded.
+  - a row is excluded as `forbidden_target` when its `SiteHostname` is not
+    `QUARANTINE_SITE_HOSTNAME`, its `SitePath` is not canonical, or its site is in
+    `FORBIDDEN_TARGET_SITE_PATHS` (BCR GROUP) or is the quarantine site, which is added
+    automatically.
 - **Stale cap.** If refreshes keep failing, a snapshot older than `CLIENT_DIRECTORY_MAX_STALE_MS`
   (default 15 minutes) counts as empty, so every upload goes to quarantine.
 
@@ -246,9 +286,11 @@ matching, and are deleted.
 #### Resolution
 
 [`ClientResolver.resolve(source)`](./packages/document-ingestion/src/services/clientResolver.ts)
-returns `source: 'directory'` for exactly one bound client row. Otherwise it returns
-`source: 'quarantine'` with a `quarantineReason`: `unmapped`, `staff`, `conflict`,
-`stale_directory` or `forbidden_target`. The upload step can add `target_unwritable`.
+returns `source: 'directory'` for exactly one bound client row, and logs the routing with ids
+only (`clientId`, `listItemId`, `teamId`). Otherwise it returns `source: 'quarantine'` with a
+`quarantineReason`: `unmapped`, `staff`, `conflict`, `stale_directory`, `forbidden_target` or
+`unbound_target`. The upload step can add `target_unwritable`, and `forbidden_target` when the
+row's site resolves to BCR GROUP or the quarantine site.
 
 After classification, `resolvePostClassification` does exactly one thing, and only for a
 `directory` client. If that client's NIP is on the invoice as seller or buyer, it sets the
@@ -261,7 +303,9 @@ back.
 The quarantine site is a SharePoint communication site. It has no Microsoft 365 group, unique
 permissions for the triage staff, and sharing disabled. It is configured by
 `QUARANTINE_SITE_HOSTNAME`, `QUARANTINE_SITE_PATH`, `QUARANTINE_DRIVE_NAME` (`Dokumenty` on this
-tenant) and `QUARANTINE_ROOT_FOLDER` (default `Kwarantanna`).
+tenant) and `QUARANTINE_ROOT_FOLDER` (default `Kwarantanna`). `QUARANTINE_SITE_HOSTNAME` doubles
+as the tenant's SharePoint host: it must look like `<tenant>.sharepoint.com`, and a Directory row
+naming any other host routes nobody.
 
 - A file goes to `Kwarantanna/YYYY/MM/<batchId>/<sanitised original name>`.
 - Ingestion then PATCHes the list item's `UploaderOid`, `QuarantineReason`, `OriginalFilename`
@@ -279,6 +323,25 @@ keeps one `SharePointService` per target, so site and drive resolution happens o
 Uploads use `@microsoft.graph.conflictBehavior=fail`. If the name is taken, they retry with
 `_1` to `_10`, without probing first. Every path segment is sanitised and then
 `encodeURIComponent`-ed.
+
+- **Resolved-site guard.** A path check compares spellings; this compares what Graph resolved.
+  Before writing a client document, the service compares the resolved site's site-collection id
+  with BCR GROUP's (from `CLIENT_DIRECTORY_SITE_ID`) and with the quarantine site's (resolved
+  once from `QUARANTINE_SITE_HOSTNAME` and `QUARANTINE_SITE_PATH`, then cached; if it cannot be
+  resolved, the write is refused). A match throws `SharePointTargetError` of kind
+  `forbidden_site`, is logged as `sharepoint.forbidden_site` with ids only, and the document goes
+  to quarantine as `forbidden_target`. The quarantine target itself is checked against BCR GROUP
+  only.
+- **Retries.** The service's own retry (`withRetry`, bounded exponential back-off with jitter)
+  covers only network failures (no HTTP status), 500 and 502. 429, 503 and 504 are left to the
+  Graph SDK's `RetryHandler`, which honours `Retry-After`; the two layers never retry the same
+  failure, so their delays do not multiply.
+- **Batch deadline.** A batch has 150 s from its start, inside the platform's 230 s HTTP limit. A
+  document not started by then comes back `rejected` with a generic "try again" code; it is
+  never uploaded late.
+- **Possible duplicate.** A PUT that failed on the network may still have landed. If its retry
+  then meets a 409 and takes a suffixed name, the same document may now be stored twice; that is
+  logged as `sharepoint.possible_duplicate`, with ids only, for staff to check.
 
 <details>
 <summary>As-is before v2 (Sep 2026): two-phase resolution, promotion and the fallback bucket</summary>
@@ -398,9 +461,15 @@ site the identity files into:
 
 So the identity can write to every client site: that is by design, not a single-site scope (see
 T3 in [`docs/security.md`](./docs/security.md)). Never grant `Files.ReadWrite.All` or
-`Sites.ReadWrite.All` instead. The grant procedure is in
-[`docs/admin-sharepoint-grant.md`](./docs/admin-sharepoint-grant.md) and, for client sites, the
-onboarding repo's `Grant-TeamSiteAccess.ps1` runbook.
+`Sites.ReadWrite.All` instead.
+
+Every grant names the **managed identity's app id** (`INGEST_MI_APPID`), never the Ingestion
+API app registration's. The registration is only the token audience of §5.2; ingestion never
+authenticates to Graph as it, so a site grant to it does nothing. The procedure is in
+[`docs/setup-guide.md` §5](./docs/setup-guide.md#5-grant-sharepoint-site-permission-sitesselected):
+the Graph app role as in [`docs/admin-sharepoint-grant.md`](./docs/admin-sharepoint-grant.md),
+and site grants through the onboarding repo's `Grant-TeamSiteAccess.ps1` runbook or Graph, as in
+[`infrastructure/quarantine/README.md`](./infrastructure/quarantine/README.md#write-grant-for-the-ingestion-managed-identity).
 
 ---
 
@@ -411,10 +480,14 @@ onboarding repo's `Grant-TeamSiteAccess.ps1` runbook.
 | Claude is off, low confidence, or an API error | Filed in `98_Nieposortowane/<YYYY>/<MM>/` in the client's own space, for manual review. |
 | Uploader not bound to exactly one client | Quarantine, with the reason. |
 | Directory cannot be refreshed for over 15 min | Everything goes to quarantine (`stale_directory`). |
-| Name already taken (Graph 409 with `conflictBehavior=fail`) | Retry as `name_1` … `name_10`. |
+| Uploader's only row is not bound (`RootFolder`, `DriveId` or `TeamId` missing) | Quarantine (`unbound_target`). |
+| The row's site resolves to BCR GROUP or the quarantine site | Refused before writing (`sharepoint.forbidden_site`); quarantine (`forbidden_target`). |
+| Name already taken (Graph 409 with `conflictBehavior=fail`) | Retry as `name_1` … `name_10`. A suffixed name taken after a retried network failure is logged as `sharepoint.possible_duplicate`. |
 | The client's site refuses the write after retries | Quarantine (`target_unwritable`). |
 | The quarantine write fails too | The item is `rejected` with a generic Polish "try again" message. It is never written elsewhere. |
-| Graph 5xx | Exponential back-off with jitter (`p-retry`, 3 attempts). |
+| Network failure, Graph 500 or 502 | The service's own retry: bounded exponential back-off with jitter. |
+| Graph 429, 503 or 504 | The Graph SDK's `RetryHandler`, honouring `Retry-After`. The service does not retry these again. |
+| Batch still running 150 s after it started | Documents not yet started are `rejected` with a generic "try again" code, never uploaded late. |
 | Token expired | MSAL's token cache refreshes it; ingestion gets tokens lazily per request. |
 | File > 4 MB | Graph upload session (`createUploadSession`), 320 KiB chunks, also with `conflictBehavior=fail`. |
 | Antivirus block (Graph 423) | Generic Polish message; no retry. |
@@ -422,7 +495,9 @@ onboarding repo's `Grant-TeamSiteAccess.ps1` runbook.
 
 Every request is logged with the Teams `activityId` and `conversationId`, and from Phase 0 with a
 server-minted `documentId` per document. Routing outcomes are the events `document.filed` and
-`document.quarantined`, which carry ids and codes only. So triage is one query:
+`document.quarantined`, which carry ids and codes only (`document.filed` also carries the row's
+`teamId`). `sharepoint.forbidden_site` and `sharepoint.possible_duplicate` carry ids only too. So
+triage is one query:
 
 ```kusto
 traces
@@ -435,21 +510,24 @@ traces
 
 ## 7. Deployment topology
 
-A single Azure resource group per environment:
+A single Azure resource group per environment. `<sfx>` is a suffix the template derives from
+the resource group's id:
 
 ```
 rg-bcr-ledger-<env>
-├── stbcrledger<env>          (Storage – Functions runtime)
-├── plan-bcr-ledger-<env>     (Linux consumption plan, Node 22)
-├── func-bcr-bot-<env>
-├── func-bcr-ingest-<env>
-├── bot-bcr-ledger-<env>      (Azure Bot, Teams channel enabled)
-├── kv-bcr-ledger-<env>       (Key Vault, RBAC mode)
-├── appi-bcr-ledger-<env>     (Application Insights)
-└── log-bcr-ledger-<env>      (Log Analytics workspace)
+├── stbcr<env><sfx>           (Storage – Functions runtime)
+├── plan-bcr-<env>-<sfx>      (Linux consumption plan, Node 22)
+├── func-bcr-bot-<env>-<sfx>
+├── func-bcr-ingest-<env>-<sfx>
+├── bot-bcr-<env>-<sfx>       (Azure Bot, Teams channel enabled)
+├── kv-bcr-<env>-<sfx>        (Key Vault, RBAC mode)
+├── appi-bcr-<env>-<sfx>      (Application Insights)
+└── log-bcr-<env>-<sfx>       (Log Analytics workspace)
 ```
 
-All of it is declared in [`infrastructure/main.bicep`](./infrastructure/main.bicep).
+All of it is declared in [`infrastructure/main.bicep`](./infrastructure/main.bicep), except the
+Phase-0 ingestion settings: a new environment gets those once, after its first deploy
+([`docs/setup-guide.md` §3d](./docs/setup-guide.md#3d-add-the-phase-0-settings-the-template-lacks)).
 
 ⚠️ **The template has drifted from what runs in "dev"**, which is production: it serves
 PESKOVOI. The routing settings were set by hand and are missing from the template. Until the

@@ -13,6 +13,16 @@ Microsoft Graph.
 > `GraphError 401 generalException` because the MI itself has no Graph
 > permissions yet. Please redo the grant against the **MI** below.
 
+> **For any grant made today.** This page records the June 2026 grants for the TEST site, with
+> that deployment's ids. Step 1 (the Graph app role) is still done this way, once per managed
+> identity. A per-site grant now follows
+> [`infrastructure/quarantine/README.md`](../infrastructure/quarantine/README.md#write-grant-for-the-ingestion-managed-identity)
+> (the onboarding runbook, or Graph by a SharePoint administrator), for the managed identity's
+> app id derived from the Function App (`INGEST_MI_APPID`, see
+> [`setup-guide.md` §5](setup-guide.md#5-grant-sharepoint-site-permission-sitesselected)). Never
+> grant to the Ingestion API app registration. `infrastructure/grant-sharepoint-permission.sh`,
+> which granted to it by default, is deleted.
+
 ---
 
 ## Two grants required
@@ -20,7 +30,7 @@ Microsoft Graph.
 | # | Where | What | Why |
 |---|---|---|---|
 | 1 | Microsoft Graph (tenant-wide) | App role **`Sites.Selected`** (application) | Without this, the MI's Graph token has no `roles` claim — Graph rejects every call. |
-| 2 | The SharePoint site | Permission **`write`** | Restricts what `Sites.Selected` lets the MI do to a single site. |
+| 2 | The SharePoint site | Permission **`write`** | Names one site the MI may write to. `Sites.Selected` is an allow-list of such grants, one per site, not a single-site scope: the MI ends up with `write` on every client site it files into ([`security.md`](security.md), T3). |
 
 Both must be done by an admin **with the right directory role**:
 
@@ -155,10 +165,11 @@ You should see an entry with:
 - `"roles": ["write"]`
 - `"grantedToIdentities[0].application.id": "d5226274-a2c0-4ae9-9c3b-34158c43f2fc"`
 
-> **Optional cleanup.** The previous (incorrect) grant for app id
-> `b8b90018-9af0-4d7a-ada2-71559952ebbe` is still in the list. It's
-> harmless (no MI is using that app id to call Graph), but you can
-> delete it:
+> **Cleanup.** The previous (incorrect) grant for app id
+> `b8b90018-9af0-4d7a-ada2-71559952ebbe` is still in the list. It gives
+> ingestion nothing (no code calls Graph as that app id), but it makes a
+> read of the list look as if ingestion can write here. Record it for
+> deletion; the delete is:
 > `DELETE https://graph.microsoft.com/v1.0/sites/<siteId>/permissions/<permissionId>`
 > where `<permissionId>` is the `id` of the old entry.
 

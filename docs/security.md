@@ -28,7 +28,10 @@ one SharePoint site. Each threat now has a status:
 **The ingestion identity's site grants.** Before Phase 0, it had `write` on TEST, PESKOVOI and
 BCR GROUP. Phase 0 adds `write` on the quarantine site, and on each client site bound in the
 Phase-0 change window. It downgrades BCR GROUP to `read`, because the Client Directory is read
-there and nothing may be written there.
+there and nothing may be written there. Every grant names the managed identity's app id. A grant
+to the Ingestion API app registration gives ingestion nothing, because ingestion never
+authenticates as it, but it makes a permissions list look as if ingestion can write. Such
+entries are recorded for deletion.
 
 ## 2. Secrets inventory
 
@@ -62,7 +65,11 @@ same name, and the second overwrote the first. One SharePoint item could then ho
 documents, possibly from two clients, in its version history.
 **Now:** uploads use `@microsoft.graph.conflictBehavior=fail` with a suffix retry, `_1` to `_10`,
 and there is no probe. **Status: P0.** A replay within the token's lifetime still files a second
-copy in the same client's space. De-duplication comes with the document index (Phase 2).
+copy in the same client's space. So can a PUT that failed on the network but had landed: its
+retry takes a suffixed name, and that case is logged as `sharepoint.possible_duplicate` for staff
+to check. The service itself retries only network failures, 500 and 502, and leaves 429, 503
+and 504 to the Graph SDK, so retries do not stack; a batch starts no document after 150 s.
+De-duplication comes with the document index (Phase 2).
 
 ### T3. The ingestion identity writes to the wrong site (corrected)
 
@@ -79,7 +86,13 @@ Anything that controls what that identity writes can write into every one of tho
 **Phase 0 narrows what decides the target:**
 
 - identity only (T8);
-- no BCR GROUP or quarantine target (forbidden targets);
+- a row routes only once the binding tool has set its `RootFolder`, `DriveId` and `TeamId`
+  (`unbound_target` otherwise);
+- one client per Team: rows sharing a site, a `DriveId` or a `TeamId` are all excluded;
+- a `SitePath` must be exactly `/sites/<name>` or `/teams/<name>` on the tenant's one host, so
+  a sub-site or a look-alike spelling of another site is refused, not normalised;
+- no BCR GROUP or quarantine target, checked twice: by path in the Directory, and by the
+  resolved site-collection id before each write (`sharepoint.forbidden_site`);
 - the row's `DriveId` must match;
 - only the bot's app may call (T15).
 
@@ -161,8 +174,16 @@ version history, and the duplicate check failed open once three rows shared a ke
 - routing fields written by `tools/directory-bindings.mjs` from Graph, with a before/after log,
   not typed by hand.
 
+**Not covered in Phase 0: a binding goes stale.** The tool checks each guest's Team memberships
+when it runs; ingestion never re-checks them. A guest bound to client A and later added to client
+B's Team, for example because B's onboarding invited the same email, keeps routing everything
+into A's space, B's documents included, until the tool runs again and the whole plan is applied.
+A guest removed from A's Team keeps writing into A's folder until then. Meanwhile the whole plan
+is applied after every onboarding, never only the new row, and `check` runs at least weekly
+([admin guide](client-directory-admin-guide.md#keeping-the-bindings-current)).
+
 **Status: Partly mitigated in P0; Phase 2** replaces the list with a registry whose bindings
-cannot change without two approvals.
+cannot change without two approvals, and checks Team membership when a document arrives.
 
 ### T11. Key Vault readable at resource-group scope
 
@@ -187,9 +208,10 @@ App Insights keeps 30 days and is readable by anyone with read on the resource. 
 register of which client sent what.
 **Now:** ids only:
 
-- a server-minted `documentId` per document;
-- events `document.filed`, `document.quarantined`, `directory.conflict` and
-  `ingestion.caller.rejected`;
+- a server-minted `documentId` per document, and the ids of the row it routed to
+  (`clientId`, `listItemId`, `teamId`);
+- events `document.filed`, `document.quarantined`, `directory.conflict`,
+  `ingestion.caller.rejected`, `sharepoint.forbidden_site` and `sharepoint.possible_duplicate`;
 - one redaction list covering file names, titles, URLs, paths, parties and NIPs.
 
 **Status: P0**, deployed only after IR-0 copied the old lines into the evidence store. Old lines
@@ -250,6 +272,12 @@ check that every setting the code reads exists in Bicep, `what-if`, and environm
 - **Quarantine cards leak nothing.** A quarantined document's card carries no link, folder or
   client name.
 - **The single-document route is deleted.** `/api/ingest` was an unused second entry point.
+- **Deploy packages are built, not kept.** The committed `artifacts/*.zip` were pre-Phase-0
+  builds, and packaging updated an archive in place, so a new `dist` could ship next to an old
+  `@bcr/shared`, or next to the compiled output of a deleted function. The zips are now
+  git-ignored and built fresh for each deploy from a cleaned `dist`, with production
+  dependencies at the `yarn.lock` versions and install scripts disabled; packaging fails on a
+  compiled file with no source behind it.
 
 ## Accepted risks
 
@@ -257,7 +285,7 @@ check that every setting the code reads exists in Bicep, `what-if`, and environm
 |---|---|---|---|---|
 | **Secret rotation deferred** (T15, and the Anthropic key). Plaintext copies of both secrets are on developer laptops. | New credentials come from Roman, who will provide them soon. Rotating twice gains nothing. | Roman | New credentials arrive. Then rotate and delete the laptop copies the same day. | Caller pinning: only the bot's app id is accepted. A forged upload needs a real guest's id, lands only in that guest's own client, and is logged under that id. The secret cannot read documents, because the bot holds no SharePoint permission. |
 | **Yahor's dual role.** He is the developer, the operator who deploys, and a Global Administrator. One person can change the code, ship it and change tenant permissions. That is also a bus factor of one. | BCR has one technical person today. | Roman | A second admin or a formal approval path exists. | Roman reviews every binding plan before it is applied. IR-2 moves need two people. Every tenant and Azure change is a recorded command with its before and after state. The IR evidence is immutable and readable by Roman and the IOD. Yahor does not upload through the bot. Planned: Roman approves production deploys through GitHub environment protection, and a `HANDOVER.md`. |
-| **One identity writes every client site** (T3). | Inherent to the current design. | Yahor | Phase 2 (upload by id, attestation, nightly audit). | Identity-only routing, forbidden targets, `DriveId` check, `conflictBehavior=fail`. |
+| **One identity writes every client site** (T3). | Inherent to the current design. | Yahor | Phase 2 (upload by id, attestation, nightly audit). | Identity-only routing, only bound rows route, one client per site, drive and Team, canonical site paths, forbidden targets checked by path and by resolved site id, `DriveId` check, `conflictBehavior=fail`. |
 | **No P1: 7-day Entra sign-in log, no Conditional Access** (T14). | Needs a licence purchase. | Roman | Decision 5. | Purview audit log: file operations and sign-in events, about 180 days. `{NIP}@` accounts blocked (T-1). |
 
 ## 4. Data residency and retention

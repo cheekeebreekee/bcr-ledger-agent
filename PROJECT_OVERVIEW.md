@@ -172,14 +172,14 @@ Bicep deploy replaces them all, and the template has drifted (lesson 20).
 | Setting | Notes |
 |---|---|
 | `AZURE_TENANT_ID`, `INGESTION_APP_ID`, `EXPECTED_AUDIENCE`, `EXPECTED_ROLES` | Token validation. `EXPECTED_ROLES` defaults to `Documents.Ingest`. |
-| `BOT_CALLER_APP_IDS` | **New, required.** Comma-separated app ids allowed to call; today the bot's only. |
-| `CLIENT_DIRECTORY_SITE_ID`, `CLIENT_DIRECTORY_LIST_ID` | Where the Client Directory is |
+| `BOT_CALLER_APP_IDS` | **New, required.** Comma-separated app ids allowed to call; today the bot's only. Each must be a GUID. |
+| `CLIENT_DIRECTORY_SITE_ID`, `CLIENT_DIRECTORY_LIST_ID` | Where the Client Directory is. The site id must be the three-part Graph id (`<host>,<guid>,<guid>`): it also names BCR GROUP for the resolved-site write guard. |
 | `CLIENT_DIRECTORY_CACHE_TTL_MS` | Default 300000 (5 min) |
 | `CLIENT_DIRECTORY_MAX_STALE_MS` | **New.** Default 900000 (15 min). An older snapshot routes nothing. |
-| `QUARANTINE_SITE_HOSTNAME`, `QUARANTINE_SITE_PATH` | **New, required.** The staff-only quarantine site |
+| `QUARANTINE_SITE_HOSTNAME`, `QUARANTINE_SITE_PATH` | **New, required.** The staff-only quarantine site. The host must be `<tenant>.sharepoint.com`, and it is also the only host a Directory row may name. The path must be exactly `/sites/<name>` or `/teams/<name>`. |
 | `QUARANTINE_DRIVE_NAME` | **New.** Default `Documents`; on this tenant, `Dokumenty` |
 | `QUARANTINE_ROOT_FOLDER` | **New.** Default `Kwarantanna` |
-| `FORBIDDEN_TARGET_SITE_PATHS` | **New, required.** Sites no row may route to: at least `/sites/BCRGROUPSp.zo.o`. The quarantine path is added automatically. |
+| `FORBIDDEN_TARGET_SITE_PATHS` | **New, required.** Sites no row may route to: at least `/sites/BCRGROUPSp.zo.o`. Each entry exactly `/sites/<name>` or `/teams/<name>`. The quarantine path is added automatically. |
 | `ANTHROPIC_ENABLED`, `ANTHROPIC_API_KEY` (Key Vault), `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_CONTENT_BYTES`, `ANTHROPIC_CONFIDENCE_THRESHOLD` | Classification. The threshold defaults to 0.6. |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING`, `LOG_LEVEL` | |
 
@@ -213,8 +213,9 @@ bcr-ledger-agent/
 ├── infrastructure/
 │   ├── main.bicep                       # Azure resources (drifted from dev; see lesson 20)
 │   ├── main.dev.parameters.json
-│   ├── deploy.sh                        # Bicep + zip-deploy wrapper. Not for Phase 0.
-│   └── grant-sharepoint-permission.sh   # (legacy) only works in tenants without strict pre-auth
+│   ├── deploy.sh                        # Bicep + zip-deploy wrapper. New environments only; refuses dev.
+│   ├── quarantine/                      # quarantine site script, and the managed identity's site grant
+│   └── ir/                              # IR evidence store
 ├── tools/                               # operator tools: directory-bindings, inventory-misfiled, ir0/
 ├── teams-app/
 │   ├── manifest.json                    # Teams app manifest 0.2.0 (personal scope only, no tab)
@@ -224,7 +225,7 @@ bcr-ledger-agent/
 │   ├── client-directory-admin-guide.md  # the routing list and its rules
 │   ├── security.md                      # threat model T1–T17 and accepted risks
 │   ├── setup-guide.md, admin-sharepoint-grant.md, deployment.md, local-development.md
-├── artifacts/                           # Built zips (teams-bot, document-ingestion, teams-app)
+├── artifacts/                           # build output, git-ignored: fresh zips per deploy
 ├── .env.example                         # Documented env var template
 └── PROJECT_OVERVIEW.md                  # ← this file
 ```
@@ -351,13 +352,27 @@ this deploy. Download it without printing its URL, which can carry a SAS token (
 [`human-steps.md` H-9, step 1](docs/operations/human-steps.md#h-9-deploy-the-bot-with-the-gate-in-log-mode)
 has the command. One exception: a pre-Phase-0 ingestion package is never a rollback.
 
-**2. Package.** Each app's `package` script (`tools/package-function.mjs`) builds a **new** zip
-every time: a fresh staging folder, production dependencies only, and `@bcr/shared` copied from
-the `packages/shared/dist` just built. It fails if that copy lacks the Phase-0 config.
+**2. Package.** `yarn workspace @bcr/<pkg> package` cleans `dist` and the `tsbuildinfo`,
+rebuilds, and runs `tools/package-function.mjs`, which builds a **new** zip every time, in a fresh
+staging folder:
+
+- it deletes the old zip before anything else, so a failed run leaves no zip rather than a stale
+  one;
+- it fails if any compiled `dist/**/*.js`, the app's or `@bcr/shared`'s, has no `src/**/*.ts`
+  behind it, so the output of a deleted source (such as the old `functions/userTarget.js`) is
+  never shipped;
+- it ships no `*.map`, `*.d.ts` or `*.tsbuildinfo`;
+- it installs production dependencies at the exact versions in `yarn.lock`, with install scripts
+  disabled, and checks every top-level dependency's version against the root `node_modules`;
+- it vendors `@bcr/shared` from the `packages/shared/dist` just built, and fails if that copy
+  lacks the Phase-0 config.
+
+`artifacts/*.zip` are git-ignored and no longer tracked: the zips that used to be committed were
+pre-Phase-0 builds. Never commit a zip, and deploy only one built for this deploy.
 
 ```bash
-corepack yarn build && corepack yarn workspace @bcr/teams-bot package            # → artifacts/teams-bot.zip
-corepack yarn build && corepack yarn workspace @bcr/document-ingestion package   # → artifacts/document-ingestion.zip
+corepack yarn workspace @bcr/teams-bot package            # → artifacts/teams-bot.zip
+corepack yarn workspace @bcr/document-ingestion package   # → artifacts/document-ingestion.zip
 ```
 
 **3. Check the vendored `@bcr/shared` before deploying** (lesson 10). Both counts must be
@@ -421,7 +436,10 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
 
 1. **Function MI ≠ API app registration.** The ingestion function calls Graph as its
    system-assigned **managed identity** (app id `d5226274-…`), not as the API app registration
-   (`b8b90018-…`). Grant `Sites.Selected` to the MI.
+   (`b8b90018-…`). Grant `Sites.Selected` and every per-site permission to the MI. The legacy
+   `infrastructure/grant-sharepoint-permission.sh` granted to the app registration by default,
+   wrote without a dry run and hard-coded this tenant's ids; it is deleted. Grants follow
+   [`docs/setup-guide.md` §5](docs/setup-guide.md#5-grant-sharepoint-site-permission-sitesselected).
 
 2. **Sites.Selected needs TWO grants** to work:
    - an app role assignment on Microsoft Graph (tenant-wide):
@@ -464,8 +482,10 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
     `dist` shipped next to a July copy of `@bcr/shared`. A bot built that way ignores
     `BOT_GATE_MODE`; an ingestion built that way fails at cold start. The `package` script now
     runs `tools/package-function.mjs`, which stages a fresh folder and copies `@bcr/shared` from
-    `packages/shared/dist`. Still check the zip before every deploy
-    ([Build and deploy](#build-and-deploy), step 3).
+    `packages/shared/dist`. It also deletes the old zip first, refuses a compiled file with no
+    source behind it, and installs dependencies at the `yarn.lock` versions; and the zips are no
+    longer committed, so there is no old archive to update. Still check the zip before every
+    deploy ([Build and deploy](#build-and-deploy), step 3).
 
 11. **The Teams manifest v1.17 schema** rejects the `packageName` field. Remove it before
     uploading.
@@ -503,8 +523,10 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
 
 18. **Duplicate checks must not depend on row order.** The old single-pass dedupe deleted a key
     on the second duplicate and re-added it on the third, and merged rows sharing a ClientId. The
-    Directory is now read in two passes: collect every key's rows first, then decide. See the
-    [admin guide](docs/client-directory-admin-guide.md#duplicates-and-conflicts).
+    Directory is now read in two passes: collect every key's rows first, then decide. A target
+    conflict is keyed on the site, the `DriveId` and the `TeamId`, not on the folder: two rows in
+    one library with different `RootFolder` spellings are still two clients in one library. See
+    the [admin guide](docs/client-directory-admin-guide.md#duplicates-and-conflicts).
 
 19. **`config-zip` → blob workaround.** When the Kudu upload keeps timing out:
     - upload the zip directly to the storage account (`stbcrdev...`, container
@@ -533,3 +555,13 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
 23. **`Sites.Selected` is not a single-site scope.** It is an allow-list of per-site grants. An
     identity that files for many clients holds write on all of their sites. Design as if the
     ingestion identity can reach every client, because it can (`docs/security.md` T3).
+
+24. **A guest binding is checked when the tool runs, never at upload.** Routing reads only the
+    Directory. When an onboarding invites someone who is already a guest of another client (one
+    owner, two companies), Entra returns the same user, onboarding adds them to the new Team, and
+    their existing row keeps routing everything, the new company's documents included, into the
+    first client's space. Only a fresh `directory-bindings.mjs propose` and an apply of the whole
+    plan take them off it. After every onboarding, apply the whole plan, never `--only` the new
+    row, and run `check` at least weekly
+    ([admin guide](docs/client-directory-admin-guide.md#keeping-the-bindings-current)). Phase 2
+    checks membership at upload time.

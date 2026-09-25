@@ -3,30 +3,50 @@
 ## Run the bot and ingestion API side-by-side
 
 ```bash
+cp packages/teams-bot/local.settings.json.example packages/teams-bot/local.settings.json
+cp packages/document-ingestion/local.settings.json.example packages/document-ingestion/local.settings.json
+# fill both in: see setup-guide.md §6. Both apps refuse to start on a missing or malformed setting.
+
 # Terminal 1 — ingestion API on :7071
 yarn start:ingestion
 
 # Terminal 2 — bot on :3978
 yarn start:bot
-
-# Terminal 3 — Bot Framework Emulator
-#   open it, "Open Bot" → http://localhost:3978/api/messages
-#   Microsoft App ID / Password = the values in local.settings.json
 ```
 
-## Mocking the ingestion API while iterating on the bot
+The bot needs `MICROSOFT_APP_ID`, `MICROSOFT_APP_PASSWORD` and `MICROSOFT_APP_TENANT_ID` to
+start, so it runs as a real app registration: use a test registration's values, in your local
+file only.
 
-If you only want to work on the bot UX you can stub the ingestion API.
-The included `mockIngestion.ts` mini-server returns a canned success
-response, lets you verify the adaptive cards render correctly, and never
-touches SharePoint:
+## What the Bot Framework Emulator can and cannot do
+
+**The Emulator cannot get a file filed.** Every activity passes the bot's gate first, and the
+gate lets through only a Teams 1:1 chat (`conversation.conversationType` = `personal`) from the
+BCR tenant (`channelData.tenant.id`), sent by a user with a GUID `from.aadObjectId`. Emulator
+activities carry none of these by default.
+
+- With `BOT_GATE_MODE=enforce`, the value in the example settings and the default, the gate
+  refuses every Emulator activity. The bot answers a refused message only in a personal
+  conversation, so the Emulator sees **no reply at all**. That is the gate working, not a
+  broken bot: the log shows `bot.gate.rejected` with the reason.
+- With `BOT_GATE_MODE=log` in your **local** settings, the gate logs the refusal and lets the turn
+  through. That is enough for the help card and card layout. A file sent this way still comes
+  back as a rejected row: the bot forwards the activity's conversation type, tenant and user id
+  as they are, and ingestion's source check refuses the batch with 400.
+
+Never set `log` on a deployed bot outside the rollout window in
+[`operations/human-steps.md`](operations/human-steps.md#phase-0).
+
+To see what the bot does with a real Teams activity, use its tests:
+`packages/teams-bot/src/bot/ledgerBot.test.ts` drives `LedgerBot` through `TestAdapter` with
+Teams-shaped 1:1 activities and a fake ingestion client, so card changes can be checked without
+the Emulator, a token or SharePoint:
 
 ```bash
-yarn ts-node scripts/mockIngestion.ts
-# then set INGESTION_BASE_URL=http://localhost:7071 in the bot's
-# local.settings.json (no real auth required because the bot still mints
-# a JWT but the mock server just discards it)
+yarn workspace @bcr/teams-bot test src/bot/ledgerBot.test.ts
 ```
+
+To exercise ingestion itself, call it directly, as below.
 
 ## Triggering ingestion without the bot
 
@@ -68,7 +88,10 @@ curl -X POST http://localhost:7071/api/ingest/batch \
 ```
 
 A user id that is on no row of your test Directory comes back as `quarantined`, with no result.
-That is the expected answer for an unbound uploader.
+That is the expected answer for an unbound uploader. To see a document filed, the test row must be
+bound (`RootFolder`, `DriveId` and `TeamId` set, `SitePath` exactly `/sites/<name>`, and
+`SiteHostname` equal to your local `QUARANTINE_SITE_HOSTNAME`); otherwise it is quarantined as
+`unbound_target` or `forbidden_target`.
 
 ## Useful Kusto
 

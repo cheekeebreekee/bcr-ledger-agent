@@ -18,7 +18,7 @@ exact UI path (and CLI equivalent) where you can find or generate it.
 | **Yarn 4 via Corepack** | 4.3.1 | `corepack enable && corepack prepare yarn@4.3.1 --activate` |
 | **Azure CLI** | ≥ 2.65 | <https://learn.microsoft.com/cli/azure/install-azure-cli> |
 | **Azure Functions Core Tools** | bundled per workspace | installed by `yarn install` |
-| **Bot Framework Emulator** *(optional, for local testing)* | latest | <https://github.com/microsoft/BotFramework-Emulator/releases> |
+| **Bot Framework Emulator** *(optional)* | latest | <https://github.com/microsoft/BotFramework-Emulator/releases>. It cannot get a file through the bot's gate; see [`local-development.md`](./local-development.md). |
 | **`jq`** | any | `brew install jq` |
 
 You will also need:
@@ -45,6 +45,7 @@ into multiple places. Keep a scratchpad open:
 | **Bot App Password** | long string | Client secret on the Bot app reg |
 | **Ingestion App ID** | UUID | App registration (the “API identity”) |
 | **Ingestion App ID URI** | `api://<uuid>` | *Expose an API* blade on Ingestion app |
+| **Ingestion managed identity app id** (`INGEST_MI_APPID`) | UUID | The ingestion Function App's system-assigned managed identity, after §3b. The identity that calls Microsoft Graph, and the only one that gets SharePoint grants (§5). |
 | **SharePoint Site ID** | comma-tuple | `GET /sites/{hostname}:/sites/{path}` |
 | **App Insights Connection String** | `InstrumentationKey=…;IngestionEndpoint=…;` | App Insights → *Configure → Properties* |
 | **Anthropic API Key** | `sk-ant-…` | [Anthropic Console](https://console.anthropic.com/) → *API Keys* |
@@ -60,6 +61,12 @@ The architecture uses **two** app registrations:
    ingestion HTTP API. The bot acquires a token for this app and presents
    it on every `POST /api/ingest/batch` call. Since Phase 0, ingestion also checks that the
    token's app id is the bot's (`BOT_CALLER_APP_IDS`), so no other app can call it.
+
+Neither registration calls Microsoft Graph. Ingestion calls Graph as its Function App's
+**system-assigned managed identity**, which the Bicep deploy in §3 creates. That identity, and
+only that identity, gets `Sites.Selected` and the per-site grants in §5. A SharePoint grant to
+the Ingestion API app registration gives ingestion nothing, because ingestion never
+authenticates as it.
 
 ### 2a. Bot app registration
 
@@ -110,11 +117,9 @@ On the new registration:
    - **Allowed member types:** *Applications*
    - **Value:** `Documents.Ingest`
    - **Description:** *Allows the caller to ingest documents into SharePoint.*
-3. **API permissions → + Add a permission → Microsoft Graph → Application
-   permissions:**
-   - `Sites.Selected` (we’ll scope this to a single SharePoint site in
-     step 5)
-4. Click **Grant admin consent for <your tenant>**.
+
+Add **no** Microsoft Graph permission to this registration. `Sites.Selected` goes to the
+ingestion Function App's managed identity in §5, never to this app registration.
 
 | Copy this value | Use as |
 |---|---|
@@ -146,7 +151,7 @@ az ad app show --id "$INGESTION_APP_ID" \
 ```json
 {
   "roles": ["Documents.Ingest"],
-  "uris": ["api://b8b90018-9af0-4d7a-ada2-71559952ebbe"]
+  "uris": ["api://<INGESTION_APP_ID>"]
 }
 ```
 
@@ -256,12 +261,15 @@ and creates everything in one resource group:
 
 ### 3a. Fill in parameter file
 
-Edit [`infrastructure/main.dev.parameters.json`](../infrastructure/main.dev.parameters.json):
+This guide builds a **new** environment, named here `<env>` (for example `qa`, or `prod`, which
+does not exist yet). Fill in `infrastructure/main.<env>.parameters.json`; for any name but
+`prod`, copy it from [`main.prod.parameters.json`](../infrastructure/main.prod.parameters.json)
+first. Never edit or deploy the `dev` file: "dev" is production.
 
 ```jsonc
 {
   "parameters": {
-    "environmentName":            { "value": "dev" },
+    "environmentName":            { "value": "<env>" },
     "location":                   { "value": "westeurope" },
     "botAppId":                   { "value": "<Bot App ID from §2a>" },
     "ingestionAppId":             { "value": "<Ingestion App ID from §2b>" },
@@ -272,51 +280,110 @@ Edit [`infrastructure/main.dev.parameters.json`](../infrastructure/main.dev.para
     "enableAnthropic":            { "value": true },
     "anthropicModel":             { "value": "claude-opus-4-5-20251101" },
     "anthropicConfidenceThreshold": { "value": "0.6" },
-    "clientCompanyName":          { "value": "0000 TEST Sp. z o.o." },
+    "clientCompanyName":          { "value": "" },
     "clientNip":                  { "value": "" }
   }
 }
 ```
 
+The `sharePoint*`, `clientCompanyName` and `clientNip` parameters only feed app settings that
+nothing reads any more (see `PROJECT_OVERVIEW.md` → Configuration). The template still requires
+the first two; any placeholder will do. They go with the Bicep drift fix (gate G1).
+
 ### 3b. Deploy
 
-> ⚠️ **For a brand-new environment only. Never run this against "dev" before the Bicep drift
-> fix (gate G1).** "dev" is production: it serves a real client. `yarn deploy:dev` deploys
-> `main.bicep` first, which replaces every app setting with the template's, and the template
-> lacks the settings set by hand, so ingestion fails at cold start. To ship code to "dev",
-> deploy code only, in the order in
-> [`operations/human-steps.md`](operations/human-steps.md#phase-0).
+> ⚠️ **For a brand-new environment only. Never deploy "dev" this way before the Bicep drift
+> fix (gate G1).** "dev" is production: it serves a real client. A template deploy replaces
+> every app setting with the template's, and the template lacks the settings set by hand there,
+> so ingestion would fail at cold start. `infrastructure/deploy.sh` refuses `dev` in any
+> spelling, and the `rg-bcr-ledger-dev` resource group. To ship code to "dev", deploy code only,
+> in the order in [`operations/human-steps.md`](operations/human-steps.md#phase-0).
 
 ```bash
 az login
 az account set --subscription <Subscription ID>
 
 cd bcr-ledger-agent
-yarn install
-yarn build
-yarn deploy:dev
+corepack enable                          # deploy.sh calls yarn, which must be Yarn 4.3.1
+corepack yarn deploy:prod                # a new prod environment
+./infrastructure/deploy.sh <env>         # any other new environment: the same script
 ```
 
-The script will print the final Function App names — note them:
+The script deploys the template, then builds, packages and zip-deploys both Function Apps
+(see [`PROJECT_OVERVIEW.md` → Build and deploy](../PROJECT_OVERVIEW.md#build-and-deploy) for what
+packaging checks). It prints the two Function App names. Note them, with the other names the
+template gave (`XXXX` is a suffix derived from the resource group):
 
-| Output | Use later as |
+| Resource | Use later as |
 |---|---|
-| `func-bcr-bot-dev-XXXX` | bot messaging endpoint host |
-| `func-bcr-ingest-dev-XXXX` | ingestion API host |
-| `kv-bcr-ledger-dev-XXXX` | Key Vault name for secrets |
-| `appi-bcr-ledger-dev-XXXX` | App Insights resource |
+| `func-bcr-bot-<env>-XXXX` | bot messaging endpoint host |
+| `func-bcr-ingest-<env>-XXXX` | ingestion API host, and the managed identity that gets the SharePoint grants (§5) |
+| `kv-bcr-<env>-XXXX` | Key Vault for the secrets (§4): `az keyvault list -g rg-bcr-ledger-<env> --query "[].name" -o tsv` |
+| `appi-bcr-<env>-XXXX` | Application Insights |
+
+Nothing works yet. Ingestion refuses to start until it has the settings in §3d, both apps need
+the secrets in §4, and ingestion can reach no SharePoint site until §5.
 
 ### 3c. Bot messaging endpoint
 
 After deployment, set the Bot Service’s messaging endpoint to:
 
 ```
-https://func-bcr-bot-dev-XXXX.azurewebsites.net/api/messages
+https://func-bcr-bot-<env>-XXXX.azurewebsites.net/api/messages
 ```
 
 UI path: **Azure Portal → Azure Bot resource → *Configuration* → *Messaging endpoint***.
 
 The Bicep template attempts this automatically — verify the field is set.
+
+### 3d. Add the Phase-0 settings the template lacks
+
+`main.bicep` does not set the Phase-0 ingestion settings yet (gate G1). Until they are set,
+ingestion refuses to start, and its cold-start error names the first missing or malformed
+setting. Add them once, before any traffic. `appsettings set` merges and never removes a
+setting, and `-o none` keeps the storage account key out of your terminal.
+
+They need three things to exist first: the quarantine site
+([`infrastructure/quarantine/README.md`](../infrastructure/quarantine/README.md)), the Client
+Directory list ([admin guide → Creating the list from scratch](client-directory-admin-guide.md#creating-the-list-from-scratch)),
+and the bot's app id from §2a. What each value must look like is in §6c; ingestion checks every
+shape at cold start.
+
+```bash
+RG=rg-bcr-ledger-<env>
+INGEST=func-bcr-ingest-<env>-XXXX                 # from §3b
+SP_HOST=<tenant>.sharepoint.com                   # lower case: no https://, no path
+
+az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
+  "BOT_CALLER_APP_IDS=<Bot App ID from §2a>" \
+  "CLIENT_DIRECTORY_SITE_ID=<hostname>,<siteGuid>,<webGuid>" \
+  "CLIENT_DIRECTORY_LIST_ID=<Client Directory list id>" \
+  "QUARANTINE_SITE_HOSTNAME=$SP_HOST" \
+  "QUARANTINE_SITE_PATH=/sites/<quarantine site name>" \
+  "QUARANTINE_DRIVE_NAME=<the quarantine site's library name>" \
+  "QUARANTINE_ROOT_FOLDER=Kwarantanna" \
+  "FORBIDDEN_TARGET_SITE_PATHS=/sites/<site that holds the Client Directory>" \
+  "CLIENT_DIRECTORY_MAX_STALE_MS=900000"
+```
+
+`QUARANTINE_SITE_HOSTNAME` is also the only SharePoint host a Client Directory row may name: a
+row on any other host routes nobody. `FORBIDDEN_TARGET_SITE_PATHS` must name the site that holds
+the Client Directory; the quarantine path is added to it automatically.
+
+The bot needs nothing extra: the template sets `MICROSOFT_APP_TYPE=SingleTenant`, and an unset
+`BOT_GATE_MODE` means `enforce`.
+
+**Verify.** List only the settings you set, never every setting (the list includes the storage
+account key):
+
+```bash
+az functionapp config appsettings list -g $RG -n $INGEST -o table --query \
+  "[?starts_with(name,'QUARANTINE_') || starts_with(name,'CLIENT_DIRECTORY_') || name=='BOT_CALLER_APP_IDS' || name=='FORBIDDEN_TARGET_SITE_PATHS'].{name:name,value:value}"
+```
+
+Then restart ingestion (§4 does). `GET https://$INGEST.azurewebsites.net/api/health` must answer
+200, and Application Insights `exceptions` must hold no `ValidationError`, whose message names
+the setting it refused.
 
 ---
 
@@ -327,7 +394,7 @@ Both Function Apps are configured to read these via
 *Configuration* blade after deployment).
 
 ```bash
-KV=kv-bcr-ledger-dev-XXXX   # from §3b output
+KV=kv-bcr-<env>-XXXX   # from §3b
 
 # Bot client secret (required)
 az keyvault secret set --vault-name "$KV" \
@@ -340,41 +407,66 @@ az keyvault secret set --vault-name "$KV" \
   --value "<ANTHROPIC_API_KEY — sk-ant-…>"
 
 # Restart the function apps so they pick up the references
-az functionapp restart -g rg-bcr-ledger-dev -n func-bcr-bot-dev-XXXX
-az functionapp restart -g rg-bcr-ledger-dev -n func-bcr-ingest-dev-XXXX
+az functionapp restart -g rg-bcr-ledger-<env> -n func-bcr-bot-<env>-XXXX
+az functionapp restart -g rg-bcr-ledger-<env> -n func-bcr-ingest-<env>-XXXX
 ```
 
 ---
 
 ## 5. Grant SharePoint site permission (`Sites.Selected`)
 
-`Sites.Selected` is the modern, **least-privilege** alternative to
-`Sites.ReadWrite.All`. The ingestion app is allowed to write only to the
-single site you grant it.
+Ingestion reads and writes SharePoint as the ingestion Function App's **system-assigned managed
+identity**. Every grant below goes to that identity. **Never grant to the Ingestion API app
+registration** (`INGESTION_APP_ID`): ingestion never authenticates as it, so the grant does
+nothing, yet a permissions list then shows `write` for an id that looks right. In June 2026 that
+mistake was the 401 at the first smoke test
+([`admin-sharepoint-grant.md`](admin-sharepoint-grant.md)).
+
+`Sites.Selected` is not a single-site scope. It is an allow-list of per-site grants, and the
+identity ends up with `write` on every client site it files into (see
+[`security.md`](security.md), T3).
+
+Derive the identity's ids from the Function App, so nobody types a GUID:
 
 ```bash
-# 1. Look up the site ID
-SITE_ID=$(az rest --method get \
-  --uri "https://graph.microsoft.com/v1.0/sites/contoso.sharepoint.com:/sites/BCR-Ledger" \
-  --query id -o tsv)
-
-# 2. Grant the Ingestion app reg the "write" role on that site
-az rest --method post \
-  --uri "https://graph.microsoft.com/v1.0/sites/$SITE_ID/permissions" \
-  --body '{
-    "roles": ["write"],
-    "grantedToIdentities": [{
-      "application": {
-        "id": "<INGESTION_APP_ID>",
-        "displayName": "BCR Ledger Ingestion API"
-      }
-    }]
-  }'
+RG=rg-bcr-ledger-<env>
+INGEST=func-bcr-ingest-<env>-XXXX            # from §3b
+INGEST_MI_OID=$(az functionapp identity show -g $RG -n $INGEST --query principalId -o tsv)
+INGEST_MI_APPID=$(az ad sp show --id "$INGEST_MI_OID" --query appId -o tsv)
 ```
 
-> ⚠️ The user running this command needs `Sites.FullControl.All` (typically
-> a Global / SharePoint admin). Once granted, you’re done — no per-folder
-> ACLs needed.
+The object id is for the app-role assignment, the app id for the site grants. Swapping them
+creates a grant that silently protects nothing.
+
+1. **The Graph app role `Sites.Selected`**, once for this identity. It needs Global
+   Administrator or Privileged Role Administrator, and the Azure CLI cannot make it in this
+   tenant (`AADSTS65002`). Use Graph Explorer, as in
+   [`admin-sharepoint-grant.md`](admin-sharepoint-grant.md), Step 1, with `$INGEST_MI_OID` as
+   both the URL's service principal and `principalId`. That page's `resourceId` is the Microsoft
+   Graph service principal of the BCR tenant; in any other tenant, use that tenant's
+   (`az ad sp show --id 00000003-0000-0000-c000-000000000000 --query id -o tsv`).
+2. **A per-site permission** for `$INGEST_MI_APPID`, on each site the identity touches:
+
+   | Site | Role | When |
+   |---|---|---|
+   | The quarantine site | `write` | Before ingestion takes traffic. See [`infrastructure/quarantine/README.md`](../infrastructure/quarantine/README.md#write-grant-for-the-ingestion-managed-identity). |
+   | The site that holds the Client Directory list (BCR GROUP) | `read` | Before ingestion takes traffic. **Never `write`**: nothing is ever filed there. |
+   | Each client's Team site | `write` | When that client is bound, as step 1 of [Onboarding a client](client-directory-admin-guide.md#onboarding-a-client-phase-0). |
+
+   Make a `write` grant with the onboarding repo's `Grant-TeamSiteAccess.ps1` runbook
+   (`AppId="$INGEST_MI_APPID"`), or with a Graph `POST /sites/{site-id}/permissions` by a
+   SharePoint administrator. Both are in
+   [`infrastructure/quarantine/README.md`](../infrastructure/quarantine/README.md#write-grant-for-the-ingestion-managed-identity).
+   The `read` grant is the same Graph call with `"roles": ["read"]`. The runbook only ever
+   grants `write`, and it is not a check: when it finds no grant it creates one. So never run it
+   to verify a grant, and never against BCR GROUP or any other site in
+   `FORBIDDEN_TARGET_SITE_PATHS`.
+
+**Verify, read-only.** `GET https://graph.microsoft.com/v1.0/sites/{site-id}/permissions`, with
+`Sites.FullControl.All` consented, lists one entry whose `grantedToIdentities[0].application.id`
+equals `$INGEST_MI_APPID`, with the role from the table. An entry for the Ingestion API app
+registration does not count: record it for deletion. Per-site grants take about 5 minutes to
+apply.
 
 ---
 
@@ -426,16 +518,16 @@ for the design.
 | `INGESTION_APP_ID` | Ingestion app reg → **Overview → Application (client) ID** *(§2b)* |
 | `EXPECTED_AUDIENCE` | `api://<INGESTION_APP_ID>` (no `/.default` suffix) |
 | `EXPECTED_ROLES` | Comma-separated list. Default `Documents.Ingest`. Add new role names if you create more in step §2b. |
-| `CLIENT_DIRECTORY_SITE_ID` | Microsoft Graph site id (`<hostname>,<siteGuid>,<webGuid>`) of the SharePoint site that hosts the Client Directory list. `GET https://graph.microsoft.com/v1.0/sites/{hostname}:/{sitePath}` returns it. |
+| `CLIENT_DIRECTORY_SITE_ID` | Microsoft Graph site id (`<hostname>,<siteGuid>,<webGuid>`) of the SharePoint site that hosts the Client Directory list. `GET https://graph.microsoft.com/v1.0/sites/{hostname}:/{sitePath}` returns it. Must be exactly that three-part form: ingestion also uses it to refuse any write into this site, and the path form (`host:/sites/x:`) would switch that check off, so it fails at cold start. |
 | `CLIENT_DIRECTORY_LIST_ID` | GUID of the Client Directory list itself. Returned by `GET /sites/{id}/lists?$filter=displayName eq 'Client Directory'`. |
 | `CLIENT_DIRECTORY_CACHE_TTL_MS` | *(optional)* Directory snapshot cache TTL in milliseconds. Default `300000` (5 min). |
 | `CLIENT_DIRECTORY_MAX_STALE_MS` | *(optional)* Oldest snapshot still used when refreshes fail. Default `900000` (15 min). Past it, every upload goes to quarantine. |
-| `BOT_CALLER_APP_IDS` | **Required.** Comma-separated app ids allowed to call ingestion: the bot app reg's client id *(§2a)*. |
-| `QUARANTINE_SITE_HOSTNAME` | **Required.** SharePoint hostname of the quarantine site. |
-| `QUARANTINE_SITE_PATH` | **Required.** e.g. `/sites/BCRLedgerKwarantanna`. Must start with `/`. A communication site with no group and sharing disabled; see `docs/operations/human-steps.md` H-5. |
+| `BOT_CALLER_APP_IDS` | **Required.** Comma-separated app ids allowed to call ingestion: the bot app reg's client id *(§2a)*. Each entry must be a GUID. |
+| `QUARANTINE_SITE_HOSTNAME` | **Required.** `<tenant>.sharepoint.com`, lower case, with no `https://` and no path. The quarantine site's host, and also **the only host a Client Directory row may name**: a row whose `SiteHostname` differs routes nobody (`forbidden_target`). |
+| `QUARANTINE_SITE_PATH` | **Required.** e.g. `/sites/BCRLedgerKwarantanna`: exactly `/sites/<name>` or `/teams/<name>` ([canonical site path](../ARCHITECTURE.md#the-client-directory)). A communication site with no group and sharing disabled; see `docs/operations/human-steps.md` H-5. |
 | `QUARANTINE_DRIVE_NAME` | *(optional)* Default `Documents`. `Dokumenty` on Polish tenants. |
 | `QUARANTINE_ROOT_FOLDER` | *(optional)* Default `Kwarantanna`. |
-| `FORBIDDEN_TARGET_SITE_PATHS` | **Required.** Comma-separated site paths no Directory row may route to: at least the BCR GROUP site, e.g. `/sites/BCRGROUPSp.zo.o`. The quarantine path is added automatically. |
+| `FORBIDDEN_TARGET_SITE_PATHS` | **Required.** Comma-separated site paths no Directory row may route to: at least the site that holds the Client Directory, e.g. `/sites/BCRGROUP`. Each entry exactly `/sites/<name>` or `/teams/<name>`; a URL or a sub-site fails at cold start. The quarantine path is added automatically. |
 
 The `FALLBACK_*` settings were removed in Phase 0. The fallback bucket they described (the BCR
 GROUP library root, readable by the whole team) is replaced by the quarantine.
@@ -479,42 +571,50 @@ Even though the Azure Bot resource has the Teams channel enabled, Teams
 users won’t see anything until you sideload (or publish) the Teams app
 package built from [`teams-app/manifest.json`](../teams-app/manifest.json).
 
-### 7a. Prepare the manifest
+### 7a. Build the package
+
+The committed `teams-app/manifest.json` (version 0.2.0: personal scope only, no tab) holds two
+`REPLACE-WITH-BOT-APP-ID` placeholders, `id` and `bots[0].botId`. Replace them in a staging copy,
+so no real id lands in the tracked file, check the result, then zip. The icons
+(`color.png` 192×192, `outline.png` 32×32) are already in `teams-app/`.
 
 ```bash
-cd teams-app
-# Replace the two REPLACE-WITH-BOT-APP-ID placeholders
-sed -i.bak "s/REPLACE-WITH-BOT-APP-ID/<MICROSOFT_APP_ID>/g" manifest.json && rm manifest.json.bak
+cd bcr-ledger-agent
+BOT_APP_ID=<MICROSOFT_APP_ID from §2a>
+STAGE=$(mktemp -d)
+ZIP="$PWD/artifacts/teams-app.zip"
+cp teams-app/manifest.json teams-app/color.png teams-app/outline.png "$STAGE"/
+sed -i.bak "s/REPLACE-WITH-BOT-APP-ID/$BOT_APP_ID/g" "$STAGE/manifest.json" && rm "$STAGE/manifest.json.bak"
+
+grep -c REPLACE-WITH "$STAGE/manifest.json"                         # 0
+jq -r '.id, .bots[0].botId' "$STAGE/manifest.json"                  # $BOT_APP_ID, twice
+jq -r '.version' "$STAGE/manifest.json"                             # 0.2.0
+jq -c '[.. | .scopes? // empty | .[]] | unique' "$STAGE/manifest.json"   # ["personal"]
+jq 'has("staticTabs")' "$STAGE/manifest.json"                       # false
+
+mkdir -p artifacts && rm -f "$ZIP"
+(cd "$STAGE" && zip -X "$ZIP" manifest.json color.png outline.png)
 ```
 
-Add the required icons (one-time):
+If any check prints something else, stop: the zip would be refused, or would ship the wrong app.
+To update the tenant's existing "Asystent BCR" app, the id must be that app's id, which is the
+bot's `MICROSOFT_APP_ID`; a different id creates a second app. `artifacts/*.zip` are git-ignored
+build output: never commit `teams-app.zip`, or a `manifest.json` with a real id in it.
 
-- **`color.png`** — 192×192, full colour
-- **`outline.png`** — 32×32, transparent + white outline
-
-### 7b. Build the .zip
-
-```bash
-mkdir -p ../artifacts
-zip ../artifacts/teams-app.zip manifest.json color.png outline.png
-```
-
-### 7c. Sideload for a single user (fastest)
+### 7b. Sideload for a single user (fastest)
 
 1. Open Teams desktop or web.
 2. Left rail → **Apps → Manage your apps → Upload an app → Upload a custom app**.
 3. Pick `artifacts/teams-app.zip`.
 4. Click **Add**.
-5. Open a 1:1 chat with the bot. Drop in a file named e.g.
-   `Invoice_03_2026.pdf`.
+5. Open a 1:1 chat with the bot, as a guest bound to a test client, and send a synthetic
+   document, never a real one.
 
-You should see a card like:
+You should see one card with a row for the file: **Dokument · Kategoria · Folder** and an
+"Otwórz" link into that client's space. An uploader who is not bound to exactly one client gets
+"Dokument przekazano do weryfikacji przez zespół BCR." instead, with no link.
 
-> ✅ Filed **Invoice_03_2026.pdf**
-> Type: Invoice · Confidence: 95% · Folder: `Invoices/2026/03`
-> [Open in SharePoint]
-
-### 7d. Publish org-wide (Teams admin)
+### 7c. Publish org-wide (Teams admin)
 
 1. **Teams admin center → Teams apps → Manage apps → + Upload new app →
    Upload** the same `teams-app.zip`.
@@ -530,10 +630,10 @@ You should see a card like:
 
 ```bash
 # 1. Ingestion is alive and unauthenticated /health works
-curl https://func-bcr-ingest-dev-XXXX.azurewebsites.net/api/health
+curl https://func-bcr-ingest-<env>-XXXX.azurewebsites.net/api/health
 
 # 2. Bot endpoint exists (returns 405 to a GET — that's expected)
-curl -i https://func-bcr-bot-dev-XXXX.azurewebsites.net/api/messages
+curl -i https://func-bcr-bot-<env>-XXXX.azurewebsites.net/api/messages
 
 # 3. End to end: the TEST guest sends a synthetic document to the bot in a 1:1 chat.
 ```
@@ -594,10 +694,14 @@ union requests, exceptions, traces
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Bot times out in Teams, no logs | Messaging endpoint wrong on Bot resource | Set it to `https://func-bcr-bot-<env>-XXXX.azurewebsites.net/api/messages` |
+| Ingestion's `/api/health` fails after a deploy, and `exceptions` hold a `ValidationError` | A setting the template does not set is missing or malformed; the message names it | Set it as in §3d, with `-o none`. Never with a Bicep deploy |
+| `deploy.sh` refuses to deploy `dev` (or `rg-bcr-ledger-dev`) | Deliberate: "dev" serves a real client, and a template deploy replaces its hand-set settings | Deploy code only, as in [`operations/human-steps.md`](operations/human-steps.md#phase-0) |
 | `+ Add a permission → My APIs` shows **No results** | Ingestion API has no *Application ID URI* and/or no *app role*, **or** you're signed in to a different tenant | Run the preflight in §2b (`az ad app show --id …`); fix whichever array is empty, then **Refresh** the *My APIs* tab |
 | `401 Unauthorized` from ingestion | Bot’s token has no `Documents.Ingest` role | Re-check §2c (Bot app reg → *API permissions* → application permission + admin consent) |
 | Ingestion logs `Token missing required role` but portal shows *✅ Granted* | CLI script used `az ad app permission admin-consent` (creates only delegated grants, **not** app-role assignments) | Run the `az rest --method POST … /appRoleAssignments` from §2c, then verify the GET returns one entry |
-| `403 Forbidden` on Graph upload | `Sites.Selected` not granted on the target site | Re-run §5 |
+| A client's uploads land in quarantine as `unbound_target` | The row lacks `RootFolder`, `DriveId` or `TeamId`: it was never bound, or someone cleared a field | Bind it with `tools/directory-bindings.mjs` (propose, review, apply), never by hand; see the [admin guide](client-directory-admin-guide.md#onboarding-a-client-phase-0) |
+| A client's uploads land in quarantine as `forbidden_target` or `conflict` | The row names a host other than `QUARANTINE_SITE_HOSTNAME`, a `SitePath` that is not exactly `/sites/<name>` or `/teams/<name>`, or a forbidden site; or it shares its site, `DriveId` or `TeamId` with another row | `directory-bindings.mjs check` names the row and the reason, and `directory.conflict` logs the list item ids of a conflict. Fix the rows as in the [admin guide](client-directory-admin-guide.md#duplicates-and-conflicts) |
+| A client's uploads land in quarantine as `target_unwritable`, or Graph answers `401`/`403` | The ingestion **managed identity** lacks the `Sites.Selected` app role or the site's `write` grant. Often the grant went to the Ingestion API app registration instead. | Check read-only as in §5 (**Verify**): the entry must name `INGEST_MI_APPID`. Then make the missing grant to the managed identity, never to the app registration |
 | Bot replies “⚠️ Could not file …” with `Folder traversal not allowed` | Tenant filename contains `..` or path separator | Rename the file or extend `pathBuilder.ts` rules |
 | Cards never render in Teams | The bot identity is wrong | Confirm `MICROSOFT_APP_ID` matches the Bot app reg, *and* the Teams `manifest.json` `id` + `bots[0].botId` use the same value |
 | `func: command not found` running `yarn start:bot` | Dependencies not installed from repo root | `cd bcr-ledger-agent && corepack yarn install` |
@@ -608,7 +712,7 @@ union requests, exceptions, traces
 ## 11. Where to go next
 
 - [`local-development.md`](./local-development.md) — running both functions
-  locally + Emulator + curl recipes.
+  locally, what the Emulator cannot do, and curl recipes.
 - [`security.md`](./security.md) — threat model, secrets inventory,
   compliance checklist.
 - [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — full sequence diagram and

@@ -85,8 +85,8 @@ Each `packages/*` is independently buildable and deployable.
 
 ## Quick start (local)
 
-Requirements: **Node 22 LTS**, **Yarn 4**, **Azure Functions Core Tools v4**,
-**Azure CLI**, and a Bot Framework Emulator install.
+Requirements: **Node 22 LTS**, **Yarn 4**, **Azure Functions Core Tools v4** and
+**Azure CLI**.
 
 ```bash
 # 1. Install deps for all workspaces
@@ -104,8 +104,10 @@ yarn start:bot           # http://localhost:3978/api/messages
 yarn start:ingestion     # http://localhost:7071/api/ingest/batch
 ```
 
-Then point the **Bot Framework Emulator** at `http://localhost:3978/api/messages`
-and drag any file named like `Invoice_03_2026.pdf` into the chat.
+The Bot Framework Emulator cannot get a file filed any more: the bot's gate accepts only a
+Teams 1:1 chat from the BCR tenant with a user object id, and Emulator activities carry none of
+that. [`docs/local-development.md`](./docs/local-development.md) shows what works locally: the
+bot's `TestAdapter` tests for card work, and a direct call to the ingestion API.
 
 ---
 
@@ -118,8 +120,8 @@ and drag any file named like `Invoice_03_2026.pdf` into the chat.
 | `yarn lint` | ESLint over the whole repo |
 | `yarn start:bot` | Start the Teams-bot Function App locally |
 | `yarn start:ingestion` | Start the document-ingestion Function App locally |
-| `yarn deploy:dev` | Deploy infra + code to the `dev` environment. **Not during Phase 0:** it deploys Bicep, which has drifted from what runs. Use the code-only steps in [`human-steps.md`](./docs/operations/human-steps.md#phase-0). |
-| `yarn deploy:prod` | Deploy infra + code to the `prod` environment |
+| `yarn deploy:dev` | **Refused.** "dev" is production, and `infrastructure/deploy.sh` refuses it until the Bicep drift fix: a template deploy would replace the settings set by hand there. Deploy code only, as in [`human-steps.md`](./docs/operations/human-steps.md#phase-0). |
+| `yarn deploy:prod` | Deploy infra + code to a **new** `prod` environment. Then add the settings the template lacks ([`setup-guide.md` §3d](./docs/setup-guide.md#3d-add-the-phase-0-settings-the-template-lacks)), or ingestion will not start. |
 
 ---
 

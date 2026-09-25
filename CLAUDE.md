@@ -56,12 +56,21 @@ Local run (two processes; `prestart` builds, and `@bcr/shared` must be built fir
 ```bash
 cp packages/teams-bot/local.settings.json.example packages/teams-bot/local.settings.json
 cp packages/document-ingestion/local.settings.json.example packages/document-ingestion/local.settings.json
-yarn start:bot            # http://localhost:3978/api/messages  (point Bot Framework Emulator here)
+yarn start:bot            # http://localhost:3978/api/messages
 yarn start:ingestion      # http://localhost:7071/api/ingest/batch
 ```
 
-Deploy: `yarn deploy:dev` / `yarn deploy:prod` run `infrastructure/deploy.sh <env>` (Bicep, then
-zip-deploy of both Function Apps); `deploy.yml` does the same via Azure OIDC.
+The Bot Framework Emulator no longer gets a file through: the gate accepts only a Teams 1:1 chat
+from the BCR tenant with a GUID `aadObjectId`, which Emulator activities lack (silence in
+`enforce`; in a local `BOT_GATE_MODE=log`, ingestion's source check still answers 400). Test bot
+turns with `TestAdapter` (`ledgerBot.test.ts`) and ingestion with a direct call, as in
+`docs/local-development.md`.
+
+Deploy: `infrastructure/deploy.sh <env>` (`yarn deploy:prod`) deploys Bicep, then zip-deploys both
+Function Apps; `deploy.yml` does the same via Azure OIDC. Both are for a **new** environment only,
+and both refuse `dev` (`deploy.sh` in any spelling, and `rg-bcr-ledger-dev`). A new environment
+then needs the Phase-0 ingestion settings the template lacks, set once with `appsettings set`
+(`docs/setup-guide.md` §3d); until then ingestion refuses to start.
 
 > ⚠️ **"dev" is production: it serves PESKOVOI.** Until the Bicep drift fix (gate G1), never run
 > `yarn deploy:*`, `infrastructure/deploy.sh` or the Deploy workflow against it. `main.bicep`
@@ -70,12 +79,18 @@ zip-deploy of both Function Apps); `deploy.yml` does the same via Azure OIDC.
 > `docs/operations/human-steps.md` (Phase 0), and add settings with
 > `az functionapp config appsettings set … -o none`, which merges.
 
-`yarn build && yarn workspace @bcr/<pkg> package` builds a fresh zip into `artifacts/`
-(`tools/package-function.mjs` stages it and vendors the just-built `@bcr/shared`). Before
-deploying, check that the vendored copy is current: `unzip -p artifacts/<pkg>.zip
-node_modules/@bcr/shared/dist/config.js | grep -c botGateMode` (ingestion:
-`forbiddenTargetSitePaths`) must be greater than 0. CI (`.github/workflows/ci.yml`) runs lint →
-type-check → build → test plus `bicep build`/`bicep lint`.
+`yarn workspace @bcr/<pkg> package` builds a fresh zip into `artifacts/`. It cleans `dist` and the
+`tsbuildinfo`, rebuilds, then runs `tools/package-function.mjs`, which deletes the old zip first,
+fails if any `dist/**/*.js` (the app's or `@bcr/shared`'s) has no `src/**/*.ts` behind it, ships
+no `*.map`/`*.d.ts`/`*.tsbuildinfo`, installs production dependencies at the exact `yarn.lock`
+versions with install scripts disabled (checking each top-level version against the root
+`node_modules`), and vendors the just-built `@bcr/shared`. `artifacts/*.zip` are git-ignored build
+output: never commit one, and deploy only a zip built for that deploy. Before deploying, still
+check the vendored copy: `unzip -p artifacts/<pkg>.zip node_modules/@bcr/shared/dist/config.js |
+grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths`) must be greater than 0.
+
+CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test, plus `bicep build` and
+`bicep lint`.
 
 ---
 
@@ -106,9 +121,10 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
    `userAadObjectId`, and the BCR tenant are accepted; filename has no path separators, base64
    shape, ≤25 docs per batch, ≤100 MiB decoded.
 3. **Resolve the client** — `services/clientResolver.ts#resolve()` maps `source.userAadObjectId` to
-   exactly one Client Directory row, else returns the **staff-only quarantine** with a reason
-   (`unmapped`, `staff`, `conflict`, `stale_directory`, …). Quarantined documents are never
-   classified.
+   exactly one bound Client Directory row, else returns the **staff-only quarantine** with a reason:
+   `unmapped`, `staff`, `conflict`, `stale_directory`, `forbidden_target` or `unbound_target` (the
+   row lacks `RootFolder`, `DriveId` or `TeamId`). The upload step adds `target_unwritable`.
+   Quarantined documents are never classified.
 4. **Classify** — `services/classificationService.ts` runs classifiers in order and returns the
    first result at/above 0.8 confidence, else the best one. Chain is
    `ClaudeClassifier → FallbackClassifier` (Claude only if `ANTHROPIC_ENABLED` + key). Only the
@@ -116,10 +132,16 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
 5. **Direction** — `resolvePostClassification()` flips sprzedaż ⇄ zakup from the bound client's own
    NIP. It never changes the client.
 6. **Upload** — `sharePointServiceFactory.ts` returns a per-target cached `SharePointService`, which
-   resolves site+drive ids (refusing a drive that differs from the row's `DriveId`), creates the
-   folder chain idempotently, then PUTs (≤4 MiB) or opens an upload session — both with
-   `conflictBehavior=fail`, taking the next free `_n` name on a 409. If the client's space can't be
-   written, the document goes to quarantine (`target_unwritable`), never anywhere else.
+   resolves site+drive ids (refusing a drive that differs from the row's `DriveId`, and a site
+   whose site-collection id is BCR GROUP's or the quarantine site's: `SharePointTargetError`
+   `forbidden_site` → quarantine as `forbidden_target`), creates the folder chain idempotently,
+   then PUTs (≤4 MiB) or opens an upload session — both with `conflictBehavior=fail`, taking the
+   next free `_n` name on a 409. If the client's space can't be written, the document goes to
+   quarantine (`target_unwritable`), never anywhere else. Its own retry (`withRetry`) covers only
+   network failures, 500 and 502; 429/503/504 belong to the Graph SDK's `RetryHandler` — never
+   stack the two. A batch starts no document after 150 s (the rest are `rejected`, generic retry
+   code), and a suffixed name taken after a retried network failure logs
+   `sharepoint.possible_duplicate`.
 
 ### Invariants — break these and documents mis-file
 
@@ -135,10 +157,33 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
 - **Directory lookups are fail-closed and order-independent.** `buildSnapshot` in
   `clientDirectoryReader.ts` works in two passes: collect every key's rows, then admit a user id only
   when exactly one trusted row holds it. A user id on two rows (or on a client and an admin row) routes
-  nowhere; rows sharing a target, or pointing at a forbidden site or another host, are excluded
-  entirely. A shared NIP or ClientId only raises `directory.conflict` — neither routes anything. A
-  snapshot older than `CLIENT_DIRECTORY_MAX_STALE_MS` is treated as unavailable (everything to
-  quarantine). BCR staff ids never belong on client rows.
+  nowhere. Client rows that share a site (host + canonical path, whatever drive or folder each
+  names), a `DriveId` or a `TeamId` (case-insensitive) are all excluded, their users `conflict`. A
+  row on a host other than `QUARANTINE_SITE_HOSTNAME`, on a forbidden site (BCR GROUP, the
+  quarantine site) or with a non-canonical `SitePath` is excluded as `forbidden_target`. A row
+  without `RootFolder`, `DriveId` or `TeamId` routes nobody (`unbound_target`); only
+  `tools/directory-bindings.mjs apply` binds a row, writing all three together. A shared NIP or
+  ClientId only raises `directory.conflict` — neither routes anything. A snapshot older than
+  `CLIENT_DIRECTORY_MAX_STALE_MS` is treated as unavailable (everything to quarantine). BCR staff
+  ids never belong on client rows.
+- **One canonical site path, on both sides.** Trim, split on `/`, drop empty segments; valid only as
+  exactly `sites|teams` + a name matching `^[A-Za-z0-9_-][A-Za-z0-9._-]*$` that does not end in `.`;
+  compare `/<seg0>/<seg1>` lower-cased. Sub-sites, `.`/`..`, `%`, `\` and whitespace are refused,
+  never normalised. `canonicalSitePath` (ingestion) and the site-path helpers in
+  `tools/lib/bindings.mjs` must agree exactly and share one edge-case table in their tests; change
+  both or neither. `QUARANTINE_SITE_PATH` and `FORBIDDEN_TARGET_SITE_PATHS` must pass it at cold
+  start.
+- **A guest binding is only as fresh as the last tool run.** Routing never checks Team
+  membership: a guest bound to client A and later added to client B's Team (B's onboarding
+  re-invited the same email) keeps routing everything, B's documents included, into A until
+  `tools/directory-bindings.mjs` runs again and the **whole** plan is applied. After any
+  onboarding, apply the whole plan, never `--only <new row>`, and run `check` at least weekly
+  (`docs/client-directory-admin-guide.md` → Keeping the bindings current). The runtime `memberOf`
+  check is Phase 2; until then, never describe or build a flow that binds only the new row.
+- **Nothing is written into BCR GROUP or the quarantine site as a client target, whatever a row
+  says.** The path checks compare spellings; `SharePointService` also compares the *resolved*
+  site-collection id with BCR GROUP's (from `CLIENT_DIRECTORY_SITE_ID`) and the quarantine site's
+  (resolved lazily and cached — failing to resolve it refuses the write). Keep both layers.
 - **`parsers/folderTaxonomy.ts` is the single source of truth for folder layout.** `categoryCatalog`
   drives the Claude system prompt *and* the tool-call enum *and* `buildFolderPath()`, so the model
   can never name a category the uploader can't build a path for. Add or rename a category there and
@@ -151,8 +196,8 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
   raced, and told a caller which names already existed).
 - **Responses and logs carry ids, not client data.** A quarantined row has no link, folder or name;
   the result card shows the taxonomy label, never the model's reasoning; logs carry `documentId`,
-  `clientId`, `listItemId`, `driveItemId` — file names, titles, NIPs and SharePoint locations are
-  redacted by the root logger (`shared/src/logger.ts`).
+  `clientId`, `listItemId`, `teamId`, `driveItemId` — file names, titles, NIPs and SharePoint
+  locations are redacted by the root logger (`shared/src/logger.ts`).
 - **Only 1:1 chats are processed.** Teams *channel* uploads never reach a bot (drag-drop bypasses
   Bot Framework; `@mention` activities carry only mention HTML), and group chats are refused. Every
   activity passes the bot gate (personal conversation, BCR tenant, GUID `aadObjectId`) before any
@@ -235,14 +280,16 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
 
 ## Azure / SharePoint facts that bite
 
-`PROJECT_OVERVIEW.md` → *Lessons learned* has the full list (19 items). The ones that affect code:
+`PROJECT_OVERVIEW.md` → *Lessons learned* has the full list (24 items). The ones that affect code:
 
 - **SharePoint drive names are locale-dependent** — Polish tenants use `Dokumenty`, not `Documents`.
   Always resolve via `GET /sites/{id}/drives`; per-client names come from the Directory's `DriveName`
   column, the quarantine site's from `QUARANTINE_DRIVE_NAME`.
 - **Graph calls use the Function App's system-assigned managed identity**, not the API app
   registration, and `Sites.Selected` needs *two* grants (Graph app role + per-site permission);
-  per-site grants take ~5 min to propagate. See `docs/admin-sharepoint-grant.md`.
+  per-site grants take ~5 min to propagate. Every grant names the MI's app id (`INGEST_MI_APPID`);
+  a grant to the API app registration does nothing. See `docs/setup-guide.md` §5 and
+  `infrastructure/quarantine/README.md` (the old `grant-sharepoint-permission.sh` is deleted).
 - `MICROSOFT_APP_TYPE` must be `SingleTenant` (the app registration is `AzureADMyOrg`); the wrong
   value is a 401 at Bot Framework auth.
 - `@anthropic-ai/sdk` must stay ≥ 0.40 for typed PDF `document` content blocks
