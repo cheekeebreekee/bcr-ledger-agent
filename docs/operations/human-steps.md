@@ -1164,22 +1164,44 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    that row; check that the printed after-state no longer holds it. For a real client, the
    canary must come from an identity bound to that client, and there are two ways:
    - by arrangement, the client's contact sends the synthetic canary file BCR gives them; or
-   - BCR's canary guest joins that one client Team for the canary only. At that moment it is in
-     no other Team at all, or the tool excludes it (`guest_in_other_team`). Afterwards it
-     leaves the Team, and its id comes off the row the same way it went on. A plain `propose`
-     is not enough: without `--write-verified` the row is SKIP `write_grant_unknown`, and
-     `apply` refuses a SKIP row. So:
+   - BCR's canary guest ([H-5b](#h-5b-invite-the-canary-guest)) joins that one client Team for
+     the canary only. While its id is on the row, every upload it makes is filed into
+     PESKOVOI's channel, where the client sees it, so run these in one go, in this order:
+     1. A BCR owner of PESKOVOI's Team adds the canary guest to it. It must be in no other Team
+        at all, or the tool excludes it (`guest_in_other_team`).
+     2. `propose --write-verified <PESKOVOI sitePath>`. A plain `propose` is not enough: without
+        `--write-verified` the row is SKIP `write_grant_unknown`, and `apply` refuses a SKIP
+        row. The plan adds the canary's id to PESKOVOI's row.
+     3. `apply` that plan with `--only <PESKOVOI listItemId>`, a dry run and then `--apply`. The
+        printed after-state holds the canary's id.
+     4. The canary upload: the canary guest sends the synthetic PDF. Expect what the TEST canary
+        (H-12 step 7) expects, in PESKOVOI's channel, then delete the canary file.
+     5. The canary guest leaves PESKOVOI's Team.
+     6. `propose` again, with `--write-verified` for the TEST and PESKOVOI sites only (the rows
+        already applied, so no further client is bound before its own canary). Review it as in
+        H-12 step 5, and apply that plan **whole**, without `--only`: a dry run, then `--apply`.
+        PESKOVOI's printed after-state no longer holds the canary's id.
+     7. H-12 step 4's `node tools/directory-bindings.mjs check | grep -ci <canary id>` prints `0`.
+
+     Sub-steps 2 and 3, once the canary guest is in the Team:
 
      ```bash
      node tools/directory-bindings.mjs propose --write-verified <PESKOVOI sitePath>
      # The dry run. Then run the same command again with --apply added.
-     node tools/directory-bindings.mjs apply --plan tools/out/<new plan>.json --only <PESKOVOI listItemId> \
+     node tools/directory-bindings.mjs apply --plan tools/out/<plan from 2>.json --only <PESKOVOI listItemId> \
        --health-url https://$INGEST.azurewebsites.net/api/health
      ```
 
-     The printed after-state must no longer hold the canary's id, and step 4's `check | grep`
-     prints `0` again. Until then, an upload by the canary guest is filed into PESKOVOI's
-     channel, where the client sees it.
+     Sub-steps 6 and 7, only after the upload and after the canary guest has left the Team:
+
+     ```bash
+     node tools/directory-bindings.mjs propose --write-verified <TEST sitePath> --write-verified <PESKOVOI sitePath>
+     # The dry run. Then run the same command again with --apply added.
+     node tools/directory-bindings.mjs apply --plan tools/out/<plan from 6>.json \
+       --health-url https://$INGEST.azurewebsites.net/api/health
+     # Must print 0.
+     node tools/directory-bindings.mjs check | grep -ci <canary id>
+     ```
 
    Never use a real client document, and never a staff account, because staff go to quarantine
    by design.
@@ -1241,8 +1263,25 @@ Phase 1. Until then the [standing checks](#standing-checks) stand in for it.
 
 **Rollback.**
 
-- A binding: `node tools/directory-bindings.mjs rollback --log tools/out/<apply-log>.json --apply`
-  (a dry run without `--apply`) restores the before-state it printed. That row's guests then go to quarantine, which is safe.
+- A binding: `node tools/directory-bindings.mjs rollback --log tools/out/<apply-log>.json` is a
+  dry run; the same with `--apply` restores the before-state that `apply` printed, for every row
+  in the log, or only for the rows named with `--only <listItemId>` (repeatable). What that
+  means depends on what the apply did:
+  - **It only bound the row and took no id off it** (TEST's apply in step 6, if TEST's row held
+    no staff id): the rollback unbinds it, and that row's guests go to quarantine again. Safe.
+  - **It took ids off the row** (a staff id, a guest now in another Team, the canary): the
+    rollback would put them back, so it is **not safe by default**. Prefer running `propose`
+    again and applying the whole plan. Before each PATCH, `rollback` re-checks every id it
+    would add back exactly as `apply` re-checks a guest (a `Guest` whose Teams are exactly the
+    row's `TeamId`). If any fails it refuses that row (`guest_recheck_failed`) and exits 2, so
+    it never re-creates cross-client routing and never puts a staff id back. Step 8 is such a
+    case: PESKOVOI's before-state holds Yahor's staff id, so its rollback is refused.
+
+  To make a bound row route nobody at once, when its rollback is refused, set its `Status` to
+  `Inactive` by hand (T-5's versioning records it). Within the Directory refresh (5 minutes;
+  the emergency stop covers that time if needed) its guests' uploads go to quarantine as
+  `unmapped`. Roman and Yahor then decide, and `check` shows the row before it is set `Active`
+  again.
 - The ingestion build: stop the app, revert the offending commit, rebuild, check the zip as in
   step 1 and deploy it. **Never redeploy a pre-Phase-0 ingestion zip**, including the one saved
   in step 1.
