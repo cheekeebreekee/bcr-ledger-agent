@@ -8,8 +8,8 @@ import { createLogger } from '@bcr/shared';
 import { loadIngestionConfig } from './config';
 import { AuthMiddleware } from './auth/authMiddleware';
 import { createGraphClient } from './services/graphClient';
-import { SharePointServiceFactory } from './services/sharePointServiceFactory';
-import { cachedSiteIdLookup, forbiddenSiteKeys } from './services/sharePointService';
+import { forbiddenSiteKeys } from './services/sharePointService';
+import { createSharePointWiring } from './services/sharePointWiring';
 import { ClientDirectoryReader } from './services/clientDirectoryReader';
 import { ClientResolver } from './services/clientResolver';
 import { ClassificationService, FallbackClassifier } from './services/classificationService';
@@ -26,35 +26,14 @@ export const auth = new AuthMiddleware({
 export const graph = createGraphClient();
 
 /**
- * The staff-only quarantine. Its own site path is always forbidden as a
- * client target, whatever FORBIDDEN_TARGET_SITE_PATHS says.
+ * The staff-only quarantine and the two SharePoint factories: client targets
+ * may never resolve to BCR GROUP or the quarantine; the quarantine may never
+ * resolve to BCR GROUP. See services/sharePointWiring.ts.
  */
-export const quarantineTarget = {
-  siteHostname: config.quarantineSiteHostname,
-  sitePath: config.quarantineSitePath,
-  driveName: config.quarantineDriveName,
-  ...(config.quarantineRootFolder ? { rootFolder: config.quarantineRootFolder } : {}),
-};
-
-// The Client Directory lives on the BCR GROUP site, so its site id is BCR
-// GROUP's: whatever a Directory row's path says, nothing is ever written there.
-const bcrGroupSiteIds = [config.clientDirectorySiteId];
-
-/**
- * Client targets: refused when the RESOLVED site is BCR GROUP's collection or
- * the quarantine's, whatever spelling the row's path used. The quarantine's
- * id is looked up on first use and kept; while it can't be looked up, client
- * targets are refused (their documents go to quarantine).
- */
-export const clientSharePointFactory = new SharePointServiceFactory(graph, {
-  forbiddenSiteIds: bcrGroupSiteIds,
-  forbiddenSiteLookups: [cachedSiteIdLookup(graph, quarantineTarget)],
-});
-
-/** The quarantine target alone: guarded against BCR GROUP, not against itself. */
-export const quarantineSharePointFactory = new SharePointServiceFactory(graph, {
-  forbiddenSiteIds: bcrGroupSiteIds,
-});
+const sharePoint = createSharePointWiring(graph, config);
+export const { quarantineTarget, clientSharePointFactory, quarantineSharePointFactory } =
+  sharePoint;
+const bcrGroupSiteIds = sharePoint.bcrGroupSiteIds;
 
 // Once per cold start, so an operator can see the guard is on and which
 // collection it holds (a GUID, not a name). The quarantine's collection is
