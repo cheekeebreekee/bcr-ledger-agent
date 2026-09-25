@@ -13,10 +13,18 @@
  *   `BCR Group —` marker, or BCR GROUP) is not bound. A duplicate ClientId,
  *   NIP, site or target skips every row that shares it. An unreadable fact
  *   skips the row rather than being read as "absent".
- * - **A site path means one site.** SitePath is compared the way the
- *   ingestion builds its request (empty segments dropped, case folded), and a
- *   `.` or `..` segment, which URL parsing would resolve to another site, makes
- *   the row invalid.
+ * - **A site path means one site.** SitePath is canonicalised by the same
+ *   rule as the ingestion (contract C1: exactly `/sites/<name>` or
+ *   `/teams/<name>`, a plain name, empty segments dropped, case folded).
+ *   Anything else makes the row invalid, because Graph could resolve it to a
+ *   site other than the one compared.
+ * - **Never BCR GROUP, never the quarantine.** A row is skipped as
+ *   `forbidden_target` when its path is forbidden (the forbidden list, which
+ *   is required, and the quarantine path), its host is not the tenant's, or
+ *   its site resolves to the Client Directory's own site collection (BCR
+ *   GROUP) or to a forbidden site, whatever the path says.
+ * - **One place, one client (C4).** Rows that share a site, a DriveId or a
+ *   TeamId are all skipped, as the ingestion excludes all of them.
  * - **A binding already set is not changed here (I10).** A row whose RootFolder,
  *   DriveId or TeamId is set to something else is skipped for a person to look
  *   at.
@@ -59,6 +67,14 @@ export const GUARD_FIELDS = Object.freeze([
   'IsAdmin',
 ]);
 
+/**
+ * Problems that mean an id on an Active client row routes where it should
+ * not, today: staff on a client row, or a bound guest who is no longer a
+ * guest of that row's Team alone. `check` exits 3 when any row has one, so a
+ * scheduled run can raise it (C12).
+ */
+export const ROUTING_DRIFT_CODES = Object.freeze(['staff_ids', 'staff_ids_removed', 'bound_guest_ineligible']);
+
 /** Columns `--add-columns` creates (single line of text). */
 export const NEW_COLUMNS = Object.freeze(['DriveId', 'TeamId']);
 
@@ -87,37 +103,91 @@ export function normalizeNip(value) {
   return String(value ?? '').replace(/\D+/g, '');
 }
 
+const SITE_KIND = /^(sites|teams)$/i;
+const SITE_NAME = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
+
 /**
- * The segments of a site path as the ingestion requests it: trimmed, split on
- * `/`, empty segments dropped (`encodeGraphPath` drops them too). `null` when
- * a segment is `.` or `..`: URL parsing resolves those, so `/sites/x/../Y`
- * would be compared as one site and requested as another.
+ * The two segments of a client site path, or `null` when the path is not
+ * canonical. This is the ingestion's `canonicalSitePath` rule (contract C1),
+ * and the two must agree exactly: the tests hold the same table.
+ *
+ * The whole string is trimmed, split on `/`, and empty segments are dropped.
+ * It is canonical only with exactly two segments: `sites` or `teams`, then a
+ * name of letters, digits, `_`, `-` and `.`, not starting with `.` and not
+ * ending with `.`. Everything else is refused, because Graph could resolve it
+ * to a site other than the one compared: `.` and `..` (URL parsing resolves
+ * them), `%` escapes, `\`, whitespace or zero-width characters inside a
+ * segment, sub-sites and one or three-plus segments.
  */
 export function sitePathSegments(path) {
   const segments = String(path ?? '')
     .trim()
     .split('/')
     .filter(Boolean);
-  return segments.some((s) => s === '.' || s === '..') ? null : segments;
+  if (segments.length !== 2) return null;
+  const [kind, name] = segments;
+  if (!SITE_KIND.test(kind) || !SITE_NAME.test(name) || name.endsWith('.')) return null;
+  return segments;
 }
 
 /**
  * `/Sites//Foo/` → `/sites/foo`, the canonical form every comparison uses.
- * SharePoint URLs are case-insensitive. `''` for an empty path, and `null`
- * for one that is not canonical (see `sitePathSegments`); callers treat
+ * SharePoint URLs are case-insensitive. `null` for a path that is not
+ * canonical (see `sitePathSegments`), the empty path included; callers treat
  * `null` as "matches nothing" and refuse the row.
  */
 export function normalizeSitePath(path) {
   const segments = sitePathSegments(path);
-  if (segments === null) return null;
-  return segments.length ? `/${segments.join('/')}`.toLowerCase() : '';
+  return segments ? `/${segments[0]}/${segments[1]}`.toLowerCase() : null;
 }
 
-/** A site path as an operator names it on the command line: `/sites/<name>` or `/teams/<name>`. */
+/** A site path as an operator names it on the command line: canonical, `/sites/<name>` or `/teams/<name>`. */
 export function isSiteCollectionPath(path) {
-  const canonical = normalizeSitePath(path);
-  return Boolean(canonical) && /^\/(sites|teams)\/[^/]+$/.test(canonical);
+  return normalizeSitePath(path) !== null;
 }
+
+/**
+ * The site collection a resolved site's web URL belongs to, as
+ * `/sites/<name>` lower-cased, or `''`. Only the first two segments count, so
+ * a sub-site of a forbidden site still matches it.
+ */
+export function siteCollectionPathOfUrl(webUrl) {
+  try {
+    const u = new URL(String(webUrl ?? ''));
+    const parts = u.pathname.split('/').filter(Boolean);
+    if (parts.length < 2 || !SITE_KIND.test(parts[0])) return '';
+    let name = parts[1];
+    try {
+      name = decodeURIComponent(name);
+    } catch {
+      // Keep the encoded form; it can only fail to match, never match wrongly.
+    }
+    return `/${parts[0]}/${name}`.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+/** The host of a resolved site's web URL, lower-cased, or `''`. */
+export function hostOfUrl(webUrl) {
+  try {
+    return new URL(String(webUrl ?? '')).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * The site-collection GUID of a Graph site id (`host,<collection>,<web>`),
+ * lower-cased, or `''` when the id does not have three parts.
+ */
+export function siteCollectionId(siteId) {
+  const parts = String(siteId ?? '').split(',');
+  return parts.length === 3 ? normalizeGuid(parts[1]) : '';
+}
+
+/** The only shape a tenant's SharePoint host may have (contract C2). */
+export const TENANT_HOST = /^[a-z0-9-]+\.sharepoint\.com$/i;
 
 /** For display-name comparison only: NFC, trimmed, single spaces, lower case. */
 export function normalizeName(value) {
@@ -150,7 +220,11 @@ export function siteKey(hostname, sitePath) {
     .toLowerCase()}|${path}`;
 }
 
-/** `https://Host/sites/Foo%20Bar/` → `host|/sites/foo bar`, or `''` if not a URL. */
+/**
+ * `https://Host/sites/Foo/` → `host|/sites/foo`, or `''` if it is not a URL
+ * or its path is not canonical. Only used to find the Team whose root site
+ * this is; the site id is the primary key for that.
+ */
 export function siteUrlKey(webUrl) {
   try {
     const u = new URL(String(webUrl ?? ''));
@@ -167,9 +241,12 @@ export function siteUrlKey(webUrl) {
 }
 
 /**
- * The key the ingestion snapshot excludes duplicates by (contract P0-4):
- * host|path|drive|rootFolder. Case-folded, which can only make more rows
- * collide, never fewer.
+ * `host|path|drive|rootFolder`: the exact place a row writes to, reported as
+ * `duplicate_target` because it names that place for the reviewer. It is
+ * finer than what the ingestion excludes by: every row sharing a site
+ * (`siteKey`, `duplicate_site`), a DriveId or a TeamId (contract C4,
+ * `duplicate_driveId` / `duplicate_teamId`, and `target_conflict` in the
+ * plan). Case-folded, which can only make more rows collide, never fewer.
  */
 export function targetKey(row, rootFolder = row.rootFolder) {
   const site = siteKey(row.siteHostname, row.sitePath);
@@ -222,10 +299,11 @@ export function parseDirectoryRow(item) {
 /**
  * Keys shared by more than one Active row.
  *
- * `clientId`, `nip`, `site` and `target` make every row involved ambiguous.
- * `userId` is what the ingestion drops key by key; here it is reported.
- * Admin rows take part in the clientId, NIP and user-id checks but have no
- * target.
+ * `clientId`, `nip`, `site`, `target`, `driveId` and `teamId` make every row
+ * involved ambiguous. The ingestion excludes every client row that shares a
+ * site, a DriveId or a TeamId (C4). `userId` is what the ingestion drops key
+ * by key; here it is reported. Admin rows take part in the clientId, NIP and
+ * user-id checks but have no target.
  */
 export function findDuplicates(rows) {
   const groups = {
@@ -233,6 +311,8 @@ export function findDuplicates(rows) {
     nip: new Map(),
     site: new Map(),
     target: new Map(),
+    driveId: new Map(),
+    teamId: new Map(),
     userId: new Map(),
   };
   const add = (kind, key, id) => {
@@ -248,6 +328,10 @@ export function findDuplicates(rows) {
     if (!row.isAdmin && row.siteHostname && row.sitePath) {
       add('site', siteKey(row.siteHostname, row.sitePath), row.listItemId);
       add('target', targetKey(row), row.listItemId);
+    }
+    if (!row.isAdmin) {
+      add('driveId', row.driveId.toLowerCase(), row.listItemId);
+      add('teamId', row.teamId.toLowerCase(), row.listItemId);
     }
     for (const id of row.userIds) add('userId', id, row.listItemId);
   }
@@ -411,7 +495,8 @@ export function classifyTeamPeople({ teamId, members, owners, memberOfByUser, kn
 }
 
 /**
- * Whether the ingestion identity may write to a site, from
+ * Whether the ingestion's managed identity (its app id, INGEST_MI_APPID) may
+ * write to a site, from
  * `GET /sites/{id}/permissions`. `null` means the caller could not read the
  * permissions, which is common: it needs Sites.FullControl.All.
  *
@@ -480,13 +565,62 @@ const isError = (v) => Boolean(v && typeof v === 'object' && 'error' in v);
 const describeTeam = (t) => `${t.id}${t.displayName ? ` "${t.displayName}"` : ''}`;
 
 /**
+ * Why a client row may never be bound, whatever else is true of it; empty
+ * when nothing forbids it. The ingestion refuses the same places: by path
+ * (FORBIDDEN_TARGET_SITE_PATHS and the quarantine path), by host (the tenant's
+ * only SharePoint host, QUARANTINE_SITE_HOSTNAME), and by the site Graph
+ * actually resolves (the Client Directory's own site collection, BCR GROUP,
+ * and any forbidden site the web URL lands in), so that no spelling of a
+ * path gets round the first check.
+ *
+ * @param {ReturnType<typeof parseDirectoryRow>} row
+ * @param {object | {error:string} | undefined} site  the resolved site, if looked up
+ * @param {object} ctx
+ * @param {Set<string>} [ctx.forbiddenSitePaths]       canonical paths
+ * @param {string} [ctx.tenantHost]                   lower-case host, or ''
+ * @param {string} [ctx.directorySiteCollectionId]    lower-case GUID, or ''
+ * @returns {string[]}
+ */
+export function forbiddenTargetReasons(row, site, ctx = {}) {
+  if (row.isAdmin) return [];
+  const why = [];
+  const canonical = normalizeSitePath(row.sitePath);
+  if (canonical && ctx.forbiddenSitePaths?.has(canonical)) {
+    why.push('SitePath is a forbidden target (FORBIDDEN_TARGET_SITE_PATHS or the quarantine site)');
+  }
+  if (ctx.tenantHost && row.siteHostname && row.siteHostname !== ctx.tenantHost) {
+    why.push(`SiteHostname is not ${ctx.tenantHost}, the only SharePoint host a row may name`);
+  }
+  if (site && !isError(site)) {
+    const collection = siteCollectionId(site.id);
+    if (ctx.directorySiteCollectionId) {
+      if (!collection) {
+        why.push('the resolved site id is not <host>,<collection>,<web>; it cannot be checked against BCR GROUP');
+      } else if (collection === ctx.directorySiteCollectionId) {
+        why.push("the site resolves to the Client Directory's own site collection (BCR GROUP)");
+      }
+    }
+    const resolvedPath = siteCollectionPathOfUrl(site.webUrl);
+    if (resolvedPath && resolvedPath !== canonical && ctx.forbiddenSitePaths?.has(resolvedPath)) {
+      why.push(`the site resolves to ${resolvedPath}, a forbidden target`);
+    }
+    const host = hostOfUrl(site.webUrl);
+    if (ctx.tenantHost && host && host !== ctx.tenantHost) {
+      why.push(`the site resolves to host ${host}, not ${ctx.tenantHost}`);
+    }
+  }
+  return why;
+}
+
+/**
  * What to do when the grant cannot be read. Verifying is a read. The grant
  * runbook is a write: it creates a write grant whenever it finds none, so it
  * is never the way to "check" one.
  */
 export const WRITE_GRANT_UNKNOWN =
   'unknown: verify read-only with GET /sites/{site-id}/permissions (Graph Explorer, ' +
-  'Sites.FullControl.All); it must list a "write" role for the ingestion app id. ' +
+  'Sites.FullControl.All); it must list a "write" role for the app id of the ingestion ' +
+  "Function App's system-assigned managed identity (INGEST_MI_APPID), not the API app registration. " +
   "Grant-TeamSiteAccess.ps1 CREATES a write grant: run it only to grant one on this client's own site, " +
   'never on a forbidden site such as BCR GROUP. Once verified, pass';
 
@@ -500,7 +634,9 @@ export const WRITE_GRANT_UNKNOWN =
  * @param {ReturnType<typeof parseDirectoryRow>} row
  * @param {object} facts
  * @param {object} ctx
- * @param {Set<string>} [ctx.forbiddenSitePaths]  normalised site paths
+ * @param {Set<string>} [ctx.forbiddenSitePaths]  normalised site paths, the quarantine path included
+ * @param {string} [ctx.tenantHost]               the tenant's SharePoint host, lower-case
+ * @param {string} [ctx.directorySiteCollectionId] site-collection GUID of the Client Directory site
  * @param {Set<string>} [ctx.knownTeamIds]       normalised ids of every Team in the tenant
  * @param {Set<string>} [ctx.ingestAppIds]
  * @param {Set<string>} [ctx.writeVerified]       normalised site paths or list item ids
@@ -520,19 +656,21 @@ export function assessRow(row, facts = {}, ctx = {}) {
     add('no_site', 'skip', 'row has no SiteHostname/SitePath');
   }
   const canonicalPath = normalizeSitePath(row.sitePath);
-  const pathNotCanonical = canonicalPath === null;
+  // An empty SitePath is `no_site`; only a path that is there can be malformed.
+  const pathNotCanonical = Boolean(row.sitePath) && canonicalPath === null;
   if (pathNotCanonical) {
     add(
       'site_path_not_canonical',
       'skip',
-      'SitePath has a "." or ".." segment, which URL parsing resolves to another site. ' +
-        'Correct it by hand to the path of the site itself',
+      'SitePath is not exactly /sites/<name> or /teams/<name> with a plain name (letters, digits, ' +
+        '"_", "-", "."; no "." or ".." segment, no "%", "\\" or spaces, no sub-site). Graph could ' +
+        'resolve it to another site, and the ingestion excludes the row. Correct it by hand to ' +
+        "the path of the Team's root site",
     );
   }
-  const forbidden = Boolean(canonicalPath && ctx.forbiddenSitePaths?.has(canonicalPath));
-  if (forbidden) {
-    add('forbidden_target', 'skip', 'SitePath is a forbidden target (FORBIDDEN_TARGET_SITE_PATHS)');
-  }
+  const forbiddenWhy = forbiddenTargetReasons(row, facts.site, ctx);
+  const forbidden = forbiddenWhy.length > 0;
+  if (forbidden) add('forbidden_target', 'skip', forbiddenWhy.join('; '));
 
   for (const dup of ctx.duplicates ?? []) {
     if (!dup.listItemIds.includes(row.listItemId)) continue;
@@ -546,6 +684,14 @@ export function assessRow(row, facts = {}, ctx = {}) {
 
   if (row.invalidUserIds.length) {
     add('invalid_user_ids', 'warn', `${row.invalidUserIds.length} UserAadObjectIds line(s) are not GUIDs`);
+  }
+  if (!row.isAdmin && (!row.rootFolder || !row.driveId || !row.teamId)) {
+    add(
+      'unbound_target',
+      'warn',
+      "RootFolder, DriveId or TeamId is empty: the ingestion quarantines this row's users " +
+        '(unbound_target) until an apply binds all three',
+    );
   }
 
   // --- the ids already on the row ------------------------------------------
@@ -719,6 +865,35 @@ export function assessRow(row, facts = {}, ctx = {}) {
           "no guest belongs to this Team alone; the client's uploads go to quarantine",
         );
       }
+      // Ids already on the row that this Team no longer vouches for: a guest
+      // since added to another Team, or dropped from this one (R46). They
+      // route here until a PATCH takes them off. Staff and unknown ids have
+      // their own codes.
+      const eligibleIds = new Set(people.eligible.map((p) => p.id));
+      const excludedById = new Map(people.excluded.map((e) => [e.id, e]));
+      const drifted = row.isAdmin
+        ? []
+        : row.userIds.filter((id) => {
+            const user = usersById.get(id);
+            if (user === null || (user && !isError(user) && user.userType === 'Member')) return false;
+            return !eligibleIds.has(id);
+          });
+      if (drifted.length) {
+        const list = drifted
+          .map((id) => {
+            const e = excludedById.get(id);
+            if (!e) return `${id} (not a member of this Team)`;
+            const teams = e.otherTeams?.length ? `: also in ${e.otherTeams.map(describeTeam).join(', ')}` : '';
+            return `${e.userPrincipalName || id} (${e.reason}${teams})`;
+          })
+          .join('; ');
+        add(
+          'bound_guest_ineligible',
+          'warn',
+          `${drifted.length} id(s) on the row are not guests of this Team alone, and route here until ` +
+            `the plan's PATCH takes them off. Run propose and apply the whole plan: ${list}`,
+        );
+      }
     }
   }
 
@@ -734,7 +909,11 @@ export function assessRow(row, facts = {}, ctx = {}) {
       : evaluateWriteGrant(facts.permissions, ctx.ingestAppIds);
   evidence.writeGrant = grant;
   if (grant === 'missing') {
-    add('write_grant_missing', 'skip', 'the ingestion identity has no write permission on this site');
+    add(
+      'write_grant_missing',
+      'skip',
+      "the ingestion Function App's managed identity (--ingest-app-ids) has no write permission on this site",
+    );
   } else if (grant === 'unknown') {
     const verified = ctx.writeVerified?.has(canonicalPath) || ctx.writeVerified?.has(row.listItemId);
     if (verified) {
@@ -833,13 +1012,14 @@ export function planDigest(rows) {
  * - a proposed user id already on another row (as it will stand after the
  *   plan) is dropped from the proposal, so the plan never creates a
  *   duplicate that the ingestion would then drop for both clients;
- * - two rows whose targets (host|path|drive|rootFolder) would collide after
- *   the plan are both skipped.
+ * - rows that would share a site, a DriveId or a TeamId after the plan are
+ *   all skipped as `target_conflict`, since the ingestion excludes every one
+ *   of them (C4).
  *
  * Repeats until nothing changes, since a skip reverts a row to its current
  * values and can create a new collision.
  */
-export function buildPlan({ rows, assessments, directory, ingestAppIds = [], createdAt }) {
+export function buildPlan({ rows, assessments, directory, ingestAppIds = [], guards, createdAt }) {
   const rowById = new Map(rows.map((r) => [r.listItemId, r]));
   const entries = assessments.map((a) => {
     const row = rowById.get(a.listItemId);
@@ -897,8 +1077,8 @@ export function buildPlan({ rows, assessments, directory, ingestAppIds = [], cre
     splitLines(e.action === 'PATCH' && 'UserAadObjectIds' in e.patch ? e.patch.UserAadObjectIds : e.before.UserAadObjectIds)
       .map(normalizeGuid)
       .filter(Boolean);
-  const finalRootFolder = (e) =>
-    e.action === 'PATCH' && 'RootFolder' in e.patch ? e.patch.RootFolder : e.before.RootFolder;
+  const finalValue = (e, field) =>
+    fieldString(e.action === 'PATCH' && field in e.patch ? e.patch[field] : e.before[field]);
 
   for (let pass = 0; pass < 10; pass += 1) {
     let changed = false;
@@ -922,22 +1102,31 @@ export function buildPlan({ rows, assessments, directory, ingestAppIds = [], cre
       }
     }
 
-    // targets
+    // targets: the ingestion excludes every row that shares a site, a DriveId
+    // or a TeamId (C4), as the rows will stand after the plan.
     const byTarget = new Map();
-    for (const e of entries) {
-      const row = rowById.get(e.listItemId);
-      if (!row.active || row.isAdmin || !row.siteHostname || !row.sitePath) continue;
-      const key = targetKey(row, finalRootFolder(e));
-      if (!key) continue; // a non-canonical SitePath is already a SKIP and targets nothing
+    const put = (key, e) => {
       if (!byTarget.has(key)) byTarget.set(key, []);
       byTarget.get(key).push(e);
+    };
+    for (const e of entries) {
+      const row = rowById.get(e.listItemId);
+      if (!row.active || row.isAdmin) continue;
+      // A non-canonical SitePath is already a SKIP and has no site key.
+      const site = row.siteHostname && row.sitePath ? siteKey(row.siteHostname, row.sitePath) : '';
+      if (site) put(`site ${site}`, e);
+      const drive = finalValue(e, 'DriveId').toLowerCase();
+      if (drive) put(`DriveId ${drive}`, e);
+      const teamValue = finalValue(e, 'TeamId').toLowerCase();
+      if (teamValue) put(`TeamId ${teamValue}`, e);
     }
-    for (const group of byTarget.values()) {
+    for (const [key, group] of byTarget) {
       if (group.length < 2) continue;
+      const kind = key.slice(0, key.indexOf(' '));
       for (const e of group) {
         if (e.action !== 'PATCH') continue;
         const others = group.filter((o) => o !== e).map((o) => o.listItemId).join(', ');
-        e.reasons.push({ code: 'target_conflict', detail: `target would equal row(s) ${others}` });
+        e.reasons.push({ code: 'target_conflict', detail: `${kind} would equal that of row(s) ${others}` });
         settle(e);
         changed = true;
       }
@@ -955,6 +1144,11 @@ export function buildPlan({ rows, assessments, directory, ingestAppIds = [], cre
     createdAt: createdAt ?? new Date().toISOString(),
     directory,
     ingestAppIds: [...ingestAppIds],
+    // What the rows were checked against (forbidden paths, quarantine path,
+    // tenant host, the Directory's site collection). Outside the digest:
+    // `apply` checks every row again, and a recorded value can only add to
+    // what it is given, never remove from it.
+    ...(guards ? { guards } : {}),
     digest: planDigest(planRows),
     rows: planRows,
   };
@@ -998,6 +1192,10 @@ export function validatePlan(plan) {
         errors.push(`${at}: UserAadObjectIds has a non-GUID line`);
       }
       for (const f of BINDING_FIELDS) if (typeof row.before?.[f] !== 'string') errors.push(`${at}: before.${f} missing`);
+      // A row routes only once RootFolder, DriveId and TeamId are all set
+      // (C3); a PATCH never leaves one of them empty.
+      const unbound = ['RootFolder', 'DriveId', 'TeamId'].filter((f) => !fieldString(f in p ? p[f] : row.before?.[f]));
+      if (unbound.length) errors.push(`${at}: PATCH leaves ${unbound.join(', ')} empty`);
     }
   }
   return errors;

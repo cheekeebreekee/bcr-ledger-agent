@@ -24,18 +24,27 @@
  * - Only four columns are ever written: RootFolder, UserAadObjectIds, DriveId
  *   and TeamId. Nothing else on a row, and never a Team, channel, group,
  *   permission or visibility. BCR GROUP's visibility is read, never changed.
- * - Ambiguity skips the row: a duplicate key, a non-canonical SitePath, a
- *   Public team, a missing or non-standard channel, a drive mismatch, an
- *   unknown write grant. A guest who is also in any other Team is never bound.
- *   Staff (Member) ids are removed from a client row only with
+ * - Ambiguity skips the row: a duplicate key (a site, DriveId or TeamId shared
+ *   with another row included), a non-canonical SitePath, a Public team, a
+ *   missing or non-standard channel, a drive mismatch, an unknown write
+ *   grant. A guest who is also in any other Team is never bound. Staff
+ *   (Member) ids are removed from a client row only with
  *   `--confirm-remove-staff <listItemId>` for that row.
+ * - Never BCR GROUP, never the quarantine (contract C8). The forbidden list is
+ *   required, the quarantine path is always forbidden, a row on another host
+ *   than `--tenant-host` is skipped, and a row whose site resolves to the
+ *   Client Directory's own site collection is skipped whatever the flags say.
  * - `apply` refuses a plan that was edited after `propose` (digest), is older
- *   than `--max-plan-age-hours`, or whose row changed since (stale guard). It
- *   refuses to run unless the ingestion `/api/health` reports
+ *   than `--max-plan-age-hours` (at most 72), or whose row changed since
+ *   (stale guard). Before each PATCH it checks the row again against the
+ *   guards it is given, and re-reads every guest the row will route: each
+ *   must still be a Guest in the row's Team and in no other Team. It refuses
+ *   to run unless the ingestion `/api/health` reports
  *   `build.routing=identity-only`, the marker only the P0 build has.
  * - Every applied row is logged before the PATCH is sent (`writing`) and again
  *   after it, and the log is on disk at both points, so `rollback` knows every
- *   row an interrupted run may have written.
+ *   row an interrupted run may have written. The log is created fresh (an
+ *   existing file is refused) and every rewrite is atomic and fsynced.
  * - The token is read from `GRAPH_TOKEN` and never printed.
  *
  * See tools/README.md for scopes and the full procedure.
@@ -71,45 +80,67 @@ import {
   fieldString,
   findDuplicates,
   findTeamForSite,
+  forbiddenTargetReasons,
   healthExpectations,
   healthSatisfies,
   isSiteCollectionPath,
+  isTeamGroup,
   mapSitesToTeams,
   normalizeGuid,
   normalizeSitePath,
   P0_HEALTH_EXPECTATION,
+  ROUTING_DRIFT_CODES,
+  TENANT_HOST,
   parseDirectoryRow,
   pickAccountingChannel,
   pickFields,
   rollbackPatch,
+  siteCollectionId,
   sitePathSegments,
   splitLines,
   staleFields,
   validatePlan,
 } from './lib/bindings.mjs';
 
+/**
+ * The oldest plan `apply` takes, in hours, and its default. A hard cap: the
+ * guests are re-read at apply, but everything else the plan saw (the Team,
+ * its channel folder, its drive) is not.
+ */
+const MAX_PLAN_AGE_HOURS = 72;
+
 const USAGE = `
 Usage:
-  node tools/directory-bindings.mjs check    [common] [--out <report.json>]
-  node tools/directory-bindings.mjs propose  [common] [--out <plan.json>]
+  node tools/directory-bindings.mjs check    [common] [guards] [--out <report.json>]
+  node tools/directory-bindings.mjs propose  [common] [guards] [--out <plan.json>]
             [--write-verified <sitePath|listItemId>]... [--confirm-remove-staff <listItemId>]...
   node tools/directory-bindings.mjs apply    --plan <plan.json> --health-url https://<ingestion-host>/api/health
-            [--expect-health <key=value>]... [--only <listItemId>]... [--max-plan-age-hours 24] [--apply]
+            [guards] [--expect-health <key=value>]... [--only <listItemId>]...
+            [--max-plan-age-hours ${MAX_PLAN_AGE_HOURS}] [--out <new log file>] [--apply]
 
   apply always requires the health body to report ${P0_HEALTH_EXPECTATION};
   --expect-health adds further checks, it never replaces that one.
-  node tools/directory-bindings.mjs rollback --log <apply-log.json> [--apply]
+  node tools/directory-bindings.mjs rollback --log <apply-log.json> [--out <new log file>] [--apply]
   node tools/directory-bindings.mjs --add-columns [--site-id ..] [--list-id ..] [--apply]
 
 Common:
-  --site-id <id>              Graph site id of the Client Directory site
+  --site-id <id>              Graph site id of the Client Directory site (BCR GROUP)
                               (env DIRECTORY_SITE_ID or CLIENT_DIRECTORY_SITE_ID)
   --list-id <id>              Client Directory list id
                               (env DIRECTORY_LIST_ID or CLIENT_DIRECTORY_LIST_ID)
-  --ingest-app-ids <a,b>      app (client) ids of the ingestion identity (env INGEST_APP_IDS)
-  --forbidden-site-paths <a,b>  rows targeting these are skipped (env FORBIDDEN_TARGET_SITE_PATHS)
+  --ingest-app-ids <a,b>      app id of the ingestion Function App's managed identity,
+                              INGEST_MI_APPID (env INGEST_APP_IDS)
   --channel-name <name>       default "${CHANNEL_NAME}"
   --concurrency <n>           parallel Graph requests, default 4
+
+Guards (check, propose and apply):
+  --forbidden-site-paths <a,b>  REQUIRED: rows on these sites are never bound
+                              (env FORBIDDEN_TARGET_SITE_PATHS; BCR GROUP at least)
+  --quarantine-site-path <p>  the quarantine site, always forbidden (env QUARANTINE_SITE_PATH)
+  --tenant-host <host>        the only SharePoint host a row may name
+                              (env QUARANTINE_SITE_HOSTNAME)
+  A row whose site resolves to the Client Directory's own site collection is
+  never bound, whatever the flags say.
 
 Environment: GRAPH_TOKEN (delegated Graph token; see tools/README.md).
 Nothing is written without --apply.
@@ -123,6 +154,8 @@ const OPTIONS = {
   'list-id': { type: 'string' },
   'ingest-app-ids': { type: 'string', multiple: true },
   'forbidden-site-paths': { type: 'string', multiple: true },
+  'quarantine-site-path': { type: 'string' },
+  'tenant-host': { type: 'string' },
   'write-verified': { type: 'string', multiple: true },
   'confirm-remove-staff': { type: 'string', multiple: true },
   'channel-name': { type: 'string' },
@@ -136,14 +169,17 @@ const OPTIONS = {
   'max-plan-age-hours': { type: 'string' },
 };
 
+/** The guard flags: what a row may never be bound to. Required list, optional extras. */
+const GUARD_FLAGS = ['forbidden-site-paths', 'quarantine-site-path', 'tenant-host'];
+
 /** Which flags each command accepts. A flag outside its command is refused, not ignored. */
 const ALLOWED = {
-  check: ['site-id', 'list-id', 'ingest-app-ids', 'forbidden-site-paths', 'write-verified',
+  check: ['site-id', 'list-id', 'ingest-app-ids', ...GUARD_FLAGS, 'write-verified',
     'confirm-remove-staff', 'channel-name', 'concurrency', 'out'],
-  propose: ['site-id', 'list-id', 'ingest-app-ids', 'forbidden-site-paths', 'write-verified',
+  propose: ['site-id', 'list-id', 'ingest-app-ids', ...GUARD_FLAGS, 'write-verified',
     'confirm-remove-staff', 'channel-name', 'concurrency', 'out'],
   apply: ['plan', 'apply', 'only', 'health-url', 'expect-health', 'max-plan-age-hours', 'site-id',
-    'list-id', 'out'],
+    'list-id', ...GUARD_FLAGS, 'out'],
   rollback: ['log', 'apply', 'out'],
   'add-columns': ['add-columns', 'apply', 'site-id', 'list-id'],
 };
@@ -241,11 +277,26 @@ function concurrencyOf(values) {
   return n;
 }
 
-function assessOptions(values, env) {
-  const ingestAppIds = csvList(values['ingest-app-ids'] ?? env.INGEST_APP_IDS);
-  const badIds = ingestAppIds.filter((id) => !normalizeGuid(id));
-  if (badIds.length) throw new CliError(`--ingest-app-ids: not GUIDs: ${badIds.join(', ')}`);
+/**
+ * What no row may be bound to, as the ingestion refuses it (contract C8):
+ * the forbidden list (required, as the ingestion requires it), the quarantine
+ * path, the tenant's one SharePoint host, and the Client Directory's own site
+ * collection (BCR GROUP), which is checked against the resolved site id and
+ * needs no flag.
+ *
+ * @param {object} values  parsed flags
+ * @param {object} env
+ * @param {string} directorySiteId  `<host>,<collection>,<web>`
+ * @param {object} [recorded]  the plan's `guards`; they can only add to the flags
+ */
+function guardOptions(values, env, directorySiteId, recorded) {
   const forbidden = csvList(values['forbidden-site-paths'] ?? env.FORBIDDEN_TARGET_SITE_PATHS);
+  if (!forbidden.length) {
+    throw new CliError(
+      'FORBIDDEN_TARGET_SITE_PATHS / --forbidden-site-paths is required (BCR GROUP at least, ' +
+        'as /sites/<name>). The ingestion refuses to start without it, and so does this tool.',
+    );
+  }
   // A forbidden entry that is not a plain site path (a pasted URL, a `..`)
   // would match no row, and the guard would be off without anyone noticing.
   const badForbidden = forbidden.filter((p) => !isSiteCollectionPath(p));
@@ -255,6 +306,64 @@ function assessOptions(values, env) {
         badForbidden.join(', '),
     );
   }
+  const quarantineGiven = String(values['quarantine-site-path'] ?? env.QUARANTINE_SITE_PATH ?? '').trim();
+  if (quarantineGiven && !isSiteCollectionPath(quarantineGiven)) {
+    throw new CliError(
+      `--quarantine-site-path / QUARANTINE_SITE_PATH: not a /sites/<name> or /teams/<name> path: ${quarantineGiven}`,
+    );
+  }
+  const hostGiven = String(values['tenant-host'] ?? env.QUARANTINE_SITE_HOSTNAME ?? '').trim();
+  if (hostGiven && !TENANT_HOST.test(hostGiven)) {
+    throw new CliError(`--tenant-host / QUARANTINE_SITE_HOSTNAME: not <tenant>.sharepoint.com: ${hostGiven}`);
+  }
+  const directorySiteCollectionId = siteCollectionId(directorySiteId);
+  if (!directorySiteCollectionId) {
+    throw new CliError(
+      'the Client Directory site id has no site-collection GUID (<host>,<collection guid>,<web guid>); ' +
+        'without it no row can be checked against BCR GROUP',
+    );
+  }
+
+  // A value recorded in the plan and not given now still applies: each can
+  // only exclude more rows, never fewer.
+  const paths = new Set(forbidden.map(normalizeSitePath));
+  const recordedPaths = Array.isArray(recorded?.forbiddenSitePaths) ? recorded.forbiddenSitePaths : [];
+  for (const p of recordedPaths) {
+    const canonical = normalizeSitePath(p);
+    if (canonical) paths.add(canonical);
+  }
+  const quarantinePath = normalizeSitePath(quarantineGiven) ?? normalizeSitePath(recorded?.quarantineSitePath) ?? '';
+  if (quarantinePath) paths.add(quarantinePath);
+  const recordedHost = String(recorded?.tenantHost ?? '').trim();
+  const tenantHost = (hostGiven || (TENANT_HOST.test(recordedHost) ? recordedHost : '')).toLowerCase();
+  return {
+    guards: {
+      forbiddenSitePaths: [...paths].sort(),
+      quarantineSitePath: quarantinePath,
+      tenantHost,
+      directorySiteCollectionId,
+    },
+    ctx: { forbiddenSitePaths: paths, tenantHost, directorySiteCollectionId },
+  };
+}
+
+function printGuards(print, guards) {
+  print(`  forbidden  ${guards.forbiddenSitePaths.join(', ')}`);
+  print(
+    `  guard      site collection ${guards.directorySiteCollectionId} (the Client Directory's) is never bound`,
+  );
+  if (!guards.quarantineSitePath) {
+    print(warn('  no --quarantine-site-path (QUARANTINE_SITE_PATH): a row on the quarantine site is not caught here'));
+  }
+  if (guards.tenantHost) print(`  host       ${guards.tenantHost} only`);
+  else print(warn('  no --tenant-host (QUARANTINE_SITE_HOSTNAME): a row on another host is not caught here'));
+}
+
+function assessOptions(values, env, directorySiteId) {
+  const ingestAppIds = csvList(values['ingest-app-ids'] ?? env.INGEST_APP_IDS);
+  const badIds = ingestAppIds.filter((id) => !normalizeGuid(id));
+  if (badIds.length) throw new CliError(`--ingest-app-ids: not GUIDs: ${badIds.join(', ')}`);
+  const { guards, ctx: guardCtx } = guardOptions(values, env, directorySiteId);
   const writeVerified = new Set();
   for (const v of csvList(values['write-verified'])) {
     writeVerified.add(v);
@@ -263,9 +372,9 @@ function assessOptions(values, env) {
   }
   return {
     ingestAppIds,
-    forbidden,
+    guards,
     ctx: {
-      forbiddenSitePaths: new Set(forbidden.map(normalizeSitePath)),
+      ...guardCtx,
       ingestAppIds: new Set(ingestAppIds.map(normalizeGuid)),
       writeVerified,
       confirmRemoveStaff: new Set(csvList(values['confirm-remove-staff'])),
@@ -411,9 +520,9 @@ export async function gather(graph, { siteId, listId, channelName, concurrency, 
     const facts = { usersById };
     factsByRow.set(row.listItemId, facts);
     if (row.isAdmin || !row.siteHostname || !row.sitePath) return;
-    // A `.`/`..` segment: not looked up, the row is skipped as not canonical.
+    // Not canonical (contract C1): not looked up, the row is skipped as such.
     const segments = sitePathSegments(row.sitePath);
-    if (!segments?.length) return;
+    if (!segments) return;
 
     const sitePath = encodePath(segments.join('/'));
     facts.site = await safe(() =>
@@ -575,10 +684,11 @@ function printDuplicates(print, duplicates) {
 async function gatherAndAssess(ctx, heading) {
   const { values, env, print } = ctx;
   const ids = directoryIds(values, env);
-  const opts = assessOptions(values, env);
+  const opts = assessOptions(values, env, ids.siteId);
   print('');
   print(bold(heading));
   print(`  directory  site ${ids.siteId} · list ${ids.listId}`);
+  printGuards(print, opts.guards);
   tokenBanner(ctx);
   const graph = ctx.graph();
   if (!opts.ingestAppIds.length) {
@@ -612,10 +722,19 @@ async function runCheck(ctx) {
     printRowCheck(print, row, a, gathered.factsByRow.get(a.listItemId), gathered.usersById);
   }
   const ready = assessments.filter((a) => !a.problems.some((p) => p.severity === 'skip'));
+  const drift = assessments.filter((a) => a.problems.some((p) => ROUTING_DRIFT_CODES.includes(p.code)));
   print('');
   print(bold('Summary'));
   print(`  ${assessments.length} Active row(s): ${ok(`${ready.length} ready`)}, ${bad(`${assessments.length - ready.length} skipped`)}`);
   print(`  ${gathered.rows.length - gathered.active.length} inactive row(s) not examined`);
+  if (drift.length) {
+    print(
+      bad(
+        `  ACTION: row(s) ${drift.map((a) => a.listItemId).join(', ')} hold an id that routes there and ` +
+          `should not (${ROUTING_DRIFT_CODES.join(' / ')}). Run propose and apply the whole plan.`,
+      ),
+    );
+  }
 
   if (values.out) {
     const report = {
@@ -623,15 +742,17 @@ async function runCheck(ctx) {
       createdAt: ctx.now().toISOString(),
       directory: ids,
       ingestAppIds: opts.ingestAppIds,
+      guards: opts.guards,
       duplicates: gathered.duplicates,
       unreadableTeamSites: gathered.teamIndex.unreadable,
+      routingDrift: drift.map((a) => a.listItemId),
       rows: assessments,
     };
     const written = writeJsonFile(values.out, report);
     print(`  report     ${written.path}  sha256 ${written.sha256}`);
   }
   print('');
-  return 0;
+  return drift.length ? 3 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +800,7 @@ async function runPropose(ctx) {
     assessments,
     directory: ids,
     ingestAppIds: opts.ingestAppIds,
+    guards: opts.guards,
     createdAt: ctx.now().toISOString(),
   });
   for (const r of plan.rows) printPlanRow(print, r);
@@ -695,7 +817,9 @@ async function runPropose(ctx) {
   print('Review the file, then dry-run the apply (nothing is written without --apply):');
   print(`  node tools/directory-bindings.mjs apply --plan ${written.path} \\`);
   print('    --health-url https://<ingestion-host>/api/health');
-  print(dim(`  (apply always requires the health body to report ${P0_HEALTH_EXPECTATION})`));
+  print(dim(`  (apply always requires the health body to report ${P0_HEALTH_EXPECTATION},`));
+  print(dim('   and the forbidden list: FORBIDDEN_TARGET_SITE_PATHS or --forbidden-site-paths)'));
+  print(dim('  Apply the whole plan. --only is for a staged rollout, never after an onboarding.'));
   print('');
   return 0;
 }
@@ -766,6 +890,71 @@ async function requireColumns(graph, directory, fields) {
   }
 }
 
+/**
+ * The row's target as it stands now, checked again against the guards this
+ * run was given (C8): propose may have run with other flags, or none. Also
+ * whether SitePath still resolves to the site propose saw.
+ *
+ * @returns {Promise<{forbidden: string[], stale: string[]}>}
+ */
+async function recheckTarget(graph, planRow, current, guardCtx) {
+  const row = parseDirectoryRow({ id: planRow.listItemId, fields: current });
+  const segments = sitePathSegments(row.sitePath);
+  if (!row.siteHostname || !segments) {
+    return { forbidden: ['SiteHostname is empty, or SitePath is not /sites/<name> or /teams/<name>'], stale: [] };
+  }
+  const site = await graph.get(
+    `/sites/${row.siteHostname}:/${encodePath(segments.join('/'))}?$select=id,webUrl`,
+  );
+  const forbidden = forbiddenTargetReasons(row, site, guardCtx);
+  const stale = [];
+  const seen = String(planRow.evidence?.siteId ?? '').toLowerCase();
+  if (seen && String(site?.id ?? '').toLowerCase() !== seen) {
+    stale.push(`SitePath now resolves to site ${site?.id ?? '?'}, not ${planRow.evidence.siteId} as at propose`);
+  }
+  return { forbidden, stale };
+}
+
+/**
+ * Whether every id the row will route after the PATCH is still a Guest who
+ * belongs to the row's Team and to no other Team (C8, R19). Propose checked
+ * it; memberships change, and a guest added to a second client's Team would
+ * file that client's documents here. Reads only; a read that fails throws,
+ * and the row is not written.
+ *
+ * @param {() => Promise<Set<string>>} knownTeamIds  every Team in the tenant, read once
+ * @returns {Promise<string[]>} why not; empty when every id still qualifies
+ */
+async function recheckGuests(graph, planRow, knownTeamIds) {
+  const final = (field) => fieldString(field in planRow.patch ? planRow.patch[field] : planRow.before?.[field]);
+  const ids = splitLines(final('UserAadObjectIds')).map(normalizeGuid).filter(Boolean);
+  const teamId = normalizeGuid(final('TeamId'));
+  const why = [];
+  for (const id of ids) {
+    const user = await lookupUser(graph, id);
+    if (user === null) {
+      why.push(`${id} no longer exists`);
+      continue;
+    }
+    if (isErr(user)) throw new Error(`could not read user ${id}: ${user.error}`);
+    if (user.userType !== 'Guest') {
+      why.push(`${id} is ${user.userType ? `a ${user.userType}` : 'not a Guest'}`);
+      continue;
+    }
+    const groups = (
+      await graph.all(
+        `/users/${id}/memberOf?$select=id,displayName,description,resourceProvisioningOptions&$top=999`,
+      )
+    ).filter(isGroup);
+    const known = await knownTeamIds();
+    const teams = new Set(groups.filter((g) => isTeamGroup(g, known)).map((g) => normalizeGuid(g.id) || String(g.id)));
+    if (!teamId || !teams.has(teamId)) why.push(`${id} is no longer in the row's Team`);
+    const others = [...teams].filter((t) => t !== teamId);
+    if (others.length) why.push(`${id} is also in Team(s) ${others.join(', ')}`);
+  }
+  return why;
+}
+
 async function runApply(ctx) {
   const { print, values } = ctx;
   const APPLY = Boolean(values.apply);
@@ -774,8 +963,10 @@ async function runApply(ctx) {
   const errors = validatePlan(plan);
   if (errors.length) throw new CliError(`the plan is not applicable:\n  - ${errors.join('\n  - ')}`);
 
-  const maxAgeHours = Number(values['max-plan-age-hours'] ?? 24);
-  if (!Number.isFinite(maxAgeHours) || maxAgeHours <= 0) throw new CliError('--max-plan-age-hours must be > 0');
+  const maxAgeHours = Number(values['max-plan-age-hours'] ?? MAX_PLAN_AGE_HOURS);
+  if (!Number.isFinite(maxAgeHours) || maxAgeHours <= 0 || maxAgeHours > MAX_PLAN_AGE_HOURS) {
+    throw new CliError(`--max-plan-age-hours must be more than 0 and at most ${MAX_PLAN_AGE_HOURS}`);
+  }
   const ageHours = (ctx.now().getTime() - Date.parse(plan.createdAt)) / 3_600_000;
   if (!Number.isFinite(ageHours) || ageHours > maxAgeHours || ageHours < -0.1) {
     throw new CliError(
@@ -789,6 +980,8 @@ async function runApply(ctx) {
   if ((given.siteId && given.siteId !== directory.siteId) || (given.listId && given.listId !== directory.listId)) {
     throw new CliError('--site-id/--list-id differ from the directory the plan was made for');
   }
+  // Every row is checked again against these before it is written.
+  const { guards, ctx: guardCtx } = guardOptions(values, ctx.env, directory.siteId, plan.guards);
 
   const only = new Set(csvList(values.only));
   const byId = new Map(plan.rows.map((r) => [r.listItemId, r]));
@@ -799,14 +992,29 @@ async function runApply(ctx) {
     }
   }
   const selected = plan.rows.filter((r) => r.action === 'PATCH' && (!only.size || only.has(r.listItemId)));
+  // A PATCH that takes an id off a row is what stops a guest now in two
+  // Teams from routing to the old one (C12). --only can leave it out.
+  const leftOut = plan.rows.filter(
+    (r) => r.action === 'PATCH' && only.size && !only.has(r.listItemId) && (r.removedUserIds ?? []).length,
+  );
 
   print('');
   print(bold(`Apply directory bindings — ${APPLY ? bad('APPLY') : 'DRY RUN (nothing is written)'}`));
   print(`  plan       ${values.plan}  sha256 ${planSha256}`);
   print(`  made       ${plan.createdAt} (${ageHours.toFixed(1)} h ago)`);
   print(`  directory  site ${directory.siteId} · list ${directory.listId}`);
+  printGuards(print, guards);
   tokenBanner(ctx);
   print(`  rows       ${selected.length} PATCH selected · ${plan.rows.filter((r) => r.action === 'SKIP').length} SKIP refused · ${plan.rows.filter((r) => r.action === 'NOOP').length} NOOP`);
+  if (leftOut.length) {
+    print(
+      warn(
+        `  --only leaves out PATCH row(s) ${leftOut.map((r) => r.listItemId).join(', ')}, which take user ids ` +
+          'off a row. After an onboarding, apply the whole plan: until those rows are applied, a guest ' +
+          'who is now in two Teams still routes to the old one.',
+      ),
+    );
+  }
 
   // The P0 gate: bindings take effect through the P0 ingestion build (DriveId
   // check, quarantine, no promotion). Applying them to an older build would
@@ -845,12 +1053,27 @@ async function runApply(ctx) {
     planDigest: plan.digest,
     directory,
     operator: describeToken(ctx.env.GRAPH_TOKEN ?? '')?.who ?? '',
+    guards,
     startedAt: ctx.now().toISOString(),
     finishedAt: null,
     rows: [],
   };
-  const flush = () => (APPLY ? writeJsonFile(logFile, log) : null);
+  // The first write creates the log and refuses an existing file; every
+  // later one replaces it atomically (tmp, fsync, rename).
+  let logCreated = false;
+  const flush = () => {
+    if (!APPLY) return null;
+    const written = writeJsonFile(logFile, log, { exclusive: !logCreated });
+    logCreated = true;
+    return written;
+  };
   flush();
+
+  let teamIds;
+  const knownTeamIds = async () => {
+    teamIds ??= graph.all(TEAMS_QUERY).then((ts) => new Set(ts.map((t) => normalizeGuid(t.id)).filter(Boolean)));
+    return teamIds;
+  };
 
   let failures = 0;
   for (const r of selected) {
@@ -873,6 +1096,24 @@ async function runApply(ctx) {
         entry.staleFields = stale;
         failures += 1;
         print(`    ${bad('refused')} the row changed since propose: ${stale.join(', ')}. Re-run propose.`);
+        flush();
+        continue;
+      }
+      const target = await recheckTarget(graph, r, current, guardCtx);
+      if (target.forbidden.length) {
+        entry.result = 'forbidden_target';
+        entry.forbiddenReasons = target.forbidden;
+        failures += 1;
+        print(`    ${bad('refused')} forbidden target: ${target.forbidden.join('; ')}`);
+        flush();
+        continue;
+      }
+      const staleReasons = [...target.stale, ...(await recheckGuests(graph, r, knownTeamIds))];
+      if (staleReasons.length) {
+        entry.result = 'stale';
+        entry.staleReasons = staleReasons;
+        failures += 1;
+        print(`    ${bad('refused')} changed since propose: ${staleReasons.join('; ')}. Re-run propose.`);
         flush();
         continue;
       }
@@ -977,7 +1218,13 @@ async function runRollback(ctx) {
     finishedAt: null,
     rows: [],
   };
-  const flush = () => (APPLY ? writeJsonFile(outFile, out) : null);
+  let logCreated = false;
+  const flush = () => {
+    if (!APPLY) return null;
+    const written = writeJsonFile(outFile, out, { exclusive: !logCreated });
+    logCreated = true;
+    return written;
+  };
   flush();
 
   let failures = 0;

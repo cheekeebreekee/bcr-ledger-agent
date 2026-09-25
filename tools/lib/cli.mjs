@@ -4,7 +4,17 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -96,18 +106,73 @@ export function sha256File(path) {
   return sha256(readFileSync(path));
 }
 
+/** Write all of `content` to a new file, fsync it and close it. `flag` is `wx`: never an existing file. */
+function writeNewFile(path, content) {
+  const fd = openSync(path, 'wx', 0o600);
+  try {
+    writeFileSync(fd, content);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** So that a rename or a new file survives a crash. Best effort: not every platform allows it. */
+function fsyncDir(dir) {
+  let fd;
+  try {
+    fd = openSync(dir, 'r');
+    fsyncSync(fd);
+  } catch {
+    // A directory that cannot be opened or synced (Windows) keeps the file
+    // durable only as far as the file's own fsync goes.
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 /**
  * Write a file readable only by its owner. Evidence and plans carry client
  * names and ids; a world-readable file in a shared home directory is a leak.
+ *
+ * The write survives a crash: the content goes to a temporary file beside the
+ * target, is fsynced, and is renamed over it. A crash leaves the old file or
+ * the new one, never a truncated one, which a later reader would refuse
+ * whole. With `exclusive`, the target must not exist yet: an apply or
+ * rollback log never replaces another file (an earlier log, or the plan).
+ *
+ * @param {string} path
+ * @param {string} content
+ * @param {{exclusive?: boolean}} [opts]
  */
-export function writePrivateFile(path, content) {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  writeFileSync(path, content, { mode: 0o600 });
+export function writePrivateFile(path, content, { exclusive = false } = {}) {
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (exclusive) {
+    try {
+      writeNewFile(path, content);
+    } catch (err) {
+      if (err.code === 'EEXIST') {
+        throw new CliError(`${path} exists; choose a new name. A log never overwrites another file.`);
+      }
+      throw err;
+    }
+  } else {
+    const tmp = `${path}.tmp-${process.pid}`;
+    try {
+      unlinkSync(tmp); // left by a run that died between write and rename
+    } catch {
+      // usually absent
+    }
+    writeNewFile(tmp, content);
+    renameSync(tmp, path);
+  }
+  fsyncDir(dir);
   return { path, sha256: sha256(content) };
 }
 
-export function writeJsonFile(path, data) {
-  return writePrivateFile(path, `${JSON.stringify(data, null, 2)}\n`);
+export function writeJsonFile(path, data, opts) {
+  return writePrivateFile(path, `${JSON.stringify(data, null, 2)}\n`, opts);
 }
 
 export function readJsonFile(path) {

@@ -24,7 +24,17 @@
  * the site's own Team. Those guests come from `--site-guests` or a
  * `directory-bindings.mjs propose` plan (`--bindings-plan`); without either,
  * every identity-routed item is suspect (`uploader_guest_unverified`).
+ * Without `--ir0`, every file the ingestion wrote is suspect (`no_ir0_given`):
+ * nothing then says who uploaded it or where it was routed.
  * Sharing links are not read here: IR-2 checks them per item.
+ *
+ * ## Whose token
+ *
+ * SharePoint leaves a folder the caller cannot open out of a listing, with no
+ * error. After T-4/T-4b only the site Owners can open the root taxonomy
+ * folders, so IR-1 must run with an Owner's or a site collection admin's
+ * token. The folders found at each library root are always printed, and
+ * `--expect-root-folders` (the list T-4/T-4b saved) makes a missing one exit 3.
  *
  * Output: a JSON register (with parameters, input hashes and a summary) and a
  * CSV of the same rows, both in tools/out/ with their sha256 printed.
@@ -66,6 +76,9 @@ import {
   dedupeTraces,
   indexIr0,
   isCandidate,
+  isTaxonomyFolder,
+  missingRootFolders,
+  parseExpectRootFolders,
   parseIr0Export,
   parseSiteGuests,
   parseSiteSpec,
@@ -79,6 +92,7 @@ Usage:
        --ingest-app-ids <appId[,appId]> [--drive-name Dokumenty]... [--all-drives]
        [--ir0 <export.json|dir>]... [--fallback-site <label|/sites/Path>]...
        [--site-guests <label>=<oid,oid,...>]... [--bindings-plan <plan.json>]
+       [--expect-root-folders <label>=<name,name,...>]...
        [--all-items] [--no-versions] [--window-ms 10000] [--concurrency 4] [--out-dir <dir>]
 
   --site            a site to walk; repeat for each (BCR GROUP, PESKOVOI, TEST)
@@ -93,8 +107,15 @@ Usage:
                     Without either, every upload routed by identity is suspect.
   --all-items       register every file, not only the ingestion's
   --no-versions     skip the per-file versions call (every row then reads versions_unreadable)
+  --expect-root-folders <label>=<name,name,...>
+                    the folders that must be at a site's library root (the list saved in
+                    T-4/T-4b "Read first"); repeat per site. Any not seen: exit 3
 
 Environment: GRAPH_TOKEN (delegated; Sites.Read.All or Files.Read.All). Read-only.
+The token must be an Owner's or a site collection admin's on every site walked:
+after T-4/T-4b a member's token does not see the locked folders at all.
+Without --ir0, every file the ingestion wrote is suspect (no_ir0_given).
+Exit codes: 0 done; 1 refused; 3 register written, but an expected root folder was not seen.
 `.trim();
 
 const OPTIONS = {
@@ -107,6 +128,7 @@ const OPTIONS = {
   'fallback-site': { type: 'string', multiple: true },
   'site-guests': { type: 'string', multiple: true },
   'bindings-plan': { type: 'string' },
+  'expect-root-folders': { type: 'string', multiple: true },
   'all-items': { type: 'boolean' },
   'no-versions': { type: 'boolean' },
   'window-ms': { type: 'string' },
@@ -141,10 +163,16 @@ function ir0Files(specs) {
   return files;
 }
 
-/** Breadth-first walk of a drive. Folders are listed `concurrency` at a time. */
+/**
+ * Breadth-first walk of a drive. Folders are listed `concurrency` at a time.
+ * `rootFolders` are the folder names at the library root, as this token sees
+ * them: SharePoint leaves a folder the caller cannot open out of a listing,
+ * without an error.
+ */
 export async function walkDrive(graph, driveId, { concurrency = 4, onLevel = () => {} } = {}) {
   const drive = encodeURIComponent(driveId);
   const files = [];
+  const rootFolders = [];
   let folders = 0;
   let other = 0;
   let level = [{ id: null, path: '' }];
@@ -160,6 +188,7 @@ export async function walkDrive(graph, driveId, { concurrency = 4, onLevel = () 
         const path = `${folder.path}/${c.name}`;
         if (c.folder) {
           folders += 1;
+          if (!folder.id) rootFolders.push(c.name);
           next.push({ id: c.id, path });
         } else if (c.file) {
           files.push({ ...c, path, parentPath: folder.path });
@@ -172,7 +201,8 @@ export async function walkDrive(graph, driveId, { concurrency = 4, onLevel = () 
     onLevel({ depth, folders, files: files.length });
     level = next;
   }
-  return { files, folders, other };
+  rootFolders.sort((a, b) => a.localeCompare(b));
+  return { files, folders, other, rootFolders };
 }
 
 export async function main(argv, deps = {}) {
@@ -249,6 +279,13 @@ export async function main(argv, deps = {}) {
     }
   }
 
+  let expectedRootFolders;
+  try {
+    expectedRootFolders = parseExpectRootFolders(values['expect-root-folders'], sites);
+  } catch (err) {
+    throw new CliError(err.message);
+  }
+
   const driveNames = values['all-drives'] ? [] : csvList(values['drive-name'] ?? ['Dokumenty']);
   if (values['all-drives'] && values['drive-name']) {
     throw new CliError('--all-drives and --drive-name are exclusive');
@@ -270,6 +307,12 @@ export async function main(argv, deps = {}) {
     throw new CliError(`GRAPH_TOKEN expired at ${claims.expiresAt.toISOString()}`);
   }
   print(`  token      ${claims?.who ?? dim('(claims unreadable)')}`);
+  print(
+    dim(
+      '             must be an Owner or site collection admin of every site walked: after T-4/T-4b ' +
+        "a member's token does not see the locked folders, and they are silently left out",
+    ),
+  );
   print(`  sites      ${sites.map((s) => `${s.label}=${s.sitePath}`).join(', ')}`);
   print(`  drives     ${driveNames.length ? driveNames.join(', ') : 'all document libraries'}`);
   print(`  ingest     ${ingestAppIds.join(', ')}`);
@@ -325,7 +368,15 @@ export async function main(argv, deps = {}) {
       print(warn(`             ${ir0Stats.uploadsWithoutBatch} upload(s) with no "client resolved" line`));
     }
   } else {
-    print(warn('  no --ir0: rows carry no routing evidence and no uploader id'));
+    print(
+      warn(
+        '  no --ir0: rows carry no routing evidence and no uploader id, so every file the ingestion ' +
+          'wrote is suspect (no_ir0_given). Restore the IR-0 export from the evidence store first.',
+      ),
+    );
+  }
+  if (!expectedRootFolders.size) {
+    print(warn('  no --expect-root-folders: a locked folder this token cannot see would go unnoticed'));
   }
 
   // --- walk ---------------------------------------------------------------
@@ -340,6 +391,8 @@ export async function main(argv, deps = {}) {
   const walked = [];
   const siteReport = [];
   const creatorApps = new Map();
+  /** Root folder names seen, by canonical site path, across the site's walked drives. */
+  const rootFoldersSeen = new Map();
   for (const site of sites) {
     print('');
     print(bold(`${site.label} · ${site.hostname}:${site.sitePath}`));
@@ -381,11 +434,21 @@ export async function main(argv, deps = {}) {
         files: result.files.length,
         folders: result.folders,
         otherItems: result.other,
+        rootFolders: result.rootFolders,
       });
       walked.push({ site, drive: { id: drive.id, name: drive.name }, items: result.files });
+      const key = normalizeSitePath(site.sitePath);
+      rootFoldersSeen.set(key, [...(rootFoldersSeen.get(key) ?? []), ...result.rootFolders]);
       print(`  ${drive.name}: ${ok(`${result.files.length} files`)} in ${result.folders} folders`);
+      const taxonomy = result.rootFolders.filter(isTaxonomyFolder);
+      print(
+        `  ${drive.name}: taxonomy folders at the root: ` +
+          `${taxonomy.length ? taxonomy.join(', ') : warn('none seen')}` +
+          dim(` (${result.rootFolders.length - taxonomy.length} other root folder(s))`),
+      );
     }
   }
+  const missingRoots = missingRootFolders(expectedRootFolders, rootFoldersSeen);
 
   // --- versions -------------------------------------------------------------
   const candidates = walked.flatMap((w) =>
@@ -439,10 +502,15 @@ export async function main(argv, deps = {}) {
         : null,
       bindingsPlan: bindingsPlanInput,
       sharedPlanSites,
+      expectRootFolders: Object.fromEntries(expectedRootFolders),
       allItems: Boolean(values['all-items']),
       versions: !values['no-versions'],
       windowMs,
     },
+    // False when an expected root folder was not seen: the walk may have
+    // been short of folders this token cannot open.
+    complete: missingRoots.length === 0,
+    missingRootFolders: missingRoots,
     ir0Inputs,
     ir0Stats,
     sites: siteReport,
@@ -477,6 +545,18 @@ export async function main(argv, deps = {}) {
   print('Store both files, and their hashes, in the IR-0 evidence container');
   print('(infrastructure/ir/evidence-store.sh). Nothing was moved or deleted.');
   print('');
+  if (missingRoots.length) {
+    print(bad('INCOMPLETE: expected root folders were not seen, so the register may be short:'));
+    for (const m of missingRoots) {
+      const site = sites.find((s) => normalizeSitePath(s.sitePath) === m.sitePath);
+      print(bad(`  ${site?.label ?? m.sitePath}: ${m.missing.join(', ')}`));
+    }
+    print('A folder the token cannot open is left out without an error. Re-run with the token of an');
+    print('Owner or site collection admin of that site; if the folder really is gone, say so in the');
+    print('incident record and drop it from --expect-root-folders.');
+    print('');
+    return 3;
+  }
   return 0;
 }
 

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
@@ -61,5 +61,19 @@ describe('cli helpers', () => {
     assert.equal(digest, sha256(readFileSync(file)));
     assert.deepEqual(readJsonFile(file).data, { a: 1 });
     assert.throws(() => readJsonFile(join(dir, 'missing.json')), CliError);
+  });
+
+  test('a rewrite replaces the file whole, and an exclusive write never replaces one', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-'));
+    const file = join(dir, 'log.json');
+    writeJsonFile(file, { n: 1 }, { exclusive: true });
+    assert.throws(() => writeJsonFile(file, { n: 2 }, { exclusive: true }), /exists; choose a new name/);
+    assert.deepEqual(readJsonFile(file).data, { n: 1 });
+    // A temporary file left by a run that died before its rename is replaced.
+    writeFileSync(`${file}.tmp-${process.pid}`, 'half a log');
+    writeJsonFile(file, { n: 3 });
+    assert.deepEqual(readJsonFile(file).data, { n: 3 });
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(dir), ['log.json']);
   });
 });

@@ -192,6 +192,65 @@ describe('inventory-misfiled', () => {
     assert.equal(noVersions.row.d3.suspect, true, 'an unread version history fails closed');
   });
 
+  test('prints the taxonomy folders at each root; an expected one not seen exits 3 with the register written', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'ir1-test-'));
+    const base = [
+      '--site', 'BCR=contoso.sharepoint.com:/sites/BCRGROUP',
+      '--site', 'https://contoso.sharepoint.com/sites/0001CLIENTA',
+      '--ingest-app-ids', INGEST,
+    ];
+    const registerIn = (dir) => JSON.parse(readFileSync(join(dir, readdirSync(dir).find((n) => n.endsWith('.json'))), 'utf8'));
+
+    // 01_Faktury is locked (T-4) and this token cannot see it.
+    const shortDir = mkdtempSync(join(tmpdir(), 'ir1-out-'));
+    const short = run(
+      [...base, '--expect-root-folders', 'BCR=98_nieposortowane,01_Faktury', '--out-dir', shortDir],
+      tenant().fetch,
+      outDir,
+    );
+    assert.equal(await short.promise, 3);
+    const text = short.out.text();
+    assert.match(text, /Dokumenty: taxonomy folders at the root: 98_Nieposortowane/);
+    assert.match(text, /Dokumenty: taxonomy folders at the root: none seen/, 'the client site has none');
+    assert.match(text, /INCOMPLETE[\s\S]*BCR: 01_Faktury/);
+    assert.match(text, /Owner or site collection admin/);
+    const reg = registerIn(shortDir);
+    assert.equal(reg.complete, false);
+    assert.deepEqual(reg.missingRootFolders, [{ sitePath: '/sites/bcrgroup', missing: ['01_Faktury'] }]);
+    assert.deepEqual(reg.sites[0].drives[0].rootFolders, ['98_Nieposortowane']);
+
+    const fullDir = mkdtempSync(join(tmpdir(), 'ir1-out-'));
+    const full = run([...base, '--expect-root-folders', 'BCR=98_Nieposortowane', '--out-dir', fullDir], tenant().fetch, outDir);
+    assert.equal(await full.promise, 0);
+    assert.equal(registerIn(fullDir).complete, true);
+
+    await assert.rejects(
+      run([...base, '--expect-root-folders', 'NOPE=01_Faktury'], tenant().fetch, outDir).promise,
+      /--expect-root-folders NOPE: not one of the --site values/,
+    );
+  });
+
+  test('without --ir0 every file the ingestion wrote is suspect', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'ir1-test-'));
+    const dir = mkdtempSync(join(tmpdir(), 'ir1-out-'));
+    const { promise, out } = run(
+      [
+        '--site', 'https://contoso.sharepoint.com/sites/0001CLIENTA',
+        '--ingest-app-ids', INGEST,
+        '--site-guests', `0001CLIENTA=${U3}`,
+        '--out-dir', dir,
+      ],
+      tenant().fetch,
+      outDir,
+    );
+    assert.equal(await promise, 0);
+    assert.match(out.text(), /no --ir0: [\s\S]*no_ir0_given/);
+    const reg = JSON.parse(readFileSync(join(dir, readdirSync(dir).find((n) => n.endsWith('.json'))), 'utf8'));
+    const d3 = reg.rows.find((r) => r.driveItemId === 'd3');
+    assert.ok(d3.flags.includes('no_ir0_given'));
+    assert.equal(d3.suspect, true);
+  });
+
   test('refuses to run without --ingest-app-ids, a site, or with a bad drive name', async () => {
     const { fetch } = tenant();
     const outDir = mkdtempSync(join(tmpdir(), 'ir1-test-'));

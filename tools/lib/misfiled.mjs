@@ -36,7 +36,14 @@
  * `directory-bindings` plan); without that list, the item is suspect.
  */
 
-import { PLAN_KIND, normalizeGuid, normalizeSitePath, splitLines } from './bindings.mjs';
+import {
+  PLAN_KIND,
+  normalizeGuid,
+  normalizeName,
+  normalizeSitePath,
+  sitePathSegments,
+  splitLines,
+} from './bindings.mjs';
 
 export const REGISTER_KIND = 'bcr.ir1.inventory';
 
@@ -75,6 +82,7 @@ export const SUSPECT_FLAGS = Object.freeze(
     'ir0_batch_missing',
     'ir0_filename_repeated_in_batch',
     'no_ir0_record',
+    'no_ir0_given',
     'overwritten_by_ingest',
     'multiple_uploads_same_item',
     'has_prior_versions',
@@ -112,12 +120,81 @@ export function parseSiteSpec(spec) {
     hostname = rest.slice(0, colon);
     sitePath = rest.slice(colon + 1);
   }
-  sitePath = sitePath.replace(/\/+$/, '');
-  if (!/^\/(sites|teams)\/[^/]+$/i.test(sitePath) || /\/\.{1,2}$/.test(sitePath)) {
-    throw new Error(`site "${spec}": path must be /sites/<name> or /teams/<name>`);
+  // The same rule the ingestion and directory-bindings apply (contract C1):
+  // a path that is not canonical could be walked as one site and compared
+  // as another.
+  const segments = sitePathSegments(sitePath);
+  if (!segments) {
+    throw new Error(`site "${spec}": path must be /sites/<name> or /teams/<name> with a plain name`);
   }
   if (!/^[a-z0-9.-]+$/i.test(hostname)) throw new Error(`site "${spec}": bad hostname`);
-  return { label: label || sitePath.split('/')[2], hostname: hostname.toLowerCase(), sitePath };
+  return { label: label || segments[1], hostname: hostname.toLowerCase(), sitePath: `/${segments.join('/')}` };
+}
+
+/** A walked site named on the command line by its `--site` label or its path. */
+function findSite(sites, name) {
+  return sites.find(
+    (s) => s.label.toLowerCase() === name.toLowerCase() || normalizeSitePath(s.sitePath) === normalizeSitePath(name),
+  );
+}
+
+/** For comparing folder names: SharePoint names are case-insensitive. */
+const folderKey = (name) => normalizeName(name);
+
+/** Whether a folder name is one of the ledger taxonomy folders (`01_Faktury`, `98_Nieposortowane`, …). */
+export function isTaxonomyFolder(name) {
+  return TAXONOMY_FOLDER.test(String(name ?? ''));
+}
+
+/**
+ * `--expect-root-folders <site>=<name,name,...>` values: the folders that
+ * must be seen at the library root of each site (the list saved in T-4/T-4b
+ * "Read first"). `<site>` is a `--site` label or its path.
+ *
+ * @param {string[]} specs
+ * @param {Array<{label:string, sitePath:string}>} sites  the walked sites
+ * @returns {Map<string, string[]>} by canonical site path
+ */
+export function parseExpectRootFolders(specs, sites) {
+  const out = new Map();
+  for (const spec of specs ?? []) {
+    const text = String(spec);
+    const eq = text.indexOf('=');
+    if (eq <= 0) throw new Error(`--expect-root-folders "${text}": expected <site label>=<name,name,...>`);
+    const name = text.slice(0, eq).trim();
+    const site = findSite(sites, name);
+    if (!site) throw new Error(`--expect-root-folders ${name}: not one of the --site values`);
+    const names = text
+      .slice(eq + 1)
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!names.length) throw new Error(`--expect-root-folders ${name}: no folder names`);
+    const key = normalizeSitePath(site.sitePath);
+    out.set(key, [...new Set([...(out.get(key) ?? []), ...names])]);
+  }
+  return out;
+}
+
+/**
+ * The expected root folders the walk did not see, per site. A folder the
+ * signed-in person cannot open is left out of a listing without an error:
+ * after T-4/T-4b, a token that is not an Owner's or a site collection
+ * admin's sees none of the locked folders, and the inventory would be
+ * silently short (R21).
+ *
+ * @param {Map<string, string[]>} expected  from `parseExpectRootFolders`
+ * @param {Map<string, string[]>} seen      root folder names walked, by canonical site path
+ * @returns {Array<{sitePath: string, missing: string[]}>} only sites with something missing
+ */
+export function missingRootFolders(expected, seen) {
+  const out = [];
+  for (const [sitePath, names] of expected) {
+    const have = new Set((seen.get(sitePath) ?? []).map(folderKey));
+    const missing = names.filter((n) => !have.has(folderKey(n)));
+    if (missing.length) out.push({ sitePath, missing });
+  }
+  return out;
 }
 
 /** `/sites/foo` from a SharePoint web URL, lower-cased; `''` when it has none. */
@@ -248,6 +325,7 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
   const batchesByInvocation = new Map();
   const refined = new Map();
   const classified = new Map();
+  const classifiedPerName = new Map();
   const routed = [];
   const noMatch = [];
   const admin = [];
@@ -266,9 +344,12 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
       case m.refined:
         refined.set(`${r.invocationId}|${r.filename}`, r);
         break;
-      case m.classified:
-        classified.set(`${r.invocationId}|${r.filename}`, r);
+      case m.classified: {
+        const key = `${r.invocationId}|${r.filename}`;
+        classified.set(key, r);
+        classifiedPerName.set(key, (classifiedPerName.get(key) ?? 0) + 1);
         break;
+      }
       case m.routedByUser:
         routed.push(r);
         break;
@@ -317,9 +398,13 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
   }
 
   // `classified` and `refined` lines are found by invocationId + filename.
-  // Two uploads of one name in one batch (the legacy bot named every unnamed
-  // attachment "attachment.bin") make that lookup pick a sibling's line, so
-  // neither upload takes one, and both are flagged.
+  // Two documents of one name in one batch (the legacy bot named every
+  // unnamed attachment "attachment.bin") make that lookup pick a sibling's
+  // line, so none of them takes one, and all are flagged. The sibling need
+  // not have been uploaded: one classified (and perhaps promoted) that then
+  // failed ("batch document failed") logged its lines all the same. Every
+  // processed document logs "classified" before any refined or upload line,
+  // so counting those catches every sibling that could lend its lines.
   const perNameInBatch = new Map();
   for (const u of uploads) {
     const key = `${u.invocationId}|${u.filename}`;
@@ -333,7 +418,8 @@ export function indexIr0(records, { windowMs = 10_000 } = {}) {
     const batch = batchFor(u);
     if (!batch) withoutBatch += 1;
     const key = `${u.invocationId}|${u.filename}`;
-    const repeated = Boolean(u.invocationId) && perNameInBatch.get(key) > 1;
+    const repeated =
+      Boolean(u.invocationId) && (perNameInBatch.get(key) > 1 || (classifiedPerName.get(key) ?? 0) > 1);
     const ref = repeated ? undefined : refined.get(key);
     const cls = repeated ? undefined : classified.get(key);
     const { oids, source } = uploaderFor(batch);
@@ -532,9 +618,7 @@ export function parseSiteGuests(specs, sites) {
     const eq = text.indexOf('=');
     if (eq <= 0) throw new Error(`--site-guests "${text}": expected <site label>=<oid,oid,...>`);
     const name = text.slice(0, eq).trim();
-    const site = sites.find(
-      (s) => s.label.toLowerCase() === name.toLowerCase() || normalizeSitePath(s.sitePath) === normalizeSitePath(name),
-    );
+    const site = findSite(sites, name);
     if (!site) throw new Error(`--site-guests ${name}: not one of the --site values`);
     const ids = text
       .slice(eq + 1)
@@ -619,6 +703,9 @@ export function classifyItem(item, where, ctx) {
   if (versionCount !== null && versionCount > 1) flags.push('has_prior_versions');
   if (item.versionsError) flags.push('versions_unreadable');
   if (ctx.ir0 && (ingestCreated || ingestModified) && !ir0) flags.push('no_ir0_record');
+  // Without the IR-0 export nothing says who uploaded a file or where it was
+  // routed, so nothing the ingestion wrote can be called clean (R24).
+  if (!ctx.ir0 && (ingestCreated || ingestModified)) flags.push('no_ir0_given');
   if (ir0) flags.push(...ir0Flags(ir0, where.site.sitePath, ctx.siteGuests ?? null));
 
   return {

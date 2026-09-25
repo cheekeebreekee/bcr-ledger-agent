@@ -21,7 +21,8 @@
 #   --prefix          blob name prefix; default ir0/<UTC date>
 #   --grant-uploader  give the signed-in operator "Storage Blob Data
 #                     Contributor" on the container (shared keys are off, so
-#                     uploading needs a data role)
+#                     uploading needs a data role). The operator must be one
+#                     of the readers: that role can read, too.
 #
 # Safety model:
 #   - Dry run by default. State is read and printed; every change is printed
@@ -36,13 +37,22 @@
 #   - No public access, no shared keys, TLS 1.2, a CanNotDelete lock on the
 #     account. An existing account is reused only if it already has all
 #     three: the script never loosens or tightens someone else's account.
-#   - Only the named readers can read. Every "Storage Blob Data *" role that
-#     reaches the container (assigned there or inherited from the account,
-#     resource group, subscription or above) must be a named reader's Reader
-#     role, or, with --grant-uploader, the operator's Contributor role.
-#     Anything else stops the run, dry run included, and is listed.
-#   - With --grant-uploader, the command that removes the operator's write
-#     role again is printed at the end, to run once the upload is checked.
+#   - Only the named readers can read. Every role assignment that reaches the
+#     container (assigned there or inherited from the account, resource
+#     group, subscription or above) is judged by what its role definition
+#     permits, not by its name: a role whose dataActions, wildcards included
+#     and notDataActions subtracted, allow reading blobs must be a named
+#     reader's built-in "Storage Blob Data Reader", or, with --grant-uploader,
+#     the operator's built-in "Storage Blob Data Contributor". Anything else
+#     stops the run, dry run included, and is listed.
+#   - With --grant-uploader, the operator must be one of the named readers.
+#     The script does not remove the write role (the account's CanNotDelete
+#     lock is in the way, and lifting it is for a person): it prints the
+#     commands, and an --apply run ends INCOMPLETE with exit code 3 until a
+#     run without --grant-uploader passes.
+#
+# Exit codes: 0 done; 1 refused or failed; 3 applied, but the operator still
+# holds write access (--grant-uploader).
 #
 # Uses the Azure CLI only.
 # -----------------------------------------------------------------------------
@@ -51,6 +61,12 @@ set -euo pipefail
 CTO_UPN="yahor.simak@bcr-group.pl"
 READER_ROLE="Storage Blob Data Reader"
 UPLOADER_ROLE="Storage Blob Data Contributor"
+# The built-in definitions' ids, the same in every tenant. Allowed roles are
+# matched by id, which names the built-in definition itself, not by name.
+READER_ROLE_ID="2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
+UPLOADER_ROLE_ID="ba92f5b4-2d11-453d-a403-e96b0029c9fe"
+# What "can read the evidence" means, as an Azure data action (lower case).
+BLOB_READ="microsoft.storage/storageaccounts/blobservices/containers/blobs/read"
 
 RG=""
 ACCOUNT=""
@@ -164,39 +180,102 @@ for reader in "${READERS[@]}"; do
   READER_OIDS+=("$oid")
 done
 MY_OID=""
-if [[ $GRANT_UPLOADER == 1 ]]; then MY_OID=$(lower "$(az ad signed-in-user show --query id --output tsv)"); fi
+if [[ $GRANT_UPLOADER == 1 ]]; then
+  MY_OID=$(lower "$(az ad signed-in-user show --query id --output tsv)")
+  # The uploader's role reads as well as writes, so only a named reader may
+  # hold it, even for the upload.
+  MY_OID_IS_READER=0
+  for oid in "${READER_OIDS[@]}"; do
+    if [[ -n "$oid" && "$oid" == "$MY_OID" ]]; then MY_OID_IS_READER=1; fi
+  done
+  if [[ $MY_OID_IS_READER == 0 ]]; then
+    if [[ $APPLY == 1 || $READERS_ALL_NAMED == 1 ]]; then
+      die "--grant-uploader: the uploader must be one of the named readers, and $ME is not.
+  $UPLOADER_ROLE can read the evidence too. Have Roman, the IOD or the CTO run the upload."
+    fi
+    echo "  ⚠ $ME is not among the readers named so far; --apply refuses unless they are one of them"
+  fi
+fi
 
-# "<object id>|<role>" per line: the only data-plane assignments allowed.
+# "<object id>|<role definition GUID>" per line: the only assignments allowed
+# to read blobs in the container.
 ALLOWED_DATA_ROLES=""
 for oid in "${READER_OIDS[@]}"; do
-  if [[ -n "$oid" ]]; then ALLOWED_DATA_ROLES+="$oid|$READER_ROLE"$'\n'; fi
+  if [[ -n "$oid" ]]; then ALLOWED_DATA_ROLES+="$oid|$READER_ROLE_ID"$'\n'; fi
 done
-if [[ -n "$MY_OID" ]]; then ALLOWED_DATA_ROLES+="$MY_OID|$UPLOADER_ROLE"$'\n'; fi
+if [[ -n "$MY_OID" ]]; then ALLOWED_DATA_ROLES+="$MY_OID|$UPLOADER_ROLE_ID"$'\n'; fi
 
-# Every "Storage Blob Data *" assignment that reaches $1, inherited ones
-# included, as "principalId<TAB>role<TAB>scope<TAB>principalName". The name,
-# which can be empty, is last: `read` collapses empty tab-separated fields.
-data_roles_at() {
+# Every role assignment that reaches $1, inherited ones included, as
+# "principalId<TAB>roleDefinitionId<TAB>scope<TAB>role name<TAB>principal name".
+# An empty field would collapse under `read`, so empty names print as "-".
+assignments_at() {
   az role assignment list --scope "$1" --include-inherited \
-    --query "[?starts_with(roleDefinitionName, 'Storage Blob Data')].[principalId, roleDefinitionName, scope, principalName]" \
+    --query "[].[principalId, roleDefinitionId, scope, roleDefinitionName || '-', principalName || '-']" \
     --output tsv
 }
 
-# Report the data roles reaching $1 and stop on any that is not allowed.
+# Whether the role definition $1 (a full roleDefinitionId) lets its holder
+# read blobs: some permission block has a dataAction matching $BLOB_READ
+# ("*" is a wildcard, as Azure reads it) and no notDataAction matching it.
+# Sets CAN_READ to 1 or 0; answers are cached per definition. Judged by what
+# the role permits, not by its name, so a custom or differently named role
+# with blob read is caught.
+ROLE_VERDICTS=""
+CAN_READ=0
+role_can_read_blobs() {
+  local rid="$1" cached lines d n a granted excluded
+  local -a actions
+  cached=$(printf '%s' "$ROLE_VERDICTS" | awk -F'\t' -v r="$rid" '$1 == r { print $2; exit }')
+  if [[ -n "$cached" ]]; then
+    CAN_READ=$cached
+    return 0
+  fi
+  # One line per permission block: its dataActions, a tab, its
+  # notDataActions, each space-separated; "-" stands for none.
+  lines=$(az rest --method get --url "https://management.azure.com${rid}?api-version=2022-04-01" \
+    --query "properties.permissions[].[join(' ', dataActions || \`[\"-\"]\`), join(' ', notDataActions || \`[\"-\"]\`)]" \
+    --output tsv </dev/null) || die "cannot read role definition $rid (needs Microsoft.Authorization/roleDefinitions/read)"
+  CAN_READ=0
+  while IFS=$'\t' read -r d n; do
+    [[ -n "$d" ]] || continue
+    granted=0
+    excluded=0
+    read -ra actions <<<"$(lower "$d")"
+    for a in "${actions[@]}"; do
+      # shellcheck disable=SC2053 # $a is a pattern on purpose: Azure's "*".
+      if [[ "$BLOB_READ" == $a ]]; then granted=1; fi
+    done
+    read -ra actions <<<"$(lower "${n:--}")"
+    for a in "${actions[@]}"; do
+      # shellcheck disable=SC2053
+      if [[ "$BLOB_READ" == $a ]]; then excluded=1; fi
+    done
+    if [[ $granted == 1 && $excluded == 0 ]]; then CAN_READ=1; fi
+  done <<<"$lines"
+  ROLE_VERDICTS+="$rid"$'\t'"$CAN_READ"$'\n'
+}
+
+# Report every assignment reaching $1 that can read blobs, and stop on any
+# that is not allowed.
 check_data_roles() {
-  local scope="$1" rows pid role name at unexpected=0
-  rows=$(data_roles_at "$scope") || die "cannot list role assignments on $scope (needs Microsoft.Authorization/roleAssignments/read)"
-  echo "  data roles reaching the container (from $scope, inherited included):"
-  if [[ -z "$rows" ]]; then echo "    none"; fi
-  while IFS=$'\t' read -r pid role at name; do
-    [[ -n "$pid" ]] || continue
-    if printf '%s' "$ALLOWED_DATA_ROLES" | grep -Fqx "$(lower "$pid")|$role"; then
-      echo "    ok          $role  ${name:-$pid}  @ $at"
+  local scope="$1" rows pid rid role name at unexpected=0 shown=0 role_id
+  rows=$(assignments_at "$scope") || die "cannot list role assignments on $scope (needs Microsoft.Authorization/roleAssignments/read)"
+  echo "  roles that can read blobs in the container (from $scope, inherited included):"
+  while IFS=$'\t' read -r pid rid at role name; do
+    [[ -n "$pid" && -n "$rid" ]] || continue
+    role_can_read_blobs "$rid"
+    [[ $CAN_READ == 1 ]] || continue
+    shown=$((shown + 1))
+    role_id=$(lower "${rid##*/}")
+    [[ "$name" != "-" ]] || name="$pid"
+    if printf '%s' "$ALLOWED_DATA_ROLES" | grep -Fqx "$(lower "$pid")|$role_id"; then
+      echo "    ok          $role  $name  @ $at"
     else
       unexpected=$((unexpected + 1))
-      echo "    NOT ALLOWED $role  ${name:-$pid}  @ $at"
+      echo "    NOT ALLOWED $role  $name  @ $at"
     fi
   done <<<"$rows"
+  if ((shown == 0)); then echo "    none"; fi
   if ((unexpected > 0)); then
     if [[ $READERS_ALL_NAMED == 0 && $APPLY != 1 ]]; then
       echo "  ⚠ $unexpected assignment(s) not verified: name every reader (ROMAN_UPN, IOD_UPN or --reader) to check them"
@@ -447,10 +526,7 @@ echo "Role assignments on the container"
 az role assignment list --scope "$SCOPE" \
   --query "[].{principal:principalName, type:principalType, role:roleDefinitionName}" --output table
 echo
-echo "Data roles that reach the container, inherited included"
-az role assignment list --scope "$SCOPE" --include-inherited \
-  --query "[?starts_with(roleDefinitionName, 'Storage Blob Data')].{principal:principalName, type:principalType, role:roleDefinitionName, scope:scope}" \
-  --output table
+check_data_roles "$SCOPE"
 if [[ ${#UPLOAD_LIST[@]} -gt 0 ]]; then
   echo
   echo "Blobs under $PREFIX/"
@@ -468,5 +544,13 @@ echo "period can then only be extended, and nothing in the container can be dele
 echo "for $RETENTION_DAYS days after it was written."
 echo "  az storage container immutability-policy lock --account-name $ACCOUNT --resource-group $RG \\"
 echo "    --container-name $CONTAINER --if-match '$etag'"
-if [[ $GRANT_UPLOADER == 1 ]]; then print_uploader_removal; fi
+if [[ $GRANT_UPLOADER == 1 ]]; then
+  print_uploader_removal
+  echo
+  echo "INCOMPLETE: $ME still holds $UPLOADER_ROLE (read and write) on the container."
+  echo "Remove it as shown above once the upload is checked (H-2 step 6), then confirm with a"
+  echo "run without --grant-uploader, which stops while the role is still there."
+  echo
+  exit 3
+fi
 echo

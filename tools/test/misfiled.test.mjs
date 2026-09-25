@@ -9,7 +9,10 @@ import {
   classifyItem,
   dedupeTraces,
   indexIr0,
+  isTaxonomyFolder,
+  missingRootFolders,
   normalizeTrace,
+  parseExpectRootFolders,
   parseIr0Export,
   parseSiteGuests,
   parseSiteSpec,
@@ -19,6 +22,7 @@ import {
 } from '../lib/misfiled.mjs';
 import { PLAN_KIND } from '../lib/bindings.mjs';
 import { HOST, U1, U2, U3, U4, U5, U6, line, traces } from './ir0-fixture.mjs';
+import { SITE_PATH_CASES } from './site-path-cases.mjs';
 
 const g = (s) => `00000000-0000-4000-8000-${s.padStart(12, '0')}`;
 const INGEST = g('e1');
@@ -30,14 +34,54 @@ describe('site specs', () => {
       hostname: 'contoso.sharepoint.com',
       sitePath: '/sites/BCRGROUP',
     });
-    assert.deepEqual(parseSiteSpec('https://Contoso.sharepoint.com/sites/0001%20A/'), {
-      label: '0001 A',
+    assert.deepEqual(parseSiteSpec('https://Contoso.sharepoint.com/sites/0001A/'), {
+      label: '0001A',
       hostname: 'contoso.sharepoint.com',
-      sitePath: '/sites/0001 A',
+      sitePath: '/sites/0001A',
     });
-    for (const bad of ['contoso', 'contoso.sharepoint.com:/sites/a/b', 'x=/sites/a', 'http://h/sites/a', 'h.example:/sites/..']) {
+    for (const bad of [
+      'contoso',
+      'contoso.sharepoint.com:/sites/a/b',
+      'x=/sites/a',
+      'http://h/sites/a',
+      'h.example:/sites/..',
+      'https://contoso.sharepoint.com/sites/0001%20A',
+      'contoso.sharepoint.com:/sites/a.',
+      'contoso.sharepoint.com:/foo/a',
+    ]) {
       assert.throws(() => parseSiteSpec(bad), Error, bad);
     }
+    // The same table as the ingestion and directory-bindings (C1).
+    for (const [path, canonical] of SITE_PATH_CASES) {
+      const spec = `contoso.sharepoint.com:${path.trim().startsWith('/') ? path.trim() : `/${path.trim()}`}`;
+      if (canonical === null) assert.throws(() => parseSiteSpec(spec), Error, spec);
+      else assert.equal(parseSiteSpec(spec).sitePath.toLowerCase(), canonical, spec);
+    }
+  });
+
+  test('expected root folders: parsed per site, compared case-insensitively, missing ones named', () => {
+    const sites = [
+      { label: 'BCR', sitePath: '/sites/BCRGROUP' },
+      { label: 'A', sitePath: '/sites/0001CLIENTA' },
+    ];
+    const expected = parseExpectRootFolders(
+      ['BCR=01_Faktury, 98_Nieposortowane', '/sites/bcrgroup=02_Wyciągi_bankowe', 'A=01_Faktury'],
+      sites,
+    );
+    assert.deepEqual(expected.get('/sites/bcrgroup'), ['01_Faktury', '98_Nieposortowane', '02_Wyciągi_bankowe']);
+    const seen = new Map([
+      ['/sites/bcrgroup', ['01_faktury', '98_Nieposortowane', 'General']],
+      ['/sites/0001clienta', ['01_Faktury']],
+    ]);
+    assert.deepEqual(missingRootFolders(expected, seen), [
+      { sitePath: '/sites/bcrgroup', missing: ['02_Wyciągi_bankowe'] },
+    ]);
+    assert.deepEqual(missingRootFolders(expected, new Map()).map((m) => m.missing.length), [3, 1]);
+    assert.throws(() => parseExpectRootFolders(['Z=01_Faktury'], sites), /not one of the --site values/);
+    assert.throws(() => parseExpectRootFolders(['BCR='], sites), /no folder names/);
+    assert.throws(() => parseExpectRootFolders(['01_Faktury'], sites), /expected/);
+    assert.equal(isTaxonomyFolder('98_Nieposortowane'), true);
+    assert.equal(isTaxonomyFolder('Dokumenty księgowe'), false);
   });
 
   test('sitePathFromWebUrl', () => {
@@ -190,6 +234,30 @@ describe('indexIr0', () => {
     const rows = buildRegister({ walked: [], ir0: idx, ingestAppIds: new Set() });
     for (const r of rows) assert.ok(r.flags.includes('ir0_filename_repeated_in_batch'), r.driveItemId);
   });
+
+  test('a same-named sibling that was classified and promoted, then failed, lends A nothing (R14)', () => {
+    const batch = [
+      line(0, M.noDirectoryMatch, { conversationId: 'c', userAadObjectId: U1 }),
+      line(2, M.clientResolved, { invocationId: 'i', conversationId: 'c', resolution: 'fallback', clientId: 'FALLBACK', sitePath: '/sites/BCRGROUP' }),
+      // A: classified, uploaded to the fallback bucket.
+      line(100, M.classified, { invocationId: 'i', filename: 'attachment.bin', documentType: 'Inne', folderPath: '98_Nieposortowane/2026/09' }),
+      line(200, M.uploaded, { invocationId: 'i', filename: 'attachment.bin', driveItemId: 'A', webUrl: `${HOST}/sites/BCRGROUP/x/attachment.bin` }),
+      // B: classified, promoted into client 0002, then its upload failed.
+      line(300, M.classified, { invocationId: 'i', filename: 'attachment.bin', documentType: 'Faktura', folderPath: '01_Faktury/x' }),
+      line(310, M.refined, { invocationId: 'i', filename: 'attachment.bin', clientId: '0002', sitePath: '/sites/0002CLIENTB', promotedFromFallback: true }),
+      line(400, M.batchFailed, { invocationId: 'i', filename: 'attachment.bin' }),
+    ];
+    const a = indexIr0(parseIr0Export(batch)).byDriveItemId.get('A');
+    assert.equal(a.filenameRepeatedInBatch, true);
+    assert.equal(a.refined, false);
+    assert.equal(a.promotedFromFallback, false);
+    assert.equal(a.finalClientId, 'FALLBACK', "the batch's client, not the sibling's");
+    assert.equal(a.finalSitePath, '/sites/BCRGROUP');
+    assert.equal(a.documentType, '');
+    const [row] = buildRegister({ walked: [], ir0: new Map([['A', a]]), ingestAppIds: new Set() });
+    assert.ok(row.flags.includes('ir0_filename_repeated_in_batch'));
+    assert.ok(!row.flags.includes('promoted_by_content'), 'A was never promoted');
+  });
 });
 
 describe('guests of each site', () => {
@@ -300,11 +368,10 @@ describe('register', () => {
     assert.ok(unreadable.flags.includes('versions_unreadable'));
     assert.equal(unreadable.suspect, true);
     assert.ok(classifyItem(file('zz', '', 'n.pdf'), cliA, ctx).flags.includes('no_ir0_record'));
-    assert.equal(
-      classifyItem(file('zz', '', 'n.pdf'), cliA, { ...ctx, ir0: null }).flags.includes('no_ir0_record'),
-      false,
-      'without an IR-0 export there is nothing to be missing from',
-    );
+    const noExport = classifyItem(file('zz', '', 'n.pdf'), cliA, { ...ctx, ir0: null });
+    assert.equal(noExport.flags.includes('no_ir0_record'), false, 'without an IR-0 export there is nothing to be missing from');
+    assert.ok(noExport.flags.includes('no_ir0_given'));
+    assert.equal(noExport.suspect, true, 'without IR-0 nothing the ingestion wrote is clean (R24)');
     const overwritten = classifyItem(file('zz', '', 'o.pdf', { createdBy: app(g('e9')) }), cliA, ctx);
     assert.ok(overwritten.flags.includes('overwritten_by_ingest'));
   });
@@ -333,6 +400,9 @@ describe('register', () => {
 
     const all = buildRegister({ walked, ir0: null, ingestAppIds, fallbackSitePaths: new Set(), includeAll: true });
     assert.equal(all.length, 3);
+    const byName = Object.fromEntries(all.map((r) => [r.name, r]));
+    assert.ok(byName['c.pdf'].flags.includes('no_ir0_given'));
+    assert.ok(!byName['staff.docx'].flags.includes('no_ir0_given'), 'only what the ingestion wrote');
 
     const summary = summarizeRegister(rows);
     assert.equal(summary.rows, rows.length);

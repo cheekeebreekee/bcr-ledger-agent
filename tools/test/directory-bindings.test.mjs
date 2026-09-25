@@ -12,17 +12,24 @@ import { IDS, createTenant } from './tenant-fixture.mjs';
 
 const NOW = new Date('2026-09-25T10:00:00Z');
 const TOKEN = fakeJwt({ upn: 'operator@contoso.example', scp: 'Sites.Read.All', exp: 1_900_000_000 });
-const DIR_ARGS = ['--site-id', IDS.dirSite, '--list-id', IDS.list, '--ingest-app-ids', IDS.ingestApp];
+const GUARD_ARGS = ['--forbidden-site-paths', '/sites/BCRGROUP'];
+const DIR_ARGS = ['--site-id', IDS.dirSite, '--list-id', IDS.list, '--ingest-app-ids', IDS.ingestApp, ...GUARD_ARGS];
+/** The same, without the forbidden list. */
+const DIR_ONLY = DIR_ARGS.slice(0, -GUARD_ARGS.length);
 const HEALTH_URL = 'https://ingest.contoso.example/api/health';
 const HEALTH_ARGS = ['--health-url', HEALTH_URL];
 const P0_HEALTH = { status: 'ok', build: { phase: 'p0', routing: 'identity-only' } };
+
+/** The operator's shell, as H-7 sets it: the forbidden list comes from there for apply. */
+const SHELL_ENV = { GRAPH_TOKEN: TOKEN, FORBIDDEN_TARGET_SITE_PATHS: '/sites/BCRGROUP' };
 
 /**
  * @param {object} [o]
  * @param {(url: string, init: object, next: typeof fetch) => Promise<Response>} [o.intercept]
  *   sees every Graph request before the fake tenant does
+ * @param {object} [o.env]  the environment; default SHELL_ENV
  */
-function harness({ health = P0_HEALTH, now = NOW, intercept } = {}) {
+function harness({ health = P0_HEALTH, now = NOW, intercept, env = SHELL_ENV } = {}) {
   const tenant = createTenant();
   const out = capture();
   const outDir = mkdtempSync(join(tmpdir(), 'bindings-test-'));
@@ -30,7 +37,7 @@ function harness({ health = P0_HEALTH, now = NOW, intercept } = {}) {
   const graphFetch = intercept ? (url, init) => intercept(url, init ?? {}, tenant.fetch) : tenant.fetch;
   const run = (argv, extra = {}) =>
     main(argv, {
-      env: { GRAPH_TOKEN: TOKEN },
+      env,
       print: out.print,
       graphFetch,
       healthFetch: async (url, init) => {
@@ -54,8 +61,10 @@ async function proposePlan(h, extra = []) {
 describe('directory-bindings check', () => {
   test('reports each Active row read-only, and never prints the token', async () => {
     const h = harness();
-    assert.equal(await h.run(['check', ...DIR_ARGS]), 0);
+    // 3: row 2 holds a staff id, which routes that person's uploads to client B.
+    assert.equal(await h.run(['check', ...DIR_ARGS]), 3);
     const text = h.out.text();
+    assert.match(text, /ACTION: row\(s\) 2 hold an id that routes there and should not/);
     assert.match(text, /Row 1 · ClientId 0001[\s\S]*ready for propose/);
     assert.match(text, /Row 2 · ClientId 0002[\s\S]*SKIP staff_ids/);
     assert.match(text, /Row 2 · ClientId 0002[\s\S]*WARN team_not_bcr[\s\S]*Row 3/);
@@ -80,6 +89,99 @@ describe('directory-bindings check', () => {
       /not a \/sites\/<name> or \/teams\/<name> path/,
     );
     await assert.rejects(h.run(['check', ...DIR_ARGS, '--forbidden-site-paths', '/sites/x/../BCRGROUP']), CliError);
+  });
+
+  test('refuses to run without the forbidden list, or with a malformed guard value', async () => {
+    const withList = harness();
+    const { file } = await proposePlan(withList);
+    const h = harness({ env: { GRAPH_TOKEN: TOKEN } });
+    for (const command of ['check', 'propose']) {
+      await assert.rejects(h.run([command, ...DIR_ONLY]), /FORBIDDEN_TARGET_SITE_PATHS \/ --forbidden-site-paths is required/);
+    }
+    await assert.rejects(h.run(['apply', '--plan', file, ...HEALTH_ARGS]), /--forbidden-site-paths is required/);
+    await assert.rejects(h.run(['check', ...DIR_ARGS, '--quarantine-site-path', '/sites/Q/sub']), /--quarantine-site-path/);
+    await assert.rejects(h.run(['check', ...DIR_ARGS, '--tenant-host', 'contoso.example']), /--tenant-host/);
+    // The environment counts as the flag does (3: row 2's staff id).
+    assert.equal(await withList.run(['check', ...DIR_ONLY]), 3);
+    assert.deepEqual([...h.writes(), ...withList.writes()], []);
+  });
+
+  test('never binds BCR GROUP, the quarantine or another host, whatever the path list says', async () => {
+    const h = harness();
+    const client = { Status: 'Active', DriveName: 'Dokumenty', RootFolder: '' };
+    h.tenant.state.items.set('6', {
+      ...client,
+      Title: 'Row on BCR GROUP',
+      ClientId: '0006',
+      NIP: '0000000006',
+      SiteHostname: IDS.host,
+      SitePath: '/sites/BCRGROUP',
+    });
+    h.tenant.state.items.set('7', {
+      ...client,
+      Title: 'Row on the quarantine',
+      ClientId: '0007',
+      NIP: '0000000007',
+      SiteHostname: IDS.host,
+      SitePath: '/sites/QUARANTINE',
+    });
+    h.tenant.state.items.set('8', {
+      ...client,
+      Title: 'Row on another host',
+      ClientId: '0008',
+      NIP: '0000000008',
+      SiteHostname: 'fabrikam.sharepoint.com',
+      SitePath: '/sites/0008CLIENT',
+    });
+    // BCR GROUP is not on this list: its site collection is the Directory's.
+    const file = join(h.outDir, 'guarded-plan.json');
+    const args = [...DIR_ONLY, '--forbidden-site-paths', '/sites/SomethingElse', '--out', file];
+    assert.equal(
+      await h.run(['propose', ...args, '--quarantine-site-path', '/sites/QUARANTINE', '--tenant-host', IDS.host]),
+      0,
+    );
+    const plan = JSON.parse(readFileSync(file, 'utf8'));
+    const byId = Object.fromEntries(plan.rows.map((r) => [r.listItemId, r]));
+    for (const id of ['6', '7', '8']) {
+      assert.equal(byId[id].action, 'SKIP', id);
+      assert.ok(byId[id].reasons.some((r) => r.code === 'forbidden_target'), `${id}: ${JSON.stringify(byId[id].reasons)}`);
+    }
+    assert.match(byId['6'].reasons.find((r) => r.code === 'forbidden_target').detail, /Client Directory's own site collection/);
+    assert.match(byId['8'].reasons.find((r) => r.code === 'forbidden_target').detail, /not contoso\.sharepoint\.com/);
+    assert.equal(byId['1'].action, 'PATCH', 'the clean row is unaffected');
+    assert.deepEqual(plan.guards, {
+      forbiddenSitePaths: ['/sites/quarantine', '/sites/somethingelse'],
+      quarantineSitePath: '/sites/quarantine',
+      tenantHost: IDS.host,
+      directorySiteCollectionId: IDS.dirSite.split(',')[1],
+    });
+    assert.match(h.out.text(), /site collection \S+ \(the Client Directory's\) is never bound/);
+    assert.deepEqual(h.writes(), []);
+  });
+
+  test('a bound guest later added to another Team is named, and check exits 3 until the plan is applied', async () => {
+    const h = harness();
+    h.tenant.state.columns.push({ name: 'DriveId', text: {} }, { name: 'TeamId', text: {} });
+    // Row 2's staff id would also count; take it off so only the drift remains.
+    h.tenant.state.items.get('2').UserAadObjectIds = IDS.guestB;
+    const { file } = await proposePlan(h);
+    assert.equal(await h.run(['apply', '--plan', file, '--apply', ...HEALTH_ARGS, '--out', join(h.outDir, 'l.json')]), 0);
+    assert.equal(await h.run(['check', ...DIR_ARGS]), 0, 'bound and clean');
+
+    // Onboarding reuses guest A for company C's Team (R46).
+    h.tenant.state.members.get(IDS.teamC).push(IDS.guestA);
+    const report = join(h.outDir, 'report.json');
+    assert.equal(await h.run(['check', ...DIR_ARGS, '--out', report]), 3);
+    assert.match(
+      h.out.text(),
+      new RegExp(`WARN bound_guest_ineligible — 1 id\\(s\\) on the row[\\s\\S]*guest_in_other_team: also in ${IDS.teamC}`),
+    );
+    assert.deepEqual(JSON.parse(readFileSync(report, 'utf8')).routingDrift, ['1']);
+    // The plan takes the guest off row 1.
+    const again = await proposePlan(h);
+    const r1 = again.plan.rows.find((r) => r.listItemId === '1');
+    assert.equal(r1.action, 'PATCH');
+    assert.equal(r1.patch.UserAadObjectIds, '');
   });
 
   test('refuses flags that belong to another command', async () => {
@@ -250,10 +352,20 @@ describe('directory-bindings apply', () => {
     writeFileSync(edited, JSON.stringify(copy));
     await assert.rejects(h.run(['apply', '--plan', edited, '--apply', ...HEALTH_ARGS]), /digest/);
 
-    const later = new Date(NOW.getTime() + 25 * 3_600_000);
+    const later = new Date(NOW.getTime() + 73 * 3_600_000);
     await assert.rejects(
       h.run(['apply', '--plan', file, '--apply', ...HEALTH_ARGS], { now: later }),
-      /Re-run propose/,
+      /the limit is 72 h[\s\S]*Re-run propose/,
+    );
+    const shorter = new Date(NOW.getTime() + 25 * 3_600_000);
+    await assert.rejects(
+      h.run(['apply', '--plan', file, '--apply', ...HEALTH_ARGS, '--max-plan-age-hours', '24'], { now: shorter }),
+      /the limit is 24 h/,
+    );
+    // 72 h is a hard cap: no flag widens it.
+    await assert.rejects(
+      h.run(['apply', '--plan', file, ...HEALTH_ARGS, '--max-plan-age-hours', '100']),
+      /at most 72/,
     );
 
     h.tenant.state.items.get('1').SitePath = '/sites/SomewhereElse';
@@ -263,6 +375,77 @@ describe('directory-bindings apply', () => {
     const log = JSON.parse(readFileSync(logFile, 'utf8'));
     assert.equal(log.rows[0].result, 'stale');
     assert.deepEqual(log.rows[0].staleFields, ['SitePath']);
+  });
+
+  test('re-reads every guest the row will route: a second Team, a lost Team or a changed userType refuses it', async () => {
+    for (const [name, change, want] of [
+      ['added to a second Team', (t) => t.state.members.get(IDS.teamC).push(IDS.guestA), `also in Team\\(s\\) ${IDS.teamC}`],
+      [
+        'removed from the Team',
+        (t) => t.state.members.set(IDS.teamA, t.state.members.get(IDS.teamA).filter((id) => id !== IDS.guestA)),
+        "no longer in the row's Team",
+      ],
+      ['now a Member', (t) => (t.state.users.get(IDS.guestA).userType = 'Member'), 'is a Member'],
+      ['deleted', (t) => t.state.users.delete(IDS.guestA), 'no longer exists'],
+    ]) {
+      const h = harness();
+      h.tenant.state.columns.push({ name: 'DriveId', text: {} }, { name: 'TeamId', text: {} });
+      const { file } = await proposePlan(h);
+      change(h.tenant);
+      const logFile = join(h.outDir, 'apply-log.json');
+      assert.equal(await h.run(['apply', '--plan', file, '--apply', ...HEALTH_ARGS, '--out', logFile]), 2, name);
+      assert.deepEqual(h.writes().filter((c) => c.method === 'PATCH'), [], `${name}: written`);
+      const [row] = JSON.parse(readFileSync(logFile, 'utf8')).rows;
+      assert.equal(row.result, 'stale', name);
+      assert.match(row.staleReasons.join(' | '), new RegExp(want), name);
+    }
+  });
+
+  test('checks each row again against the guards it is given, whatever propose was given', async () => {
+    const h = harness();
+    h.tenant.state.columns.push({ name: 'DriveId', text: {} }, { name: 'TeamId', text: {} });
+    const { file } = await proposePlan(h);
+    const logFile = join(h.outDir, 'apply-log.json');
+    const args = ['apply', '--plan', file, '--apply', ...HEALTH_ARGS, '--out', logFile];
+    assert.equal(await h.run([...args, '--quarantine-site-path', '/sites/0001CLIENTA']), 2);
+    assert.deepEqual(h.writes().filter((c) => c.method === 'PATCH'), []);
+    const [row] = JSON.parse(readFileSync(logFile, 'utf8')).rows;
+    assert.equal(row.result, 'forbidden_target');
+    assert.match(row.forbiddenReasons.join(' '), /forbidden target/);
+
+    // The site behind SitePath changed since propose: stale, not written.
+    h.tenant.state.sites.get('/sites/0001CLIENTA').id = IDS.siteC;
+    const log2 = join(h.outDir, 'apply-log-2.json');
+    assert.equal(await h.run(['apply', '--plan', file, '--apply', ...HEALTH_ARGS, '--out', log2]), 2);
+    assert.match(JSON.parse(readFileSync(log2, 'utf8')).rows[0].staleReasons[0], /now resolves to site/);
+    assert.deepEqual(h.writes().filter((c) => c.method === 'PATCH'), []);
+  });
+
+  test('--only that leaves out a row taking ids off says to apply the whole plan', async () => {
+    const h = harness();
+    h.tenant.state.columns.push({ name: 'DriveId', text: {} }, { name: 'TeamId', text: {} });
+    // Row 2's staff id comes off once confirmed and verified: a removal.
+    const { file } = await proposePlan(h, ['--confirm-remove-staff', '2', '--write-verified', '/sites/0002CLIENTB']);
+    assert.equal(await h.run(['apply', '--plan', file, ...HEALTH_ARGS, '--only', '1']), 0);
+    assert.match(h.out.text(), /--only leaves out PATCH row\(s\) 2, which take user ids off a row/);
+  });
+
+  test('the log never replaces an existing file, and leaves no temporary file behind', async () => {
+    const h = harness();
+    h.tenant.state.columns.push({ name: 'DriveId', text: {} }, { name: 'TeamId', text: {} });
+    const { file, plan } = await proposePlan(h);
+    await assert.rejects(
+      h.run(['apply', '--plan', file, '--apply', ...HEALTH_ARGS, '--out', file]),
+      /exists; choose a new name/,
+    );
+    assert.deepEqual(h.writes().filter((c) => c.method === 'PATCH'), [], 'refused before any write');
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), plan, 'the plan is intact');
+
+    const logFile = join(h.outDir, 'apply-log.json');
+    assert.equal(await h.run(['apply', '--plan', file, '--apply', ...HEALTH_ARGS, '--out', logFile]), 0);
+    assert.deepEqual(readdirSync(h.outDir).filter((n) => n.includes('.tmp-')), []);
+    await assert.rejects(h.run(['rollback', '--log', logFile, '--apply', '--out', logFile]), /exists/);
+    assert.equal(JSON.parse(readFileSync(logFile, 'utf8')).kind, 'bcr.directory-bindings.apply-log');
   });
 });
 
