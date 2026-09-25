@@ -69,6 +69,23 @@ export function joinFolderPath(root: string | undefined, relative: string): stri
   return `${root.replace(/\/+$/, '')}/${relative.replace(/^\/+/, '')}`;
 }
 
+/**
+ * Encode an already-sanitised, `/`-separated path for use inside a Graph URL
+ * (`/drives/{id}/root:/{path}:/content`). Each segment is percent-encoded on
+ * its own so `#`, `%`, `?` and spaces — "Dokumenty księgowe" has one — can't
+ * truncate or redirect the request, while the separators stay separators.
+ *
+ * Always call this AFTER {@link sanitizeFolderPath} / {@link sanitizeFilename};
+ * encoding is not sanitising.
+ */
+export function encodeGraphPath(sanitisedPath: string): string {
+  return sanitisedPath
+    .split('/')
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
+
 function sanitizeSegment(segment: string): string {
   const trimmed = segment.trim();
   if (trimmed === '..' || trimmed === '.') {

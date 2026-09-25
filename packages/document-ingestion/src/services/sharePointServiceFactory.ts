@@ -36,5 +36,13 @@ function cacheKey(t: SharePointTarget): string {
   // sitePath is case-sensitive in SharePoint URLs but SharePoint itself
   // treats hostnames as case-insensitive. Normalize hostname only so we
   // don't accidentally split a case-varied write across two instances.
-  return [t.siteHostname.toLowerCase(), t.sitePath, t.driveName, t.rootFolder ?? ''].join('|');
+  // expectedDriveId is part of the key: two rows naming the same path but
+  // pinned to different drives must not share a resolved drive id.
+  return [
+    t.siteHostname.toLowerCase(),
+    t.sitePath,
+    t.driveName,
+    t.rootFolder ?? '',
+    t.expectedDriveId ?? '',
+  ].join('|');
 }

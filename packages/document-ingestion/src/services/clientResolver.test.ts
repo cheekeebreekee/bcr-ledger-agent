@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type {
   Classification,
   ClientDirectoryEntry,
@@ -5,14 +7,25 @@ import type {
   IngestionSource,
   SharePointTarget,
 } from '@bcr/shared';
-import type { ClientDirectoryReader, ClientDirectorySnapshot } from './clientDirectoryReader';
+import {
+  buildSnapshot,
+  type ClientDirectoryReader,
+  type ClientDirectorySnapshot,
+} from './clientDirectoryReader';
 import { applyInvoiceDirection, ClientResolver } from './clientResolver';
 
-const fallbackTarget: SharePointTarget = {
-  siteHostname: 'contoso.sharepoint.com',
-  sitePath: '/sites/BCRGROUP',
-  driveName: 'Documents',
+const HOST = 'contoso.sharepoint.com';
+
+const quarantineTarget: SharePointTarget = {
+  siteHostname: HOST,
+  sitePath: '/sites/BCRLedgerKwarantanna',
+  driveName: 'Dokumenty',
+  rootFolder: 'Kwarantanna',
 };
+
+const OID_A = 'ae3987d3-9a3a-4ff8-bcf7-713d24e79c48';
+const OID_B = '0b8c7a2e-51f4-4a7e-9d3e-2f1c6a9b8d70';
+const OID_STAFF = '5f0d2c11-7c3e-4b2a-8e61-9a4d3b2c1e0f';
 
 function makeEntry(overrides: Partial<ClientDirectoryEntry>): ClientDirectoryEntry {
   return {
@@ -21,10 +34,9 @@ function makeEntry(overrides: Partial<ClientDirectoryEntry>): ClientDirectoryEnt
     clientId: '0001',
     nip: '',
     companyNameAliases: [],
-    personNames: [],
     userAadObjectIds: [],
     target: {
-      siteHostname: 'client.sharepoint.com',
+      siteHostname: HOST,
       sitePath: '/sites/Client-0001',
       driveName: 'Dokumenty',
     },
@@ -34,127 +46,135 @@ function makeEntry(overrides: Partial<ClientDirectoryEntry>): ClientDirectoryEnt
   };
 }
 
+/** Uses the real snapshot builder, so resolver tests exercise real routing rules. */
 function makeReader(entries: ClientDirectoryEntry[]): ClientDirectoryReader {
-  const byNip = new Map<string, ClientDirectoryEntry>();
-  const byUserAadObjectId = new Map<string, ClientDirectoryEntry>();
-  for (const e of entries) {
-    if (e.nip) byNip.set(e.nip, e);
-    for (const aad of e.userAadObjectIds) if (aad) byUserAadObjectId.set(aad, e);
-  }
-  const snapshot: ClientDirectorySnapshot = {
-    entries,
-    byNip,
-    byCompanyAlias: new Map(),
-    byPersonName: new Map(),
-    byUserAadObjectId,
-    fetchedAt: 0,
-  };
+  const snapshot = buildSnapshot(entries, 0, {
+    forbiddenSitePaths: ['/sites/BCRGROUP', quarantineTarget.sitePath],
+    allowedSiteHostname: HOST,
+  });
+  return readerFor(snapshot);
+}
+
+function readerFor(snapshot: ClientDirectorySnapshot): ClientDirectoryReader {
   return { getSnapshot: jest.fn().mockResolvedValue(snapshot) } as unknown as ClientDirectoryReader;
 }
+
+const clientA = makeEntry({
+  listItemId: '11',
+  clientId: '0002',
+  title: '[0002] Client A',
+  nip: '1111111111',
+  companyNameAliases: ['Client A Sp. z o.o.'],
+  userAadObjectIds: [OID_A],
+  target: { siteHostname: HOST, sitePath: '/sites/ClientA', driveName: 'Dokumenty' },
+});
+
+const clientB = makeEntry({
+  listItemId: '12',
+  clientId: '0003',
+  title: '[0003] Client B',
+  nip: '2222222222',
+  companyNameAliases: ['Client B Sp. z o.o.'],
+  userAadObjectIds: [OID_B],
+  target: { siteHostname: HOST, sitePath: '/sites/ClientB', driveName: 'Dokumenty' },
+});
+
+const staffRow = makeEntry({
+  listItemId: '99',
+  clientId: 'bcr-admin',
+  title: 'BCR staff',
+  isAdmin: true,
+  userAadObjectIds: [OID_STAFF],
+  target: { siteHostname: '', sitePath: '', driveName: 'Documents' },
+});
 
 const baseSource: IngestionSource = {
   tenantId: 'tenant-1',
   channelId: 'msteams',
   conversationId: 'conv-1',
   activityId: 'act-1',
+  conversationType: 'personal',
   teamsChannelId: undefined,
   userAadObjectId: undefined,
   userDisplayName: undefined,
 };
 
 describe('ClientResolver.resolve', () => {
-  const opts = { fallbackTarget, fallbackClientId: 'bcr-group', fallbackTitle: 'BCR Group' };
-
-  it('routes to fallback when no user id is provided', async () => {
-    const resolver = new ClientResolver(makeReader([]), opts);
-    const resolved = await resolver.resolve(baseSource);
-    expect(resolved.source).toBe('fallback');
-    expect(resolved.clientId).toBe('bcr-group');
-    expect(resolved.target).toBe(fallbackTarget);
-    expect(resolved.matchedBy).toBeUndefined();
+  const resolver = new ClientResolver(makeReader([clientA, clientB, staffRow]), {
+    quarantineTarget,
   });
 
-  it('routes to fallback when the user id is not in the directory', async () => {
-    const resolver = new ClientResolver(makeReader([]), opts);
-    const resolved = await resolver.resolve({
-      ...baseSource,
-      userAadObjectId: 'ae3987d3-9a3a-4ff8-bcf7-713d24e79c48',
-    });
-    expect(resolved.source).toBe('fallback');
-  });
-
-  it('routes to the mapped client via userAadObjectId (1:1 DM path)', async () => {
-    const entry = makeEntry({
+  it('routes a bound guest to their own client', async () => {
+    const resolved = await resolver.resolve({ ...baseSource, userAadObjectId: OID_A });
+    expect(resolved).toEqual({
+      source: 'directory',
       clientId: '0002',
-      title: '[0002] PESKOVOI',
-      nip: '9571185285',
-      companyNameAliases: ['PESKOVOI Sp. z o.o.'],
-      userAadObjectIds: ['ae3987d3-9a3a-4ff8-bcf7-713d24e79c48'],
-      target: {
-        siteHostname: 'contoso.sharepoint.com',
-        sitePath: '/sites/PESKOVOI',
-        driveName: 'Dokumenty',
-      },
+      listItemId: '11',
+      title: '[0002] Client A',
+      matchedBy: 'userAadObjectId',
+      target: clientA.target,
+      nip: '1111111111',
+      companyName: 'Client A Sp. z o.o.',
     });
-    const resolver = new ClientResolver(makeReader([entry]), opts);
+  });
+
+  it('matches the user id case-insensitively', async () => {
     const resolved = await resolver.resolve({
       ...baseSource,
-      userAadObjectId: 'ae3987d3-9a3a-4ff8-bcf7-713d24e79c48',
+      userAadObjectId: OID_A.toUpperCase(),
     });
     expect(resolved.source).toBe('directory');
-    expect(resolved.matchedBy).toBe('userAadObjectId');
-    expect(resolved.clientId).toBe('0002');
-    expect(resolved.target).toEqual(entry.target);
-    expect(resolved.nip).toBe('9571185285');
-    expect(resolved.companyName).toBe('PESKOVOI Sp. z o.o.');
   });
 
-  it('user id lookup is case-insensitive on the caller side', async () => {
-    const entry = makeEntry({
-      clientId: '0002',
-      userAadObjectIds: ['ae3987d3-9a3a-4ff8-bcf7-713d24e79c48'],
-    });
-    const resolver = new ClientResolver(makeReader([entry]), opts);
-    const resolved = await resolver.resolve({
-      ...baseSource,
-      userAadObjectId: 'AE3987D3-9A3A-4FF8-BCF7-713D24E79C48',
-    });
-    expect(resolved.matchedBy).toBe('userAadObjectId');
+  it.each([
+    ['no user id', undefined],
+    ['an unknown user id', '9d1e2f3a-4b5c-4d6e-8f70-81a2b3c4d5e6'],
+  ])('quarantines %s as unmapped — never BCR GROUP, never another client', async (_label, oid) => {
+    const resolved = await resolver.resolve({ ...baseSource, userAadObjectId: oid });
+    expect(resolved).toEqual({ source: 'quarantine', reason: 'unmapped', target: quarantineTarget });
   });
 
-  it('falls back when user id is registered on an admin row', async () => {
-    const adminUser = makeEntry({
-      clientId: 'admin-yahor',
-      isAdmin: true,
-      userAadObjectIds: ['ae3987d3-9a3a-4ff8-bcf7-713d24e79c48'],
-      target: { siteHostname: '', sitePath: '', driveName: '' },
-    });
-    const resolver = new ClientResolver(makeReader([adminUser]), opts);
-    const resolved = await resolver.resolve({
-      ...baseSource,
-      userAadObjectId: 'ae3987d3-9a3a-4ff8-bcf7-713d24e79c48',
-    });
-    expect(resolved.source).toBe('fallback');
+  it('quarantines BCR staff as staff (they pick the client explicitly in a later phase)', async () => {
+    const resolved = await resolver.resolve({ ...baseSource, userAadObjectId: OID_STAFF });
+    expect(resolved).toEqual({ source: 'quarantine', reason: 'staff', target: quarantineTarget });
   });
 
-  it('falls back to title as companyName when no aliases are set', async () => {
-    const entry = makeEntry({
-      clientId: '0002',
-      title: 'PESKOVOI',
-      companyNameAliases: [],
-      userAadObjectIds: ['ae3987d3-9a3a-4ff8-bcf7-713d24e79c48'],
-    });
-    const resolver = new ClientResolver(makeReader([entry]), opts);
-    const resolved = await resolver.resolve({
-      ...baseSource,
-      userAadObjectId: 'ae3987d3-9a3a-4ff8-bcf7-713d24e79c48',
-    });
-    expect(resolved.companyName).toBe('PESKOVOI');
+  it('quarantines a user id that sits on a client row and an admin row as conflict', async () => {
+    const r = new ClientResolver(
+      makeReader([clientA, { ...staffRow, userAadObjectIds: [OID_A] }]),
+      { quarantineTarget },
+    );
+    const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
+    expect(resolved).toMatchObject({ source: 'quarantine', reason: 'conflict' });
+  });
+
+  it('quarantines everything when the directory is unavailable', async () => {
+    const unavailable: ClientDirectorySnapshot = {
+      entries: [],
+      byUserAadObjectId: new Map(),
+      staffUserIds: new Set(),
+      conflictedUserIds: new Set(),
+      excludedRows: new Map(),
+      health: 'unavailable',
+      fetchedAt: 0,
+    };
+    const r = new ClientResolver(readerFor(unavailable), { quarantineTarget });
+    const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
+    expect(resolved).toMatchObject({ source: 'quarantine', reason: 'stale_directory' });
+  });
+
+  it('falls back to the title as companyName when no aliases are set', async () => {
+    const r = new ClientResolver(
+      makeReader([{ ...clientA, companyNameAliases: [] }]),
+      { quarantineTarget },
+    );
+    const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
+    expect(resolved.source === 'directory' && resolved.companyName).toBe('[0002] Client A');
   });
 });
 
 // ---------------------------------------------------------------------------
-// Phase 3 — post-classification refinement (content NIP + direction)
+// Post-classification: direction only, never the client
 // ---------------------------------------------------------------------------
 
 function makeClassification(overrides: Partial<Classification> = {}): Classification {
@@ -169,138 +189,107 @@ function makeClassification(overrides: Partial<Classification> = {}): Classifica
 }
 
 describe('ClientResolver.resolvePostClassification', () => {
-  const opts = { fallbackTarget, fallbackClientId: 'bcr-group', fallbackTitle: 'BCR Group' };
-
-  const peskovoi = makeEntry({
-    clientId: '0002',
-    title: '[0002] PESKOVOI',
-    nip: '9571185285',
-    companyNameAliases: ['PESKOVOI Sp. z o.o.'],
-    target: {
-      siteHostname: 'contoso.sharepoint.com',
-      sitePath: '/sites/PESKOVOI',
-      driveName: 'Dokumenty',
-    },
+  const resolver = new ClientResolver(makeReader([clientA, clientB, staffRow]), {
+    quarantineTarget,
   });
 
-  it('promotes fallback to a Directory client when a party NIP matches', async () => {
-    const resolver = new ClientResolver(makeReader([peskovoi]), opts);
-    const preResolved = await resolver.resolve(baseSource);
-    expect(preResolved.source).toBe('fallback');
-
-    const parties: DocumentParty[] = [
-      { role: 'seller', nip: '8652567240', companyName: 'Autorud' },
-      { role: 'buyer', nip: '9571185285', companyName: 'PESKOVOI Sp. z o.o.' },
-    ];
-    const post = await resolver.resolvePostClassification(
-      preResolved,
-      makeClassification({ parties }),
+  it('flips a nieposortowane invoice to faktury_zakupu when the bound client is the buyer', async () => {
+    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: OID_A });
+    const post = resolver.resolvePostClassification(
+      pre,
+      makeClassification({ parties: [{ role: 'buyer', nip: '1111111111' }] }),
     );
-
-    expect(post.promotedFromFallback).toBe(true);
-    expect(post.client.source).toBe('directory');
-    expect(post.client.matchedBy).toBe('nip');
-    expect(post.client.clientId).toBe('0002');
-    expect(post.client.target).toEqual(peskovoi.target);
-  });
-
-  it('flips a nieposortowane invoice to faktury_zakupu when client is a buyer', async () => {
-    const resolver = new ClientResolver(makeReader([peskovoi]), opts);
-    const preResolved = await resolver.resolve(baseSource);
-
-    const parties: DocumentParty[] = [
-      { role: 'seller', nip: '8652567240', companyName: 'Autorud' },
-      { role: 'buyer', nip: '9571185285', companyName: 'PESKOVOI' },
-    ];
-    const post = await resolver.resolvePostClassification(
-      preResolved,
-      makeClassification({ parties }),
-    );
-
-    expect(post.promotedFromFallback).toBe(true);
+    expect(post.client).toBe(pre);
     expect(post.directionCorrection).toBe('zakup');
     expect(post.classification.folderPath).toBe('01_Faktury/02_Faktury_zakupu/2026/02');
-    expect(post.classification.fields.category).toBe('faktury_zakupu');
-    expect(post.classification.documentType).toBe('Faktura zakupu');
   });
 
-  it('flips a nieposortowane invoice to faktury_sprzedazy when client is a seller', async () => {
-    const resolver = new ClientResolver(makeReader([peskovoi]), opts);
-    const preResolved = await resolver.resolve(baseSource);
-
-    const parties: DocumentParty[] = [
-      { role: 'seller', nip: '9571185285', companyName: 'PESKOVOI' },
-      { role: 'buyer', nip: '8652567240', companyName: 'Autorud' },
-    ];
-    const post = await resolver.resolvePostClassification(
-      preResolved,
-      makeClassification({ parties }),
+  it('flips to faktury_sprzedazy when the bound client is the seller', async () => {
+    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: OID_A });
+    const post = resolver.resolvePostClassification(
+      pre,
+      makeClassification({ parties: [{ role: 'seller', nip: '1111111111' }] }),
     );
-
     expect(post.directionCorrection).toBe('sprzedaz');
-    expect(post.classification.folderPath).toBe('01_Faktury/01_Faktury_sprzedaży/2026/02');
     expect(post.classification.fields.category).toBe('faktury_sprzedazy');
   });
 
-  it('keeps fallback when multiple Directory clients appear in the same document', async () => {
-    const otherClient = makeEntry({
-      clientId: '0003',
-      nip: '8652567240',
-      title: 'Autorud',
-    });
-    const resolver = new ClientResolver(makeReader([peskovoi, otherClient]), opts);
-    const preResolved = await resolver.resolve(baseSource);
-
-    const parties: DocumentParty[] = [
-      { role: 'seller', nip: '8652567240' },
-      { role: 'buyer', nip: '9571185285' },
-    ];
-    const post = await resolver.resolvePostClassification(
-      preResolved,
-      makeClassification({ parties }),
+  // Regressions for the verified findings nip-promotion-misfile and
+  // prompt-injection-steers-routing: a document naming another client's NIP
+  // stays exactly where identity put it.
+  it("keeps a quarantined receipt in quarantine even though client B's NIP is on it", async () => {
+    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: undefined });
+    const post = resolver.resolvePostClassification(
+      pre,
+      makeClassification({ parties: [{ role: 'seller', nip: '2222222222' }] }),
     );
+    expect(post.client).toEqual({ source: 'quarantine', reason: 'unmapped', target: quarantineTarget });
+  });
 
-    expect(post.promotedFromFallback).toBeUndefined();
-    expect(post.client.source).toBe('fallback');
+  it("keeps a staff upload in quarantine even when exactly one client's NIP matches", async () => {
+    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: OID_STAFF });
+    const post = resolver.resolvePostClassification(
+      pre,
+      makeClassification({ parties: [{ role: 'buyer', nip: '1111111111' }] }),
+    );
+    expect(post.client.source).toBe('quarantine');
+  });
+
+  it("keeps client A's upload in A when the document names only client B", async () => {
+    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: OID_A });
+    const post = resolver.resolvePostClassification(
+      pre,
+      makeClassification({ parties: [{ role: 'seller', nip: '2222222222' }] }),
+    );
+    expect(post.client).toBe(pre);
+    expect(post.directionCorrection).toBeUndefined();
+  });
+
+  it('never changes the client for any combination of parties (property)', async () => {
+    const roles: DocumentParty['role'][] = ['seller', 'buyer', 'issuer', 'recipient', 'unknown'];
+    const nips = ['1111111111', '2222222222', '3333333333', ''];
+    const uploaders = [OID_A, OID_B, OID_STAFF, undefined];
+    for (const oid of uploaders) {
+      const pre = await resolver.resolve({ ...baseSource, userAadObjectId: oid });
+      for (const role of roles) {
+        for (const nip of nips) {
+          for (const other of nips) {
+            const parties: DocumentParty[] = [
+              { role, nip },
+              { role: 'seller', nip: other },
+            ];
+            const post = resolver.resolvePostClassification(pre, makeClassification({ parties }));
+            expect(post.client).toBe(pre);
+          }
+        }
+      }
+    }
   });
 
   it('does nothing when no parties are extracted', async () => {
-    const resolver = new ClientResolver(makeReader([peskovoi]), opts);
-    const preResolved = await resolver.resolve(baseSource);
-    const post = await resolver.resolvePostClassification(preResolved, makeClassification());
-    expect(post.promotedFromFallback).toBeUndefined();
-    expect(post.directionCorrection).toBeUndefined();
-    expect(post.classification).toEqual(makeClassification());
+    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: OID_A });
+    const classification = makeClassification();
+    const post = resolver.resolvePostClassification(pre, classification);
+    expect(post.classification).toBe(classification);
   });
+});
 
-  it('does not modify categories outside of the invoice / nieposortowane whitelist', async () => {
-    const resolver = new ClientResolver(makeReader([peskovoi]), opts);
-    const preResolved = await resolver.resolve(baseSource);
-    const parties: DocumentParty[] = [
-      { role: 'seller', nip: '9571185285', companyName: 'PESKOVOI' },
-      { role: 'buyer', nip: '8652567240' },
-    ];
-    const post = await resolver.resolvePostClassification(
-      preResolved,
-      makeClassification({
-        documentType: 'Umowa',
-        folderPath: '03_Umowy',
-        fields: { category: 'umowy' },
-        parties,
-      }),
+describe('content-based routing stays deleted', () => {
+  // The control for the cross-client write path is that the code does not
+  // exist. If someone re-adds a NIP lookup or a promotion step to the
+  // resolver, this fails before it can ship.
+  it('clientResolver.ts has no NIP lookup and no promotion', () => {
+    const source = readFileSync(join(__dirname, 'clientResolver.ts'), 'utf8');
+    const offenders = ['byNip', 'promote', 'Promote', 'fallback'].filter((needle) =>
+      source.includes(needle),
     );
-    // Direction is not touched for umowy, but the fallback promotion still runs.
-    expect(post.promotedFromFallback).toBe(true);
-    expect(post.directionCorrection).toBeUndefined();
-    expect(post.classification.folderPath).toBe('03_Umowy');
+    expect(offenders).toEqual([]);
   });
 });
 
 describe('applyInvoiceDirection', () => {
   it('returns null when parties is empty', () => {
-    expect(
-      applyInvoiceDirection(makeClassification({ parties: [] }), '9571185285'),
-    ).toBeNull();
+    expect(applyInvoiceDirection(makeClassification({ parties: [] }), '9571185285')).toBeNull();
   });
 
   it('returns null when the current category is neither invoice nor nieposortowane', () => {
@@ -343,9 +332,7 @@ describe('applyInvoiceDirection', () => {
 
   it('flips nieposortowane → faktury_zakupu for a buyer client', () => {
     const applied = applyInvoiceDirection(
-      makeClassification({
-        parties: [{ role: 'buyer', nip: '9571185285' }],
-      }),
+      makeClassification({ parties: [{ role: 'buyer', nip: '9571185285' }] }),
       '9571185285',
     );
     expect(applied?.direction).toBe('zakup');
@@ -356,9 +343,7 @@ describe('applyInvoiceDirection', () => {
   it('ignores party roles other than seller/buyer', () => {
     expect(
       applyInvoiceDirection(
-        makeClassification({
-          parties: [{ role: 'unknown', nip: '9571185285' }],
-        }),
+        makeClassification({ parties: [{ role: 'unknown', nip: '9571185285' }] }),
         '9571185285',
       ),
     ).toBeNull();

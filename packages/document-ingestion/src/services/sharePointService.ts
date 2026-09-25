@@ -6,8 +6,13 @@ import {
   type ResolvedSharePointTarget,
   type SharePointTarget,
 } from '@bcr/shared';
-import { sanitizeFolderPath, sanitizeFilename, joinFolderPath } from '../utils/pathBuilder';
-import { retry, AbortRetryError } from '../utils/retry';
+import {
+  encodeGraphPath,
+  joinFolderPath,
+  sanitizeFilename,
+  sanitizeFolderPath,
+} from '../utils/pathBuilder';
+import { retry, AbortRetryError, type RetryOptions } from '../utils/retry';
 
 /**
  * Cut-off for using a simple PUT vs. an upload session. The Graph docs
@@ -18,6 +23,9 @@ const SIMPLE_UPLOAD_LIMIT_BYTES = 4 * 1024 * 1024;
 /** 320 KiB-aligned chunk size for upload sessions (Graph requirement). */
 const CHUNK_SIZE_BYTES = 5 * 320 * 1024; // ~1.5 MiB
 
+/** Name attempts per upload: the original, then `_1` … `_10`. */
+const MAX_NAME_SUFFIX = 10;
+
 export interface UploadDocumentArgs {
   readonly folderPath: string;
   readonly filename: string;
@@ -26,42 +34,100 @@ export interface UploadDocumentArgs {
 }
 
 /**
+ * A target that cannot be used, as opposed to a transient write failure.
+ * The ingestion pipeline sends the document to quarantine instead:
+ * `drive_mismatch` means the path now resolves to a different drive than
+ * the one recorded for the client (a recreated Team can take the same URL).
+ */
+export class SharePointTargetError extends SharePointError {
+  constructor(
+    public readonly kind: 'drive_mismatch' | 'site_not_found' | 'drive_not_found' | 'forbidden',
+    message: string,
+    cause?: unknown,
+  ) {
+    super(message, kind === 'forbidden' ? 403 : kind === 'drive_mismatch' ? 409 : 404, cause);
+  }
+}
+
+export interface SharePointServiceOptions {
+  /** Retry policy for transient Graph failures. Injected short in tests. */
+  readonly retry?: RetryOptions;
+  /** Injected in tests; defaults to global `fetch` (upload-session chunks). */
+  readonly fetch?: typeof fetch;
+}
+
+/**
  * Thin SharePoint façade over Microsoft Graph. Exposes only the operations
  * the ingestion API actually needs:
  *
- *  - resolve site + drive ids (cached)
+ *  - resolve site + drive ids (cached), checking the recorded drive id
  *  - ensure a folder hierarchy exists
- *  - upload a file (with simple or chunked strategy)
- *  - resolve filename collisions with `_n` suffixes
+ *  - upload a file without ever overwriting (`conflictBehavior=fail`), taking
+ *    the next free `_n` name on a 409 — no existence probes, so no race and
+ *    no oracle telling a caller which names already exist
+ *  - set list-item columns on an uploaded file (quarantine metadata)
  */
 export class SharePointService {
   private readonly log = createLogger('ingestion/sharePointService');
+  private readonly retryOptions: RetryOptions;
+  private readonly fetchFn: typeof fetch;
   private resolvedTarget: Promise<ResolvedSharePointTarget> | undefined;
 
   constructor(
     private readonly graph: Client,
     private readonly target: SharePointTarget,
-  ) {}
+    opts: SharePointServiceOptions = {},
+  ) {
+    this.retryOptions = opts.retry ?? { retries: 3, minTimeoutMs: 250, factor: 2 };
+    this.fetchFn = opts.fetch ?? fetch;
+  }
 
   async uploadDocument(args: UploadDocumentArgs): Promise<DriveItemRef> {
     const target = await this.getResolvedTarget();
     const cleanFolder = sanitizeFolderPath(joinFolderPath(target.rootFolder, args.folderPath));
     const cleanFilename = sanitizeFilename(args.filename);
+    const { name, ext } = splitExtension(cleanFilename);
 
     await this.ensureFolderPath(target.driveId, cleanFolder);
-    const finalFilename = await this.resolveCollisionFreeName(
-      target.driveId,
-      cleanFolder,
-      cleanFilename,
-    );
-    const fullPath = `${cleanFolder}/${finalFilename}`.replace(/^\/+/, '');
 
-    this.log.info({ fullPath, sizeBytes: args.content.length }, 'uploading to SharePoint');
-
-    if (args.content.length <= SIMPLE_UPLOAD_LIMIT_BYTES) {
-      return this.simpleUpload(target.driveId, fullPath, args.content, args.contentType);
+    for (let n = 0; n <= MAX_NAME_SUFFIX; n++) {
+      const candidate = n === 0 ? cleanFilename : `${name}_${n}${ext}`;
+      const encodedPath = encodeGraphPath(`${cleanFolder}/${candidate}`);
+      const item =
+        args.content.length <= SIMPLE_UPLOAD_LIMIT_BYTES
+          ? await this.simpleUpload(target.driveId, encodedPath, args.content, args.contentType)
+          : await this.chunkedUpload(target.driveId, encodedPath, args.content);
+      if (item === 'conflict') continue;
+      this.assertSameDrive(item, target.driveId);
+      this.log.info(
+        { driveItemId: item.id, sizeBytes: args.content.length, nameSuffix: n },
+        'uploaded to SharePoint',
+      );
+      return item;
     }
-    return this.chunkedUpload(target.driveId, fullPath, args.content, args.contentType);
+    throw new SharePointError('Too many filename collisions', 409);
+  }
+
+  /**
+   * Set list-item columns on an uploaded file, e.g. the quarantine columns
+   * `UploaderOid` / `QuarantineReason`. Best-effort: the upload already
+   * happened, and the same facts are in the audit log event.
+   */
+  async setListItemFields(driveItemId: string, fields: Readonly<Record<string, string>>): Promise<boolean> {
+    const target = await this.getResolvedTarget();
+    try {
+      await retry(
+        () =>
+          this.graph
+            .api(`/drives/${target.driveId}/items/${driveItemId}/listItem/fields`)
+            .patch(fields) as Promise<unknown>,
+        this.retryOptions,
+      );
+      return true;
+    } catch (err) {
+      this.log.warn({ err: describeGraphError(err), driveItemId }, 'setting list-item fields failed');
+      return false;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -78,18 +144,29 @@ export class SharePointService {
   }
 
   private async resolveTarget(): Promise<ResolvedSharePointTarget> {
-    const sitePath = this.target.sitePath.replace(/^\/+/, '');
-    const site = (await this.graph
-      .api(`/sites/${this.target.siteHostname}:/${sitePath}`)
-      .get()) as { id: string };
-    const drives = (await this.graph.api(`/sites/${site.id}/drives`).get()) as {
-      value: { id: string; name: string }[];
-    };
-    const drive = drives.value.find((d: { id: string; name: string }) => d.name === this.target.driveName);
+    const sitePath = encodeGraphPath(this.target.sitePath);
+    let site: { id: string };
+    try {
+      site = (await this.graph
+        .api(`/sites/${this.target.siteHostname}:/${sitePath}`)
+        .get()) as { id: string };
+    } catch (err) {
+      throw classifyTargetError(err, 'site_not_found', 'Site could not be resolved');
+    }
+    let drives: { value: { id: string; name: string }[] };
+    try {
+      drives = (await this.graph.api(`/sites/${site.id}/drives`).get()) as typeof drives;
+    } catch (err) {
+      throw classifyTargetError(err, 'drive_not_found', 'Drives could not be listed');
+    }
+    const drive = drives.value.find((d) => d.name === this.target.driveName);
     if (!drive) {
-      throw new SharePointError(
-        `Drive "${this.target.driveName}" not found in site ${this.target.sitePath}`,
-        404,
+      throw new SharePointTargetError('drive_not_found', 'Drive not found on the target site');
+    }
+    if (this.target.expectedDriveId && drive.id !== this.target.expectedDriveId) {
+      throw new SharePointTargetError(
+        'drive_mismatch',
+        'The target path resolves to a different drive than the one recorded for this client',
       );
     }
     return { ...this.target, siteId: site.id, driveId: drive.id };
@@ -106,121 +183,120 @@ export class SharePointService {
 
     for (const segment of segments) {
       try {
-        await this.graph
-          .api(`/drives/${driveId}/items/${parent}/children`)
-          .post({
-            name: segment,
-            folder: {},
-            '@microsoft.graph.conflictBehavior': 'fail',
-          });
+        await this.graph.api(`/drives/${driveId}/items/${parent}/children`).post({
+          name: segment,
+          folder: {},
+          '@microsoft.graph.conflictBehavior': 'fail',
+        });
       } catch (err) {
-        if (!isConflictError(err)) {
-          throw new SharePointError(`Failed to create folder "${segment}"`, 502, err);
+        if (graphStatus(err) === 403) {
+          throw new SharePointTargetError('forbidden', 'No write access to the target drive', err);
+        }
+        if (graphStatus(err) !== 409) {
+          throw new SharePointError('Failed to create a folder', 502, err);
         }
       }
       // Re-fetch parent id (whether we created it or it already existed).
       const item = (await this.graph
-        .api(`/drives/${driveId}/items/${parent}:/${segment}`)
+        .api(`/drives/${driveId}/items/${parent}:/${encodeURIComponent(segment)}`)
         .get()) as { id: string };
       parent = item.id;
     }
   }
 
-  private async resolveCollisionFreeName(
-    driveId: string,
-    folderPath: string,
-    desired: string,
-  ): Promise<string> {
-    const { name, ext } = splitExtension(desired);
-    let candidate = desired;
-    for (let i = 1; i <= 10; i++) {
-      const exists = await this.fileExists(driveId, folderPath, candidate);
-      if (!exists) return candidate;
-      candidate = `${name}_${i}${ext}`;
-    }
-    throw new SharePointError(`Too many filename collisions for "${desired}"`, 409);
-  }
-
-  private async fileExists(driveId: string, folderPath: string, filename: string): Promise<boolean> {
-    try {
-      const path = `${folderPath}/${filename}`.replace(/^\/+/, '');
-      await this.graph.api(`/drives/${driveId}/root:/${path}`).get();
-      return true;
-    } catch (err) {
-      if (isNotFoundError(err)) return false;
-      throw err;
-    }
-  }
-
+  /** PUT that never overwrites. Returns `'conflict'` when the name is taken. */
   private async simpleUpload(
     driveId: string,
-    fullPath: string,
+    encodedPath: string,
     content: Buffer,
     contentType: string,
-  ): Promise<DriveItemRef> {
-    return retry(
-      async () => {
+  ): Promise<DriveItemRef | 'conflict'> {
+    try {
+      return await retry(async () => {
         try {
           return (await this.graph
-            .api(`/drives/${driveId}/root:/${fullPath}:/content`)
+            .api(`/drives/${driveId}/root:/${encodedPath}:/content`)
+            .query({ '@microsoft.graph.conflictBehavior': 'fail' })
             .header('Content-Type', contentType)
             .put(content)) as DriveItemRef;
         } catch (err) {
           if (isRetryableError(err)) throw err;
-          throw new AbortRetryError(err instanceof Error ? err.message : String(err));
+          throw new StatusAbort(err);
         }
-      },
-      { retries: 3, minTimeoutMs: 250, factor: 2 },
-    );
+      }, this.retryOptions);
+    } catch (err) {
+      const cause = err instanceof StatusAbort ? err.original : err;
+      if (graphStatus(cause) === 409) return 'conflict';
+      if (graphStatus(cause) === 403) {
+        throw new SharePointTargetError('forbidden', 'No write access to the target drive', cause);
+      }
+      throw new SharePointError('Upload failed', 502, cause);
+    }
   }
 
+  /** Upload session that never overwrites. Returns `'conflict'` when the name is taken. */
   private async chunkedUpload(
     driveId: string,
-    fullPath: string,
+    encodedPath: string,
     content: Buffer,
-    _contentType: string,
-  ): Promise<DriveItemRef> {
-    const session = await this.graph
-      .api(`/drives/${driveId}/root:/${fullPath}:/createUploadSession`)
-      .post({
-        item: { '@microsoft.graph.conflictBehavior': 'rename' },
-      });
+  ): Promise<DriveItemRef | 'conflict'> {
+    let session: { uploadUrl: string };
+    try {
+      session = (await this.graph
+        .api(`/drives/${driveId}/root:/${encodedPath}:/createUploadSession`)
+        .post({ item: { '@microsoft.graph.conflictBehavior': 'fail' } })) as { uploadUrl: string };
+    } catch (err) {
+      if (graphStatus(err) === 409) return 'conflict';
+      if (graphStatus(err) === 403) {
+        throw new SharePointTargetError('forbidden', 'No write access to the target drive', err);
+      }
+      throw new SharePointError('Upload session could not be created', 502, err);
+    }
 
-    const uploadUrl: string = session.uploadUrl;
     let offset = 0;
     let lastResponse: unknown;
-
     while (offset < content.length) {
       const end = Math.min(offset + CHUNK_SIZE_BYTES, content.length);
       const chunk = content.subarray(offset, end);
       const rangeHeader = `bytes ${offset}-${end - 1}/${content.length}`;
 
-      lastResponse = await retry(
-        async () => {
-          const res = await fetch(uploadUrl, {
-            method: 'PUT',
-            headers: {
-              'Content-Length': String(chunk.length),
-              'Content-Range': rangeHeader,
-            },
-            body: chunk,
-          });
-          if (res.status === 202) {
-            return await res.json();
-          }
-          if (res.status === 200 || res.status === 201) {
-            return (await res.json()) as DriveItemRef;
-          }
-          const text = await res.text();
-          if (res.status >= 500) throw new Error(`Chunk upload HTTP ${res.status}: ${text}`);
-          throw new AbortRetryError(`Chunk upload HTTP ${res.status}: ${text}`);
-        },
-        { retries: 3, minTimeoutMs: 500, factor: 2 },
-      );
+      const outcome = await retry(async () => {
+        const res = await this.fetchFn(session.uploadUrl, {
+          method: 'PUT',
+          headers: { 'Content-Length': String(chunk.length), 'Content-Range': rangeHeader },
+          body: chunk,
+        });
+        if (res.status === 202 || res.status === 200 || res.status === 201) {
+          return (await res.json()) as unknown;
+        }
+        // A name taken while the session was open is reported on the last chunk.
+        if (res.status === 409) return 'conflict' as const;
+        if (res.status >= 500 || res.status === 429) {
+          throw new Error(`Chunk upload HTTP ${res.status}`);
+        }
+        throw new AbortRetryError(`Chunk upload HTTP ${res.status}`);
+      }, this.retryOptions);
 
+      if (outcome === 'conflict') return 'conflict';
+      lastResponse = outcome;
       offset = end;
     }
     return lastResponse as DriveItemRef;
+  }
+
+  /**
+   * The item must be in the drive we addressed. Anything else means the
+   * write went somewhere we did not intend; stop and say so loudly.
+   */
+  private assertSameDrive(item: DriveItemRef, driveId: string): void {
+    const actual = item.parentReference?.driveId;
+    if (actual && actual !== driveId) {
+      this.log.error(
+        { event: 'sharepoint.drive_mismatch', driveItemId: item.id },
+        'uploaded item is not in the addressed drive',
+      );
+      throw new SharePointTargetError('drive_mismatch', 'Uploaded item landed in an unexpected drive');
+    }
   }
 }
 
@@ -234,12 +310,22 @@ export function splitExtension(filename: string): { name: string; ext: string } 
   return { name: filename.slice(0, i), ext: filename.slice(i) };
 }
 
-function isConflictError(err: unknown): boolean {
-  return graphStatus(err) === 409;
+/** Wraps a non-retryable Graph error so `retry` stops but the status survives. */
+class StatusAbort extends AbortRetryError {
+  constructor(public readonly original: unknown) {
+    super('non-retryable Graph error');
+  }
 }
 
-function isNotFoundError(err: unknown): boolean {
-  return graphStatus(err) === 404;
+function classifyTargetError(
+  err: unknown,
+  notFoundKind: 'site_not_found' | 'drive_not_found',
+  message: string,
+): SharePointError {
+  const status = graphStatus(err);
+  if (status === 403 || status === 401) return new SharePointTargetError('forbidden', message, err);
+  if (status === 404) return new SharePointTargetError(notFoundKind, message, err);
+  return new SharePointError(message, 502, err);
 }
 
 function isRetryableError(err: unknown): boolean {
@@ -248,11 +334,19 @@ function isRetryableError(err: unknown): boolean {
   return status === 429 || (status >= 500 && status < 600);
 }
 
-function graphStatus(err: unknown): number | undefined {
+export function graphStatus(err: unknown): number | undefined {
   if (err && typeof err === 'object') {
-    const candidate = (err as { statusCode?: number; status?: number }).statusCode ??
+    const candidate =
+      (err as { statusCode?: number; status?: number }).statusCode ??
       (err as { statusCode?: number; status?: number }).status;
     if (typeof candidate === 'number') return candidate;
   }
   return undefined;
+}
+
+/** Status and Graph error code only — never the request URL (it contains paths). */
+function describeGraphError(err: unknown): { status: number | undefined; code: string | undefined } {
+  const code =
+    err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+  return { status: graphStatus(err), code: typeof code === 'string' ? code : undefined };
 }

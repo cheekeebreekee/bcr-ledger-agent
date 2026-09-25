@@ -8,6 +8,13 @@ export interface SharePointTarget {
   readonly driveName: string;
   /** Optional sub-folder under the drive root that prefixes every upload. */
   readonly rootFolder?: string;
+  /**
+   * Drive id recorded for this target (Directory `DriveId` column). When set,
+   * the drive resolved from `sitePath` + `driveName` must have exactly this id;
+   * otherwise the path now points somewhere else (a deleted and recreated
+   * Team can take the same URL) and nothing is written there.
+   */
+  readonly expectedDriveId?: string;
 }
 
 /**

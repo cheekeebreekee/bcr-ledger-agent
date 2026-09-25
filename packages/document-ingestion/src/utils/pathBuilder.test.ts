@@ -1,4 +1,4 @@
-import { joinFolderPath, sanitizeFilename, sanitizeFolderPath } from './pathBuilder';
+import { encodeGraphPath, joinFolderPath, sanitizeFilename, sanitizeFolderPath } from './pathBuilder';
 
 describe('sanitizeFolderPath', () => {
   it('keeps a safe path unchanged', () => {
@@ -61,5 +61,21 @@ describe('joinFolderPath', () => {
   it('joins with a single slash regardless of trailing/leading slashes', () => {
     expect(joinFolderPath('Ledger/', '/Invoices/2026/03')).toBe('Ledger/Invoices/2026/03');
     expect(joinFolderPath('Ledger', 'Invoices/2026/03')).toBe('Ledger/Invoices/2026/03');
+  });
+});
+
+describe('encodeGraphPath', () => {
+  it('percent-encodes each segment and keeps the separators', () => {
+    expect(encodeGraphPath('Dokumenty księgowe/01_Faktury/FV #1 100%.pdf')).toBe(
+      'Dokumenty%20ksi%C4%99gowe/01_Faktury/FV%20%231%20100%25.pdf',
+    );
+  });
+
+  it('drops empty segments from leading, trailing and doubled slashes', () => {
+    expect(encodeGraphPath('/a//b/')).toBe('a/b');
+  });
+
+  it('encodes ? and & so they cannot start a query string', () => {
+    expect(encodeGraphPath('a?b&c')).toBe('a%3Fb%26c');
   });
 });

@@ -30,6 +30,7 @@ may resolve to a different version). Azure Functions Core Tools v4 and Azure CLI
 yarn install                 # or: yarn install --immutable (what CI runs)
 yarn build                   # topological build of every workspace (tsc -b)
 yarn test                    # Jest in every workspace
+yarn test:coverage           # Jest + per-package coverage thresholds (what CI runs)
 yarn lint                    # ESLint over packages/**/src/**/*.ts
 yarn type-check              # tsc --noEmit per workspace
 yarn format                  # Prettier over sources + infrastructure/**/*.bicep
@@ -39,14 +40,15 @@ Single workspace / single test / single case:
 
 ```bash
 yarn workspace @bcr/document-ingestion test src/services/clientResolver.test.ts
-yarn workspace @bcr/document-ingestion test -t 'promotes fallback'
+yarn workspace @bcr/document-ingestion test -t 'never changes the client'
 yarn workspace @bcr/shared test:coverage        # enforces per-package thresholds
 ```
 
 Coverage thresholds are **per package and they fail the run**: `shared` 85/85/80/80
 (lines/statements/functions/branches), `document-ingestion` 85/85/80/75, `teams-bot` 80/80/75/70.
-`src/functions/**` and `src/index.ts` are excluded from coverage in the two Function App packages —
-HTTP wiring is tested via the exported `handleX` functions, not the `app.http()` registration.
+`src/functions/**`, `src/index.ts` and `src/runtime.ts` are excluded from coverage in the two
+Function App packages — they are HTTP registration and cold-start wiring. The logic lives in services
+with injected collaborators (e.g. `services/batchIngestor.ts`) and is tested there.
 
 Local run (two processes; `prestart` builds, and `@bcr/shared` must be built first):
 
@@ -54,7 +56,7 @@ Local run (two processes; `prestart` builds, and `@bcr/shared` must be built fir
 cp packages/teams-bot/local.settings.json.example packages/teams-bot/local.settings.json
 cp packages/document-ingestion/local.settings.json.example packages/document-ingestion/local.settings.json
 yarn start:bot            # http://localhost:3978/api/messages  (point Bot Framework Emulator here)
-yarn start:ingestion      # http://localhost:7071/api/ingest
+yarn start:ingestion      # http://localhost:7071/api/ingest/batch
 ```
 
 Deploy: `yarn deploy:dev` / `yarn deploy:prod` run `infrastructure/deploy.sh <env>` (Bicep, then
@@ -80,49 +82,69 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
 
 ### The ingestion pipeline (the part that needs several files to understand)
 
-`functions/ingestDocument.ts` orchestrates; every collaborator is a cold-start singleton from
+`functions/ingestDocument.ts` is thin wiring (the only route is `POST /api/ingest/batch`);
+`services/batchIngestor.ts` runs the pipeline; every collaborator is a cold-start singleton from
 `runtime.ts`:
 
 1. **Auth** — `auth/authMiddleware.ts` verifies the AAD JWT itself (signature via tenant JWKS,
-   issuer, audience, `roles` claim). Functions are `authLevel: 'anonymous'` *on purpose*.
-2. **Validate** — `functions/validation.ts` (zod): filename has no path separators, base64 shape,
-   ≤25 docs per batch, ≤100 MiB decoded.
-3. **Pre-resolve client** — `services/clientResolver.ts#resolve()` maps `source.userAadObjectId` to
-   a Client Directory row, else the fallback bucket.
+   issuer, audience, `tid`, a `roles` claim from the route's policy) **and** that the calling app id
+   (`appid ?? azp`) is on `BOT_CALLER_APP_IDS`. Functions are `authLevel: 'anonymous'` *on purpose*.
+2. **Validate** — `functions/validation.ts` (zod): only `conversationType: 'personal'`, a GUID
+   `userAadObjectId`, and the BCR tenant are accepted; filename has no path separators, base64
+   shape, ≤25 docs per batch, ≤100 MiB decoded.
+3. **Resolve the client** — `services/clientResolver.ts#resolve()` maps `source.userAadObjectId` to
+   exactly one Client Directory row, else returns the **staff-only quarantine** with a reason
+   (`unmapped`, `staff`, `conflict`, `stale_directory`, …). Quarantined documents are never
+   classified.
 4. **Classify** — `services/classificationService.ts` runs classifiers in order and returns the
    first result at/above 0.8 confidence, else the best one. Chain is
-   `ClaudeClassifier → FallbackClassifier` (Claude only if `ANTHROPIC_ENABLED` + key).
-5. **Post-resolve** — `resolvePostClassification()` uses the `parties[]` Claude extracted to
-   (a) promote a fallback upload to a real client when exactly one party NIP matches the Directory,
-   and (b) flip sprzedaż ⇄ zakup and rebuild the folder path.
+   `ClaudeClassifier → FallbackClassifier` (Claude only if `ANTHROPIC_ENABLED` + key). Only the
+   bound client's own identity is primed into the prompt.
+5. **Direction** — `resolvePostClassification()` flips sprzedaż ⇄ zakup from the bound client's own
+   NIP. It never changes the client.
 6. **Upload** — `sharePointServiceFactory.ts` returns a per-target cached `SharePointService`, which
-   resolves site+drive ids, creates the folder chain idempotently, de-collides the filename with
-   `_n`, then PUTs (≤4 MiB) or uses a chunked upload session.
+   resolves site+drive ids (refusing a drive that differs from the row's `DriveId`), creates the
+   folder chain idempotently, then PUTs (≤4 MiB) or opens an upload session — both with
+   `conflictBehavior=fail`, taking the next free `_n` name on a 409. If the client's space can't be
+   written, the document goes to quarantine (`target_unwritable`), never anywhere else.
 
 ### Invariants — break these and documents mis-file
 
-- **Two-phase resolution is deliberate.** Phase 1 runs *before* Claude so the client's identity can
-  be primed into the prompt (that is how direction is decided confidently); phase 2 runs *after* so
-  content can still correct routing. Any phase-2 failure must degrade to the phase-1 routing —
-  an upload never blocks on refinement.
+- **Routing is decided ONLY from the authenticated uploader identity.** Document content — parties,
+  NIPs, model output, the filename — can never select or change the client. The old phase 2 that
+  "promoted" unrouted uploads to whichever client's NIP was in the document filed one client's papers
+  into another client's Team and was steerable by prompt injection; it is deleted, and
+  `clientResolver.test.ts` fails if a NIP lookup or promotion comes back. Anything that can't be tied
+  to exactly one client goes to the staff-only quarantine — never BCR GROUP, never a guess.
 - **`ClaudeClassifier.classify()` never throws and never rejects.** Unsupported type, oversize, API
   error, malformed output, low confidence → return `null` so `FallbackClassifier` files the document
   into `98_Nieposortowane/YYYY/MM/` for manual review. Preserve this contract.
-- **Directory lookups are fail-closed.** In `clientDirectoryReader.ts`, a key (NIP, alias, person
-  name, AAD id) appearing on two different clients is *deleted* from the lookup map and logged —
-  better to fall back than to file into the wrong client's SharePoint site. Name matching is exact
-  after normalization, never fuzzy, for the same reason.
+- **Directory lookups are fail-closed and order-independent.** `buildSnapshot` in
+  `clientDirectoryReader.ts` works in two passes: collect every key's rows, then admit a user id only
+  when exactly one trusted row holds it. A user id on two rows (or on a client and an admin row) routes
+  nowhere; rows sharing a target, or pointing at a forbidden site or another host, are excluded
+  entirely. A shared NIP or ClientId only raises `directory.conflict` — neither routes anything. A
+  snapshot older than `CLIENT_DIRECTORY_MAX_STALE_MS` is treated as unavailable (everything to
+  quarantine). BCR staff ids never belong on client rows.
 - **`parsers/folderTaxonomy.ts` is the single source of truth for folder layout.** `categoryCatalog`
   drives the Claude system prompt *and* the tool-call enum *and* `buildFolderPath()`, so the model
   can never name a category the uploader can't build a path for. Add or rename a category there and
   nowhere else; `dated: true` categories require `year`/`month` and get a `YYYY/MM` leaf.
 - **Never build a SharePoint path by string concatenation.** Go through
-  `utils/pathBuilder.ts` (`sanitizeFolderPath` / `sanitizeFilename` / `joinFolderPath`) — it rejects
-  traversal and reserved names and strips SharePoint's forbidden characters.
-- **Routing is user-identity based.** Teams *channel* uploads never reach a bot (drag-drop bypasses
-  Bot Framework; `@mention` activities carry only mention HTML). `teamsChannelId` is captured for
-  telemetry only — do not reintroduce channel-based routing. The Personal Tab
-  (`teams-bot/src/functions/mydocs.ts` → `GET /api/user-target`) exists because of this.
+  `utils/pathBuilder.ts` (`sanitizeFolderPath` / `sanitizeFilename` / `joinFolderPath`, then
+  `encodeGraphPath` for the URL) — it rejects traversal and reserved names, strips SharePoint's
+  forbidden characters, and percent-encodes `#`, `%` and spaces so they can't truncate the request.
+- **Uploads never overwrite.** `conflictBehavior=fail` on both upload paths; no existence probes (they
+  raced, and told a caller which names already existed).
+- **Responses and logs carry ids, not client data.** A quarantined row has no link, folder or name;
+  the result card shows the taxonomy label, never the model's reasoning; logs carry `documentId`,
+  `clientId`, `listItemId`, `driveItemId` — file names, titles, NIPs and SharePoint locations are
+  redacted by the root logger (`shared/src/logger.ts`).
+- **Only 1:1 chats are processed.** Teams *channel* uploads never reach a bot (drag-drop bypasses
+  Bot Framework; `@mention` activities carry only mention HTML), and group chats are refused. Every
+  activity passes the bot gate (personal conversation, BCR tenant, GUID `aadObjectId`) before any
+  logic runs, and the ingestion API re-checks it. `teamsChannelId` is telemetry only. The anonymous
+  Personal Tab lookup (`/api/user-target`) is deleted: it mapped any user id to their client.
 
 ### Bot side
 
@@ -130,7 +152,9 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
 testable with `TestAdapter`; `functions/messages.ts` just calls `adapter.processActivityDirect`.
 All attachments from one activity are downloaded in parallel and sent as **one batch**, so the user
 gets a single consolidated result card. A per-file download or ingest failure becomes a `rejected`
-row in that card rather than an aborted turn.
+row in that card rather than an aborted turn. The gate (`BOT_GATE_MODE=log|enforce`) runs for every
+activity type before the turn logic; the card escapes every inserted value and renders Polish text by
+error code, never raw error messages.
 
 ---
 
@@ -202,7 +226,7 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
 
 - **SharePoint drive names are locale-dependent** — Polish tenants use `Dokumenty`, not `Documents`.
   Always resolve via `GET /sites/{id}/drives`; per-client names come from the Directory's `DriveName`
-  column, the fallback from `FALLBACK_DRIVE_NAME`.
+  column, the quarantine site's from `QUARANTINE_DRIVE_NAME`.
 - **Graph calls use the Function App's system-assigned managed identity**, not the API app
   registration, and `Sites.Selected` needs *two* grants (Graph app role + per-site permission);
   per-site grants take ~5 min to propagate. See `docs/admin-sharepoint-grant.md`.

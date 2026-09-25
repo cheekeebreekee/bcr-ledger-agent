@@ -12,25 +12,23 @@ import { ClientDirectoryReader } from './services/clientDirectoryReader';
 import { ClientResolver } from './services/clientResolver';
 import { ClassificationService, FallbackClassifier } from './services/classificationService';
 import { ClaudeClassifier } from './services/claudeClassifier';
+import { BatchIngestor } from './services/batchIngestor';
 
 export const config = loadIngestionConfig();
 
 export const auth = new AuthMiddleware({
   tenantId: config.azureTenantId,
   expectedAudience: config.expectedAudience,
-  expectedRoles: config.expectedRoles,
 });
 
 export const graph = createGraphClient();
 
 export const sharePointFactory = new SharePointServiceFactory(graph);
 
-export const clientDirectory = new ClientDirectoryReader(graph, {
-  siteId: config.clientDirectorySiteId,
-  listId: config.clientDirectoryListId,
-  cacheTtlMs: config.clientDirectoryCacheTtlMs,
-});
-
+/**
+ * The staff-only quarantine. Its own site path is always forbidden as a
+ * client target, whatever FORBIDDEN_TARGET_SITE_PATHS says.
+ */
 export const quarantineTarget = {
   siteHostname: config.quarantineSiteHostname,
   sitePath: config.quarantineSitePath,
@@ -38,11 +36,18 @@ export const quarantineTarget = {
   ...(config.quarantineRootFolder ? { rootFolder: config.quarantineRootFolder } : {}),
 };
 
-export const clientResolver = new ClientResolver(clientDirectory, {
-  fallbackTarget: quarantineTarget,
-  fallbackClientId: 'quarantine',
-  fallbackTitle: 'BCR quarantine',
+export const clientDirectory = new ClientDirectoryReader(graph, {
+  siteId: config.clientDirectorySiteId,
+  listId: config.clientDirectoryListId,
+  cacheTtlMs: config.clientDirectoryCacheTtlMs,
+  maxStaleMs: config.clientDirectoryMaxStaleMs,
+  forbiddenSitePaths: [...config.forbiddenTargetSitePaths, config.quarantineSitePath],
+  // Every client site lives on the tenant's one SharePoint host — the same
+  // host as the quarantine site. A row naming any other host routes nobody.
+  allowedSiteHostname: config.quarantineSiteHostname,
 });
+
+export const clientResolver = new ClientResolver(clientDirectory, { quarantineTarget });
 
 export const classification = new ClassificationService([
   ...(config.anthropicEnabled && config.anthropicApiKey
@@ -57,3 +62,9 @@ export const classification = new ClassificationService([
     : []),
   new FallbackClassifier(),
 ]);
+
+export const batchIngestor = new BatchIngestor({
+  resolver: clientResolver,
+  classification,
+  sharePointFactory,
+});

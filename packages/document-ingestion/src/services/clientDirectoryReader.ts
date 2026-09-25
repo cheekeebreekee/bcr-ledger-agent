@@ -8,34 +8,62 @@ export interface ClientDirectoryReaderOptions {
   readonly listId: string;
   /** How long the snapshot is cached in-process before refetching (ms). */
   readonly cacheTtlMs: number;
+  /**
+   * Oldest snapshot still used while refreshes fail (ms). Past this age the
+   * directory is treated as unavailable and every upload goes to quarantine.
+   */
+  readonly maxStaleMs: number;
+  /**
+   * Site paths no row may route to (BCR GROUP, the quarantine site). Compared
+   * case-insensitively, ignoring a trailing slash.
+   */
+  readonly forbiddenSitePaths: readonly string[];
+  /**
+   * The tenant's SharePoint host. A row pointing at any other host is
+   * excluded — nothing may be filed outside the tenant.
+   */
+  readonly allowedSiteHostname: string;
+  /** Minimum gap between refresh attempts while refreshes keep failing (ms). */
+  readonly retryBackoffMs?: number;
   /** Optional clock injection for tests. */
   readonly now?: () => number;
 }
 
 /**
- * Immutable in-memory snapshot of the Client Directory. Consumers should
- * treat this as a read-only view; the reader will return a fresh snapshot
- * (with rebuilt lookup maps) after the TTL expires.
+ * Why a row takes no part in routing. Rows are excluded, never "fixed up":
+ * a row that cannot be trusted routes nobody, and those users' uploads go to
+ * quarantine where a person decides.
+ */
+export type ExcludedRowReason = 'forbidden_target' | 'target_conflict';
+
+/**
+ * Immutable in-memory snapshot of the Client Directory.
+ *
+ * Built in two passes so the result does not depend on row order (the old
+ * incremental "delete on second sight" let a third duplicate re-add the key,
+ * which is fail-open). Pass one collects every key's rows; pass two admits a
+ * key only when exactly one trusted row holds it.
  */
 export interface ClientDirectorySnapshot {
+  /** Every active, well-formed row, including excluded and admin rows. */
   readonly entries: readonly ClientDirectoryEntry[];
-  /** Lookup by digits-only NIP. Populated only for rows with a non-empty NIP. */
-  readonly byNip: ReadonlyMap<string, ClientDirectoryEntry>;
-  /**
-   * Lookup by normalized alias (see {@link normalizeName}). One alias can
-   * only ever map to a single entry \u2014 duplicate aliases across clients are
-   * dropped from the map (a warning is logged) so a document never files
-   * into the wrong client's SharePoint space.
-   */
-  readonly byCompanyAlias: ReadonlyMap<string, ClientDirectoryEntry>;
-  /** Same rules as `byCompanyAlias` but for `PersonNames`. */
-  readonly byPersonName: ReadonlyMap<string, ClientDirectoryEntry>;
-  /**
-   * Lookup by AAD object id (case-insensitive, GUID normalized).
-   * Used for user-identity-based routing when the request originates from a
-   * 1:1 DM with the bot (no channel context).
-   */
+  /** AAD object id (normalized) → the one client row it routes to. */
   readonly byUserAadObjectId: ReadonlyMap<string, ClientDirectoryEntry>;
+  /** AAD object ids that appear only on admin (staff) rows. */
+  readonly staffUserIds: ReadonlySet<string>;
+  /**
+   * AAD object ids that appear on more than one row, or on a row excluded for
+   * a target conflict. These users are quarantined as `conflict`.
+   */
+  readonly conflictedUserIds: ReadonlySet<string>;
+  /** List item id → why that row routes nobody. */
+  readonly excludedRows: ReadonlyMap<string, ExcludedRowReason>;
+  /**
+   * `fresh`: fetched within the TTL, or a failed refresh fell back to a snapshot
+   * younger than `maxStaleMs`. `unavailable`: never fetched, or the last good
+   * snapshot is too old — the resolver quarantines everything.
+   */
+  readonly health: 'fresh' | 'unavailable';
   /** Timestamp (ms) when the snapshot was fetched. */
   readonly fetchedAt: number;
 }
@@ -51,17 +79,18 @@ interface DirectoryFields {
   ClientId?: string;
   NIP?: string;
   CompanyNameAliases?: string;
-  PersonNames?: string;
   UserAadObjectIds?: string;
   SiteHostname?: string;
   SitePath?: string;
   DriveName?: string;
   RootFolder?: string;
+  DriveId?: string;
+  TeamId?: string;
   IsAdmin?: boolean;
   Status?: string;
 }
 
-interface GraphListItem {
+export interface GraphListItem {
   id: string;
   fields?: DirectoryFields;
 }
@@ -77,33 +106,41 @@ interface GraphListItemsPage {
  * SharePoint UI see the change without redeploying.
  *
  * Concurrent callers during a refresh all share the same in-flight
- * promise \u2014 the list is fetched at most once per TTL window.
+ * promise — the list is fetched at most once per TTL window.
  */
 export class ClientDirectoryReader {
   private readonly log = createLogger('ingestion/clientDirectory');
-  private readonly cacheTtlMs: number;
   private readonly now: () => number;
+  private readonly retryBackoffMs: number;
   private snapshot: ClientDirectorySnapshot | undefined;
   private inFlight: Promise<ClientDirectorySnapshot> | undefined;
+  private lastFailedAttemptAt: number | undefined;
 
   constructor(
     private readonly graph: Client,
     private readonly opts: ClientDirectoryReaderOptions,
   ) {
-    this.cacheTtlMs = opts.cacheTtlMs;
     this.now = opts.now ?? Date.now;
+    this.retryBackoffMs = opts.retryBackoffMs ?? 30_000;
   }
 
   /**
    * Return the current snapshot, refreshing it if the TTL has expired.
-   * Never throws \u2014 on failure, returns the last successful snapshot if
-   * one exists, or an empty snapshot otherwise (so uploads still route
-   * to the configured fallback bucket).
+   * Never throws. When a refresh fails, the last good snapshot is used only
+   * while it is younger than `maxStaleMs`; after that an `unavailable`
+   * snapshot is returned so nothing routes on data that may have been
+   * corrected (a revoked user, a repointed row) since it was read.
    */
   async getSnapshot(): Promise<ClientDirectorySnapshot> {
+    const now = this.now();
     const cached = this.snapshot;
-    if (cached && this.now() - cached.fetchedAt < this.cacheTtlMs) {
+    if (cached && now - cached.fetchedAt < this.opts.cacheTtlMs) {
       return cached;
+    }
+    // While refreshes keep failing, don't start a full list read on every
+    // request — that turns Graph throttling into a self-inflicted outage.
+    if (this.lastFailedAttemptAt !== undefined && now - this.lastFailedAttemptAt < this.retryBackoffMs) {
+      return this.fallbackFor(cached, now);
     }
     if (!this.inFlight) {
       this.inFlight = this.refresh().finally(() => {
@@ -111,15 +148,28 @@ export class ClientDirectoryReader {
       });
     }
     try {
-      return await this.inFlight;
+      const fresh = await this.inFlight;
+      this.lastFailedAttemptAt = undefined;
+      return fresh;
     } catch (err) {
-      // Fall back to the stale snapshot if we have one \u2014 uploads keep
-      // working with the last known-good directory. If we've never
-      // fetched successfully, return an empty snapshot so the resolver
-      // takes the fallback path.
-      this.log.error({ err }, 'directory refresh failed; using stale/empty snapshot');
-      return cached ?? emptySnapshot(this.now());
+      this.lastFailedAttemptAt = this.now();
+      this.log.error({ err }, 'directory refresh failed');
+      return this.fallbackFor(cached, this.now());
     }
+  }
+
+  private fallbackFor(
+    cached: ClientDirectorySnapshot | undefined,
+    now: number,
+  ): ClientDirectorySnapshot {
+    if (cached && now - cached.fetchedAt < this.opts.maxStaleMs) {
+      return cached;
+    }
+    this.log.warn(
+      { snapshotAgeMs: cached ? now - cached.fetchedAt : null },
+      'directory unavailable or too stale — every upload goes to quarantine',
+    );
+    return unavailableSnapshot(now);
   }
 
   private async refresh(): Promise<ClientDirectorySnapshot> {
@@ -128,15 +178,28 @@ export class ClientDirectoryReader {
     const entries = raw
       .map(toEntry)
       .filter((e): e is ClientDirectoryEntry => e !== null && e.active);
-    const snapshot = buildSnapshot(entries, this.now(), this.log);
+    const snapshot = buildSnapshot(entries, this.now(), {
+      forbiddenSitePaths: this.opts.forbiddenSitePaths,
+      allowedSiteHostname: this.opts.allowedSiteHostname,
+      onConflict: (kind, listItemIds) =>
+        // Ids only: a key can be a person's AAD id, and a NIP names a company.
+        this.log.warn({ event: 'directory.conflict', kind, listItemIds }, 'directory.conflict'),
+    });
     this.snapshot = snapshot;
-    this.log.info({ entryCount: entries.length }, 'directory snapshot ready');
+    this.log.info(
+      {
+        entryCount: entries.length,
+        routableUserCount: snapshot.byUserAadObjectId.size,
+        excludedRowCount: snapshot.excludedRows.size,
+      },
+      'directory snapshot ready',
+    );
     return snapshot;
   }
 
   private async fetchAllItems(): Promise<GraphListItem[]> {
     const items: GraphListItem[] = [];
-    // Explicit `expand=fields` \u2014 without it Graph returns items without
+    // Explicit `expand=fields` — without it Graph returns items without
     // any of the custom column values. `select` narrows the payload.
     let path: string | undefined =
       `/sites/${this.opts.siteId}/lists/${this.opts.listId}/items` +
@@ -169,7 +232,7 @@ export function toEntry(item: GraphListItem): ClientDirectoryEntry | null {
   const driveName = strOrEmpty(f.DriveName).trim() || 'Documents';
   const isAdmin = f.IsAdmin === true;
 
-  // A row without a client id is unusable \u2014 no way to log/refer to it.
+  // A row without a client id is unusable — no way to log/refer to it.
   if (!clientId) return null;
 
   // Admin rows do not need a SharePoint target (they don't file anywhere
@@ -177,11 +240,14 @@ export function toEntry(item: GraphListItem): ClientDirectoryEntry | null {
   if (!isAdmin && (!siteHostname || !sitePath)) return null;
 
   const rootFolder = strOrEmpty(f.RootFolder).trim();
+  const expectedDriveId = strOrEmpty(f.DriveId).trim();
+  const teamId = strOrEmpty(f.TeamId).trim();
   const target: SharePointTarget = {
     siteHostname,
     sitePath,
     driveName,
     ...(rootFolder ? { rootFolder } : {}),
+    ...(expectedDriveId ? { expectedDriveId } : {}),
   };
 
   return {
@@ -190,32 +256,14 @@ export function toEntry(item: GraphListItem): ClientDirectoryEntry | null {
     clientId,
     nip: normalizeNip(strOrEmpty(f.NIP)),
     companyNameAliases: splitLines(strOrEmpty(f.CompanyNameAliases)),
-    personNames: splitLines(strOrEmpty(f.PersonNames)),
     userAadObjectIds: splitLines(strOrEmpty(f.UserAadObjectIds))
       .map(normalizeAadId)
       .filter(Boolean),
     target,
+    ...(teamId ? { teamId } : {}),
     isAdmin,
     active: (strOrEmpty(f.Status).trim() || 'Active').toLowerCase() === 'active',
   };
-}
-
-/**
- * Normalized company/person name key used for content-based routing.
- * Case-folds, strips Unicode diacritics, collapses whitespace, and
- * drops most punctuation. Deliberately NOT fuzzy \u2014 the match must be
- * exact after normalization to avoid ever mis-filing into the wrong
- * client's SharePoint space.
- */
-export function normalizeName(input: string): string {
-  return input
-    .normalize('NFKD')
-    // eslint-disable-next-line no-misleading-character-class -- intentional combining-mark strip
-    .replace(/[\u0300-\u036f]/g, '') // combining diacritics
-    .toLowerCase()
-    .replace(/[^\p{Letter}\p{Number}\s]+/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
 }
 
 /** Digits-only NIP normalization. Returns `''` for junk input. */
@@ -233,73 +281,147 @@ export function normalizeAadId(input: string): string {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(t) ? t : '';
 }
 
-// ---------------------------------------------------------------------------
+/**
+ * Canonical form of a routing target, so two rows naming the same place in
+ * different spellings are recognised as the same target. Hostnames are
+ * case-insensitive; SharePoint site and folder paths are compared
+ * case-insensitively too, because two rows differing only in case would
+ * still write into the same library.
+ */
+export function normalizeTarget(t: SharePointTarget): string {
+  return [
+    t.siteHostname.trim().toLowerCase(),
+    normalizeSitePath(t.sitePath),
+    t.driveName.trim().toLowerCase(),
+    (t.rootFolder ?? '').trim().replace(/^\/+|\/+$/g, '').toLowerCase(),
+  ].join('|');
+}
 
-function buildSnapshot(
+export function normalizeSitePath(p: string): string {
+  return `/${p.trim().replace(/^\/+|\/+$/g, '')}`.toLowerCase();
+}
+
+export interface BuildSnapshotOptions {
+  readonly forbiddenSitePaths: readonly string[];
+  readonly allowedSiteHostname: string;
+  readonly onConflict?: (kind: ConflictKind, listItemIds: readonly string[]) => void;
+}
+
+export type ConflictKind = 'userAadObjectId' | 'target' | 'nip' | 'clientId';
+
+/**
+ * Build the routing maps. Order-independent: the same set of rows gives the
+ * same maps in any order.
+ *
+ * Rules:
+ *  - A row pointing at a forbidden site or another host is excluded
+ *    (`forbidden_target`).
+ *  - Rows sharing a normalized target are all excluded (`target_conflict`):
+ *    two clients in one library is a leak by construction.
+ *  - A user id on exactly one row routes: to that row if it is a client row,
+ *    to "staff" if it is an admin row. On two or more rows — two clients, or
+ *    a client and an admin row — it routes nowhere (`conflict`). A user id on
+ *    an excluded client row is a conflict too.
+ *  - A NIP or ClientId shared by rows only raises an alert: neither routes
+ *    anything any more, and excluding a real client over a test row sharing
+ *    its NIP would quarantine a live client for no safety gain.
+ */
+export function buildSnapshot(
   entries: readonly ClientDirectoryEntry[],
   fetchedAt: number,
-  log: ReturnType<typeof createLogger>,
+  opts: BuildSnapshotOptions,
 ): ClientDirectorySnapshot {
-  const byNip = new Map<string, ClientDirectoryEntry>();
-  const byCompanyAlias = new Map<string, ClientDirectoryEntry>();
-  const byPersonName = new Map<string, ClientDirectoryEntry>();
-  const byUserAadObjectId = new Map<string, ClientDirectoryEntry>();
+  const forbidden = new Set(opts.forbiddenSitePaths.map(normalizeSitePath));
+  const allowedHost = opts.allowedSiteHostname.trim().toLowerCase();
+  const excludedRows = new Map<string, ExcludedRowReason>();
+
+  // Pass 1: collect every key's rows.
+  const rowsByTarget = new Map<string, string[]>();
+  const rowsByUser = new Map<string, ClientDirectoryEntry[]>();
+  const rowsByNip = new Map<string, string[]>();
+  const rowsByClientId = new Map<string, string[]>();
 
   for (const e of entries) {
-    if (e.nip) {
-      putUnique(byNip, e.nip, e, 'nip', log);
+    if (!e.isAdmin) {
+      const host = e.target.siteHostname.trim().toLowerCase();
+      if (host !== allowedHost || forbidden.has(normalizeSitePath(e.target.sitePath))) {
+        excludedRows.set(e.listItemId, 'forbidden_target');
+      } else {
+        push(rowsByTarget, normalizeTarget(e.target), e.listItemId);
+      }
+      if (e.nip) push(rowsByNip, e.nip, e.listItemId);
     }
-    for (const alias of e.companyNameAliases) {
-      const key = normalizeName(alias);
-      if (key) putUnique(byCompanyAlias, key, e, 'companyAlias', log);
+    push(rowsByClientId, e.clientId, e.listItemId);
+    for (const oid of new Set(e.userAadObjectIds)) {
+      if (oid) push(rowsByUser, oid, e);
     }
-    for (const name of e.personNames) {
-      const key = normalizeName(name);
-      if (key) putUnique(byPersonName, key, e, 'personName', log);
+  }
+
+  for (const ids of rowsByTarget.values()) {
+    if (ids.length > 1) {
+      for (const id of ids) excludedRows.set(id, 'target_conflict');
+      opts.onConflict?.('target', ids);
     }
-    for (const aad of e.userAadObjectIds) {
-      if (aad) putUnique(byUserAadObjectId, aad, e, 'userAadObjectId', log);
+  }
+  for (const ids of rowsByNip.values()) {
+    if (ids.length > 1) opts.onConflict?.('nip', ids);
+  }
+  for (const ids of rowsByClientId.values()) {
+    if (ids.length > 1) opts.onConflict?.('clientId', ids);
+  }
+
+  // Pass 2: admit each user id only when exactly one trusted row holds it.
+  const byUserAadObjectId = new Map<string, ClientDirectoryEntry>();
+  const staffUserIds = new Set<string>();
+  const conflictedUserIds = new Set<string>();
+
+  for (const [oid, rows] of rowsByUser) {
+    if (rows.length > 1) {
+      conflictedUserIds.add(oid);
+      opts.onConflict?.(
+        'userAadObjectId',
+        rows.map((r) => r.listItemId),
+      );
+      continue;
+    }
+    const [row] = rows;
+    if (!row) continue;
+    if (row.isAdmin) {
+      staffUserIds.add(oid);
+    } else if (excludedRows.has(row.listItemId)) {
+      conflictedUserIds.add(oid);
+    } else {
+      byUserAadObjectId.set(oid, row);
     }
   }
 
   return {
     entries,
-    byNip,
-    byCompanyAlias,
-    byPersonName,
     byUserAadObjectId,
+    staffUserIds,
+    conflictedUserIds,
+    excludedRows,
+    health: 'fresh',
     fetchedAt,
   };
 }
 
-function putUnique<T extends { clientId: string }>(
-  map: Map<string, T>,
-  key: string,
-  entry: T,
-  kind: string,
-  log: ReturnType<typeof createLogger>,
-): void {
-  const existing = map.get(key);
-  if (existing && existing.clientId !== entry.clientId) {
-    log.warn(
-      { kind, key, existing: existing.clientId, incoming: entry.clientId },
-      'duplicate directory key across clients \u2014 dropping to prevent mis-routing',
-    );
-    map.delete(key); // fail-closed: better no match than the wrong client
-    return;
-  }
-  map.set(key, entry);
-}
-
-function emptySnapshot(fetchedAt: number): ClientDirectorySnapshot {
+function unavailableSnapshot(fetchedAt: number): ClientDirectorySnapshot {
   return {
     entries: [],
-    byNip: new Map(),
-    byCompanyAlias: new Map(),
-    byPersonName: new Map(),
     byUserAadObjectId: new Map(),
+    staffUserIds: new Set(),
+    conflictedUserIds: new Set(),
+    excludedRows: new Map(),
+    health: 'unavailable',
     fetchedAt,
   };
+}
+
+function push<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+  const list = map.get(key);
+  if (list) list.push(value);
+  else map.set(key, [value]);
 }
 
 function splitLines(raw: string): readonly string[] {

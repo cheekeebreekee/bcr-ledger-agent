@@ -25,8 +25,6 @@ export interface ClientDirectoryEntry {
   readonly nip: string;
   /** Company-name variants (already parsed from the multi-line SharePoint field). */
   readonly companyNameAliases: readonly string[];
-  /** Person full names (already parsed from the multi-line SharePoint field). */
-  readonly personNames: readonly string[];
   /**
    * AAD object ids of users who are allowed to file documents for this
    * client via 1:1 DMs with the bot. Parsed from the multi-line
@@ -35,30 +33,73 @@ export interface ClientDirectoryEntry {
   readonly userAadObjectIds: readonly string[];
   /** Where documents for this client are filed. */
   readonly target: SharePointTarget;
-  /** True for BCR staff / admin rows (content-based routing applies). */
+  /** Team (M365 group) id from the `TeamId` column, when recorded. Logged only. */
+  readonly teamId?: string;
+  /**
+   * True for BCR staff rows. A staff member's uploads are held in quarantine;
+   * their ids must never appear on a client row.
+   */
   readonly isAdmin: boolean;
   /** `Status == "Active"` — inactive rows are excluded from lookups. */
   readonly active: boolean;
 }
 
 /**
- * The outcome of resolving an incoming ingestion request to a client.
- * Either a real Client Directory row matched, or we fell back to the
- * configured fallback bucket (BCR Group).
+ * Why an upload was sent to the staff-only quarantine instead of a client's
+ * space. Every case where the uploader cannot be tied to exactly one client
+ * ends here — never in BCR GROUP, never in "the client whose NIP is in the
+ * document".
+ *
+ *  - `unmapped`: the uploader's AAD id is on no active Directory row.
+ *  - `staff`: the uploader is BCR staff (an `IsAdmin` row). Staff pick the
+ *    client explicitly in a later phase; until then their uploads are held.
+ *  - `conflict`: the uploader's id is on more than one row (two clients, or a
+ *    client and an admin row), or their row shares a target with another row.
+ *  - `stale_directory`: the Directory could not be read recently enough, or the
+ *    row's drive no longer matches the drive id recorded for it.
+ *  - `forbidden_target`: the row points at a site no client may be filed to
+ *    (BCR GROUP, the quarantine itself, another SharePoint host).
+ *  - `target_unwritable`: the client's site could not be written (no grant,
+ *    site or drive gone) after retries.
  */
-export interface ResolvedClient {
-  /** Short business key. Matches `ClientDirectoryEntry.clientId` when `source === 'directory'`. */
+export type QuarantineReason =
+  | 'unmapped'
+  | 'staff'
+  | 'conflict'
+  | 'stale_directory'
+  | 'forbidden_target'
+  | 'target_unwritable';
+
+/** The uploader is bound to exactly one active client row. */
+export interface DirectoryClientResolution {
+  readonly source: 'directory';
+  /** Short business key, e.g. `0002`. Not unique in the live list — log `listItemId` too. */
   readonly clientId: string;
-  /** Human-readable label for logs. */
+  /** SharePoint list item id of the matched row: the unambiguous row reference. */
+  readonly listItemId: string;
+  /** Human-readable label. Never logged or returned to callers. */
   readonly title: string;
-  /** Which mechanism resolved this request. */
-  readonly source: 'directory' | 'fallback';
-  /** How the directory match was made (only meaningful when `source === 'directory'`). */
-  readonly matchedBy?: 'userAadObjectId' | 'nip' | 'companyName' | 'personName';
+  /** Routing is identity-only; there is no other way to match. */
+  readonly matchedBy: 'userAadObjectId';
   /** Where to file the document. */
   readonly target: SharePointTarget;
-  /** Client tax id (for downstream direction detection). May be empty. */
+  /** The bound client's own NIP, used only to derive invoice direction. May be empty. */
   readonly nip: string;
-  /** Canonical company name (for downstream direction detection). May be empty. */
+  /** The bound client's name, used only to prime classification. May be empty. */
   readonly companyName: string;
 }
+
+/** The upload cannot be tied to exactly one client; it goes to the staff quarantine. */
+export interface QuarantineResolution {
+  readonly source: 'quarantine';
+  readonly reason: QuarantineReason;
+  /** The quarantine site (never a client site). */
+  readonly target: SharePointTarget;
+}
+
+/**
+ * The outcome of resolving an ingestion request. The client comes from the
+ * authenticated uploader identity only — document content can never select or
+ * change it.
+ */
+export type ResolvedClient = DirectoryClientResolution | QuarantineResolution;

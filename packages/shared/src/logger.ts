@@ -8,13 +8,23 @@ import pino from 'pino';
  * Each functional area should create a child logger with `.child({ area })`
  * so logs can be filtered without losing context.
  */
-export const rootLogger = pino({
+export function createRootLogger(destination?: pino.DestinationStream): pino.Logger {
+  return pino(rootLoggerOptions(), destination ?? pino.destination(1));
+}
+
+function rootLoggerOptions(): pino.LoggerOptions {
+  return {
   level: process.env.LOG_LEVEL ?? 'info',
   base: {
     app: 'bcr-ledger-agent',
     env: process.env.NODE_ENV ?? 'development',
   },
   timestamp: pino.stdTimeFunctions.isoTime,
+  // Secrets, plus the client data that turned App Insights into a register of
+  // every client's uploads: file names (KSeF names embed a NIP), SharePoint
+  // locations, client titles, extracted parties. Logs carry ids instead
+  // (documentId, clientId, listItemId, driveItemId). Pino redacts one level
+  // deep with `*.x`; top-level keys are listed explicitly.
   redact: {
     paths: [
       '*.password',
@@ -23,10 +33,31 @@ export const rootLogger = pino({
       '*.authorization',
       'req.headers.authorization',
       'res.headers["set-cookie"]',
+      'filename',
+      '*.filename',
+      'fileName',
+      '*.fileName',
+      'originalFilename',
+      '*.originalFilename',
+      'webUrl',
+      '*.webUrl',
+      'fullPath',
+      '*.fullPath',
+      'sitePath',
+      '*.sitePath',
+      'title',
+      '*.title',
+      'parties',
+      '*.parties',
+      'nip',
+      '*.nip',
     ],
     censor: '[REDACTED]',
   },
-});
+  };
+}
+
+export const rootLogger = createRootLogger();
 
 export type Logger = pino.Logger;
 
