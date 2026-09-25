@@ -113,7 +113,7 @@ item closes a named root cause. The human-run steps and their order are in
 |---|---|---|
 | G0 | No deploy on push to `main` (done, `f5a2bd4`). A full appSettings deploy would have wiped the hand-set routing settings. | deploy risk |
 | P0-1 | Content-based promotion deleted. Routing uses the uploader's identity only; the invoice-direction flip stays inside the bound client. | R3 |
-| P0-2 | A staff-only quarantine site replaces the fallback bucket. Unmapped, staff, conflicting, stale, forbidden-target and unwritable-target uploads go there, never to BCR GROUP. | R2 |
+| P0-2 | A staff-only quarantine site replaces the fallback bucket. Unmapped, unbound (a row the binding tool has not bound), staff, conflicting, stale, forbidden-target and unwritable-target uploads go there, never to BCR GROUP. A row whose site resolves in Graph to BCR GROUP's or the quarantine's site collection, however its path is spelled, is refused (`sharepoint.forbidden_site`) and its upload quarantined as forbidden-target. The reasons are listed in [`human-steps.md` H-12](human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries). | R2 |
 | P0-3 | The bot refuses anything that is not a 1:1 chat from the BCR tenant with a valid user id; ingestion re-checks the same three things. Manifest 0.2.0 is personal scope only. | R6 |
 | P0-4 | The Directory snapshot is built in two passes and is order-independent. The alias and person-name maps are gone. A snapshot older than 15 minutes routes nothing. | R4 |
 | P0-5 | Personal Tab removed; `/api/user-target` deleted. | R6 (IDOR) |
@@ -660,6 +660,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | IR-3: phase-2 notices to every affected client | Roman + IOD | todo | | |
 | IR-3 (3): UODO decision for BCR-controlled data recorded | Roman + IOD | todo | | |
 | H-15: Phase-0 exit criteria signed off | Yahor, Roman | todo | | |
+| Standing checks: whole plan applied after each onboarding; weekly `check` | Yahor | from H-12 | | date of each run; apply-log hash ([`human-steps.md`](human-steps.md#standing-checks)) |
 
 ## What this changes permanently
 

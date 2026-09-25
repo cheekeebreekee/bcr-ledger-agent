@@ -90,6 +90,7 @@ Graph and SharePoint tokens are set up as described in
 | H-13 | Ingestion grant on BCR GROUP to `read` | Global Admin | after H-12 | H-12 verified |
 | H-14 | `FALLBACK_*` settings and saved pre-Phase-0 packages removed | Yahor | ≥ 24 h after H-12 | H-12 verified |
 | H-15 | Exit criteria checked | Yahor, Roman | end of phase | all |
+| — | [Standing checks](#standing-checks): whole plan after each onboarding, weekly `check`, daily quarantine query | Yahor | from H-12 on | H-12 |
 
 IR-1 (inventory) and IR-2 (relocation) run alongside, from the day H-2 is stored. They are
 described in the incident doc. IR-1 takes the plan H-7 writes. Once T-4 and T-4b have locked
@@ -503,9 +504,12 @@ changes nothing. The flags below match [`tools/README.md`](../../tools/README.md
 `node tools/directory-bindings.mjs --help` is authoritative. For the token, see that README's
 "Authentication" section: the `az` token has no SharePoint scopes.
 
-The tool needs the Directory's ids, the ingestion identity's app id and the forbidden sites.
-Without the first two it stops; without the app id every write grant reads "unknown" and every
-client row is skipped. Set them in every new shell before running it:
+The tool needs the Directory's ids, the ingestion managed identity's app id, the forbidden
+sites, the quarantine site and the tenant's SharePoint host: the same values ingestion is given
+in H-8. Without the Directory's ids or the forbidden sites it stops (`check`, `propose` and
+`apply` all refuse to run without `FORBIDDEN_TARGET_SITE_PATHS`); without the app id every
+write grant reads "unknown" and every client row is skipped. Set them in every new shell before
+running it:
 
 ```bash
 export GRAPH_TOKEN=$(node ../bcr-onboarding-agent/tools/graph-login.mjs)
@@ -515,13 +519,21 @@ export DIRECTORY_LIST_ID=$(az functionapp config appsettings list -g $RG -n $ING
   --query "[?name=='CLIENT_DIRECTORY_LIST_ID'].value | [0]" -o tsv)
 export INGEST_APP_IDS=$INGEST_MI_APPID
 export FORBIDDEN_TARGET_SITE_PATHS=/sites/BCRGROUPSp.zo.o
+export QUARANTINE_SITE_PATH=/sites/BCRLedgerKwarantanna       # always forbidden to a client row
+export QUARANTINE_SITE_HOSTNAME=$SP_HOST                      # the only host a row may name
 node tools/directory-bindings.mjs check
 ```
 
 For every row, `check` reports:
 
+- a row it will never bind, as `forbidden_target`: its `SitePath` is BCR GROUP or the
+  quarantine, its `SiteHostname` is not `$SP_HOST`, or its site resolves in Graph to the
+  Directory's own site collection (BCR GROUP) however the path is spelled. A `SitePath` that is
+  not exactly `/sites/<name>` or `/teams/<name>` is skipped as `site_path_not_canonical`.
+  Ingestion excludes the same rows;
 - staff ids on client rows;
-- duplicate ClientIds, NIPs and targets;
+- duplicate ClientIds and NIPs, and rows sharing a site, a `DriveId` or a `TeamId` (ingestion
+  excludes every such row as a conflict);
 - whether the client's Team is Private and its channel is standard;
 - whether the Team carries onboarding's `BCR Group — …` description. The five Teams
   `[0000]`–`[0004]`, TEST and PESKOVOI among them, predate onboarding and have none. That is a
@@ -829,8 +841,8 @@ window of about two hours, during working hours.
 
 These steps go in **one** window because each fixes a failure the others would cause:
 
-- once the Phase-0 ingestion is live, every onboarded guest is unmapped and goes to quarantine
-  until their row is bound;
+- once the Phase-0 ingestion is live, every onboarded guest goes to quarantine until their row
+  is bound (see *The window* below);
 - binding a row, or granting the ingestion identity another client site, is only safe once the
   code that encodes `Dokumenty księgowe` and never follows content is live;
 - a canary proves each binding before real uploads use it.
@@ -868,6 +880,13 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    `"build":{"phase":"p0","routing":"identity-only"}`. `directory-bindings.mjs apply` checks
    this itself: it refuses to write unless the `--health-url` it is given reports
    `build.routing=identity-only`. `--expect-health` only adds further checks.
+
+   **The window, from here until each row's apply.** A client row routes nobody until it holds
+   `RootFolder`, `DriveId` and `TeamId`, and only `apply` writes those, all three together. So
+   until a row is applied, an upload by an id already on it (Yahor's, on PESKOVOI's row, until
+   step 8) is quarantined as `unbound_target`, and an upload by an onboarded guest whose id is on
+   no row as `unmapped`. Both are expected here, not faults; the quarantine columns record the
+   uploader for triage.
 3. **Grant the further client sites.** Only now, with the Phase-0 build live and content
    promotion gone, grant the ingestion identity write on each client site that H-7 recorded for
    binding: H-6's runbook, with `AppId="$INGEST_MI_APPID"` and that client's site id. Derive the
@@ -878,7 +897,10 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    step 5 and wait before that client's apply.
 4. **Negative canary: quarantine.** A canary guest bound to no row uploads a synthetic PDF. The
    canary guest is a BCR-controlled outside account, invited as a guest and in no client Team.
-   Expect:
+   Before this and **every later negative canary**, confirm that with the tool (H-7's variables
+   set): `node tools/directory-bindings.mjs check | grep -ci <canary guest's object id>` prints
+   `0`, so the id is on no row and in no Team's guest list. Otherwise stop: the upload would be
+   filed into a client's channel instead of quarantined. Expect:
    - the card says "Dokument przekazano do weryfikacji przez zespół BCR", with no link;
    - the file is on the quarantine site under `Kwarantanna/YYYY/MM/<batchId>/`, with
      `UploaderOid`, `QuarantineReason = unmapped`, `OriginalFilename` and `DocumentId` filled in;
@@ -894,6 +916,10 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    node tools/directory-bindings.mjs propose --confirm-remove-staff <PESKOVOI listItemId> \
      --write-verified <TEST sitePath> --write-verified <PESKOVOI sitePath>
    ```
+
+   `propose` refuses to run without `FORBIDDEN_TARGET_SITE_PATHS`, and skips as
+   `forbidden_target` any row on BCR GROUP, on the quarantine, on another host, or whose site
+   resolves to BCR GROUP's site collection.
 
    It writes a plan under `tools/out/`. The plan holds client data and never leaves that folder.
    Roman and Yahor read it row by row:
@@ -914,8 +940,12 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    ```
 
    The tool prints each row before and after, and writes a rollback log. It refuses a plan older
-   than 24 hours, a row changed since `propose`, and a health endpoint that does not report
-   `build.routing=identity-only`.
+   than 72 hours (`--max-plan-age-hours` can lower that, never raise it), a row changed since
+   `propose`, and a health endpoint that does not report `build.routing=identity-only`. Before
+   each PATCH it reads every guest it is about to bind again: the user must still be a `Guest`,
+   and the Teams in their `memberOf` must be exactly the row's Team. Otherwise the row is
+   `stale` and skipped: run `propose` again. The apply log is a new file every run (an `--out`
+   that exists is refused), written safely before each PATCH; keep every one until H-15.
 7. **Canary on TEST.** The TEST guest uploads a synthetic PDF. Expect:
    - it lands in TEST's `Dokumenty księgowe/…`, visible in the channel's files tab;
    - the card's link opens it there;
@@ -929,42 +959,77 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    - by arrangement, the client's contact sends the synthetic canary file BCR gives them; or
    - BCR's canary guest joins that one client Team for the canary only. At that moment it is in
      no other Team at all, or the tool excludes it (`guest_in_other_team`). Afterwards it
-     leaves, and the tool is run again (`propose`, then `apply`) to take its id off the row.
+     leaves the Team, and its id comes off the row the same way it went on. A plain `propose`
+     is not enough: without `--write-verified` the row is SKIP `write_grant_unknown`, and
+     `apply` refuses a SKIP row. So:
+
+     ```bash
+     node tools/directory-bindings.mjs propose --write-verified <PESKOVOI sitePath>
+     node tools/directory-bindings.mjs apply --plan tools/out/<new plan>.json --only <PESKOVOI listItemId> \
+       --health-url https://$INGEST.azurewebsites.net/api/health      # then again with --apply
+     ```
+
+     The printed after-state must no longer hold the canary's id, and step 4's `check | grep`
+     prints `0` again. Until then, an upload by the canary guest is filed into PESKOVOI's
+     channel, where the client sees it.
 
    Never use a real client document, and never a staff account, because staff go to quarantine
    by design.
 9. **Each further client** granted in step 3: apply, then canary, one at a time.
 10. **Staff.** If you want staff uploads recorded as `staff` rather than `unmapped`, add one
-    `IsAdmin = Yes` row with the staff ids and no target. Staff ids never go on a client row.
+    `IsAdmin = Yes` row with the staff ids and no target, a `ClientId` such as `staff` and
+    `Status` Active (or empty). A row without a `ClientId` is ignored, and staff uploads then stay
+    `unmapped`. Staff ids never go on a client row.
 11. **Undo H-3.** The Phase-0 build has no promotion, so the classifier can run again, unless
     Roman has decided otherwise on the Anthropic transfer ([`security.md` T16](../security.md#t16-transfer-of-document-content-to-anthropic)):
     `az functionapp config appsettings set -g $RG -n $INGEST --settings ANTHROPIC_ENABLED=true -o none`.
-12. **Watch for an hour:**
+12. **Close with the whole plan.** Steps 6–9 applied one row at a time, so run `propose` once
+    more with the same flags as step 5 and apply that plan **without `--only`** (a dry run, then
+    `--apply`). Every PATCH in it is applied, including one that takes an id off another row. The
+    dry run should show no PATCH at all; any it shows is reviewed as in step 5 before it is
+    applied, never skipped. Then run `check`. From now on the
+    [standing checks](#standing-checks) apply.
+13. **Watch for an hour:**
 
 ```bash
 aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
   | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
   | where msg in ("document.filed", "document.quarantined", "document.quarantine_failed",
-      "directory.conflict", "ingestion.caller.rejected")
+      "directory.conflict", "ingestion.caller.rejected",
+      "sharepoint.forbidden_site", "sharepoint.possible_duplicate")
   | summarize count() by msg, reason = tostring(m.quarantineReason), kind = tostring(m.kind)' \
   <start of the window>
 ```
 
 `directory.conflict` should be empty, or explained by a decision from H-7.
 `ingestion.caller.rejected` and `document.quarantine_failed` should be empty.
+**`sharepoint.forbidden_site` must be empty.** It means a Directory row whose site resolved in
+Graph to BCR GROUP's or the quarantine's site collection, however its path was spelled; the
+document was kept out and quarantined as `forbidden_target`. Treat any row as an incident
+indicator: find the Directory row by its `listItemId` and tell Roman.
+`sharepoint.possible_duplicate` means an upload was retried after a network failure and then
+found its name taken, so the client's own folder may hold the same document twice (`name` and
+`name_n`). It never crosses clients; staff compare the two items by `driveItemId` and delete the
+copy.
+
+What each `quarantineReason` means, and what to do:
+
+| Reason | Meaning | Action |
+|---|---|---|
+| `unmapped` | The uploader's id is on no row | Expected for a guest not yet bound; otherwise check the H-7 decision for that client |
+| `unbound_target` | The uploader's one row lacks `RootFolder`, `DriveId` or `TeamId`: the tool has not bound it | Expected until that row's apply; afterwards, run `propose` and apply |
+| `staff` | The uploader is on the `IsAdmin` row | Expected; staff do not upload through the bot in Phase 0 |
+| `conflict` | The id is on two rows, or the row shares a site, `DriveId` or `TeamId` with another row | A person fixes the Directory; `directory.conflict` names the rows |
+| `stale_directory` | The Directory could not be read recently enough, or the row's drive no longer matches its `DriveId` | Check T-5's `directory refresh failed` query and the row |
+| `forbidden_target` | The row names BCR GROUP, the quarantine, another host or a path that is not exactly `/sites/<name>`, or its site resolved to BCR GROUP's or the quarantine's collection (`sharepoint.forbidden_site`) | Never "fix" it by pointing the row elsewhere by hand; tell Roman, run `check` |
+| `target_unwritable` | The client's site could not be written: no grant, or the site or drive is gone | Check that client's grant for `$INGEST_MI_APPID` (step 3) |
+
+A batch that runs longer than 150 seconds returns the documents it had not started as rejected,
+with the generic "spróbuj ponownie" code, rather than uploading them late. The user resends
+those.
 
 **After the window.** Phase 0 has **no alert rule**: alerting comes with the monitoring work in
-Phase 1. A failed quarantine write is fail-closed (the user gets "spróbuj ponownie", nothing is
-written anywhere else), but if the quarantine grant or `QUARANTINE_DRIVE_NAME` breaks, every
-unbound, staff and stale upload is refused and nobody is told. Until Phase 1, Yahor runs this
-every working day. Any row means: check H-6's grant and the quarantine library name first.
-
-```bash
-aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
-  | extend m = parse_json(message) | where tostring(m.msg) == "document.quarantine_failed"
-  | project timestamp, itemCount, quarantineReason = tostring(m.quarantineReason)' \
-  <24 hours ago, UTC>
-```
+Phase 1. Until then the [standing checks](#standing-checks) stand in for it.
 
 **Rollback.**
 
@@ -1057,6 +1122,41 @@ Bicep drift fix (gate G1), not here.
 | App-id pinning is live | `BOT_CALLER_APP_IDS` set (H-8 verify); the `authMiddleware` unit test "rejects the right role held by an app that is not on the allow-list" passes in CI; a live token from another app registration is refused with 403. Such a token lacks `Documents.Ingest`, so the role check refuses it first and logs no `ingestion.caller.rejected`. Do not grant `Documents.Ingest` to a test app to produce one. |
 | Every onboarded client's guest is bound, or quarantined with a known reason | H-7 and H-12 records in the incident's status table |
 | The IR-0 export is stored | H-2 verification |
-| The taxonomy folders at the library root of every client site the ingestion identity could write to are Owners-only | T-4b's status row lists every such site (PESKOVOI, TEST and each site IR-1 added); **Check permissions** for each client's guest returns *None* |
+| The taxonomy folders at the library root of every client site the ingestion identity could write to are Owners-only | T-4b's status row lists every such site (PESKOVOI, TEST and each site IR-1 added); **Check permissions** for each client's guest returns *None*; T-4b's check of the items outside those folders, after IR-1, is recorded for each site |
+| The BCR GROUP root folders are Owners-only, including any created after the first lock | T-4's status row records the lock and the check after H-6b |
+| The canary guest is bound to no row | `check \| grep -ci <canary guest's object id>` prints `0` (H-12 step 4), after the last canary |
+| The whole binding plan is applied, and the standing checks run | A `propose` at exit shows no PATCH row (every row NOOP, or SKIP with a recorded decision); the first weekly `check` is recorded in the incident's status table ([standing checks](#standing-checks)) |
 | `CLAUDE.md` is updated | Merged with the promotion removal |
 | CI runs coverage, green | The CI run on `main` |
+
+### Standing checks
+
+**Owner:** Yahor. **From:** H-12, until Phase 2 replaces the Directory.
+
+Phase 0 checks a guest's Team membership only when `propose` and `apply` bind a row, and it has
+no alert rule. Ingestion routes on the Directory row alone. So a bound guest who is later added
+to a second client's Team keeps routing everything, the second company's documents included,
+into the first client's channel, and nothing notices. That is an ordinary business event: one
+person running two companies. Onboarding invites the same email, gets the same guest back, adds
+it to the new Team, and writes the new row with no user ids, so no conflict is raised either.
+These checks close that gap by schedule until the robust fix, a runtime `memberOf` check (or a
+membership registry kept in sync), lands in Phase 2. Onboarding writing the guest's id into the
+new row itself (R1) waits on Roman's re-ruling of Q21.
+
+| When | What | Why |
+|---|---|---|
+| After **any** onboarding | `propose` with H-12 step 5's flags, reviewed, then `apply` of the **whole** plan (a dry run, then `--apply`): never `--only <new row>` | The whole plan carries the PATCH that takes a reused guest's id off the first client's row. A guest in two Teams is then bound to neither, and their uploads go to quarantine until a person decides |
+| **Weekly**, and after any onboarding that reuses an existing guest | `check`. A row id marked *not eligible* (now in another Team, or no longer in the row's Team), or a guest reported as `guest_in_other_team`, means: `propose` and apply the whole plan the same day | Catches Team changes made outside onboarding, and a guest who left their client's Team but can still file into its channel |
+| Before any negative canary | H-12 step 4's `check \| grep -ci <canary guest's object id>` prints `0` | A canary guest left on a row files into that client's channel |
+| Every working day | The query below. A `document.quarantine_failed` row means: check H-6's grant and the quarantine library name first. A `sharepoint.forbidden_site` row is an incident indicator (H-12 step 13) | A failed quarantine write is fail-closed (the user gets "spróbuj ponownie", nothing is written anywhere else), but if the quarantine grant or `QUARANTINE_DRIVE_NAME` breaks, every unbound, staff and stale upload is refused and nobody is told |
+
+```bash
+aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
+  | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
+  | where msg in ("document.quarantine_failed", "sharepoint.forbidden_site")
+  | project timestamp, itemCount, msg, quarantineReason = tostring(m.quarantineReason)' \
+  <24 hours ago, UTC>
+```
+
+Record the date of each weekly `check` and each post-onboarding apply, with the apply log's
+hash, in the incident's status table.
