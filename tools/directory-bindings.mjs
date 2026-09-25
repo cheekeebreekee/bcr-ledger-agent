@@ -254,18 +254,33 @@ export async function main(argv, deps = {}) {
       }),
   };
 
-  switch (command) {
-    case 'check':
-      return runCheck(ctx);
-    case 'propose':
-      return runPropose(ctx);
-    case 'apply':
-      return runApply(ctx);
-    case 'rollback':
-      return runRollback(ctx);
-    default:
-      return runAddColumns(ctx);
+  const run = {
+    check: runCheck,
+    propose: runPropose,
+    apply: runApply,
+    rollback: runRollback,
+    'add-columns': runAddColumns,
+  }[command];
+  try {
+    return await run(ctx);
+  } catch (err) {
+    throw withConsentHint(err);
   }
+}
+
+/**
+ * A 403 that stops a whole command (the Teams listing, the Directory list)
+ * is most often a delegated permission the app registration behind
+ * GRAPH_TOKEN was never admin-consented for. Say so, next to Graph's own words.
+ */
+function withConsentHint(err) {
+  if (!(err instanceof GraphError) || err.status !== 403) return err;
+  return new CliError(
+    `${err.message}\n  Graph refused this request (403). Most often the app registration that ` +
+      'issued GRAPH_TOKEN lacks admin consent for a delegated permission this command needs ' +
+      '(tools/README.md, "Authentication"). For a site or the Directory list, the signed-in ' +
+      'person may also lack access to it.',
+  );
 }
 
 // ---------------------------------------------------------------------------

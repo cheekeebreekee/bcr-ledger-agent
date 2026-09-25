@@ -280,6 +280,18 @@ describe('directory-bindings check', () => {
     await assert.rejects(h.run(['chek']), /unknown command/);
   });
 
+  test('a 403 that stops the whole run says the app registration lacks consent', async () => {
+    const h = harness({
+      intercept: async (url, init, next) => (pathOf(url) === '/groups' ? denied() : next(url, init)),
+    });
+    await assert.rejects(h.run(['check', ...DIR_ARGS]), (err) => {
+      assert.ok(err instanceof CliError);
+      assert.match(err.message, /GET \/groups → 403 accessDenied/);
+      assert.match(err.message, /Graph refused this request \(403\)[\s\S]*lacks admin consent/);
+      return true;
+    });
+  });
+
   test('refuses to run without the directory ids or the token', async () => {
     const h = harness();
     await assert.rejects(h.run(['check']), /not named/);

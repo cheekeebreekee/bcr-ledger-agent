@@ -51,11 +51,29 @@ export GRAPH_TOKEN=$(node tools/graph-login.mjs)
 
 | Command | Delegated permissions |
 |---|---|
-| `directory-bindings.mjs check` / `propose` | `Sites.Read.All`, `Group.Read.All`, `GroupMember.Read.All`, `User.Read.All`, `Channel.ReadBasic.All`. Optional: `Sites.FullControl.All`, to read site permissions. Without it the write grant is "unknown" until you verify it read-only (see [Unknown write grant](#propose)). |
-| `directory-bindings.mjs apply` | `Sites.ReadWrite.All`, plus edit rights on the Client Directory list (it has unique permissions). Also `User.Read.All`, `GroupMember.Read.All` and `Group.Read.All`: apply re-reads every guest it binds |
-| `directory-bindings.mjs rollback` | `Sites.ReadWrite.All`, plus edit rights on the Client Directory list |
-| `directory-bindings.mjs --add-columns --apply` | `Sites.Manage.All` |
+| `directory-bindings.mjs check` / `propose` | `User.Read.All` (each id's `userType`), `GroupMember.Read.All` (a Team's members and owners, each guest's `memberOf`), `Group.Read.All` (the list of Teams), `Channel.ReadBasic.All` (the channels), `Sites.Read.All` (the Directory list, each Team's root site, the rows' sites, drives and channel folders). Optional: `Sites.FullControl.All`, to read site permissions. Without it the write grant is "unknown" until you verify it read-only (see [Unknown write grant](#propose)). |
+| `directory-bindings.mjs apply` | `Sites.ReadWrite.All` or `Sites.Manage.All`, plus edit rights on the Client Directory list (it has unique permissions). Also `User.Read.All`, `GroupMember.Read.All` and `Group.Read.All`: apply re-reads every guest it binds |
+| `directory-bindings.mjs rollback` | `Sites.ReadWrite.All` or `Sites.Manage.All`, plus edit rights on the Client Directory list. Also `User.Read.All`, `GroupMember.Read.All` and `Group.Read.All`: rollback re-reads every id it would put back |
+| `directory-bindings.mjs --add-columns --apply` | `Sites.Manage.All` (it creates the columns) |
 | `inventory-misfiled.mjs` | `Sites.Read.All` (or `Files.Read.All`), and the signed-in person must be an **Owner or site collection admin of every site walked**. After T-4/T-4b only the site Owners can open the root taxonomy folders, and SharePoint leaves a folder the caller cannot open out of a listing without an error: with a member's token the locked folders, and every file in them, are silently missing. See [IR-1](#inventory-misfiledmjs-ir-1) |
+
+For `directory-bindings.mjs`, the registration therefore needs these delegated
+Graph permissions, each **admin-consented** by a Global Admin once:
+`User.Read.All`, `GroupMember.Read.All`, `Group.Read.All`,
+`Channel.ReadBasic.All`, `Sites.Read.All`, and `Sites.Manage.All` (which also
+covers the list writes of `apply`, `rollback` and `--add-columns`). The tool
+prints the token's scopes (`scopes`) at the start of every run: compare them
+with this list before you start.
+
+**A 403 from the tool means missing consent on that app registration.** A
+permission that was added but not admin-consented, or never added, is refused
+by Graph with 403 on the first request that needs it. When that request is one
+the whole command depends on (the list of Teams, the Directory list),
+`directory-bindings.mjs` stops and says so. When it is one row's read (a site,
+a Team's members), that row shows it on its SKIP line, and `check` exits 4 if
+the row is bound and holds user ids (see [Exit codes](#check)). The fix is the same: consent the permission on the
+registration, then get a new token. A 403 on one site only can also mean the
+signed-in person cannot open that site.
 
 `GRAPH_TOKEN` expires in about an hour. The tools print who the token belongs
 to and when it expires, and they refuse an expired token.
