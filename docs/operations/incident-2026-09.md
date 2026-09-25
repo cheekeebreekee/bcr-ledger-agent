@@ -654,7 +654,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-10: manifest 0.2.0 and availability (T-10) | Teams Admin | todo | | |
 | H-11: gate `enforce` after 24 h clean | Yahor | todo | | |
 | H-12: ingestion deploy, further site grants, bindings, canaries | Yahor, Roman reviews | todo | | apply log hash; sha256 of the saved pre-Phase-0 ingestion package |
-| H-13: ingestion grant on BCR GROUP downgraded to `read` | Global Admin | todo | | |
+| H-13: ingestion grant on BCR GROUP downgraded to `read` | Global Admin | todo | | any other application `write`/`owner` entry on BCR GROUP (application id and roles), and Roman's decision on it |
 | H-14: `FALLBACK_*` settings removed, pre-Phase-0 packages deleted | Yahor | todo | | |
 | IR-2 relocation complete, allow-lists issued | Roman + second person | todo | | |
 | IR-3: phase-2 notices to every affected client | Roman + IOD | todo | | |

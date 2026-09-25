@@ -596,11 +596,37 @@ with manifest 0.2.0 (see
 [`human-steps.md`](human-steps.md#h-10-upload-manifest-020-and-set-availability)). Step 2's case
 for *Everyone* relies on T-1 being done.
 
+**Build the package first** (Yahor, from the repo root; the Teams Administrator only uploads
+it). There is no ready-made zip in the repo: the `artifacts/teams-app.zip` that used to be
+committed was manifest 0.1.5, with team and group-chat scopes and the "Moje dokumenty" tab, and
+must never be uploaded. `teams-app/manifest.json` holds `REPLACE-WITH-BOT-APP-ID` in `id` and
+`bots[0].botId`. Both become the bot's app id, which is also the id of the "Asystent BCR" app
+already in the catalog. **[verify]** in the admin centre that the existing app's *App ID* is
+that value before uploading; if it differs, stop, because the upload would create a second
+app. The build works on a copy, so the tracked manifest keeps its placeholders.
+
+```bash
+# RG and BOT as in human-steps.md → Variables
+BOT_APP_ID=$(az functionapp config appsettings list -g $RG -n $BOT \
+  --query "[?name=='MICROSOFT_APP_ID'].value | [0]" -o tsv)
+T=$(mktemp -d)
+sed "s/REPLACE-WITH-BOT-APP-ID/$BOT_APP_ID/g" teams-app/manifest.json > "$T/manifest.json"
+cp teams-app/color.png teams-app/outline.png "$T/"
+grep -c REPLACE-WITH "$T/manifest.json"                        # must print 0
+OUT="$PWD/artifacts/teams-app.zip"; mkdir -p artifacts; rm -f "$OUT"
+(cd "$T" && zip -X "$OUT" manifest.json color.png outline.png)
+unzip -p "$OUT" manifest.json | jq -r \
+  '.version, (.bots[0].scopes | join(",")), (.staticTabs // [] | length), (.id == .bots[0].botId)'
+```
+
+The last command must print `0.2.0`, `personal`, `0` and `true`, one per line. Anything else:
+do not upload it.
+
 **Change.** In the Teams admin centre:
 
-1. **Teams apps → Manage apps → Asystent BCR → Upload file**, and select `artifacts/teams-app.zip`
-   built from manifest 0.2.0. That version has personal scope only and no tab. If the app is not
-   in the catalog yet, use **Upload new app** instead.
+1. **Teams apps → Manage apps → Asystent BCR → Upload file**, and select the
+   `artifacts/teams-app.zip` just built and checked. That version has personal scope only and no
+   tab. If the app is not in the catalog yet, use **Upload new app** instead.
 2. **Asystent BCR → Users and groups → Available to**: choose **Everyone**. This is the
    Phase-0 choice. The gate is the control: it refuses anything that is not a 1:1 chat from the
    BCR tenant with a valid user id, and T-1 has already blocked the `{NIP}@` accounts.
@@ -622,13 +648,15 @@ for *Everyone* relies on T-1 being done.
    older installs may remain. **[verify]** On each client team: **Manage team → Apps → Asystent
    BCR → Uninstall**. The gate already refuses those installs.
 
-**Verify.** The TEST guest finds "Asystent BCR", opens the chat and gets the help card, and so
-does PESKOVOI's guest when they next use it. Only if availability was later restricted: a staff
-account outside the groups cannot install the app.
+**Verify.** The admin centre shows version **0.2.0** for Asystent BCR. The TEST guest finds
+"Asystent BCR", opens the chat and gets the help card, and so does PESKOVOI's guest when they
+next use it. Only if availability was later restricted: a staff account outside the groups
+cannot install the app.
 
-**Rollback.** Upload the previous package, and set availability back to what it was. ⚠️ The
-previous package brings back the "Moje dokumenty" tab. After the Phase-0 bot deploy that tab only
-shows a static page, but use it only in an emergency.
+**Rollback.** Set availability back to what it was. Do not upload an older package: 0.1.5
+brings back team and group-chat installs and the "Moje dokumenty" tab. If 0.2.0 itself is
+broken, fix `teams-app/manifest.json`, raise its `version` (0.2.1), and build, check (for the
+new version, still `personal` and `0`) and upload that the same way.
 
 ---
 
@@ -653,4 +681,4 @@ laptops (`.env`) are an accepted risk, recorded in
 | T-7 | Roman decides | | | Explained / removed |
 | T-8 | | | | TEST invite checked |
 | T-9 | Roman confirms tenant level | | | TEST guest checked |
-| T-10 | | | | Everyone (Phase 0) |
+| T-10 | | | | Everyone (Phase 0); version 0.2.0 shown; sha256 of the uploaded zip |

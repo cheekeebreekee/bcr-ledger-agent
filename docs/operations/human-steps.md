@@ -55,6 +55,9 @@ APPI=appi-bcr-dev-<suffix>
 SP_HOST=<tenant>.sharepoint.com
 BOT_APP_ID=$(az functionapp config appsettings list -g $RG -n $BOT \
   --query "[?name=='MICROSOFT_APP_ID'].value | [0]" -o tsv)
+# The ingestion Function App's managed identity, as an application id. Ingestion calls Graph
+# only as this identity, so every SharePoint grant and every grant check below uses it, never
+# the ingestion API app registration's client id (INGESTION_APP_ID in the setup guide).
 INGEST_MI_APPID=$(az ad sp show --id "$(az functionapp identity show -g $RG -n $INGEST \
   --query principalId -o tsv)" --query appId -o tsv)
 
@@ -359,14 +362,21 @@ Get-SPOSiteGroup -Site https://<tenant>.sharepoint.com/sites/BCRLedgerKwarantann
 Add-SPOUser -Site https://<tenant>.sharepoint.com/sites/BCRLedgerKwarantanna -LoginName <upn> -Group '<Owners group title>'
 ```
 
-**Library columns.** After each upload, ingestion writes four columns on the quarantined item, so
-triage can decide from the uploader's identity rather than from content. They must exist, with
-exactly these names, as single lines of text:
+**The site's ids,** read-only, once the site exists (by either route). The manual columns
+below, H-5's Verify and H-6 use them, so set them in every shell that runs those steps. The
+script prints the site id too, but never paste an id by hand:
 
 ```bash
 Q_SITE=$(g "$G/sites/$SP_HOST:/sites/BCRLedgerKwarantanna?\$select=id" | jq -r .id)
 Q_LIST=$(g "$G/sites/$Q_SITE/drive/list?\$select=id" | jq -r .id)
 g "$G/sites/$Q_SITE/drive?\$select=name"          # the library name; on this tenant, Dokumenty
+```
+
+**Library columns.** After each upload, ingestion writes four columns on the quarantined item, so
+triage can decide from the uploader's identity rather than from content. They must exist, with
+exactly these names, as single lines of text:
+
+```bash
 for C in UploaderOid QuarantineReason OriginalFilename DocumentId; do
   g -X POST "$G/sites/$Q_SITE/lists/$Q_LIST/columns" -d "{\"name\":\"$C\",\"text\":{}}"
 done
@@ -394,7 +404,21 @@ Roman and the lawyer to confirm.
 
 The onboarding repo's runbook `Grant-TeamSiteAccess.ps1` makes the grant. It runs in the
 onboarding Automation account, whose identity holds `Sites.FullControl.All`. A person starts the
-job; no ledger identity gets any role on that account.
+job; no ledger identity gets any role on that account. It is the only grant path:
+`infrastructure/grant-sharepoint-permission.sh` has been deleted, because it wrote a grant on
+every run, with no dry run, to the API app registration by default.
+
+**First, the site id,** in this shell: set `Q_SITE` as in H-5 (*The site's ids*), never by
+pasting one. The runbook writes to whatever site the id names, so check that it is the
+quarantine site and not BCR GROUP:
+
+```bash
+g "$G/sites/$Q_SITE?\$select=webUrl" | jq -r .webUrl       # must end in /sites/BCRLedgerKwarantanna
+DIR_SITE=$(az functionapp config appsettings list -g $RG -n $INGEST \
+  --query "[?name=='CLIENT_DIRECTORY_SITE_ID'].value | [0]" -o tsv)
+[ "$(cut -d, -f2 <<<"$Q_SITE")" != "$(cut -d, -f2 <<<"$DIR_SITE")" ] \
+  && echo 'not BCR GROUP: go on' || echo 'STOP: that is BCR GROUP'
+```
 
 ```bash
 az automation runbook start -g rg-bcr-onboarding-dev --automation-account-name aa-bcr-onboarding-dev \
@@ -402,8 +426,10 @@ az automation runbook start -g rg-bcr-onboarding-dev --automation-account-name a
   AppDisplayName="BCR ledger ingestion"
 ```
 
-`AppId` is the managed identity's *application* id, not its object id. The variables above
-derive it, so nobody types a GUID.
+`AppId` is the ingestion managed identity's *application* id (`$INGEST_MI_APPID`), not its
+object id, and never the ingestion API app registration's client id: ingestion calls Graph only
+as its managed identity, so a grant to the app registration does nothing for it. The variables
+above derive it, so nobody types a GUID.
 
 **Verify.** The job output is one JSON line with `"outcome": "granted"` (or `"exists"`). Per-site
 grants take about 5 minutes to take effect. The functional proof is the quarantine canary in
@@ -508,7 +534,9 @@ For every row, `check` reports:
 **Write grants read "unknown" with this token,** because reading site permissions needs
 `Sites.FullControl.All`. Verify each one **read-only**: in Graph Explorer, with
 `Sites.FullControl.All` consented (see [`admin-sharepoint-grant.md`](../admin-sharepoint-grant.md)),
-`GET /sites/{site-id}/permissions` must show a `write` role for the ingestion identity's app id.
+`GET /sites/{site-id}/permissions` must show a `write` role for `$INGEST_MI_APPID`, the
+ingestion managed identity's app id. A `write` entry for any other app, the ingestion API app
+registration included, does not count: ingestion never calls Graph as it.
 Then pass that site to `propose` with `--write-verified` (H-12 step 5). Do **not** "verify" by
 running `Grant-TeamSiteAccess.ps1`: when it finds no write grant it **creates** one. Never point
 it at BCR GROUP, where it would undo H-13.
@@ -557,9 +585,24 @@ recorded decision. **Rollback.** Delete the two columns; they are empty until H-
 
 **Owner:** Yahor. **When:** day 1, after H-5, and **before any deploy**.
 
-The Phase-0 build refuses to start without these settings, and the bot's gate defaults to
-`enforce`. So they go in first. The code running now ignores settings it does not know, so
-adding them early is harmless. `appsettings set` merges; it never removes a setting.
+The Phase-0 build refuses to start without these settings, or with one in the wrong shape (see
+the table), and the bot's gate defaults to `enforce`. So they go in first. The running ingestion
+ignores settings it does not know, so adding its settings early is harmless. `appsettings set`
+merges; it never removes a setting.
+
+The running bot is different for one setting: the pre-Phase-0 bot already reads
+`MICROSOFT_APP_TYPE`, with a `MultiTenant` default. Read it before changing it, and note the
+value:
+
+```bash
+az functionapp config appsettings list -g $RG -n $BOT -o tsv \
+  --query "[?name=='MICROSOFT_APP_TYPE'].value | [0]"          # empty means not set
+```
+
+If it reads `SingleTenant`, setting it below changes nothing. Anything else, or nothing, makes
+the set below a live change to the running bot's Bot Framework authentication: right after it,
+the TEST guest sends `pomoc` and the help card must come back. If it does not, restore the noted
+value (or delete the setting, if it was not set) and stop.
 
 ```bash
 az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
@@ -578,10 +621,12 @@ az functionapp config appsettings set -g $RG -n $BOT -o none --settings \
 
 | Setting | Why this value |
 |---|---|
-| `BOT_CALLER_APP_IDS` | The bot's app id, read from the bot's own settings. Only this app may call ingestion. |
-| `QUARANTINE_*` | The site from H-5. `Dokumenty` because the site was created with the Polish locale; use what H-5's drive read returned. |
-| `FORBIDDEN_TARGET_SITE_PATHS` | BCR GROUP. No Directory row may ever route there. The code adds the quarantine path itself. |
+| `BOT_CALLER_APP_IDS` | The bot's app id, read from the bot's own settings. Only this app may call ingestion. Each entry must be a GUID. |
+| `QUARANTINE_SITE_HOSTNAME` | The tenant's SharePoint host, `<tenant>.sharepoint.com`: lower case, no `https://`, no path. It is **also the only host a Directory row may name**: a row whose `SiteHostname` differs is excluded (`forbidden_target`) and its users are quarantined. A wrong value therefore quarantines every client, as well as breaking the quarantine itself. |
+| `QUARANTINE_SITE_PATH`, `QUARANTINE_DRIVE_NAME`, `QUARANTINE_ROOT_FOLDER` | The site from H-5. The path must be exactly `/sites/<name>`. `Dokumenty` because the site was created with the Polish locale; use what H-5's drive read returned. |
+| `FORBIDDEN_TARGET_SITE_PATHS` | BCR GROUP. No Directory row may ever route there. Each entry must be exactly `/sites/<name>` or `/teams/<name>`. The code adds the quarantine path itself, and also refuses any row whose site resolves in Graph to BCR GROUP's or the quarantine's site collection (`sharepoint.forbidden_site`, quarantined as `forbidden_target`). |
 | `CLIENT_DIRECTORY_MAX_STALE_MS` | 15 minutes. After that, a directory that cannot be refreshed routes nothing. |
+| `CLIENT_DIRECTORY_SITE_ID` (already set, not changed here) | Must be the three-part Graph id, `<host>,<guid>,<guid>`. The Phase-0 build refuses any other form at cold start, because its BCR GROUP guard compares site-collection GUIDs taken from it. |
 | `BOT_GATE_MODE=log` | For the first 24 hours the gate records refusals but lets turns through (H-11). |
 | `MICROSOFT_APP_TYPE` | Now required. `SingleTenant`, because the bot's app registration is single-tenant. |
 
@@ -594,8 +639,29 @@ az functionapp config appsettings list -g $RG -n $BOT -o table --query \
   "[?name=='BOT_GATE_MODE' || name=='MICROSOFT_APP_TYPE'].{name:name,value:value}"
 ```
 
+The shapes the Phase-0 build checks at cold start, checked now, while a wrong value costs
+nothing. This must print nothing:
+
+```bash
+az functionapp config appsettings list -g $RG -n $INGEST -o json --query \
+  "[?name=='CLIENT_DIRECTORY_SITE_ID' || name=='QUARANTINE_SITE_HOSTNAME' || name=='BOT_CALLER_APP_IDS'].{name:name,value:value}" \
+  | jq -r '.[] | select(
+      (.name == "CLIENT_DIRECTORY_SITE_ID"
+        and (.value | test("^[a-z0-9.-]+,[0-9a-f-]{36},[0-9a-f-]{36}$"; "i") | not))
+      or (.name == "QUARANTINE_SITE_HOSTNAME"
+        and (.value | test("^[a-z0-9-]+\\.sharepoint\\.com$"; "i") | not))
+      or (.name == "BOT_CALLER_APP_IDS"
+        and (.value | split(",") | map(gsub("^\\s+|\\s+$"; ""))
+             | all(test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"; "i")) | not))
+    ) | "wrong shape: \(.name)"'
+```
+
+If you changed `MICROSOFT_APP_TYPE`, the TEST guest's `pomoc` came back.
+
 **Rollback.** `az functionapp config appsettings delete -g $RG -n <app> --setting-names <names> -o none`.
-Only needed if a value was wrong. The code running now does not read these settings.
+Only needed if a value was wrong. The running ingestion does not read its new settings. The
+running bot does read `MICROSOFT_APP_TYPE`: restore the value noted above, or delete the
+setting if it was not set.
 
 ### H-9: Deploy the bot with the gate in log mode
 
@@ -631,9 +697,20 @@ URL to fetch: download the running content from Kudu
 Owner) **[verify]** into the same folder. Do not deploy without a saved copy.
 
 **2. Build a fresh package.** The `package` script (`tools/package-function.mjs`) builds a new
-zip every time: a fresh staging folder, production dependencies only, and `@bcr/shared` copied
-from the `packages/shared/dist` that `yarn build` has just produced. It fails if that copy lacks
-the Phase-0 config.
+zip every time:
+
+- it deletes `artifacts/<pkg>.zip` before anything else, so a run that fails leaves no zip at
+  the deploy path rather than an old one;
+- it cleans `dist` and the `tsbuildinfo` files and builds again, and refuses any `dist/**/*.js`
+  (the app's or `@bcr/shared`'s) that has no `src/**/*.ts` behind it, so the output of a deleted
+  source file cannot ship. The zip carries no source maps, type files or build info;
+- it installs production dependencies at the exact versions in `yarn.lock`, with install
+  scripts disabled, and checks each top-level version against the tested `node_modules`;
+- it vendors `@bcr/shared` from the `packages/shared/dist` just built, and fails if that copy
+  lacks the Phase-0 config.
+
+The zips are not in git (`artifacts/*.zip` is ignored), so a `git checkout`, `git restore` or
+`git stash` cannot bring a pre-Phase-0 zip back to that path. Never take a zip from git history.
 
 ```bash
 corepack yarn install --immutable
@@ -710,10 +787,16 @@ with the gate itself, use H-11's rollback (`BOT_GATE_MODE=log`).
 Follow [T-10 in tenant-hardening](tenant-hardening.md#t-10-teams-app-availability-for-the-bot),
 with availability set to **Everyone**: in Phase 0 nothing adds client guests to a group, so a
 restricted list would lock PESKOVOI's and the TEST guest out. The case for *Everyone* relies on
-T-1 being done. Version 0.2.0 has personal scope
-only and no "Moje dokumenty" tab. Tell the clients before they
-see the change: the tab disappears, and a document the bot cannot place now says "Dokument
-przekazano do weryfikacji przez zespół BCR" instead of showing a link.
+T-1 being done. Version 0.2.0 has personal scope only and no "Moje dokumenty" tab.
+
+The package is built fresh from `teams-app/manifest.json`, with the bot's app id put in for the
+placeholders, and checked before upload: T-10's *Build the package first* has the commands.
+Yahor runs them and hands the zip to the Teams Administrator. There is no ready-made
+`artifacts/teams-app.zip` in the repo any more; the one that used to be there was manifest
+0.1.5, with team and group-chat scopes and the tab, and must never be uploaded.
+
+Tell the clients before they see the change: the tab disappears, and a document the bot cannot
+place now says "Dokument przekazano do weryfikacji przez zespół BCR" instead of showing a link.
 
 **Verify and rollback:** as in T-10.
 
@@ -776,7 +859,9 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    ```
 
    A count of `0` means a pre-Phase-0 `@bcr/shared`: that build fails at cold start, because the
-   old schema requires `FALLBACK_SITE_*`. Do not deploy it. The package saved first is the
+   old schema requires `FALLBACK_SITE_*`. Do not deploy it. The `package` script cleans `dist`,
+   deletes the old zip first and builds a new one (H-9 step 2), so after a failed run there is
+   no zip at all: build again, and never take a zip from git. The package saved first is the
    pre-Phase-0 build: it is a record of what ran, and **never** a rollback (standing rules).
 2. **Check that it is the Phase-0 build.**
    `curl -s https://$INGEST.azurewebsites.net/api/health` reports the Phase-0 build:
@@ -785,10 +870,12 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    `build.routing=identity-only`. `--expect-health` only adds further checks.
 3. **Grant the further client sites.** Only now, with the Phase-0 build live and content
    promotion gone, grant the ingestion identity write on each client site that H-7 recorded for
-   binding: H-6's runbook, with that client's site id. Then confirm each grant read-only, as in
-   H-7 (`GET /sites/{site-id}/permissions` shows `write` for the ingestion app id). Per-site
-   grants take about 5 minutes to take effect, so make them before step 5 and wait before that
-   client's apply.
+   binding: H-6's runbook, with `AppId="$INGEST_MI_APPID"` and that client's site id. Derive the
+   id from the row's `SitePath` (`g "$G/sites/$SP_HOST:<SitePath>?\$select=id" | jq -r .id`),
+   never paste one, and check it as H-6 checks the quarantine's: it must not be BCR GROUP's. Then
+   confirm each grant read-only, as in H-7 (`GET /sites/{site-id}/permissions` shows `write` for
+   `$INGEST_MI_APPID`). Per-site grants take about 5 minutes to take effect, so make them before
+   step 5 and wait before that client's apply.
 4. **Negative canary: quarantine.** A canary guest bound to no row uploads a synthetic PDF. The
    canary guest is a BCR-controlled outside account, invited as a guest and in no client Team.
    Expect:
@@ -900,14 +987,21 @@ ability as well.
 
 ```
 GET   https://graph.microsoft.com/v1.0/sites/<bcr-group-site-id>/permissions
-      → the entry whose grantedToIdentitiesV2.application.id is the ingestion identity's app id
+      → the entry whose grantedToIdentitiesV2.application.id is $INGEST_MI_APPID,
+        the ingestion managed identity's app id
 PATCH https://graph.microsoft.com/v1.0/sites/<bcr-group-site-id>/permissions/<permissionId>
       {"roles":["read"]}
 ```
 
-**Verify.** The GET shows `"roles": ["read"]`. For the next 30 minutes, the query from T-5
-(`directory refresh failed`) returns nothing, and an upload by the TEST guest still files
-correctly.
+**Verify.** The GET shows `"roles": ["read"]` for `$INGEST_MI_APPID`. For the next 30 minutes,
+the query from T-5 (`directory refresh failed`) returns nothing, and an upload by the TEST guest
+still files correctly.
+
+Read the rest of that GET too. Any other `write` or `owner` entry for an application, such as
+an old grant to the ingestion API app registration (which the setup guide once told people to
+make), is not a credential ingestion uses, but it is write access to BCR GROUP. Record each one
+(its application id and roles, no more) in the incident's status table for Roman to decide on
+its removal. This step changes only the ingestion managed identity's entry.
 
 If Graph Explorer refuses the PATCH, leave the grant as it is. The code-level forbidden target
 still holds. Record the refusal in the status table, and do not delete the grant as a
@@ -937,6 +1031,11 @@ rm tools/out/rollback/teams-bot-before-p0.zip tools/out/rollback/document-ingest
 If a pre-Phase-0 package was running from a blob uploaded by hand (lesson 19), delete that blob
 from `function-releases` too. Its SAS cannot be revoked without rotating the storage key, and
 rotation is deferred.
+
+The July packages that used to be committed under `artifacts/` are no longer tracked:
+`artifacts/*.zip` is ignored, and those builds remain only in git history (`cbf1630`), for
+forensics. Never deploy anything extracted from there with `git show`: a package is always
+built fresh by the `package` script and checked as in H-9 step 3 and H-12 step 1.
 
 **Verify.** `az functionapp config appsettings list -g $RG -n $INGEST --query "[?starts_with(name,'FALLBACK_')]" -o table`
 is empty, and `/api/health` answers. **Rollback.** Not needed: the settings and the packages are
