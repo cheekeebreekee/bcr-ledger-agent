@@ -479,12 +479,12 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-5, H-6: quarantine site and ingestion write grant | SharePoint Admin, Global Admin | todo | | |
 | H-7: Directory check; duplicate `0002` resolved; per-row decisions | Yahor, Roman | todo | | |
 | H-8: app settings added | Yahor | todo | | |
-| H-9: bot deploy, gate in `log` | Yahor | todo | | |
+| H-9: bot deploy, gate in `log` | Yahor | todo | | sha256 of the saved pre-Phase-0 bot package |
 | H-10: manifest 0.2.0 and availability (T-10) | Teams Admin | todo | | |
 | H-11: gate `enforce` after 24 h clean | Yahor | todo | | |
-| H-12: ingestion deploy, bindings, canaries | Yahor, Roman reviews | todo | | apply log hash |
+| H-12: ingestion deploy, bindings, canaries | Yahor, Roman reviews | todo | | apply log hash; sha256 of the saved pre-Phase-0 ingestion package |
 | H-13: ingestion grant on BCR GROUP downgraded to `read` | Global Admin | todo | | |
-| H-14: `FALLBACK_*` settings removed | Yahor | todo | | |
+| H-14: `FALLBACK_*` settings removed, pre-Phase-0 packages deleted | Yahor | todo | | |
 | IR-2 relocation complete, allow-lists issued | Roman + second person | todo | | |
 | IR-3: phase-2 notices to every affected client | Roman + IOD | todo | | |
 | IR-3 (3): UODO decision for BCR-controlled data recorded | Roman + IOD | todo | | |

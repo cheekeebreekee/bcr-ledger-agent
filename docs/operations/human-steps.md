@@ -390,11 +390,57 @@ The bot goes first because the Phase-0 ingestion rejects any batch without
 `conversationType: 'personal'`, and only the new bot sends it. The new bot also stops calling
 `/api/user-target`, removes the tab's data, and shows no model text on cards.
 
-```bash
-corepack yarn install --immutable && corepack yarn build && corepack yarn test
-corepack yarn workspace @bcr/teams-bot package                 # → artifacts/teams-bot.zip
+**1. Save the package that is running now, before you build.** It is the bot's rollback until
+H-12. `WEBSITE_RUN_FROM_PACKAGE` usually holds a blob URL with a SAS token, which is a
+credential: it goes into a variable and is never printed, pasted or logged (lesson 19 in
+`PROJECT_OVERVIEW.md`). Do not run this with `set -x`.
 
-# How is the app running its code? Print only the scheme, never the value (it can hold a SAS token).
+```bash
+mkdir -p tools/out/rollback && chmod 700 tools/out/rollback      # tools/out is git-ignored
+save_running() {   # $1 = app name, $2 = file name. Prints neither the URL nor its token.
+  local url
+  url=$(az functionapp config appsettings list -g $RG -n "$1" \
+    --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'].value | [0]" -o tsv)
+  case "$url" in
+    https://*) curl -sSf -o "tools/out/rollback/$2" "$url" && chmod 600 "tools/out/rollback/$2" \
+                 && shasum -a 256 "tools/out/rollback/$2" ;;
+    *) echo "WEBSITE_RUN_FROM_PACKAGE is not a URL ('${url:0:1}'): see below" ;;
+  esac
+}
+save_running $BOT teams-bot-before-p0.zip
+```
+
+Write the sha256 in the incident's status table. If the setting is `1` or empty, there is no
+URL to fetch: download the running content from Kudu
+(`https://<app>.scm.azurewebsites.net/api/zip/site/wwwroot/`, signed in as a subscription
+Owner) **[verify]** into the same folder. Do not deploy without a saved copy.
+
+**2. Build a fresh package.** The `package` script (`tools/package-function.mjs`) builds a new
+zip every time: a fresh staging folder, production dependencies only, and `@bcr/shared` copied
+from the `packages/shared/dist` that `yarn build` has just produced. It fails if that copy lacks
+the Phase-0 config.
+
+```bash
+corepack yarn install --immutable
+rm -rf packages/*/node_modules/@bcr/shared                     # lesson 15
+corepack yarn build && corepack yarn test
+corepack yarn build && corepack yarn workspace @bcr/teams-bot package   # → artifacts/teams-bot.zip
+```
+
+**3. Check the zip before deploying it.** The count must be greater than 0:
+
+```bash
+unzip -p artifacts/teams-bot.zip node_modules/@bcr/shared/dist/config.js | grep -c botGateMode
+```
+
+`0`, or an unzip error, means the zip carries a pre-Phase-0 `@bcr/shared`. That bot silently
+ignores `BOT_GATE_MODE` and enforces from the first minute, so the 24-hour log window never
+happens. Do not deploy it; rebuild.
+
+**4. Deploy the zip,** code only. How is the app running its code? Print only the scheme, never
+the value:
+
+```bash
 az functionapp config appsettings list -g $RG -n $BOT \
   --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'].value | [0]" -o tsv | cut -c1-8
 ```
@@ -402,14 +448,23 @@ az functionapp config appsettings list -g $RG -n $BOT \
 - **`1`, or nothing:** deploy the zip.
   `az functionapp deployment source config-zip -g $RG -n $BOT --src artifacts/teams-bot.zip`.
   Retry once if the upload flakes (lesson 7 in `PROJECT_OVERVIEW.md`).
-- **`https://`:** the app runs from a blob URL (lesson 19). Upload the zip as a **new** blob,
-  make a SAS for it, and set `WEBSITE_RUN_FROM_PACKAGE` to the new URL with `-o none`. Keep the
-  old URL. It is the rollback.
+- **`https://`:** the app runs from a blob URL (lesson 19). Either use `config-zip` as above, or
+  upload the zip as a **new** blob, make a SAS for it, and set `WEBSITE_RUN_FROM_PACKAGE` to the
+  new URL with `-o none`. The rollback is the file saved in step 1, not the old URL.
 
 **Verify.**
 
 1. The TEST guest opens the bot DM and sends `pomoc`. The help card comes back.
-2. That message produced no gate refusal:
+2. The new bot started with the gate in `log` mode. `botGateMode` must read `log`; an empty value
+   means the zip's `@bcr/shared` is stale (step 3):
+
+```bash
+aiq 'traces | where cloud_RoleName startswith "func-bcr-bot"
+  | extend m = parse_json(message) | where tostring(m.msg) == "bot runtime initialised"
+  | project timestamp, botGateMode = tostring(m.botGateMode)' <time of the deploy>
+```
+
+3. The message from step 1 produced no gate refusal:
 
 ```bash
 aiq 'traces | where cloud_RoleName startswith "func-bcr-bot"
@@ -423,8 +478,14 @@ The message from the TEST guest must not appear. Seeing it pass proves that a gu
 carries the BCR tenant id. The design assumes this but has not verified it yet, and in `enforce`
 mode a wrong assumption would refuse every guest.
 
-**Rollback.** Redeploy the previous bot build (or set the previous blob URL back). The previous
-bot and the current ingestion work together, because ingestion has not changed yet.
+**Rollback, only until H-12.** Deploy the zip saved in step 1, the same way as in step 4. The
+previous bot and the current ingestion work together, because ingestion has not changed yet.
+
+Once the Phase-0 ingestion is live (H-12), this rollback is gone. The Phase-0 ingestion rejects
+every batch from the pre-Phase-0 bot, which sends no `conversationType`, and `/api/user-target`
+no longer exists, so every client's upload would fail. From then on the bot only rolls forward:
+revert the offending commit, rebuild, check and deploy a new package (steps 1–4). For a problem
+with the gate itself, use H-11's rollback (`BOT_GATE_MODE=log`).
 
 ### H-10: Upload manifest 0.2.0 and set availability
 
@@ -484,7 +545,19 @@ These steps go in **one** window because each fixes a failure the others would c
 **Emergency stop,** at any point: `az functionapp stop -g $RG -n $INGEST`. Nothing is filed
 anywhere; users get the bot's generic error. `az functionapp start` resumes.
 
-1. **Deploy ingestion,** code only, as in H-9, with the `document-ingestion` package.
+1. **Deploy ingestion,** code only, as in H-9 steps 1–4, with the `document-ingestion` package:
+
+   ```bash
+   # save_running is the function from H-9 step 1; define it again in a new shell.
+   save_running $INGEST document-ingestion-before-p0.zip     # prints no URL
+   corepack yarn build && corepack yarn workspace @bcr/document-ingestion package
+   unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js \
+     | grep -c forbiddenTargetSitePaths                        # must be greater than 0
+   ```
+
+   A count of `0` means a pre-Phase-0 `@bcr/shared`: that build fails at cold start, because the
+   old schema requires `FALLBACK_SITE_*`. Do not deploy it. The package saved first is the
+   pre-Phase-0 build: it is a record of what ran, and **never** a rollback (standing rules).
 2. **Check that it is the Phase-0 build.**
    `curl -s https://$INGEST.azurewebsites.net/api/health` reports the Phase-0 build:
    `"build":{"phase":"p0","routing":"identity-only"}`. The tool enforces this itself when you
@@ -550,9 +623,11 @@ aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
 
 - A binding: `node tools/directory-bindings.mjs rollback --log tools/out/<apply-log>.json --apply`
   (a dry run without `--apply`) restores the before-state it printed. That row's guests then go to quarantine, which is safe.
-- The ingestion build: stop the app, revert the offending commit, rebuild and deploy. **Never
-  redeploy a pre-Phase-0 ingestion zip.**
-- The bot keeps running either way.
+- The ingestion build: stop the app, revert the offending commit, rebuild, check the zip as in
+  step 1 and deploy it. **Never redeploy a pre-Phase-0 ingestion zip**, including the one saved
+  in step 1.
+- The bot keeps running either way. Never restore the pre-Phase-0 bot package saved in H-9: the
+  Phase-0 ingestion rejects everything it sends.
 
 ### H-13: Downgrade the ingestion grant on BCR GROUP to read
 
@@ -592,9 +667,20 @@ az functionapp config appsettings delete -g $RG -n $INGEST -o none --setting-nam
   FALLBACK_CLIENT_ID FALLBACK_SITE_HOSTNAME FALLBACK_SITE_PATH FALLBACK_DRIVE_NAME FALLBACK_ROOT_FOLDER
 ```
 
+Retire the pre-Phase-0 packages saved in H-9 and H-12 in the same step, so neither can be
+restored by mistake. Their sha256 is already in the status table.
+
+```bash
+rm tools/out/rollback/teams-bot-before-p0.zip tools/out/rollback/document-ingestion-before-p0.zip
+```
+
+If a pre-Phase-0 package was running from a blob uploaded by hand (lesson 19), delete that blob
+from `function-releases` too. Its SAS cannot be revoked without rotating the storage key, and
+rotation is deferred.
+
 **Verify.** `az functionapp config appsettings list -g $RG -n $INGEST --query "[?starts_with(name,'FALLBACK_')]" -o table`
-is empty, and `/api/health` answers. **Rollback.** Not needed: the settings are only used by a
-build that must not come back.
+is empty, and `/api/health` answers. **Rollback.** Not needed: the settings and the packages are
+only used by builds that must not come back.
 
 The stale `SHAREPOINT_*`, `CLIENT_NIP` and `CLIENT_COMPANY_NAME` settings are removed with the
 Bicep drift fix (gate G1), not here.

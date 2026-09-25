@@ -343,15 +343,38 @@ gate in `log` mode, then `enforce`, then ingestion. Do **not** run `./infrastruc
 `yarn deploy:*` or the Deploy workflow. They deploy Bicep first, which replaces the hand-set app
 settings (lesson 20).
 
+**1. Save what is running, before you build.** The package the app runs now is the rollback for
+this deploy. Download it without printing its URL, which can carry a SAS token (lesson 19):
+[`human-steps.md` H-9, step 1](docs/operations/human-steps.md#h-9-deploy-the-bot-with-the-gate-in-log-mode)
+has the command. One exception: a pre-Phase-0 ingestion package is never a rollback.
+
+**2. Package.** Each app's `package` script (`tools/package-function.mjs`) builds a **new** zip
+every time: a fresh staging folder, production dependencies only, and `@bcr/shared` copied from
+the `packages/shared/dist` just built. It fails if that copy lacks the Phase-0 config.
+
 ```bash
-corepack yarn workspace @bcr/teams-bot package            # → artifacts/teams-bot.zip
-corepack yarn workspace @bcr/document-ingestion package   # → artifacts/document-ingestion.zip
-az functionapp deployment source config-zip -g rg-bcr-ledger-dev -n func-bcr-bot-dev-vyyintffz6ehq    --src artifacts/teams-bot.zip          --build-remote false
-az functionapp deployment source config-zip -g rg-bcr-ledger-dev -n func-bcr-ingest-dev-vyyintffz6ehq --src artifacts/document-ingestion.zip --build-remote false
+corepack yarn build && corepack yarn workspace @bcr/teams-bot package            # → artifacts/teams-bot.zip
+corepack yarn build && corepack yarn workspace @bcr/document-ingestion package   # → artifacts/document-ingestion.zip
 ```
 
-If the app runs from a blob URL (lesson 19), deploy by uploading a new blob and pointing
-`WEBSITE_RUN_FROM_PACKAGE` at it, as H-9 describes.
+**3. Check the vendored `@bcr/shared` before deploying** (lesson 10). Both counts must be
+greater than 0:
+
+```bash
+unzip -p artifacts/teams-bot.zip          node_modules/@bcr/shared/dist/config.js | grep -c botGateMode
+unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js | grep -c forbiddenTargetSitePaths
+```
+
+**4. Deploy,** one app at a time. `$RG`, `$BOT` and `$INGEST` are set as in
+[`human-steps.md` → Variables](docs/operations/human-steps.md#variables-used-below).
+
+```bash
+az functionapp deployment source config-zip -g $RG -n $BOT    --src artifacts/teams-bot.zip          --build-remote false
+az functionapp deployment source config-zip -g $RG -n $INGEST --src artifacts/document-ingestion.zip --build-remote false
+```
+
+If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_PACKAGE` at it
+(lesson 19), with `-o none`.
 
 ---
 
@@ -431,9 +454,15 @@ If the app runs from a blob URL (lesson 19), deploy by uploading a new blob and 
 9. **`package.json` `main`** must be `dist/index.js` (not `dist/src/index.js`) for Functions v4
    to find the entry point.
 
-10. **`yarn workspaces focus --production`** hoists dependencies to the root `node_modules`
-    (because `nodeLinker: node-modules`). Before zipping, copy `node_modules` into the package
-    and resolve the `@bcr/shared` workspace symlink by hand.
+10. **A function zip can carry a stale `@bcr/shared`.** With `nodeLinker: node-modules`, Yarn
+    hoists dependencies to the root `node_modules`, and `@bcr/shared` is only a workspace
+    symlink there. The old `package` script ran `zip -r` inside the package folder: it found no
+    fresh `@bcr/shared`, exited 0 anyway, and updated the existing archive in place, so the new
+    `dist` shipped next to a July copy of `@bcr/shared`. A bot built that way ignores
+    `BOT_GATE_MODE`; an ingestion built that way fails at cold start. The `package` script now
+    runs `tools/package-function.mjs`, which stages a fresh folder and copies `@bcr/shared` from
+    `packages/shared/dist`. Still check the zip before every deploy
+    ([Build and deploy](#build-and-deploy), step 3).
 
 11. **The Teams manifest v1.17 schema** rejects the `packageName` field. Remove it before
     uploading.
@@ -480,7 +509,10 @@ If the app runs from a blob URL (lesson 19), deploy by uploading a new blob and 
     - generate a long-lived SAS with the account key (a user-delegation SAS is capped at 7 days);
     - set `WEBSITE_RUN_FROM_PACKAGE=<sas url>` on the function app, and restart.
 
-    This bypasses Kudu entirely. Keep the previous URL: it is the rollback.
+    This bypasses Kudu entirely. The SAS URL is a credential: never print, paste or log it,
+    and pass `-o none` to `appsettings set`. An account-key SAS cannot be revoked without
+    rotating the key. Before switching, download the previous package from the old URL into a
+    file (human-steps H-9, step 1): that file is the rollback, not the URL.
 
 20. **Never deploy Bicep to "dev" until the drift fix.** `main.bicep`'s app settings do not match
     what runs: the routing settings were set by hand and are missing from the template. A Bicep

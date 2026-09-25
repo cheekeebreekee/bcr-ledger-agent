@@ -280,6 +280,13 @@ Edit [`infrastructure/main.dev.parameters.json`](../infrastructure/main.dev.para
 
 ### 3b. Deploy
 
+> ⚠️ **For a brand-new environment only. Never run this against "dev" before the Bicep drift
+> fix (gate G1).** "dev" is production: it serves a real client. `yarn deploy:dev` deploys
+> `main.bicep` first, which replaces every app setting with the template's, and the template
+> lacks the settings set by hand, so ingestion fails at cold start. To ship code to "dev",
+> deploy code only, in the order in
+> [`operations/human-steps.md`](operations/human-steps.md#phase-0).
+
 ```bash
 az login
 az account set --subscription <Subscription ID>
