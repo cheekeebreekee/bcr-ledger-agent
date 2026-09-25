@@ -54,6 +54,43 @@ jobs:
           yarn build
           yarn test
 
+      # Package before touching Azure, so a failed package stops the run with
+      # no infrastructure changed. The package script deletes the zip, dist and
+      # tsbuildinfo, rebuilds, and tools/package-function.mjs refuses orphan
+      # dist files, installs the yarn.lock versions with install scripts off
+      # and verifies them in the archive; any failure exits non-zero.
+      - name: Package teams-bot
+        shell: bash
+        run: yarn workspace @bcr/teams-bot package
+
+      - name: Package document-ingestion
+        shell: bash
+        run: yarn workspace @bcr/document-ingestion package
+
+      - name: Verify the packages
+        shell: bash
+        run: |
+          for pkg in teams-bot document-ingestion; do
+            if [[ ! -s "artifacts/$pkg.zip" ]]; then
+              echo "::error::artifacts/$pkg.zip was not built"; exit 1
+            fi
+          done
+          # Whole outputs are captured first: `unzip | grep -q` under pipefail
+          # can fail (or pass) on unzip's SIGPIPE rather than on the match.
+          check() { # zip, marker
+            local config
+            config="$(unzip -p "artifacts/$1.zip" node_modules/@bcr/shared/dist/config.js)"
+            if [[ "$config" != *"$2"* ]]; then
+              echo "::error::artifacts/$1.zip does not carry the Phase-0 @bcr/shared ($2)"; exit 1
+            fi
+          }
+          check teams-bot botGateMode
+          check document-ingestion forbiddenTargetSitePaths
+          listing="$(unzip -Z1 artifacts/document-ingestion.zip)"
+          if [[ "$listing" == *userTarget* ]]; then
+            echo "::error::artifacts/document-ingestion.zip carries the deleted /api/user-target handler"; exit 1
+          fi
+
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
@@ -69,12 +106,6 @@ jobs:
           parameters: infrastructure/main.${{ env.ENV_NAME }}.parameters.json
           deploymentName: bcr-ledger-${{ env.ENV_NAME }}-${{ github.run_id }}
           failOnStdErr: false
-
-      - name: Package teams-bot
-        run: yarn workspace @bcr/teams-bot package
-
-      - name: Package document-ingestion
-        run: yarn workspace @bcr/document-ingestion package
 
       - name: Deploy teams-bot function
         uses: azure/functions-action@v1
