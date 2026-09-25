@@ -1,0 +1,64 @@
+// IR-0: the ledger ingestion's routing and upload traces, for the incident register.
+//
+// Pino writes one JSON object per line to stdout, and App Insights stores that
+// line in `traces.message`, so every field is read with parse_json(message).
+// The pino message text is the `msg` key.
+//
+// The window appears twice on purpose: here, and as --start-time/--end-time
+// on `az monitor app-insights query`. With only a start time, the CLI's
+// window is one hour. export-appinsights.sh replaces @@START@@ and @@END@@.
+//
+// Messages are the ones ingestDocument.ts and clientResolver.ts logged before
+// Phase 0, plus three that explain routing outcomes: a document naming several
+// clients, a duplicate directory key, and a failed directory refresh.
+// The raw `message` is kept on every row, so nothing a projection drops is lost.
+let windowStart = datetime(@@START@@);
+let windowEnd = datetime(@@END@@);
+let routingMessages = dynamic([
+    "client resolved",
+    "routed to client via userAadObjectId",
+    "no directory match on user id — routing to fallback",
+    "matched an admin user — deferring to content routing (falling back)",
+    "promoted fallback → directory client via content NIP match",
+    "client refined post-classification",
+    "classified",
+    "uploaded",
+    "batch document failed",
+    "multiple Directory clients present in the document — keeping fallback",
+    "duplicate directory key across clients — dropping to prevent mis-routing",
+    "directory refresh failed; using stale/empty snapshot"
+]);
+traces
+| where timestamp between (windowStart .. windowEnd)
+| extend j = parse_json(message)
+| extend msg = tostring(j.msg)
+| where msg in (routingMessages)
+| project
+    timestamp,
+    itemId,
+    operation_Id,
+    cloud_RoleName,
+    cloud_RoleInstance,
+    severityLevel,
+    msg,
+    area = tostring(j.area),
+    invocationId = tostring(j.invocationId),
+    conversationId = tostring(j.conversationId),
+    activityId = tostring(j.activityId),
+    teamsChannelId = tostring(j.teamsChannelId),
+    userAadObjectId = tostring(j.userAadObjectId),
+    clientId = tostring(j.clientId),
+    title = tostring(j.title),
+    resolution = tostring(j.resolution),
+    matchedBy = tostring(j.matchedBy),
+    siteHostname = tostring(j.siteHostname),
+    sitePath = tostring(j.sitePath),
+    promotedFromFallback = tostring(j.promotedFromFallback),
+    directionCorrection = tostring(j.directionCorrection),
+    folderPath = tostring(j.folderPath),
+    documentType = tostring(j.documentType),
+    driveItemId = tostring(j.driveItemId),
+    webUrl = tostring(j.webUrl),
+    filename = tostring(j.filename),
+    message
+| order by timestamp asc
