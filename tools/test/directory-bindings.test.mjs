@@ -78,10 +78,12 @@ const pathOf = (url) => decodeURIComponent(new URL(url).pathname.replace(/^\/v1\
 describe('directory-bindings check', () => {
   test('reports each Active row read-only, and never prints the token', async () => {
     const h = harness();
-    // 3: row 2 holds a staff id, which routes that person's uploads to client B.
-    assert.equal(await h.run(['check', ...DIR_ARGS]), 3);
+    // 0: row 2 holds a staff id, but it is unbound, so the ingestion routes nobody there.
+    assert.equal(await h.run(['check', ...DIR_ARGS]), 0);
     const text = h.out.text();
-    assert.match(text, /ACTION: row\(s\) 2 hold an id that routes there and should not/);
+    assert.match(text, /not routing \(unbound\): row\(s\) 2 hold staff ids/);
+    assert.match(text, /Row 2 · ClientId 0002[\s\S]*not routing \(unbound\)[\s\S]*Row 3/);
+    assert.doesNotMatch(text, /ACTION/);
     assert.match(text, /Row 1 · ClientId 0001[\s\S]*ready for propose/);
     assert.match(text, /Row 2 · ClientId 0002[\s\S]*SKIP staff_ids/);
     assert.match(text, /Row 2 · ClientId 0002[\s\S]*WARN team_not_bcr[\s\S]*Row 3/);
@@ -118,8 +120,9 @@ describe('directory-bindings check', () => {
     await assert.rejects(h.run(['apply', '--plan', file, ...HEALTH_ARGS]), /--forbidden-site-paths is required/);
     await assert.rejects(h.run(['check', ...DIR_ARGS, '--quarantine-site-path', '/sites/Q/sub']), /--quarantine-site-path/);
     await assert.rejects(h.run(['check', ...DIR_ARGS, '--tenant-host', 'contoso.example']), /--tenant-host/);
-    // The environment counts as the flag does (3: row 2's staff id).
-    assert.equal(await withList.run(['check', ...DIR_ONLY]), 3);
+    // The environment counts as the flag does.
+    assert.equal(await withList.run(['check', ...DIR_ONLY]), 0);
+    assert.match(withList.out.text(), /forbidden +\/sites\/bcrgroup/);
     assert.deepEqual([...h.writes(), ...withList.writes()], []);
   });
 
@@ -199,6 +202,75 @@ describe('directory-bindings check', () => {
     const r1 = again.plan.rows.find((r) => r.listItemId === '1');
     assert.equal(r1.action, 'PATCH');
     assert.equal(r1.patch.UserAadObjectIds, '');
+  });
+
+  test('staff ids on a bound row are drift (exit 3); on an unbound row they route nobody (exit 0)', async () => {
+    const h = harness();
+    const unboundReport = fresh(h, 'report');
+    assert.equal(await h.run(['check', ...DIR_ARGS, '--out', unboundReport]), 0);
+    const unbound = JSON.parse(readFileSync(unboundReport, 'utf8'));
+    assert.deepEqual(
+      [unbound.exitCode, unbound.routingDrift, unbound.incomplete, unbound.notRoutingUnbound],
+      [0, [], [], ['2']],
+    );
+
+    await bind(h);
+    h.tenant.state.items.get('1').UserAadObjectIds = `${IDS.guestA}\n${IDS.staff}`;
+    const boundReport = fresh(h, 'report');
+    assert.equal(await h.run(['check', ...DIR_ARGS, '--out', boundReport]), 3);
+    assert.match(h.out.text(), /ACTION: row\(s\) 1 hold an id that routes there and should not/);
+    const bound = JSON.parse(readFileSync(boundReport, 'utf8'));
+    assert.deepEqual([bound.exitCode, bound.routingDrift, bound.notRoutingUnbound], [3, ['1'], ['2']]);
+  });
+
+  test('exits 4 when a bound row holding user ids could not be fully assessed', async () => {
+    const teamSiteOf = (team) => `/groups/${team}/sites/root`;
+    const cases = [
+      ['site_unresolved', (p) => p === `/sites/${IDS.host}:/sites/0001CLIENTA` && denied()],
+      ['no_team', (p) => p === teamSiteOf(IDS.teamA) && denied()],
+      [
+        'team_lookup_failed',
+        // A second Team claims row 1's site as its root site.
+        (p) => p === teamSiteOf(IDS.teamC) && jsonResponse(200, { id: IDS.siteA, webUrl: `https://${IDS.host}/sites/0001CLIENTA` }),
+      ],
+      ['membership_lookup_failed', (p) => p === `/groups/${IDS.teamA}/members` && denied()],
+      // Guest "multi" is in Team A but not on row 1: row 1's own guest reads fine.
+      ['guest_memberships_unreadable', (p) => p === `/users/${IDS.guestMulti}/memberOf` && denied()],
+    ];
+    for (const [code, fault] of cases) {
+      let failing = false;
+      const h = harness({
+        intercept: async (url, init, next) => (failing && fault(pathOf(url))) || next(url, init),
+      });
+      await bind(h);
+      assert.equal(await h.run(['check', ...DIR_ARGS]), 0, `${code}: clean before the fault`);
+      failing = true;
+      const report = fresh(h, 'report');
+      assert.equal(await h.run(['check', ...DIR_ARGS, '--out', report]), 4, code);
+      const r = JSON.parse(readFileSync(report, 'utf8'));
+      assert.deepEqual([r.exitCode, r.routingDrift, r.incomplete], [4, [], ['1']], code);
+      assert.ok(r.rows.find((a) => a.listItemId === '1').problems.some((p) => p.code === code), code);
+      assert.match(h.out.text(), /ACTION: row\(s\) 1 are bound and hold user ids, but could not be fully assessed/, code);
+
+      // A bound row that holds no ids routes nobody: nothing to assess.
+      h.tenant.state.items.get('1').UserAadObjectIds = '';
+      assert.equal(await h.run(['check', ...DIR_ARGS]), 0, `${code}: no ids`);
+    }
+  });
+
+  test('drift on one bound row wins over another that could not be assessed (3, not 4)', async () => {
+    let failing = false;
+    const h = harness({
+      intercept: async (url, init, next) =>
+        failing && pathOf(url) === `/groups/${IDS.teamB}/members` ? denied() : next(url, init),
+    });
+    await bind(h, ['--confirm-remove-staff', '2', '--write-verified', '/sites/0002CLIENTB']);
+    h.tenant.state.members.get(IDS.teamC).push(IDS.guestA);
+    failing = true;
+    const report = fresh(h, 'report');
+    assert.equal(await h.run(['check', ...DIR_ARGS, '--out', report]), 3);
+    const r = JSON.parse(readFileSync(report, 'utf8'));
+    assert.deepEqual([r.exitCode, r.routingDrift, r.incomplete], [3, ['1'], ['2']]);
   });
 
   test('refuses flags that belong to another command', async () => {

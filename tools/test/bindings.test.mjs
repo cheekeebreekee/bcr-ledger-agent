@@ -5,6 +5,7 @@ import {
   assessRow,
   buildPlan,
   changedSinceApply,
+  checkVerdict,
   classifyTeamPeople,
   diffBinding,
   evaluateWriteGrant,
@@ -15,6 +16,7 @@ import {
   healthExpectations,
   healthSatisfies,
   idsRollbackAdds,
+  isBoundRow,
   isSiteCollectionPath,
   isTeamGroup,
   mapSitesToTeams,
@@ -828,5 +830,42 @@ describe('apply and rollback helpers', () => {
     assert.equal(healthSatisfies({ build: { phase: 'p0' } }, healthExpectations(['build.phase=p0'])).ok, false);
     const p0 = { status: 'ok', build: { phase: 'p0', routing: 'identity-only' } };
     assert.equal(healthSatisfies(p0, healthExpectations(['build.phase=p0'])).ok, true);
+  });
+});
+
+describe('checkVerdict', () => {
+  const bound = { RootFolder: CHANNEL, DriveId: DRIVE_A, TeamId: TEAM_A };
+  const rowOf = (id, fields) => parseDirectoryRow(item(id, { ClientId: `000${id}`, NIP: `000000000${id}`, ...fields }));
+  const assessed = (id, ...codes) => ({ listItemId: String(id), problems: codes.map((code) => ({ code, severity: 'skip' })) });
+
+  test('drift on a bound row is 3; on an unbound row it routes nobody and is only reported', () => {
+    const rows = [rowOf(1, { ...bound, UserAadObjectIds: STAFF }), rowOf(2, { UserAadObjectIds: STAFF })];
+    const v = checkVerdict(rows, [assessed(1, 'staff_ids'), assessed(2, 'staff_ids', 'unbound_target')]);
+    assert.deepEqual(v, { routingDrift: ['1'], incomplete: [], notRoutingUnbound: ['2'], exitCode: 3 });
+    const unboundOnly = checkVerdict([rows[1]], [assessed(2, 'bound_guest_ineligible')]);
+    assert.deepEqual([unboundOnly.exitCode, unboundOnly.notRoutingUnbound], [0, ['2']]);
+  });
+
+  test('a bound row with ids that could not be assessed is 4; 3 wins over 4', () => {
+    for (const code of ['site_unresolved', 'no_team', 'team_lookup_failed', 'membership_lookup_failed', 'guest_memberships_unreadable']) {
+      const rows = [rowOf(1, { ...bound, UserAadObjectIds: GUEST_A })];
+      assert.deepEqual(checkVerdict(rows, [assessed(1, code)]).exitCode, 4, code);
+      // No ids on it: it routes nobody, so there is nothing to assess.
+      assert.equal(checkVerdict([rowOf(1, bound)], [assessed(1, code)]).exitCode, 0, `${code}, no ids`);
+      // Unbound: routes nobody either.
+      assert.equal(checkVerdict([rowOf(1, { UserAadObjectIds: GUEST_A })], [assessed(1, code)]).exitCode, 0, `${code}, unbound`);
+    }
+    const rows = [rowOf(1, { ...bound, UserAadObjectIds: GUEST_A }), rowOf(2, { ...bound, TeamId: g('a002'), UserAadObjectIds: GUEST_2 })];
+    const v = checkVerdict(rows, [assessed(1, 'bound_guest_ineligible'), assessed(2, 'no_team')]);
+    assert.deepEqual(v, { routingDrift: ['1'], incomplete: ['2'], notRoutingUnbound: [], exitCode: 3 });
+  });
+
+  test('admin and inactive rows never count; isBoundRow needs all three binding fields', () => {
+    const admin = rowOf(3, { ...bound, IsAdmin: true, UserAadObjectIds: STAFF });
+    const inactive = rowOf(4, { ...bound, Status: 'Inactive', UserAadObjectIds: STAFF });
+    assert.equal(checkVerdict([admin, inactive], [assessed(3, 'staff_ids'), assessed(4, 'staff_ids')]).exitCode, 0);
+    assert.equal(isBoundRow(rowOf(1, bound)), true);
+    for (const field of Object.keys(bound)) assert.equal(isBoundRow(rowOf(1, { ...bound, [field]: '' })), false, field);
+    assert.equal(isBoundRow(admin), false);
   });
 });

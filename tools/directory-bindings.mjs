@@ -11,7 +11,9 @@
  * client's upload "unknown", which Phase 0 now sends to quarantine (R1). This
  * tool fills both from Graph, per row, with a reviewed plan in between:
  *
- *   check     report what each Active row is bound to and what is wrong
+ *   check     report what each Active row is bound to and what is wrong;
+ *             exit 3 on drift on a bound row, 4 when a bound row could not
+ *             be fully assessed
  *   propose   compute the binding and write a plan file for review
  *   apply     apply a reviewed plan (PATCH list item fields), with a log
  *   rollback  restore the before-state from an apply log, re-checking every
@@ -86,6 +88,8 @@ import {
   assessRow,
   buildPlan,
   changedSinceApply,
+  checkVerdict,
+  DRIFT_UNASSESSED_CODES,
   fieldString,
   findDuplicates,
   findTeamForSite,
@@ -133,6 +137,11 @@ Usage:
   node tools/directory-bindings.mjs rollback --log <apply-log.json> [--only <listItemId>]...
             [--out <new log file>] [--apply]
   node tools/directory-bindings.mjs --add-columns [--site-id ..] [--list-id ..] [--apply]
+
+  check exits 0 when every bound row with ids was assessed and none routes where it
+  should not, 3 on drift on a bound row, 4 when a bound row could not be fully
+  assessed (3 wins). rollback refuses a row whose restore would put back an id that
+  is not a Guest of that row's Team alone. --out never replaces an existing file.
 
 Common:
   --site-id <id>              Graph site id of the Client Directory site (BCR GROUP)
@@ -636,7 +645,7 @@ function printProblems(print, problems) {
   }
 }
 
-function printRowCheck(print, row, a, facts, usersById) {
+function printRowCheck(print, row, a, facts, usersById, verdict) {
   const e = a.evidence;
   print('');
   print(bold(`Row ${row.listItemId} · ClientId ${row.clientId || '?'} · ${q(row.title)} · ${row.sitePath || '(no site)'}`));
@@ -678,6 +687,15 @@ function printRowCheck(print, row, a, facts, usersById) {
     print(`    bound now  RootFolder ${q(row.rootFolder)} · DriveId ${q(row.driveId)} · TeamId ${q(row.teamId)}`);
   }
   printProblems(print, a.problems);
+  if (verdict?.notRoutingUnbound.includes(row.listItemId)) {
+    print(
+      `    ${warn('not routing (unbound)')} the ingestion quarantines this row's users (unbound_target); ` +
+        'the PATCH that binds it also takes these ids off',
+    );
+  }
+  if (verdict?.incomplete.includes(row.listItemId)) {
+    print(`    ${bad('incomplete')} bound and holding user ids, but its drift could not be assessed`);
+  }
   const skips = a.problems.filter((p) => p.severity === 'skip').length;
   print(`    → ${skips ? bad(`SKIP (${skips} reason${skips > 1 ? 's' : ''})`) : ok('ready for propose')}`);
 }
@@ -728,25 +746,45 @@ async function runCheck(ctx) {
     print(warn(`${gathered.teamIndex.unreadable.length} Team site(s) could not be read:`));
     for (const u of gathered.teamIndex.unreadable) print(`  ${u.displayName} ${dim(u.teamId)} — ${u.error}`);
   }
+  const verdict = checkVerdict(gathered.rows, assessments);
   const rowById = new Map(gathered.rows.map((r) => [r.listItemId, r]));
   for (const a of assessments) {
     const row = rowById.get(a.listItemId);
-    printRowCheck(print, row, a, gathered.factsByRow.get(a.listItemId), gathered.usersById);
+    printRowCheck(print, row, a, gathered.factsByRow.get(a.listItemId), gathered.usersById, verdict);
   }
   const ready = assessments.filter((a) => !a.problems.some((p) => p.severity === 'skip'));
-  const drift = assessments.filter((a) => a.problems.some((p) => ROUTING_DRIFT_CODES.includes(p.code)));
   print('');
   print(bold('Summary'));
   print(`  ${assessments.length} Active row(s): ${ok(`${ready.length} ready`)}, ${bad(`${assessments.length - ready.length} skipped`)}`);
   print(`  ${gathered.rows.length - gathered.active.length} inactive row(s) not examined`);
-  if (drift.length) {
+  if (verdict.notRoutingUnbound.length) {
+    print(
+      warn(
+        `  not routing (unbound): row(s) ${verdict.notRoutingUnbound.join(', ')} hold staff ids or ids that ` +
+          "are not guests of that row's Team alone, but lack RootFolder, DriveId or TeamId, so the Phase-0 " +
+          'ingestion routes nobody there (unbound_target). The PATCH that binds such a row takes them off.',
+      ),
+    );
+  }
+  if (verdict.routingDrift.length) {
     print(
       bad(
-        `  ACTION: row(s) ${drift.map((a) => a.listItemId).join(', ')} hold an id that routes there and ` +
+        `  ACTION: row(s) ${verdict.routingDrift.join(', ')} hold an id that routes there and ` +
           `should not (${ROUTING_DRIFT_CODES.join(' / ')}). Run propose and apply the whole plan.`,
       ),
     );
   }
+  if (verdict.incomplete.length) {
+    print(
+      bad(
+        `  ACTION: row(s) ${verdict.incomplete.join(', ')} are bound and hold user ids, but could not be ` +
+          `fully assessed (${DRIFT_UNASSESSED_CODES.join(' / ')}): whether an id routes there and should ` +
+          "not is unknown. Fix the read (each row's SKIP line says which; a 403 is missing consent or " +
+          'site access), then run check again.',
+      ),
+    );
+  }
+  if (verdict.exitCode === 0) print(`  ${ok('every bound row with user ids was assessed; none routes where it should not')}`);
 
   if (values.out) {
     const report = {
@@ -757,14 +795,17 @@ async function runCheck(ctx) {
       guards: opts.guards,
       duplicates: gathered.duplicates,
       unreadableTeamSites: gathered.teamIndex.unreadable,
-      routingDrift: drift.map((a) => a.listItemId),
+      exitCode: verdict.exitCode,
+      routingDrift: verdict.routingDrift,
+      incomplete: verdict.incomplete,
+      notRoutingUnbound: verdict.notRoutingUnbound,
       rows: assessments,
     };
     const written = writeJsonFile(values.out, report, { exclusive: true });
     print(`  report     ${written.path}  sha256 ${written.sha256}`);
   }
   print('');
-  return drift.length ? 3 : 0;
+  return verdict.exitCode;
 }
 
 // ---------------------------------------------------------------------------

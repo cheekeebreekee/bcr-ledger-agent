@@ -135,13 +135,38 @@ Reports on each **Active** row:
 - **The Team's guests.** A guest is eligible only if this Team is the **only** Team they belong to. `/users/{id}/memberOf` is read with `resourceProvisioningOptions`, and every group that is a Team counts, with or without the `BCR Group —` description. That includes the legacy client Teams and BCR GROUP. A group whose kind cannot be read counts as a Team. A guest who is also in another Team is excluded as `guest_in_other_team`, and the other Team is named. Binding them would file every upload of theirs into this client's channel, including another company's documents. Members and owners are never bound.
 - **The write grant.** Whether the ingestion's managed identity (`--ingest-app-ids`, its app id `INGEST_MI_APPID`) can write to the site, from `/sites/{id}/permissions`. If the caller cannot read that, the grant is reported as **"unknown"**, to be verified read-only (see below). A forbidden or non-canonical site gets no grant advice at all.
 
-`--out <file>` also writes the report as JSON, with `routingDrift`: the rows
-behind exit code 3.
+**Bound rows, unbound rows.** A row is **bound** when it is an Active client
+row (not `IsAdmin`) with `RootFolder`, `DriveId` and `TeamId` all set. Only a
+bound row routes anyone: the Phase-0 ingestion quarantines the users of any
+other row as `unbound_target`. So drift counts only on a bound row:
+- **Drift on a bound row** (`staff_ids`, `staff_ids_removed`, `bound_guest_ineligible`) routes an upload where it should not, today. `check` prints an ACTION line and exits 3.
+- **The same codes on an unbound row** are printed as **not routing (unbound)**, on the row and in the summary, and do not make `check` exit 3. The PATCH that binds such a row also takes those ids off (staff ids only with `--confirm-remove-staff`). So at H-7, before any row is bound, a staff id on a client row is reported and recorded, not raised as an action. This holds for the Phase-0 ingestion build: the pre-Phase-0 build routes by `UserAadObjectIds` alone, so until H-12 those ids still route, which is why H-7 records them and H-12 removes them.
+
+**Incomplete rows.** "No drift found" only counts where drift could be looked
+for. A bound row that holds user ids is **incomplete** when one of these left
+its ids unassessed: `site_unresolved`, `no_team` (an unreadable Team site
+included), `team_lookup_failed`, `membership_lookup_failed` or
+`guest_memberships_unreadable`. `check` marks the row `incomplete`, names it on
+an ACTION line, and exits 4 unless there is drift elsewhere. Fix the read (the
+row's SKIP line says which; a 403 is missing consent, see
+[Authentication](#authentication)) and run `check` again. A bound row with no
+user ids routes nobody and is never incomplete.
+
+`--out <file>` also writes the report as JSON (a new file: an existing one is
+refused before anything is read). Next to every row's problems it holds:
+- `exitCode`: 0, 3 or 4, as below;
+- `routingDrift`: the bound rows behind exit code 3;
+- `incomplete`: the bound rows behind exit code 4;
+- `notRoutingUnbound`: the unbound rows with a drift code, reported only.
 
 Exit codes:
-- `0`: nothing routes where it should not.
-- `1`: refused (a missing or malformed input, an expired token).
-- `3`: **action needed**. An Active client row holds an id that routes there and should not: staff (`staff_ids`, `staff_ids_removed`) or a guest who is no longer a guest of that row's Team alone (`bound_guest_ineligible`). Run `propose` and apply the whole plan. A scheduled run alerts on this.
+- `0`: every bound row that holds user ids was assessed, and none routes where it should not.
+- `1`: refused (a missing or malformed input, an expired token, an `--out` file that exists, a 403 that stops the whole run).
+- `3`: **action needed**. A bound client row holds an id that routes there and should not: staff (`staff_ids`, `staff_ids_removed`) or a guest who is no longer a guest of that row's Team alone (`bound_guest_ineligible`). Run `propose` and apply the whole plan, the same day. A scheduled run alerts on this.
+- `4`: **action needed**. No drift was found, but at least one bound row that holds user ids could not be fully assessed (`incomplete`, above). Fix the read and run `check` again; until then, drift on that row is unknown. A scheduled run alerts on this too.
+
+3 wins over 4: a run with drift on one row and an incomplete other row exits
+3, and the report lists both.
 
 ### Codes
 
@@ -163,13 +188,13 @@ not stop a PATCH. Each line also carries a detail with the ids involved.
 | `invalid_user_ids` | warn | A `UserAadObjectIds` line is not a GUID | The PATCH rewrites the list without it |
 | `unknown_user_ids` | warn | An id on the row matches no user | The PATCH drops it |
 | `user_lookup_failed` | skip | An id on the row could not be read | Re-run; check the token's `User.Read.All` |
-| `staff_ids` | skip | A staff (Member) id on a client row: it files that person's uploads into this client (exit 3) | Re-run `propose` with `--confirm-remove-staff <listItemId>` |
+| `staff_ids` | skip | A staff (Member) id on a client row: once the row is bound, it files that person's uploads into this client (exit 3 on a bound row; "not routing (unbound)" otherwise) | Re-run `propose` with `--confirm-remove-staff <listItemId>` |
 | `staff_ids_removed` | warn | Staff ids will be removed, as confirmed | Apply the plan |
-| `bound_guest_ineligible` | warn | An id on the row is not a guest of this Team alone any more: also in another Team, or no longer in this one. It routes here until the PATCH removes it (exit 3) | Run `propose` and apply the **whole** plan now |
+| `bound_guest_ineligible` | warn | An id on the row is not a guest of this Team alone any more: also in another Team, or no longer in this one. On a bound row it routes here until the PATCH removes it (exit 3); on an unbound row it routes nobody ("not routing (unbound)") | Run `propose` and apply the **whole** plan now |
 | `unbound_target` | warn | `RootFolder`, `DriveId` or `TeamId` is empty: the row routes nobody (the ingestion quarantines as `unbound_target`) | Apply the plan's PATCH, which sets all three |
-| `site_unresolved` | skip | Graph could not resolve `SiteHostname` + `SitePath` | Correct the row, or check the token's site access |
-| `team_lookup_failed` | skip | More than one Team claims the site | Report it; Teams should never allow this |
-| `no_team` | skip | The site is not the root site of any Team (the detail says if some Team sites could not be read) | The row must name the client Team's root site |
+| `site_unresolved` | skip | Graph could not resolve `SiteHostname` + `SitePath`. On a bound row with ids: `incomplete` (exit 4) | Correct the row, or check the token's site access |
+| `team_lookup_failed` | skip | More than one Team claims the site. On a bound row with ids: `incomplete` (exit 4) | Report it; Teams should never allow this |
+| `no_team` | skip | The site is not the root site of any Team (the detail says if some Team sites could not be read). On a bound row with ids: `incomplete` (exit 4) | The row must name the client Team's root site; if Team sites could not be read, check `Group.Read.All` and `Sites.Read.All` |
 | `public_team` | skip | The client's Team is Public. This tool never changes visibility | The Teams admin makes it Private; then re-run |
 | `team_not_bcr` | warn | The Team's description is not `BCR Group — {recordNumber}`. Expected for the Teams that predate onboarding (TEST, PESKOVOI) | Nothing, for those |
 | `team_id_conflict` | skip | The row already has a different `TeamId` (I10) | A person decides; change bindings by hand |
@@ -185,8 +210,8 @@ not stop a PATCH. Each line also carries a detail with the ids involved.
 | `drive_mismatch` | skip | The channel folder is in another drive than `DriveName` | Correct `DriveName` |
 | `drive_id_conflict` | skip | The row already has a different `DriveId` (I10) | A person decides; change bindings by hand |
 | `root_folder_conflict` | skip | The row already has a different `RootFolder` (I10) | A person decides; change bindings by hand |
-| `membership_lookup_failed` | skip | The Team's members or owners could not be read | Re-run; check `GroupMember.Read.All` |
-| `guest_memberships_unreadable` | skip | A guest's own memberships could not be read, so they cannot be shown to be in this Team alone | Re-run; check `GroupMember.Read.All` |
+| `membership_lookup_failed` | skip | The Team's members or owners could not be read. On a bound row with ids: `incomplete` (exit 4) | Re-run; check `GroupMember.Read.All` |
+| `guest_memberships_unreadable` | skip | A guest's own memberships could not be read, so they cannot be shown to be in this Team alone. On a bound row with ids: `incomplete` (exit 4) | Re-run; check `GroupMember.Read.All` |
 | `guest_in_other_team` | warn | A guest of this Team is also in another Team (named) and is not bound; their uploads go to quarantine | Record it (H-7). Binding them would file another company's documents here |
 | `guest_not_in_this_team` | warn | Listed as a member, but their memberships do not include this Team; not bound | Re-run later; the two reads disagree |
 | `no_eligible_guest` | warn | No guest belongs to this Team alone; the client's uploads go to quarantine | Record it; invite the client's contact to this Team only |
@@ -353,9 +378,13 @@ holds until someone applies a new plan. So, as a standing rule:
   that takes the reused guest off the first client. Once applied, a guest in
   two Teams is on no row, and the ingestion quarantines their uploads.
 - **Run `check` at least weekly**, and after any onboarding that reuses an
-  existing guest. Exit code 3 (`bound_guest_ineligible` or `staff_ids`) means
-  an id routes where it should not: propose and apply the whole plan the
-  same day.
+  existing guest. Exit code 3 (`bound_guest_ineligible` or `staff_ids` on a
+  bound row) means an id routes where it should not: propose and apply the
+  whole plan the same day. Exit code 4 means a bound row could not be
+  assessed (`incomplete`): fix the read and run `check` again the same day,
+  because 0 is the only "all clear".
+- **Do not undo an onboarding with `rollback`.** Re-run `propose` and apply
+  the whole plan instead (see [rollback](#rollback)).
 
 The robust fix, a membership check at upload time, is Phase 2. Onboarding
 writing the guest's id to the new row waits on Roman's re-ruling of Q21.

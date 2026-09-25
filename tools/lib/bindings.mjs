@@ -69,11 +69,26 @@ export const GUARD_FIELDS = Object.freeze([
 
 /**
  * Problems that mean an id on an Active client row routes where it should
- * not, today: staff on a client row, or a bound guest who is no longer a
- * guest of that row's Team alone. `check` exits 3 when any row has one, so a
- * scheduled run can raise it (C12).
+ * not: staff on a client row, or a guest on it who is no longer a guest of
+ * that row's Team alone. `check` exits 3 when a **bound** row has one, so a
+ * scheduled run can raise it (C12). On an unbound row the ingestion routes
+ * nobody (`unbound_target`), so there it is reported as not routing.
  */
 export const ROUTING_DRIFT_CODES = Object.freeze(['staff_ids', 'staff_ids_removed', 'bound_guest_ineligible']);
+
+/**
+ * Problems that leave a row's ids unassessed for drift: the site, its Team,
+ * the Team's people or a guest's own memberships could not be read, so no
+ * drift code could be raised either way. On a bound row that holds user ids
+ * `check` exits 4 (incomplete) rather than 0.
+ */
+export const DRIFT_UNASSESSED_CODES = Object.freeze([
+  'site_unresolved',
+  'no_team',
+  'team_lookup_failed',
+  'membership_lookup_failed',
+  'guest_memberships_unreadable',
+]);
 
 /** Columns `--add-columns` creates (single line of text). */
 export const NEW_COLUMNS = Object.freeze(['DriveId', 'TeamId']);
@@ -346,6 +361,54 @@ export function findDuplicates(rows) {
 
 function byNumericId(a, b) {
   return Number(a) - Number(b) || String(a).localeCompare(String(b));
+}
+
+/**
+ * Whether the ingestion can route to this row at all: an Active client row
+ * with RootFolder, DriveId and TeamId all set (C3). Any other row's users are
+ * quarantined (`unbound_target`), whatever ids it holds.
+ */
+export function isBoundRow(row) {
+  return Boolean(row?.active && !row.isAdmin && row.rootFolder && row.driveId && row.teamId);
+}
+
+/**
+ * What `check` concludes from its assessments, and its exit code:
+ *
+ * - `routingDrift`: bound rows holding an id that routes there and should not
+ *   (a ROUTING_DRIFT_CODES problem). Exit 3.
+ * - `incomplete`: bound rows holding user ids whose drift could not be
+ *   assessed (a DRIFT_UNASSESSED_CODES problem). Exit 4 when there is no
+ *   drift: "nothing found" is not "nothing there".
+ * - `notRoutingUnbound`: unbound rows with a drift problem. Reported only:
+ *   the Phase-0 ingestion routes nobody to them, and the PATCH that binds
+ *   such a row also takes those ids off.
+ *
+ * 3 wins over 4, and 0 means every bound row with ids was assessed and none
+ * routes where it should not.
+ *
+ * @param {ReturnType<typeof parseDirectoryRow>[]} rows
+ * @param {ReturnType<typeof assessRow>[]} assessments
+ */
+export function checkVerdict(rows, assessments) {
+  const rowById = new Map(rows.map((r) => [r.listItemId, r]));
+  const routingDrift = [];
+  const incomplete = [];
+  const notRoutingUnbound = [];
+  for (const a of assessments) {
+    const row = rowById.get(a.listItemId);
+    if (!row?.active || row.isAdmin) continue;
+    const codes = new Set(a.problems.map((p) => p.code));
+    const bound = isBoundRow(row);
+    if (ROUTING_DRIFT_CODES.some((c) => codes.has(c))) {
+      (bound ? routingDrift : notRoutingUnbound).push(a.listItemId);
+    }
+    if (bound && row.userIds.length && DRIFT_UNASSESSED_CODES.some((c) => codes.has(c))) {
+      incomplete.push(a.listItemId);
+    }
+  }
+  const exitCode = routingDrift.length ? 3 : incomplete.length ? 4 : 0;
+  return { routingDrift, incomplete, notRoutingUnbound, exitCode };
 }
 
 // ---------------------------------------------------------------------------
