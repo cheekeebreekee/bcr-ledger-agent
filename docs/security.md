@@ -126,7 +126,11 @@ in A's space, whoever sent it. A crafted PDF, or a prompt injection that made th
 chosen NIP, could plant a file in any client's space. This was root cause R3 of the incident.
 **Now:** promotion is deleted. The client comes only from the uploader's identity. Content can
 only flip an invoice's direction inside that client. A source-scan test fails if a
-promote-by-NIP path comes back. **Status: Removed in P0.** It is a permanent invariant (I2) and
+promote-by-NIP path comes back. Until that build is live, promotion is switched off on the
+running build with `ANTHROPIC_ENABLED=false` (human steps H-3), and no further client site is
+granted to the ingestion identity. Documents already promoted sit in the taxonomy folders at
+the receiving client's library root; those folders are locked to the site's Owners (tenant step
+T-4b) until IR-2 moves each item. **Status: Removed in P0.** It is a permanent invariant (I2) and
 a `CLAUDE.md` rule.
 
 ### T9. Fallback commingling
@@ -135,8 +139,10 @@ a `CLAUDE.md` rule.
 at the root of the BCR GROUP team library. Every member of that team could read it, and while
 the team was Public, so could any internal account.
 **Now:** a staff-only quarantine site replaces the fallback. It has no group, unique
-permissions and sharing disabled. The documents already in BCR GROUP are locked to its Owners
-(tenant step T-4) and are being moved one by one, with two people signing off (IR-2).
+permissions and sharing disabled. Until the Phase-0 build is live, the running build's
+`FALLBACK_SITE_*` settings point at that site (human steps H-6b). The documents already in BCR
+GROUP are locked to its Owners (tenant step T-4) and are being moved one by one, with two people
+signing off (IR-2).
 **Status: Replaced by quarantine in P0.**
 
 ### T10. Directory tampering
@@ -191,11 +197,14 @@ age out within 30 days of the deploy.
 
 ### T14. No Entra ID P1
 
-The tenant has no sign-in logs, so nobody can tell whether an account was actually used. It also
-has no Conditional Access, and no way to stop ordinary users creating teams, which is how a
-Public client-named team came to exist. The Purview unified audit log (file operations, kept
-about 180 days on Audit Standard) is the only access evidence. **Status: Accepted**, pending
-Roman's decision 5 in the plan. P1 is recommended, at about $6 per user per month.
+Without P1, the Entra sign-in log keeps only about 7 days and cannot be read through Graph
+**[verify]**. There is no Conditional Access, and no way to stop ordinary users creating teams,
+which is how a Public client-named team came to exist. The Purview unified audit log is the
+longer record, kept about 180 days on Audit Standard: file operations, and interactive sign-ins
+(`UserLoggedIn`, `UserLoginFailed`) **[verify]**. IR-0 exports both, and the 7 days of Entra
+sign-ins, so whether an account was actually used is answered from those exports for the period
+they cover. Before that period it cannot be known. **Status: Accepted**, pending Roman's
+decision 5 in the plan. P1 is recommended, at about $6 per user per month.
 
 ### T15. The bot's client secret
 
@@ -249,15 +258,15 @@ check that every setting the code reads exists in Bicep, `what-if`, and environm
 | **Secret rotation deferred** (T15, and the Anthropic key). Plaintext copies of both secrets are on developer laptops. | New credentials come from Roman, who will provide them soon. Rotating twice gains nothing. | Roman | New credentials arrive. Then rotate and delete the laptop copies the same day. | Caller pinning: only the bot's app id is accepted. A forged upload needs a real guest's id, lands only in that guest's own client, and is logged under that id. The secret cannot read documents, because the bot holds no SharePoint permission. |
 | **Yahor's dual role.** He is the developer, the operator who deploys, and a Global Administrator. One person can change the code, ship it and change tenant permissions. That is also a bus factor of one. | BCR has one technical person today. | Roman | A second admin or a formal approval path exists. | Roman reviews every binding plan before it is applied. IR-2 moves need two people. Every tenant and Azure change is a recorded command with its before and after state. The IR evidence is immutable and readable by Roman and the IOD. Yahor does not upload through the bot. Planned: Roman approves production deploys through GitHub environment protection, and a `HANDOVER.md`. |
 | **One identity writes every client site** (T3). | Inherent to the current design. | Yahor | Phase 2 (upload by id, attestation, nightly audit). | Identity-only routing, forbidden targets, `DriveId` check, `conflictBehavior=fail`. |
-| **No sign-in logs or Conditional Access** (T14). | Needs a licence purchase. | Roman | Decision 5. | Purview file-operation audit. `{NIP}@` accounts blocked (T-1). |
+| **No P1: 7-day Entra sign-in log, no Conditional Access** (T14). | Needs a licence purchase. | Roman | Decision 5. | Purview audit log: file operations and sign-in events, about 180 days. `{NIP}@` accounts blocked (T-1). |
 
 ## 4. Data residency and retention
 
 - **Application Insights** keeps telemetry for 30 days (`logAnalytics.bicep`). From Phase 0 it
   holds ids and codes, not names, file names or URLs.
-- **IR evidence store:** the pre-Phase-0 logs, the Purview export and the Directory export for
-  the incident. It is immutable, readable by Roman, the IOD and `yahor.simak@bcr-group.pl` only,
-  and kept until the date the IOD sets.
+- **IR evidence store:** the pre-Phase-0 logs, the Purview export, the sign-in exports and the
+  Directory export for the incident. It is immutable, readable by Roman, the IOD and
+  `yahor.simak@bcr-group.pl` only, and kept until the date the IOD sets.
 - **Quarantine site:** items are kept 90 days after triage. That is the plan's default, for Roman
   and the lawyer to confirm.
 - **Client documents** live in each client's Team, in the "Dokumenty księgowe" channel folder.

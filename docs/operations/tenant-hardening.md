@@ -11,11 +11,14 @@ relative to the deploys is in [`human-steps.md`](human-steps.md#phase-0).
 
 ⚠️ **Three rules for every step on this page.**
 
-- **BCR GROUP stays Private, and this page does not change the team.** Its visibility, its
-  membership and its channels are untouched. [T-3](#t-3-confirm-bcr-group-is-private-read-only) only
-  reads. [T-4](#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root) and
+- **BCR GROUP stays Private.** This page never changes its visibility or its channels.
+  [T-3](#t-3-confirm-bcr-group-is-private-read-only) only reads.
+  [T-4](#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root) and
   [T-5](#t-5-lock-and-version-the-client-directory-list) change permissions on two things *inside*
-  its site: the ledger's own folders, and the routing list.
+  its site: the ledger's own folders, and the routing list. The only change to its membership is
+  in [T-7](#t-7-explain-or-remove-authoriseme), which takes `AuthoriseMe@` out of the team, and
+  only if Roman decides the account is not needed. Nothing else on this page, T-4b included,
+  touches BCR GROUP.
 - **Nothing here deletes or moves a client document.** Documents stay where IR-1 finds them, and
   IR-2 moves them later, with two people signing off.
 - **Save every "before" output.** The rollback needs it. Save it in the IR evidence store with the
@@ -227,6 +230,76 @@ every member again, so only do it if the lock broke something essential, and rec
 "Weryfikacja dokumentów" channel is not created, until this step and
 [T-7](#t-7-explain-or-remove-authoriseme) are done.
 
+## T-4b: Lock the ledger folders at the library root of the client sites
+
+| Runs it | Decides | Closes |
+|---|---|---|
+| A site owner of each client site, or SharePoint Administrator | Agreed with Roman | W4 for documents already promoted into a client's site |
+
+**Why.** Content promotion (W4) filed documents in the ledger's taxonomy folders at the **library
+root** of the receiving client's site, because `RootFolder` was empty (R5). So did every upload
+made under Yahor's id, which sat on PESKOVOI's row (R4). The client's guest is a member of the
+client's Team, so they have Edit on the whole default library, root included: they can open,
+change, move or delete another client's document there, through "Open in SharePoint", the
+breadcrumb or search. T-4 covers only BCR GROUP, and IR-2 moves items one by one, possibly over
+weeks. Locking these folders ends the exposure now, and keeps the items in place for IR-2.
+
+The client barely notices. They are told to look in the "Dokumenty księgowe" channel folder, and
+these root folders are not it. The client's own documents that sit there are released into the
+channel folder by IR-2, through the allow-list.
+
+**When.** Day 0 or day 1, with T-4, and **before IR-2 starts** on that site. It must be done
+before H-12 ([`human-steps.md` H-4](human-steps.md#h-4-tenant-hardening)).
+
+**Which sites.** PESKOVOI and TEST, the client sites the ingestion identity could write to, and
+any further site that IR-1 lists (a `site_not_walked` flag, or a further site where
+`directory-bindings.mjs check` shows a write grant). **Never BCR GROUP:** its folders are T-4, and
+this step changes nothing else there.
+
+**What gets locked: only the same 14 taxonomy folders as T-4** (the top-level folders from
+[`folderTaxonomy.ts`](../../packages/shared/src/parsers/folderTaxonomy.ts),
+`98_Nieposortowane` included), at the library root, where they exist.
+
+⚠️ **Never a channel folder.** The library root of a client site also holds one folder per
+channel: `Dokumenty księgowe`, `Ogólny` or `General`, and any others. They belong to the client's
+channels and are never touched. If a channel folder has the same name as a taxonomy folder, stop
+and ask; do not lock it.
+
+**Read first,** for each site. `<client-team-id>` is the site's Team (`check` reports it).
+
+```bash
+SITE_ID=$(g "$G/sites/<tenant>.sharepoint.com:/sites/<client-site>?\$select=id" | jq -r .id)
+g "$G/sites/$SITE_ID/drive?\$select=name,webUrl"                          # the library's URL
+g "$G/sites/$SITE_ID/drive/root/children?\$select=name,folder" | jq -r '.value[].name'
+g "$G/teams/<client-team-id>/channels?\$select=displayName" | jq -r '.value[].displayName'
+g "$G/groups/<client-team-id>/owners?\$select=userPrincipalName,userType" \
+  | jq -r '.value[] | "\(.userType)\t\(.userPrincipalName)"'
+```
+
+Save the lists, and mark which root folders are taxonomy folders and which are channel folders.
+The Team's owners become the site's Owners group, which keeps access: every owner must read
+`Member`. **If a guest is an owner, stop and tell Roman**; locking would leave that guest with
+access.
+
+**Change.** Exactly as in T-4, in the browser or scripted, with `WEB` and `LIB` pointing at this
+client site, for example `WEB=https://<tenant>.sharepoint.com/sites/<client-site>` and
+`LIB='/sites/<client-site>/Shared Documents'`. Pass only the taxonomy folders that exist on this
+site to the `for` loop: `breakroleinheritance(copyRoleAssignments=true,clearSubscopes=true)`,
+then remove the site's Members and Visitors groups. The Owners group stays.
+
+The ingestion identity writes through its site-level app grant, so its writes are not affected.
+After H-12 it no longer writes to these folders anyway: `RootFolder` then names the channel
+folder.
+
+**Verify,** for each locked folder: `HasUniqueRoleAssignments` is `true` and only the site's
+Owners group is listed (the T-4 commands). In the browser, **Manage access → Check permissions**
+for the client's guest returns *None*. As in T-4, **[verify]** that IR-1, run with a site
+owner's token, still lists the locked folders. Record each site and the time of the lock in the
+status table: it is the end date of W4 for documents already moved.
+
+**Rollback.** `sp -X POST "$(item <folder>)/resetroleinheritance()"`. This gives the client's
+guest access to another client's documents again, so only with Roman's decision, and recorded.
+
 ## T-5: Lock and version the Client Directory list
 
 | Runs it | Decides | Closes |
@@ -325,8 +398,8 @@ az rest --url "$G/users/AuthoriseMe@bcr-group.pl?\$select=id,displayName,userTyp
 az rest --url "$G/users/AuthoriseMe@bcr-group.pl/memberOf?\$select=displayName"
 ```
 
-In the IR-0 Purview export, filter on this user. Any file access by it in the fallback bucket is
-evidence for IR-3.
+In the IR-0 Purview export, filter on this user: its file operations and its sign-in events.
+Any file access by it in the fallback bucket is evidence for IR-3.
 
 **Decide.**
 
@@ -435,7 +508,7 @@ should still work. **[verify]** Lowering the capability also disables existing A
 
 | Runs it | Decides | Closes |
 |---|---|---|
-| Teams Administrator | **Roman**: staff plus client guests, or everyone | Who can install the bot at all |
+| Teams Administrator | *Everyone* in Phase 0; a restricted group only later, with the sub-steps below | Who can install the bot at all |
 
 **Why.** Client guests need the app in BCR's org catalog, and the app has to be allowed for them.
 Nobody else needs it. The real control is the bot's own gate, which refuses anything that is not
@@ -450,19 +523,30 @@ in the first place.
 1. **Teams apps → Manage apps → Asystent BCR → Upload file**, and select `artifacts/teams-app.zip`
    built from manifest 0.2.0. That version has personal scope only and no tab. If the app is not
    in the catalog yet, use **Upload new app** instead.
-2. **Asystent BCR → Users and groups → Available to**. Choose **specific users or groups**: a
-   staff group plus a security group of client guests, for example `BCR Ledger – goście
-   klientów`. Each guest is added to that group when `directory-bindings.mjs` binds them. If Roman
-   does not want to maintain that group, choose *Everyone*. That is acceptable once T-1 is done,
-   because the gate is the control.
+2. **Asystent BCR → Users and groups → Available to**: choose **Everyone**. This is the
+   Phase-0 choice. The gate is the control: it refuses anything that is not a 1:1 chat from the
+   BCR tenant with a valid user id, and T-1 has already blocked the `{NIP}@` accounts.
+   Do **not** restrict it to a group of client guests in Phase 0. Nothing fills such a group:
+   neither onboarding nor `directory-bindings.mjs` adds anyone to one, so PESKOVOI's guest and
+   the TEST guest would lose the bot on day 1, and H-11 and H-12 could not run.
+
+   If Roman later wants the restricted option, do these first, in this order, and only then
+   change *Available to*:
+   - create a security group for client guests;
+   - add the staff group, the TEST guest, every bound client guest and the canary guest to it:
+     `az ad group member add --group <group-id> --member-id <user-object-id>`;
+   - check the members with `az ad group member list --group <group-id> -o table`;
+   - from then on, add each newly bound guest by hand, before telling the client to use the bot
+     ([admin guide, Onboarding](../client-directory-admin-guide.md#onboarding-a-client-phase-0)).
 3. Optional: pin the app for guests in the global app setup policy, so they find it without
    searching.
 4. Remove any team or group-chat installations. Version 0.2.0 cannot be added to a team, but
    older installs may remain. **[verify]** On each client team: **Manage team → Apps → Asystent
    BCR → Uninstall**. The gate already refuses those installs.
 
-**Verify.** The TEST guest finds "Asystent BCR", opens the chat and gets the help card. If
-availability is restricted, a staff account outside the groups cannot install the app.
+**Verify.** The TEST guest finds "Asystent BCR", opens the chat and gets the help card, and so
+does PESKOVOI's guest when they next use it. Only if availability was later restricted: a staff
+account outside the groups cannot install the app.
 
 **Rollback.** Upload the previous package, and set availability back to what it was. ⚠️ The
 previous package brings back the "Moje dokumenty" tab. After the Phase-0 bot deploy that tab only
@@ -485,9 +569,10 @@ laptops (`.env`) are an accepted risk, recorded in
 | T-2 | | | | |
 | T-3 | | | | Time made Private, from Purview |
 | T-4 | | | | Folders locked |
+| T-4b | | | | Per client site: folders locked, time of the lock (end of W4) |
 | T-5 | | | | |
 | T-6 | Roman decides | | | Private / deleted |
 | T-7 | Roman decides | | | Explained / removed |
 | T-8 | | | | TEST invite checked |
 | T-9 | Roman confirms tenant level | | | TEST guest checked |
-| T-10 | | | | Everyone / groups |
+| T-10 | | | | Everyone (Phase 0) |

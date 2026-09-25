@@ -73,7 +73,8 @@ wrong ones either.
 Only three sites could receive a write at all, because the ingestion identity holds a site
 grant on exactly three: TEST (`/sites/0000TESTSp.zo.o.-Ksigowo`), BCR GROUP and PESKOVOI
 (`/sites/0002PESKOVOISp.zo.o.-Ksigowo`). A promoted document for any other client would have
-been refused with 403 and not stored. That bounds the inventory.
+been refused with 403 and not stored. That bounds the inventory, and it is why the rollout
+grants the ingestion identity no further client site while the old build still runs (H-7).
 
 ---
 
@@ -87,14 +88,17 @@ whether anyone used it. Dates marked *record* are filled in from the IR-0 export
 | W1 | **Fallback bucket** at the BCR GROUP library root | Every unrouted upload, from every client, plus staff uploads | Members of BCR GROUP: Roman, Yahor and `AuthoriseMe@` | Multi-tenant routing go-live, on or before 16 Jul 2026 (*record* the deploy date) | New uploads: the Phase-0 ingestion deploy. Existing items: the folder lock in [tenant hardening](tenant-hardening.md#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root), then IR-2 moves them out. |
 | W2 | **BCR GROUP was Public** | Everything in W1, and the `Onboarding klientów` channel | Any internal account, including the three `{NIP}@` accounts, which could sign in | Unknown (*record* from the group's history) | Made Private between 23 and 25 Sep (*record*) |
 | W3 | **`{NIP}@` accounts could sign in** | Their own client team (added by hand), any Public team, Viva Engage Communities | Whoever held those credentials | Account creation, by hand | Sign-in blocked: [tenant hardening T-1](tenant-hardening.md#t-1-block-sign-in-on-the-nip-client-addresses) |
-| W4 | **Content promotion** | A document moved into the site of whichever client's NIP it named, at that site's library root | Members of that client's Team, including the client's guest | Go-live (as W1) | The Phase-0 ingestion deploy (P0-1). Items already moved: IR-2. |
+| W4 | **Content promotion** | A document moved into the site of whichever client's NIP it named, at that site's library root | Members of that client's Team, including the client's guest | Go-live (as W1) | New moves: `ANTHROPIC_ENABLED=false` ([H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy)), then the Phase-0 ingestion deploy (P0-1). Items already moved: the client-site folder lock ([tenant hardening T-4b](tenant-hardening.md#t-4b-lock-the-ledger-folders-at-the-library-root-of-the-client-sites)), then IR-2 moves them. |
 | W5 | **Personal Tab IDOR** | The client name, ClientId and SharePoint URL of any user whose object id is known | Anyone on the internet with the URL | Manifest 0.1.5 and `/api/mydocs` (about 16 Jul) | The Phase-0 bot deploy (the page becomes static), manifest 0.2.0, and the Phase-0 ingestion deploy (`/api/user-target` deleted) |
 | W6 | **The upload register in App Insights** | File names, client titles, site paths, user ids | Anyone with read on the App Insights resource | First deploy | P0-9 logs ids only. Old lines age out after 30 days, except the copy IR-0 takes deliberately. |
 | W7 | **Bricore team Public** | Its `Dokumenty księgowe` channel | Any internal account | Unknown | [Tenant hardening T-6](tenant-hardening.md#t-6-the-bricore-team) |
 
-⚠️ **What the accounts *did* reach is only partly knowable.** The tenant has no Entra ID P1,
-so there are no sign-in logs. File-level events in the Purview unified audit log are the only
-access evidence, which is why IR-0 exports them first.
+⚠️ **What the accounts *did* reach is only partly knowable.** The tenant has no Entra ID P1, so
+the Entra sign-in log keeps only about 7 days and cannot be read through Graph **[verify]**. The
+Purview unified audit log is the longer record: it holds file-level events and the
+`UserLoggedIn` / `UserLoginFailed` sign-in events for about 180 days on Audit Standard
+**[verify]**. IR-0 exports both, and the 7 days of Entra sign-ins, first. Whether the `{NIP}@`
+accounts and `AuthoriseMe@` signed in (W2, W3) is answered from those exports, not assumed.
 
 ---
 
@@ -118,13 +122,20 @@ item closes a named root cause. The human-run steps and their order are in
 | P0-8 | Ingestion accepts only the bot's app id; the single-document route is deleted. | R6 |
 | P0-9 | Logs carry ids only (after IR-0 has copied the old ones). | W6 |
 | Bindings | `tools/directory-bindings.mjs` writes each row's guest ids, channel folder, `DriveId` and `TeamId` from Graph, and removes staff ids from client rows. | R1, R4, R5 |
-| Tenant | `{NIP}@` sign-in blocked and mailboxes unlicensed; ledger folders on BCR GROUP locked to Owners; the Directory list locked and versioned; guest and sharing defaults tightened. | R2, W2, W3, W7 |
+| Tenant | `{NIP}@` sign-in blocked and mailboxes unlicensed; ledger folders on BCR GROUP locked to Owners (T-4); the same folders at the library root of every client site the ingestion identity could write to locked to Owners (T-4b); the Directory list locked and versioned; guest and sharing defaults tightened. | R2, W2, W3, W4 (items already moved), W7 |
 
-**Optional, today, without a deploy.** Promotion needs the parties that only the Claude
-classifier extracts. So setting `ANTHROPIC_ENABLED=false` on the running ingestion stops R3 at
-once, at the cost of every new upload going to `98_Nieposortowane` until the Phase-0 build is
-live. This is not in the approved plan. It is a proposal for Roman:
-[`human-steps.md` H-3](human-steps.md#h-3-optional-stop-promotion-today-without-a-deploy).
+**Until the Phase-0 build is live, without a deploy** (mandatory, from the day IR-0 is stored):
+
+- **Promotion off.** Promotion needs the parties that only the Claude classifier extracts, so
+  `ANTHROPIC_ENABLED=false` on the running ingestion stops R3 at once, at the cost of every new
+  upload going to `98_Nieposortowane` for an accountant
+  ([`human-steps.md` H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy)).
+- **The fallback re-pointed.** The running build's `FALLBACK_SITE_*` settings are pointed at the
+  staff-only quarantine site, so unrouted uploads stop landing in BCR GROUP
+  ([H-6b](human-steps.md#h-6b-point-the-running-builds-fallback-at-the-quarantine)).
+- **No new site grants.** The ingestion identity gets no write on a further client site until the
+  Phase-0 build is live (H-7, H-12), because each grant would be one more site promotion could
+  reach.
 
 Two things are **not** done in Phase 0, deliberately:
 
@@ -203,7 +214,17 @@ one-hour window and returns a result that looks complete. Pass a start older tha
 the service simply returns what it still holds.
 
 `tools/ir0/` holds the scripted version of these exports; the query above is the reference for
-what it must return.
+what it must return. Run it with `--all-traces`
+([`human-steps.md` H-2](human-steps.md#h-2-preserve-the-evidence-ir-0-before-anything-changes-the-logs)),
+so the bot's own traces are kept too.
+
+**W5, the Personal Tab lookup.** Purview cannot see an anonymous Function call, so App Insights is
+the only record of W5. Before Phase 0 the bot logged `personal tab resolved` (`userObjectId`,
+`clientId`, `source`) and ingestion logged `user target resolved`. Both are in the
+`--all-traces` export. The script also always exports the `requests` rows for `/api/mydocs` and
+`/api/user-target`, which are not sampled, so they give the full count of calls, with time,
+result code and the looked-up id in the URL. `client_IP` is masked by default, so only the
+country and city columns say where a call came from **[verify]**.
 
 **How the lines join, and where they don't:**
 
@@ -235,34 +256,64 @@ what it must return.
 not depend on it, so prefer them.
 
 **B. The Purview unified audit log.** Confirm it is on, then export file operations on the
-three sites the ingestion identity could write to, and the group events for BCR GROUP.
+three sites the ingestion identity could write to, the group events for BCR GROUP, and the
+sign-in events of the `{NIP}@` accounts and `AuthoriseMe@`.
+
+**Use the script:** `tools/ir0/export-purview.ps1`, exactly as in
+[`human-steps.md` H-2](human-steps.md#h-2-preserve-the-evidence-ir-0-before-anything-changes-the-logs)
+(with `-FileOperations` and `-SignInUpn`). It gathers every page, starts a new session for every
+window, and splits a window that reaches the 50,000-record session cap. The manual commands
+below are the reference for what it does. They collect **all** pages into one variable and
+export once: `Export-Csv` overwrites its file, so exporting page by page keeps only the last
+page, and an empty final page leaves an empty file.
 
 ```powershell
 Connect-ExchangeOnline
 Get-AdminAuditLogConfig | Format-List UnifiedAuditLogIngestionEnabled   # must be True
 
-# One run per site; ReturnLargeSet pages up to 50,000 records per session.
-Search-UnifiedAuditLog -StartDate 2026-03-01 -EndDate (Get-Date) `
-  -RecordType SharePointFileOperation `
-  -Operations FileUploaded,FileAccessed,FilePreviewed,FileDownloaded,FileSyncDownloadedFull,FileModified,FileMoved,FileCopied,FileDeleted `
-  -SessionId ir0-bcrgroup -SessionCommand ReturnLargeSet -ResultSize 5000 |
-  Where-Object { ($_.AuditData | ConvertFrom-Json).SiteUrl -like '*/sites/BCRGROUPSp.zo.o*' } |
-  Export-Csv ir0-purview-bcrgroup.csv -NoTypeInformation -Encoding UTF8
+# Collect every page of one ReturnLargeSet session. A new SessionId per search, always:
+# re-using one continues the old session instead of starting a new result set.
+function Get-AllPages([hashtable] $Search) {
+  $sid = [guid]::NewGuid().ToString(); $all = @()
+  do {
+    $page = @(Search-UnifiedAuditLog @Search -SessionId $sid -SessionCommand ReturnLargeSet -ResultSize 5000)
+    $all += $page
+  } while ($page.Count -gt 0 -and $all.Count -lt $page[0].ResultCount)
+  $all
+}
 
-# Group events for BCR GROUP: who joined, who was added, when visibility changed.
-Search-UnifiedAuditLog -StartDate 2026-03-01 -EndDate (Get-Date) `
-  -Operations 'Add member to group.','Remove member from group.','Update group.',MemberAdded,MemberRemoved,TeamSettingChanged `
-  -SessionId ir0-groups -SessionCommand ReturnLargeSet -ResultSize 5000 |
+$files = Get-AllPages @{ StartDate = '2026-03-01'; EndDate = (Get-Date).ToUniversalTime()
+  RecordType = 'SharePointFileOperation'
+  Operations = 'FileUploaded','FileAccessed','FilePreviewed','FileDownloaded','FileSyncDownloadedFull',
+    'FileSyncDownloadedPartial','FileModified','FileMoved','FileCopied','FileRenamed','FileDeleted',
+    'FileRecycled','FileDeletedFirstStageRecycleBin','FileDeletedSecondStageRecycleBin' }
+foreach ($site in 'BCRGROUPSp.zo.o', '<PESKOVOI site>', '<TEST site>') {
+  $files | Where-Object { ($_.AuditData | ConvertFrom-Json).SiteUrl -like "*/sites/$site*" } |
+    Export-Csv "ir0-purview-$site.csv" -NoTypeInformation -Encoding UTF8
+}
+
+# Group events: who joined, who was added, when visibility changed.
+Get-AllPages @{ StartDate = '2026-03-01'; EndDate = (Get-Date).ToUniversalTime()
+  Operations = 'Add member to group.','Remove member from group.','Update group.','MemberAdded','MemberRemoved','TeamSettingChanged' } |
   Export-Csv ir0-purview-groups.csv -NoTypeInformation -Encoding UTF8
+
+# Sign-ins of the accounts in W2/W3 [verify that the tenant records them].
+Get-AllPages @{ StartDate = '2026-03-01'; EndDate = (Get-Date).ToUniversalTime()
+  RecordType = 'AzureActiveDirectoryStsLogon'; Operations = 'UserLoggedIn','UserLoginFailed'
+  UserIds = '<nip-1>@bcr-group.pl','<nip-2>@bcr-group.pl','<nip-3>@bcr-group.pl','AuthoriseMe@bcr-group.pl' } |
+  Export-Csv ir0-purview-signins.csv -NoTypeInformation -Encoding UTF8
 ```
 
-Repeat the first search for PESKOVOI and TEST, and for Bricore if it held client documents.
-Keep paging each session until it returns nothing. The role needed is Audit Reader or View-Only
-Audit Logs (Global Admin has it). Audit Standard keeps about 180 days, *verify in the tenant*;
-anything older than that is gone.
+Add Bricore's site to the loop if it held client documents. The role needed is Audit Reader or
+View-Only Audit Logs (Global Admin has it). Audit Standard keeps about 180 days, *verify in the
+tenant*; anything older than that is gone. The Entra admin centre's own sign-in log keeps only
+about 7 days without P1; H-2 step 3 downloads it.
 
-**C. The Client Directory as it stood.** Export the list, with its version history if any, so
-that "which ids were on which row, when" can be answered later.
+**C. The Client Directory as it stood.** Export the list, every row with all its fields and
+each item's version history, so that "which ids were on which row, when" can be answered later.
+It must happen before any Directory change: the H-7 status edit, `--add-columns`, and the H-12
+bindings. The commands are
+[`human-steps.md` H-2 step 4](human-steps.md#h-2-preserve-the-evidence-ir-0-before-anything-changes-the-logs).
 
 ### Where it goes
 
@@ -273,7 +324,9 @@ outside the ledger resource group's shared storage**, with:
   retention date. The IOD confirms the period; leave the policy unlocked until then, and lock it
   as soon as it is confirmed, because an unlocked policy can still be removed by an Owner;
 - **Storage Blob Data Reader** for Roman, the IOD and `yahor.simak@bcr-group.pl`, and nobody
-  else. Write access is held only for the upload and removed afterwards;
+  else. Write access is held only for the upload, and removed afterwards by hand: the script
+  grants it but never removes it
+  ([`human-steps.md` H-2 step 6](human-steps.md#h-2-preserve-the-evidence-ir-0-before-anything-changes-the-logs));
 - a `SHA256SUMS` file listing every export, so a later reader can prove nothing changed.
 
 The laptop copies are personal data. Delete them once the upload is verified, and record the
@@ -292,6 +345,22 @@ Confirm the three-site bound before trusting it. `tools/directory-bindings.mjs c
 for each Directory row, whether the ingestion identity holds a grant on that site. Any further
 site where it holds `write` is added to the walk.
 
+Run it with the `directory-bindings.mjs propose` plan from
+[`human-steps.md` H-7](human-steps.md#h-7-check-the-directory-before-the-deploy-and-add-the-new-columns)
+(H-12's plan, once it exists). The plan gives each site's guests, and without it the tool cannot
+tell a client guest's upload from anyone else's. `--site-guests <label>=<oid,…>` is the manual
+alternative. The flags are described in [`tools/README.md`](../../tools/README.md).
+
+```bash
+node tools/inventory-misfiled.mjs \
+  --site 'BCRGROUP=<tenant>.sharepoint.com:/sites/BCRGROUPSp.zo.o' \
+  --site 'PESKOVOI=<tenant>.sharepoint.com:/sites/<PESKOVOI site>' \
+  --site 'TEST=<tenant>.sharepoint.com:/sites/<TEST site>' \
+  --ingest-app-ids "$INGEST_MI_APPID" --fallback-site BCRGROUP \
+  --ir0 tools/out/ir0-appinsights-<UTC>/ \
+  --bindings-plan tools/out/directory-bindings-plan-<UTC>.json
+```
+
 For each item it records:
 
 - `driveItemId`, the site, the path at the time of inventory, created and modified times;
@@ -301,14 +370,19 @@ For each item it records:
 - **every IR-0 log line for that `driveItemId`**, and the uploader id that the join above
   yields, or `unknown`;
 - whether the logs show it as promoted, fallback, or routed by identity;
-- the item's own sharing links, if any;
-- from the Purview export: whether any principal other than staff and the ingestion identity
-  has an access event on it.
+- whether the uploader is a guest of that site's own client (`uploader_not_site_guest` when not).
+  Before Phase 0 the only id on a client row was staff, so every upload routed "by identity"
+  into PESKOVOI was a staff upload, whatever its content. This flag is what brings those items
+  into IR-2.
+
+It does **not** read an item's sharing links or join the Purview export. Both are checked by
+hand, per item, in [IR-2](#checks-per-item-by-hand).
 
 The output is a register of client documents, so it goes to the evidence store and nowhere
-else. Items it flags as *suspect* (promoted, uploader unknown, uploader not a guest of the
-site's own client, or more than one version) are the input to IR-2, and later jobs skip them
-unless IR-2 clears them.
+else. Items it flags as *suspect* (promoted, fallback, uploader unknown or ambiguous, uploader
+not a guest of the site's own client, and the other flags in `tools/README.md`) are the input to
+IR-2. An item with more than one version goes through IR-2's version rule whether or not it is
+flagged. Later jobs process only what IR-2 has cleared ([the allow-list](#the-allow-list)).
 
 The inventory also answers the GDPR question "which clients are affected": every client with
 an item in W1 or W4.
@@ -317,8 +391,11 @@ an item in W1 or W4.
 
 ## IR-2: relocation
 
-Nothing moves before IR-0 is stored, IR-1 is complete for that site, and the quarantine site
-exists. Moves are done by staff, by hand, with a second person checking each one.
+Nothing moves before IR-0 is stored, IR-1 is complete for that site, that site's folders are
+locked ([T-4](tenant-hardening.md#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root) for
+BCR GROUP, [T-4b](tenant-hardening.md#t-4b-lock-the-ledger-folders-at-the-library-root-of-the-client-sites)
+for a client site), and the quarantine site exists. Moves are done by staff, by hand, with a
+second person checking each one.
 
 ### Who owns an item: the rules, in order
 
@@ -329,7 +406,9 @@ produced.
 1. **Take the uploader from IR-0.** The uploader's `userAadObjectId`, joined on `driveItemId`
    as described above.
 2. **Map the uploader to candidate clients by Team membership.** Read the uploader's
-   `memberOf` and count the Teams whose description starts `BCR Group — `.
+   `memberOf` and count every Team (groups whose `resourceProvisioningOptions` contains `Team`),
+   not only those whose description starts `BCR Group — `: the five Teams `[0000]`–`[0004]`,
+   PESKOVOI's among them, predate onboarding and carry no such description.
    - A **guest of exactly one** client Team: that client is the candidate owner.
    - A guest of **several** client Teams: those clients are the candidates.
    - **Staff** (a `Member` of the tenant): membership does not narrow it, because staff belong
@@ -347,6 +426,17 @@ produced.
    incident again.
 5. **Belongs to no client** (a test file, BCR's own paper): it stays locked where it is and is
    deleted after BCR's retention decision.
+
+### Checks per item, by hand
+
+IR-1 does not do these, so the person deciding does, before signing:
+
+- **Sharing links.** In Graph Explorer, `GET /drives/{driveId}/items/{itemId}/permissions`. Any
+  link, or any grant that is not inherited from the site, goes in the register row's `Reason`,
+  and the link is removed before the item is moved.
+- **Access events.** Filter the IR-0 Purview file-operations export for the item (its URL or
+  `ObjectId`). Count the events by anyone other than staff and the ingestion identity into
+  `NonStaffAccess`. For an item in W4 that includes the receiving client's guest.
 
 ### Versions before any move
 
@@ -405,8 +495,9 @@ cleared as belonging to that client, with both signatures:
 **Every later job that touches ledger items at a library root must take this file and use
 nothing else**: the root-to-channel-folder migration, the index backfill and the
 review-task backfill. Each of them refuses to run on a drive while the register still has open
-items for it, skips every IR-1 suspect item that is not on the list, and shows included and
-excluded counts per client in its dry run before anyone approves `--apply`. Without this, those
+items for it, **processes only the `driveItemId`s on the list and skips every other item**,
+suspect or not, and shows included and excluded counts per client in its dry run before anyone
+approves `--apply`. Without this, those
 jobs would take the misfiled documents and make them searchable, billable and permanent in the
 wrong client's space.
 
@@ -420,12 +511,14 @@ wrong client's space.
    entrustment agreement (*umowa powierzenia*), so it is the **processor** and each client is
    the **controller**. Under Art. 33(2) BCR notifies each affected client without undue delay:
    PESKOVOI now, and each onboarded client that IR-1 finds with items in W1 or W4. The notice is
-   **phased** under Art. 33(4): what happened, which data categories, what was done, and that
-   the investigation continues. Each client, as controller, decides whether to notify UODO.
+   **phased** as findings are established, so that each controller can meet its own Art. 33(4)
+   duty: what happened, which data categories, what was done, and that the investigation
+   continues. Each client, as controller, decides whether to notify UODO.
    Template: [`gdpr/processor-notice-2026-09.pl.md`](gdpr/processor-notice-2026-09.pl.md)
    (English mirror: [`.en.md`](gdpr/processor-notice-2026-09.en.md)).
-2. **BCR's own breach register**, Art. 33(5), today: the incident, the exposure windows, the
-   containment steps, and the reasoning for each notification decision.
+2. **BCR's own breach register**, today: under Art. 33(5) for the data BCR controls, and as the
+   processor's record under Art. 28(3)(f) for client documents. It holds the incident, the
+   exposure windows, the containment steps, and the reasoning for each notification decision.
    Template: [`gdpr/breach-register-entry-2026-09.md`](gdpr/breach-register-entry-2026-09.md).
 3. **UODO directly, only where BCR is the controller**, which is BCR's own data (its staff,
    its own records, the routing list and the telemetry about uploads), and only if the Purview
@@ -469,22 +562,25 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-1: IR-3 (1), processor notice phase 1 to PESKOVOI | Roman + IOD | todo | | |
 | H-1: IR-3 (2), breach-register entry | IOD | todo | | register entry id |
 | H-2: IR-0 A, trace export | Yahor | todo | | `SHA256SUMS` |
-| H-2: IR-0 B, Purview export and audit-log state | Global Admin | todo | | `SHA256SUMS` |
+| H-2: IR-0 B, Purview export (file operations, group events, sign-in events) and audit-log state | Global Admin | todo | | `SHA256SUMS` |
+| H-2: Entra sign-in log, last 7 days, for the `{NIP}@` accounts and `AuthoriseMe@` | Global Admin | todo | | `SHA256SUMS` |
 | H-2: IR-0 C, Directory export | Yahor | todo | | `SHA256SUMS` |
-| H-2: evidence store created, readers verified, laptop copies deleted | Roman, Yahor | todo | | |
-| H-3: optional `ANTHROPIC_ENABLED=false` | Roman decides | todo | | yes / no |
+| H-2: evidence store created, readers verified, uploader write removed, laptop copies deleted | Roman, Yahor | todo | | |
+| H-3: `ANTHROPIC_ENABLED=false` (mandatory) | Yahor | todo | | |
 | BCR GROUP made Private (time from Purview) | — | done | *record* | T-3 |
 | H-4: tenant hardening T-1 … T-9 | per step | todo | | [`tenant-hardening.md`](tenant-hardening.md#status) |
+| T-4b: client-site root folders locked (end of W4 for items already moved) | SharePoint Admin | todo | | sites and lock times in [`tenant-hardening.md`](tenant-hardening.md#status) |
 | IR-1 inventory | Yahor | todo | | `SHA256SUMS` |
 | H-5, H-6: quarantine site and ingestion write grant | SharePoint Admin, Global Admin | todo | | |
-| H-7: Directory check; duplicate `0002` resolved; per-row decisions | Yahor, Roman | todo | | |
+| H-6b: running build's fallback re-pointed at the quarantine | Yahor | todo | | `FALLBACK_*` names; values in the evidence store (`SHA256SUMS`) |
+| H-7: Directory check; duplicate `0002` resolved; per-row decisions, incl. which sites get a grant in H-12 | Yahor, Roman | todo | | |
 | H-8: app settings added | Yahor | todo | | |
-| H-9: bot deploy, gate in `log` | Yahor | todo | | |
+| H-9: bot deploy, gate in `log` | Yahor | todo | | sha256 of the saved pre-Phase-0 bot package |
 | H-10: manifest 0.2.0 and availability (T-10) | Teams Admin | todo | | |
 | H-11: gate `enforce` after 24 h clean | Yahor | todo | | |
-| H-12: ingestion deploy, bindings, canaries | Yahor, Roman reviews | todo | | apply log hash |
+| H-12: ingestion deploy, further site grants, bindings, canaries | Yahor, Roman reviews | todo | | apply log hash; sha256 of the saved pre-Phase-0 ingestion package |
 | H-13: ingestion grant on BCR GROUP downgraded to `read` | Global Admin | todo | | |
-| H-14: `FALLBACK_*` settings removed | Yahor | todo | | |
+| H-14: `FALLBACK_*` settings removed, pre-Phase-0 packages deleted | Yahor | todo | | |
 | IR-2 relocation complete, allow-lists issued | Roman + second person | todo | | |
 | IR-3: phase-2 notices to every affected client | Roman + IOD | todo | | |
 | IR-3 (3): UODO decision for BCR-controlled data recorded | Roman + IOD | todo | | |

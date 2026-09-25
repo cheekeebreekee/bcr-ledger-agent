@@ -19,6 +19,14 @@
 >   Sprawę jego dostępu do cudzego dokumentu opisuje rejestr naruszeń.
 > - Przed wysłaniem sprawdzić umowę powierzenia: może przewidywać krótszy termin albo
 >   określoną formę powiadomienia.
+> - Krąg odbiorców w Wariancie A zależy od kroku T-7 w `tenant-hardening.md`. Nie opisywać
+>   konta `AuthoriseMe@` jako konta pracownika BCR, dopóki wynik T-7 nie zostanie zapisany w
+>   tabeli statusu incydentu. Jeśli okaże się czymś innym niż konto personelu BCR, napisać,
+>   czym jest, a jego zdarzenia dostępu z IR-0 podać w punkcie 4 osobno od dostępu personelu.
+> - Akapit o logowaniach w punkcie 4 podaje tylko to, co wynika z eksportów logowań z IR-0
+>   (zdarzenia logowania z dziennika audytu i pobrany 7-dniowy dziennik Entra, `human-steps.md`
+>   H-2). Jeśli nie zostały jeszcze przeanalizowane, napisać, że analiza trwa; nigdy nie pisać,
+>   że dzienniki logowania nie istnieją.
 > - Wersja angielska do porównania: [`processor-notice-2026-09.en.md`](processor-notice-2026-09.en.md).
 
 ---
@@ -31,7 +39,7 @@
 | **Podstawa** | art. 33 ust. 2 oraz art. 28 ust. 3 lit. f RODO |
 | **Znak sprawy** | IR-2026-09/{{NUMER_KLIENTA}} |
 | **Data** | {{DATA_WYSŁANIA}} |
-| **Etap** | 1. Informacje przekazujemy etapami, zgodnie z art. 33 ust. 4 RODO. |
+| **Etap** | 1. Kolejne informacje przekażemy etapami, w miarę ich ustalania, aby umożliwić Państwu wykonanie obowiązków, w tym z art. 33 ust. 4 RODO. |
 
 Szanowni Państwo,
 
@@ -48,11 +56,12 @@ stwierdziliśmy, że z powodu błędów w konfiguracji i w oprogramowaniu asyste
 dokumentów nie trafiła do Państwa przestrzeni.
 
 **[Wariant A]** Dokumenty zostały zapisane we wspólnej bibliotece dokumentów zespołu BCR GROUP,
-przeznaczonej dla pracowników BCR. Dostęp do niej mieli członkowie tego zespołu, czyli
-pracownicy BCR. W okresie {{OKRES_ZESPÓŁ_PUBLICZNY}} zespół był ustawiony jako publiczny. Mogło
-wtedy do niego dołączyć każde konto wewnętrzne w naszej organizacji Microsoft 365, w tym trzy
-konta skrzynek pocztowych przypisanych klientom BCR, które nie powinny były mieć możliwości
-logowania.
+przeznaczonej dla pracowników BCR. Dostęp do niej mieli członkowie tego zespołu: pracownicy BCR
+oraz jedno konto organizacyjne BCR{{UWAGA_T7 — do czasu rozstrzygnięcia T-7: „, którego
+przeznaczenie wyjaśniamy”; po T-7: czym jest to konto i kto z niego korzysta}}. W okresie
+{{OKRES_ZESPÓŁ_PUBLICZNY}} zespół był ustawiony jako publiczny. Mogło wtedy do niego dołączyć
+każde konto wewnętrzne w naszej organizacji Microsoft 365, w tym trzy konta skrzynek pocztowych
+przypisanych klientom BCR, które nie powinny były mieć możliwości logowania.
 
 **[Wariant B]** {{LICZBA_DOKUMENTÓW_B}} dokument(y) został(y) zapisany(e) w przestrzeni innego
 klienta BCR. Asystent przypisywał dokument do klienta na podstawie numeru NIP występującego w
@@ -76,18 +85,23 @@ dokumentów został ograniczony do kierownictwa BCR w dniu …”}}
 
 ## 4. Kto miał lub mógł mieć dostęp
 
-{{OPIS_ODBIORCÓW — Wariant A: „pracownicy BCR będący członkami zespołu BCR GROUP; w okresie, gdy
-zespół był publiczny, także każde konto wewnętrzne organizacji”. Wariant B: „osoby reprezentujące
-inny podmiot, klienta BCR, będące członkami jego zespołu”.}}
+{{OPIS_ODBIORCÓW — Wariant A: „członkowie zespołu BCR GROUP: pracownicy BCR oraz jedno konto
+organizacyjne BCR (zob. punkt 1); w okresie, gdy zespół był publiczny, także każde konto
+wewnętrzne organizacji”. Wariant B: „osoby reprezentujące inny podmiot, klienta BCR, będące
+członkami jego zespołu”.}}
 
 **Czy stwierdzono dostęp osób nieuprawnionych:** {{USTALENIA_DOSTĘPU — np. „Analiza dziennika
-operacji na plikach Microsoft 365 trwa; dotychczas nie stwierdziliśmy otwarcia ani pobrania
-Państwa dokumentów przez osobę spoza personelu BCR.” albo „Stwierdziliśmy, że dnia … dokument
-został otwarty przez osobę spoza personelu BCR.”}}
+audytu Microsoft 365 trwa; dotychczas nie stwierdziliśmy otwarcia ani pobrania Państwa dokumentów
+przez osobę spoza personelu BCR, a przez konto organizacyjne wspomniane w punkcie 1:
+{{żadnego / następujące}}.” albo „Stwierdziliśmy, że dnia … dokument został otwarty przez
+osobę spoza personelu BCR.”}}
 
-Nasza licencja Microsoft 365 nie rejestruje dzienników logowania. Ustalenia opieramy na dzienniku
-operacji na plikach, który obejmuje okres od {{POCZĄTEK_DZIENNIKA_AUDYTU}}. Dla wcześniejszego
-okresu nie da się ustalić, czy ktoś otworzył dokument.
+Bez licencji Microsoft Entra ID P1 dziennik logowań Entra obejmuje tylko 7 dni. Dziennik audytu
+Microsoft 365 rejestruje operacje na plikach i logowania interaktywne przez około 180 dni.
+Ustalenia opieramy na tym dzienniku, który obejmuje okres od
+{{POCZĄTEK_DZIENNIKA_AUDYTU}}{{USTALENIA_LOGOWAŃ — np. „; w tym okresie nie stwierdziliśmy
+logowania na konta skrzynek pocztowych przypisanych klientom”}}. Dla wcześniejszego okresu nie
+da się ustalić, czy ktoś otworzył dokument.
 
 ## 5. Możliwe konsekwencje
 
@@ -107,6 +121,10 @@ Zrobione (z datami):
   a zespół BCR GROUP jest ustawiony jako prywatny;
 - {{DATA}}: dostęp do folderów z dokumentami w bibliotece zespołu BCR GROUP ograniczyliśmy do
   kierownictwa BCR;
+- **[Wariant B]** {{DATA}}: wyłączyliśmy funkcję, która przypisywała dokumenty do klienta na
+  podstawie ich treści;
+- **[Wariant B]** {{DATA}}: ograniczyliśmy dostęp do folderów w przestrzeni innego klienta BCR,
+  w których zapisano Państwa dokument(y), tak że jego członkowie nie mogą ich już otworzyć;
 - {{DATA}}: zabezpieczyliśmy dzienniki zdarzeń w magazynie, którego zawartości nie można zmienić
   ani usunąć, z dostępem ograniczonym do kierownictwa BCR i inspektora ochrony danych;
 - {{DATA}}: wstrzymaliśmy automatyczne wdrażanie zmian w systemie.

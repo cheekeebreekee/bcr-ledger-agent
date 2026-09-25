@@ -3,8 +3,9 @@
 This walks through getting the bcr-ledger-agent into a brand-new Azure
 subscription and Microsoft 365 tenant.
 
-> Total time budget: ~45 minutes the first time, ~3 minutes for subsequent
-> code-only deploys via `yarn deploy:dev`.
+> Total time budget: ~45 minutes the first time. A later code-only deploy takes ~3 minutes:
+> `yarn build && yarn workspace @bcr/<pkg> package`, then `config-zip` (see
+> [`PROJECT_OVERVIEW.md` → Build and deploy](../PROJECT_OVERVIEW.md#build-and-deploy)).
 
 > ⚠️ **This guide is for a brand-new environment. Do not run it against "dev" today.** "dev"
 > serves a real client, and `main.bicep` has drifted from the app settings running there.

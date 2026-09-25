@@ -61,9 +61,21 @@ yarn start:ingestion      # http://localhost:7071/api/ingest/batch
 ```
 
 Deploy: `yarn deploy:dev` / `yarn deploy:prod` run `infrastructure/deploy.sh <env>` (Bicep, then
-zip-deploy of both Function Apps). `yarn workspace @bcr/<pkg> package` builds the zip into
-`artifacts/`. CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test plus
-`bicep build`/`bicep lint`; `deploy.yml` deploys via Azure OIDC.
+zip-deploy of both Function Apps); `deploy.yml` does the same via Azure OIDC.
+
+> ⚠️ **"dev" is production: it serves PESKOVOI.** Until the Bicep drift fix (gate G1), never run
+> `yarn deploy:*`, `infrastructure/deploy.sh` or the Deploy workflow against it. `main.bicep`
+> lacks the hand-set app settings, a Bicep deploy replaces every setting, and ingestion then
+> fails at cold start. Deploy code only, one app at a time, in the order in
+> `docs/operations/human-steps.md` (Phase 0), and add settings with
+> `az functionapp config appsettings set … -o none`, which merges.
+
+`yarn build && yarn workspace @bcr/<pkg> package` builds a fresh zip into `artifacts/`
+(`tools/package-function.mjs` stages it and vendors the just-built `@bcr/shared`). Before
+deploying, check that the vendored copy is current: `unzip -p artifacts/<pkg>.zip
+node_modules/@bcr/shared/dist/config.js | grep -c botGateMode` (ingestion:
+`forbiddenTargetSitePaths`) must be greater than 0. CI (`.github/workflows/ci.yml`) runs lint →
+type-check → build → test plus `bicep build`/`bicep lint`.
 
 ---
 

@@ -44,8 +44,8 @@ flowchart TB
     WOK{"Written after retries?"}:::gate
     QR["Quarantine, with one reason<br/>the folder never depends on content"]:::gate
     UPQ["PUT Kwarantanna/YYYY/MM/{batchId}/<br/>sanitised original filename, conflictBehavior=fail<br/>then PATCH UploaderOid, QuarantineReason,<br/>OriginalFilename, DocumentId"]:::system
-    QFAIL["Quarantine write failed<br/>rejected row, spróbuj ponownie, alert<br/>never written anywhere else"]:::gate
-    LOG["Logs, ids only: document.filed,<br/>document.quarantined, directory.conflict"]:::system
+    QFAIL["Quarantine write failed<br/>rejected row, spróbuj ponownie<br/>error log document.quarantine_failed<br/>never written anywhere else"]:::gate
+    LOG["Logs, ids only: document.filed,<br/>document.quarantined, directory.conflict,<br/>document.quarantine_failed"]:::system
   end
   ANT["Anthropic API"]:::external
   subgraph M365["Microsoft 365 tenant BCR"]
@@ -123,8 +123,12 @@ quarantine library and in the `document.quarantined` log event.
 | `forbidden_target` | The row's `SitePath` is in `FORBIDDEN_TARGET_SITE_PATHS`. BCR GROUP is always on the list, and the quarantine site is added automatically. |
 | `target_unwritable` | The client target could not be written after retries. |
 
-If the quarantine write itself fails, the user gets a rejected row asking them to try again, an
-alert fires, and the file is not written anywhere else.
+If the quarantine write itself fails, the user gets a rejected row asking them to try again, a
+`document.quarantine_failed` error is logged, and the file is not written anywhere else. No alert
+rule exists yet: alerting comes with the monitoring work in Phase 1. Until then an operator
+watches for that event
+([`human-steps.md` H-12](../operations/human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries),
+the watch query and "After the window").
 
 ## Directory snapshot
 
