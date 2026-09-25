@@ -261,9 +261,15 @@ sign-in events of the `{NIP}@` accounts and `AuthoriseMe@`.
 
 **Use the script:** `tools/ir0/export-purview.ps1`, exactly as in
 [`human-steps.md` H-2](human-steps.md#h-2-preserve-the-evidence-ir-0-before-anything-changes-the-logs)
-(with `-FileOperations` and `-SignInUpn`). It gathers every page, starts a new session for every
-window, and splits a window that reaches the 50,000-record session cap. The manual commands
-below are the reference for what it does. They collect **all** pages into one variable and
+(with `-FileOperations`, `-SignInUpn` and `-StartDate 2026-03-01T00:00:00Z`). It gathers every
+page, starts a new session for every window, and splits a window that reaches the 50,000-record
+session cap. It also exports the sharing events (`purview-sharing-events.csv`), which IR-2 needs
+because the T-4/T-4b locks erase item-level links.
+
+**The manual commands below are a fallback only,** for when the script cannot run. They are
+**not equivalent** to it: one session per search cannot split a window, so each search stops
+with an error when it reaches the session cap, and must then be run again per month (change
+`StartDate` and `EndDate`) until none does. They collect **all** pages into one variable and
 export once: `Export-Csv` overwrites its file, so exporting page by page keeps only the last
 page, and an empty final page leaves an empty file.
 
@@ -274,11 +280,16 @@ Get-AdminAuditLogConfig | Format-List UnifiedAuditLogIngestionEnabled   # must b
 # Collect every page of one ReturnLargeSet session. A new SessionId per search, always:
 # re-using one continues the old session instead of starting a new result set.
 function Get-AllPages([hashtable] $Search) {
-  $sid = [guid]::NewGuid().ToString(); $all = @()
+  $sid = [guid]::NewGuid().ToString(); $all = @(); $total = 0
   do {
     $page = @(Search-UnifiedAuditLog @Search -SessionId $sid -SessionCommand ReturnLargeSet -ResultSize 5000)
+    if ($page.Count -gt 0) { $total = $page[0].ResultCount }
     $all += $page
-  } while ($page.Count -gt 0 -and $all.Count -lt $page[0].ResultCount)
+  } while ($page.Count -gt 0 -and $all.Count -lt $total)
+  # A session stops at 50,000 records and then returns an empty page, which looks complete.
+  if ($all.Count -ge 50000 -or $all.Count -lt $total) {
+    throw "Got $($all.Count) of $total records: the session cap was reached. Split the date range."
+  }
   $all
 }
 
@@ -292,9 +303,20 @@ foreach ($site in 'BCRGROUPSp.zo.o', '<PESKOVOI site>', '<TEST site>') {
     Export-Csv "ir0-purview-$site.csv" -NoTypeInformation -Encoding UTF8
 }
 
-# Group events: who joined, who was added, when visibility changed.
+# Sharing: links created, used or removed. The T-4/T-4b locks clear item-level links, so this is
+# the only record of them afterwards (IR-2).
+$sharing = Get-AllPages @{ StartDate = '2026-03-01'; EndDate = (Get-Date).ToUniversalTime()
+  RecordType = 'SharePointSharingOperation' }
+foreach ($site in 'BCRGROUPSp.zo.o', '<PESKOVOI site>', '<TEST site>') {
+  $sharing | Where-Object { ($_.AuditData | ConvertFrom-Json).SiteUrl -like "*/sites/$site*" } |
+    Export-Csv "ir0-purview-sharing-$site.csv" -NoTypeInformation -Encoding UTF8
+}
+
+# Group events: who joined, who was added or made owner, when visibility changed.
 Get-AllPages @{ StartDate = '2026-03-01'; EndDate = (Get-Date).ToUniversalTime()
-  Operations = 'Add member to group.','Remove member from group.','Update group.','MemberAdded','MemberRemoved','TeamSettingChanged' } |
+  Operations = 'Add member to group.','Remove member from group.','Add owner to group.',
+    'Remove owner from group.','Update group.','MemberAdded','MemberRemoved','MemberRoleChanged',
+    'TeamSettingChanged' } |
   Export-Csv ir0-purview-groups.csv -NoTypeInformation -Encoding UTF8
 
 # Sign-ins of the accounts in W2/W3 [verify that the tenant records them].
@@ -330,20 +352,58 @@ outside the ledger resource group's shared storage**, with:
 - a `SHA256SUMS` file listing every export, so a later reader can prove nothing changed.
 
 The laptop copies are personal data. Delete them once the upload is verified, and record the
-hashes, not the files, in the [status table](#status).
+hashes, not the files, in the [status table](#status). IR-1 needs the trace export on disk: it
+downloads it back from the store for the run and deletes it again afterwards
+([IR-1](#ir-1-inventory)).
 
 ---
 
 ## IR-1: inventory
 
 `tools/inventory-misfiled.mjs` is read-only. It walks the default library of BCR GROUP,
-PESKOVOI and TEST, the only sites the ingestion identity could write to. It lists every item
-the ingestion identity created (`createdBy.application.id` is the ingestion managed identity),
-and every item under a ledger taxonomy folder at a library root.
+PESKOVOI and TEST, the only sites the ingestion identity could write to. It registers every item
+the ingestion identity created or last modified (`createdBy` or `lastModifiedBy`
+`application.id` is the ingestion managed identity), and every item IR-0 names. It does **not**
+register every item under a ledger taxonomy folder: pass `--all-items` for that. At the end it
+prints the applications that created files. Check that list against `--ingest-app-ids`: any
+application id that wrote under a root taxonomy folder and is not in `--ingest-app-ids` (an
+earlier or recreated ingestion identity, say) is added to it, and the run repeated.
 
 Confirm the three-site bound before trusting it. `tools/directory-bindings.mjs check` reports,
 for each Directory row, whether the ingestion identity holds a grant on that site. Any further
 site where it holds `write` is added to the walk.
+
+**Whose token.** IR-1 walks with a delegated token, and SharePoint trims every listing to what
+that user may see. After T-4 and T-4b, the locked taxonomy folders are visible only to the
+site's Owners, so a member's token silently skips them, and every item in them is missing from
+the register, from IR-2 and from the list of affected clients. So IR-1 runs with the token of
+someone who is an **Owner or a site collection admin of every site it walks**. If Yahor is not,
+someone who is runs it; on BCR GROUP that is one of its existing site Owners, and nobody is
+added to BCR GROUP for this. On a client site, the SharePoint Administrator may instead make him
+a site collection admin for the run and remove that afterwards, recorded in the status table.
+
+**The expected folders.** For each walked site, pass `--expect-root-folders <label>=<folders>`
+with the taxonomy folders saved in T-4's or T-4b's *Read first* (and any added by a re-check).
+The tool exits non-zero, naming the folder, when the walk does not see one, which is what a
+token without Owner rights produces. It always prints, per site, the taxonomy folders it found at
+the library root: compare them with the saved lists before trusting the run.
+
+**The IR-0 trace export, back from the store.** H-2 deletes the laptop copies. Download the
+export again with an account that holds Storage Blob Data Reader on the store (Roman, the IOD or
+`yahor.simak@bcr-group.pl`), check it against its `SHA256SUMS`, and delete it again once IR-1 has
+run. The blob path is `ir0/<upload date>/<export folder>/`, as `evidence-store.sh` printed it.
+
+```bash
+R=tools/out/ir0-restore; mkdir -p -m 700 "$R"
+az storage blob download-batch --auth-mode login --account-name <storage account> \
+  -s ir0-evidence -d "$R" --pattern 'ir0/<upload date>/ir0-appinsights-<UTC>/*'
+(cd "$R/ir0/<upload date>/ir0-appinsights-<UTC>" && shasum -a 256 -c SHA256SUMS)   # every line OK
+```
+
+Never drop `--ir0` to get a run through. Without it the tool cannot tell a fallback or a
+promoted upload from any other, so it flags every item the ingestion created or modified as
+`no_ir0_given` (suspect): the run is then complete but says nothing, and every such item goes to
+IR-2.
 
 Run it with the `directory-bindings.mjs propose` plan from
 [`human-steps.md` H-7](human-steps.md#h-7-check-the-directory-before-the-deploy-and-add-the-new-columns)
@@ -356,9 +416,13 @@ node tools/inventory-misfiled.mjs \
   --site 'BCRGROUP=<tenant>.sharepoint.com:/sites/BCRGROUPSp.zo.o' \
   --site 'PESKOVOI=<tenant>.sharepoint.com:/sites/<PESKOVOI site>' \
   --site 'TEST=<tenant>.sharepoint.com:/sites/<TEST site>' \
+  --expect-root-folders 'BCRGROUP=<taxonomy folders from T-4 Read first>' \
+  --expect-root-folders 'PESKOVOI=<taxonomy folders from T-4b Read first>' \
+  --expect-root-folders 'TEST=<taxonomy folders from T-4b Read first>' \
   --ingest-app-ids "$INGEST_MI_APPID" --fallback-site BCRGROUP \
-  --ir0 tools/out/ir0-appinsights-<UTC>/ \
+  --ir0 tools/out/ir0-restore/ir0/<upload date>/ir0-appinsights-<UTC>/ \
   --bindings-plan tools/out/directory-bindings-plan-<UTC>.json
+rm -rf tools/out/ir0-restore                                    # once the run is checked
 ```
 
 For each item it records:
@@ -376,7 +440,10 @@ For each item it records:
   into IR-2.
 
 It does **not** read an item's sharing links or join the Purview export. Both are checked by
-hand, per item, in [IR-2](#checks-per-item-by-hand).
+hand, per item, in [IR-2](#checks-per-item-by-hand). Once IR-1 has run for a client site,
+T-4b's Verify uses the register to lock, one by one, the flagged items that sit outside the
+locked folders
+([tenant hardening T-4b](tenant-hardening.md#t-4b-lock-the-ledger-folders-at-the-library-root-of-the-client-sites)).
 
 The output is a register of client documents, so it goes to the evidence store and nowhere
 else. Items it flags as *suspect* (promoted, fallback, uploader unknown or ambiguous, uploader
@@ -431,9 +498,15 @@ produced.
 
 IR-1 does not do these, so the person deciding does, before signing:
 
-- **Sharing links.** In Graph Explorer, `GET /drives/{driveId}/items/{itemId}/permissions`. Any
-  link, or any grant that is not inherited from the site, goes in the register row's `Reason`,
-  and the link is removed before the item is moved.
+- **Sharing links.** Filter IR-0's `purview-sharing-events.csv` (or the fallback's
+  `ir0-purview-sharing-<site>.csv`) for the item's URL or `ObjectId`: every link created, used or
+  removed. This is the record that counts. T-4 and T-4b stopped inheritance with
+  `clearSubscopes=true`, which reset every item in a locked folder and removed its links and
+  direct grants, so the live permissions no longer show them. For an item T-4b locked on its own,
+  also read the permissions it saved before the lock. Then, in Graph Explorer,
+  `GET /drives/{driveId}/items/{itemId}/permissions` for what is there now. Any link, or any
+  grant that is not inherited from the site, past or present, goes in the register row's
+  `Reason`, and a live link is removed before the item is moved.
 - **Access events.** Filter the IR-0 Purview file-operations export for the item (its URL or
   `ObjectId`). Count the events by anyone other than staff and the ingestion identity into
   `NonStaffAccess`. For an item in W4 that includes the receiving client's guest.
@@ -570,8 +643,9 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | BCR GROUP made Private (time from Purview) | — | done | *record* | T-3 |
 | H-4: tenant hardening T-1 … T-9 | per step | todo | | [`tenant-hardening.md`](tenant-hardening.md#status) |
 | T-4 checked again after H-6b | BCR GROUP site owner | todo | | time, and any folder locked, in [`tenant-hardening.md`](tenant-hardening.md#status) |
-| T-4b: client-site root folders locked after H-3, and items outside them locked one by one (end of W4 for items already moved: the later of the lock and H-3) | SharePoint Admin | todo | | sites, lock times and H-3's time in [`tenant-hardening.md`](tenant-hardening.md#status) |
-| IR-1 inventory | Yahor | todo | | `SHA256SUMS` |
+| T-4b: client-site root folders locked after H-3 (end of W4 for the items in them: the later of the lock and H-3) | SharePoint Admin | todo | | sites, lock times and H-3's time in [`tenant-hardening.md`](tenant-hardening.md#status) |
+| IR-1 inventory: run with an Owner's or site collection admin's token and `--expect-root-folders` for every site; `--ir0` restored from the store; exit 0 | Yahor, or an Owner of each site | todo | | `SHA256SUMS`; any temporary site collection admin added and removed |
+| T-4b: items outside the locked folders checked after IR-1, and locked one by one | SharePoint Admin | todo | | per site: done, and the number of items locked (the items themselves in the evidence store) |
 | H-5, H-6: quarantine site and ingestion write grant | SharePoint Admin, Global Admin | todo | | |
 | H-6b: running build's fallback re-pointed at the quarantine | Yahor | todo | | `FALLBACK_*` names; values in the evidence store (`SHA256SUMS`) |
 | H-7: Directory check; duplicate `0002` resolved; per-row decisions, incl. which sites get a grant in H-12 | Yahor, Roman | todo | | |

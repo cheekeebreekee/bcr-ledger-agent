@@ -89,8 +89,11 @@ Graph and SharePoint tokens are set up as described in
 | H-15 | Exit criteria checked | Yahor, Roman | end of phase | all |
 
 IR-1 (inventory) and IR-2 (relocation) run alongside, from the day H-2 is stored. They are
-described in the incident doc. IR-1 takes the plan H-7 writes; IR-2 moves nothing on a site
-before that site's folders are locked (T-4, T-4b).
+described in the incident doc. IR-1 takes the plan H-7 writes. Once T-4 and T-4b have locked
+the folders, IR-1 runs with the token of an Owner or site collection admin of every site it
+walks, and with `--expect-root-folders`, because a locked folder is invisible to anyone else
+([incident → IR-1](incident-2026-09.md#ir-1-inventory)). IR-2 moves nothing on a site before
+that site's folders are locked (T-4, T-4b).
 
 ---
 
@@ -149,9 +152,14 @@ unified audit log's sign-in events (`UserLoggedIn`, `UserLoginFailed`, kept abou
 **[verify]**) for the three `{NIP}@` accounts and `AuthoriseMe@`. They are the evidence for W2 and
 W3.
 
+**Start date: `2026-03-01T00:00:00Z`, as below, not go-live and not the README's example.** W2
+and W3 opened on dates nobody knows, and Audit Standard keeps only about 180 days, so the export
+must reach back past the oldest event the log still holds. A start before that is harmless: the
+service returns what it has. Anything left out now ages out for good.
+
 ```powershell
 Connect-ExchangeOnline -UserPrincipalName <auditor>
-./tools/ir0/export-purview.ps1 -SiteUrl <BCR GROUP url>, <PESKOVOI url>, <TEST url> -StartDate <UTC> `
+./tools/ir0/export-purview.ps1 -SiteUrl <BCR GROUP url>, <PESKOVOI url>, <TEST url> -StartDate 2026-03-01T00:00:00Z `
   -FileOperations FileUploaded, FileAccessed, FilePreviewed, FileDownloaded, FileSyncDownloadedFull, `
     FileSyncDownloadedPartial, FileModified, FileMoved, FileCopied, FileRenamed, FileDeleted, `
     FileRecycled, FileDeletedFirstStageRecycleBin, FileDeletedSecondStageRecycleBin `
@@ -236,7 +244,10 @@ az lock create "${LOCK[@]}" --lock-type CanNotDelete --notes "IR-0 evidence: do 
   upload is done.
 - The CanNotDelete lock is back: `az lock list -g rg-bcr-ir-evidence -o table`.
 - The immutability policy shows the retention date the IOD set.
-- The laptop copies are deleted, and their hashes are in the incident's status table.
+- The laptop copies are deleted, and their hashes are in the incident's status table. IR-1
+  needs the trace export on disk: it downloads it back from the store first and deletes it again
+  afterwards ([incident → IR-1](incident-2026-09.md#ir-1-inventory)). Do not run IR-1 without
+  it.
 
 **Rollback.** None, on purpose: the evidence is immutable. If the retention period is wrong,
 the IOD sets the right one before the policy is locked.
