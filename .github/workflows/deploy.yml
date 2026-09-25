@@ -8,8 +8,11 @@ on:
         description: Target environment
         required: true
         options: [dev, qa, prod]
-  push:
-    branches: [main]
+  # No `push` trigger. "dev" serves a real client, and main.bicep has drifted
+  # from the app settings that are actually running (CLIENT_DIRECTORY_* and
+  # FALLBACK_* are set by hand and absent from the template), so an automatic
+  # deploy on merge would wipe them and take ingestion down at cold start.
+  # Deploys are manual until the Bicep drift fix lands.
 
 permissions:
   id-token: write   # OIDC federation to Azure
