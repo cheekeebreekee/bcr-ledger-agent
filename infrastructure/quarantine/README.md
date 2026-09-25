@@ -135,7 +135,7 @@ granted `Sites.Selected`, restart it after that role is granted.
 
 ## Verify
 
-1. **The grant exists, once, as write.** Needs `Sites.FullControl.All`. Expect one entry with `roles: ["write"]` and `application.id` equal to the ingestion app id.
+1. **The grant exists, once, as write.** Needs `Sites.FullControl.All`. Expect one entry with `roles: ["write"]` and `application.id` equal to the app id of the ingestion Function App's system-assigned managed identity (`INGEST_MI_APPID` in human-steps.md), never the ingestion API app registration's.
    ```http
    GET https://graph.microsoft.com/v1.0/sites/<graph-site-id>/permissions
    ```

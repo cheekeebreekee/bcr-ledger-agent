@@ -60,7 +60,7 @@ describe('escapeMarkdown', () => {
 
 describe('rejectionText', () => {
   it('has a distinct Polish message for each known code', () => {
-    const codes = [DOWNLOAD_FAILED, INGESTION_FAILED, 'ValidationError', 'SharePointError'];
+    const codes = [DOWNLOAD_FAILED, INGESTION_FAILED, 'ValidationError', 'SharePointError', 'RetryLater'];
     const texts = codes.map(rejectionText);
     expect(new Set(texts).size).toBe(codes.length);
     expect(texts).not.toContain(rejectionText('SomethingElse'));

@@ -72,6 +72,8 @@ const REJECTION_TEXT: ReadonlyMap<string, string> = new Map([
     'Tego pliku nie można przyjąć (nieobsługiwany typ, zbyt duży rozmiar lub nieprawidłowa nazwa).',
   ],
   ['SharePointError', 'Nie udało się zapisać pliku. Spróbuj ponownie za chwilę.'],
+  // Ingestion ran out of time for this batch and did not start the file.
+  ['RetryLater', 'Nie zdążyłem przetworzyć tego pliku. Wyślij go ponownie za chwilę.'],
 ]);
 
 const DEFAULT_REJECTION_TEXT =
