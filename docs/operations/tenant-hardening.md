@@ -395,8 +395,8 @@ az rest --url "$G/users/AuthoriseMe@bcr-group.pl?\$select=id,displayName,userTyp
 az rest --url "$G/users/AuthoriseMe@bcr-group.pl/memberOf?\$select=displayName"
 ```
 
-In the IR-0 Purview export, filter on this user. Any file access by it in the fallback bucket is
-evidence for IR-3.
+In the IR-0 Purview export, filter on this user: its file operations and its sign-in events.
+Any file access by it in the fallback bucket is evidence for IR-3.
 
 **Decide.**
 

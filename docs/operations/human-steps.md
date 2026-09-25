@@ -78,7 +78,7 @@ Graph and SharePoint tokens are set up as described in
 | H-5 | Quarantine site | SharePoint Admin | day 1 | — |
 | H-6 | Ingestion identity write grant on quarantine | Global Admin | day 1 | H-5 |
 | H-6b | Running build's fallback re-pointed at the quarantine | Yahor | day 1 | H-3, H-6 verified |
-| H-7 | Directory check and new columns (no new site grants) | Yahor | day 1 | — |
+| H-7 | Directory check and new columns (no new site grants) | Yahor | day 1 | H-2 (IR-0 C stored), T-5 |
 | H-8 | New app settings, added | Yahor | day 1 | H-5 |
 | H-9 | Bot deploy, gate in `log` | Yahor | day 1 | H-2, H-8 |
 | H-10 | Manifest 0.2.0 and availability | Teams Admin | day 1 | H-9 |
@@ -123,7 +123,7 @@ never withdraws one.
 ### H-2: Preserve the evidence (IR-0), before anything changes the logs
 
 **Owner:** Roman (creates the store, as subscription Owner), Yahor (trace and Directory
-exports), Global Admin (Purview export). **When:** today. App Insights keeps 30 days, and each
+exports), Global Admin (Purview export and the Entra sign-in log). **When:** today. App Insights keeps 30 days, and each
 day of delay deletes a day of evidence. This must also happen **before H-9 and H-12**, because the
 Phase-0 code changes what is logged.
 
@@ -131,18 +131,71 @@ What to export, and why each join works, is in
 [incident → IR-0](incident-2026-09.md#ir-0-preserve-the-evidence-first). Every script is
 described, with all its flags, in [`tools/README.md`](../../tools/README.md).
 
+**1. The trace export (Yahor).** 24-hour chunks over the last 30 days. It writes the files, the
+query, `export-meta.txt` and `SHA256SUMS` under `tools/out/` (git-ignored). `--all-traces` also
+keeps every trace unfiltered, from both apps (they share the component). The script always
+exports the `requests` rows for `/api/mydocs` and `/api/user-target`: the only record of who
+used the Personal Tab lookup (W5), which Purview cannot see.
+
 ```bash
-# 1. The trace export (Yahor). 24-hour chunks over the last 30 days; writes the files,
-#    the query, export-meta.txt and SHA256SUMS under tools/out/ (git-ignored).
-tools/ir0/export-appinsights.sh --app <App Insights component> --resource-group rg-bcr-ledger-dev
+tools/ir0/export-appinsights.sh --app <App Insights component> --resource-group rg-bcr-ledger-dev --all-traces
+```
 
-# 2. The Purview export (Global Admin, PowerShell 7, "View-Only Audit Logs" role).
-#    Sites: BCR GROUP, PESKOVOI, TEST.
+**2. The Purview export (Global Admin, PowerShell 7, "View-Only Audit Logs" role).** Sites: BCR
+GROUP, PESKOVOI, TEST. The file operations include moves, copies, renames and deletions: the
+ingestion never moved or copied a file, so every such event is a person's. `-SignInUpn` adds the
+unified audit log's sign-in events (`UserLoggedIn`, `UserLoginFailed`, kept about 180 days
+**[verify]**) for the three `{NIP}@` accounts and `AuthoriseMe@`. They are the evidence for W2 and
+W3.
+
+```powershell
 Connect-ExchangeOnline -UserPrincipalName <auditor>
-./tools/ir0/export-purview.ps1 -SiteUrl <BCR GROUP url>, <PESKOVOI url>, <TEST url> -StartDate <UTC>
+./tools/ir0/export-purview.ps1 -SiteUrl <BCR GROUP url>, <PESKOVOI url>, <TEST url> -StartDate <UTC> `
+  -FileOperations FileUploaded, FileAccessed, FilePreviewed, FileDownloaded, FileSyncDownloadedFull, `
+    FileSyncDownloadedPartial, FileModified, FileMoved, FileCopied, FileRenamed, FileDeleted, `
+    FileRecycled, FileDeletedFirstStageRecycleBin, FileDeletedSecondStageRecycleBin `
+  -SignInUpn <nip-1>@bcr-group.pl, <nip-2>@bcr-group.pl, <nip-3>@bcr-group.pl, AuthoriseMe@bcr-group.pl
+```
 
-# 3. The store (Roman): an immutable container outside BCR GROUP, readable by Roman, the IOD
-#    and yahor.simak@bcr-group.pl only. A dry run first; --apply refuses until both UPNs are set.
+**3. The Entra sign-in log (Global Admin), today.** Without Entra ID P1 the portal keeps only
+about 7 days of sign-ins **[verify]**, and Graph will not return them, so this is a manual
+download before that window moves on. In the Entra admin centre: **Monitoring & health →
+Sign-in logs**, date **Last 7 days**, filter **User** to each of the four accounts above. Download
+**CSV** from both the *User sign-ins (interactive)* and *(non-interactive)* tabs into
+`tools/out/ir0-entra-signins-<UTC>/`, then `shasum -a 256 *.csv > SHA256SUMS` in that folder.
+
+**4. The Directory as it stood, IR-0 C (Yahor), before any Directory change** (the H-7 status
+edit, `--add-columns`, H-12). Every row, Active or not, with all its fields and its version
+history. `g` and `G` are set as in [`tenant-hardening.md` → Tokens](tenant-hardening.md#tokens);
+the token needs `Sites.Read.All`, and after T-5 the reader must be a BCR GROUP site owner.
+
+```bash
+DIR_SITE=$(az functionapp config appsettings list -g $RG -n $INGEST \
+  --query "[?name=='CLIENT_DIRECTORY_SITE_ID'].value | [0]" -o tsv)
+DIR_LIST=$(az functionapp config appsettings list -g $RG -n $INGEST \
+  --query "[?name=='CLIENT_DIRECTORY_LIST_ID'].value | [0]" -o tsv)
+C=tools/out/ir0-directory-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p -m 700 "$C"
+url="$G/sites/$DIR_SITE/lists/$DIR_LIST/items?expand=fields&\$top=999"; n=0
+while [ -n "$url" ]; do                                    # follow @odata.nextLink
+  g "$url" > "$C/items-$n.json"
+  url=$(jq -r '."@odata.nextLink" // empty' "$C/items-$n.json"); n=$((n+1))
+done
+for id in $(jq -r '.value[].id' "$C"/items-*.json); do
+  g "$G/sites/$DIR_SITE/lists/$DIR_LIST/items/$id/versions?\$expand=fields" > "$C/versions-$id.json"
+done
+chmod 600 "$C"/*.json
+grep -l '"error"' "$C"/*.json                              # must print nothing
+(cd "$C" && shasum -a 256 *.json > SHA256SUMS)
+```
+
+**[verify]** that the version files carry each version's `fields`. If they do not, fetch
+`…/items/{id}/versions/{versionId}/fields` for each version into the same folder.
+
+**5. The store (Roman):** an immutable container outside BCR GROUP, readable by Roman, the IOD
+and yahor.simak@bcr-group.pl only. A dry run first; `--apply` refuses until both UPNs are set.
+Run it once per export folder from steps 1–4 (`--upload-dir` takes one folder).
+
+```bash
 ROMAN_UPN=<roman> IOD_UPN=<iod> infrastructure/ir/evidence-store.sh \
   --resource-group rg-bcr-ir-evidence --account <storage account> \
   --upload-dir tools/out/<export folder> --grant-uploader
@@ -151,11 +204,36 @@ ROMAN_UPN=<roman> IOD_UPN=<iod> infrastructure/ir/evidence-store.sh \
   --upload-dir tools/out/<export folder> --grant-uploader --apply
 ```
 
+**6. Take the uploader's write access away again (Roman),** once every upload is in and
+checked. `--grant-uploader` gave the signed-in operator *Storage Blob Data Contributor* on the
+container, which also reads; nothing in the script removes it. A later upload (H-6b, IR-1)
+grants it again and ends with this step again.
+
+```bash
+SCOPE=$(az storage account show -g rg-bcr-ir-evidence -n <storage account> --query id -o tsv)/blobServices/default/containers/ir0-evidence
+az role assignment delete --assignee "$(az ad signed-in-user show --query id -o tsv)" \
+  --role "Storage Blob Data Contributor" --scope "$SCOPE"
+```
+
+If Azure refuses with `ScopeLocked`, the account's CanNotDelete lock is in the way **[verify]**.
+Lift it, delete the assignment, and put the same lock back at once:
+
+```bash
+LOCK=(--name ir0-evidence-nodelete -g rg-bcr-ir-evidence --resource-name <storage account> \
+  --resource-type Microsoft.Storage/storageAccounts)
+az lock delete "${LOCK[@]}"
+az role assignment delete --assignee "$(az ad signed-in-user show --query id -o tsv)" \
+  --role "Storage Blob Data Contributor" --scope "$SCOPE"
+az lock create "${LOCK[@]}" --lock-type CanNotDelete --notes "IR-0 evidence: do not delete"
+```
+
 **Verify.**
 
-- The container lists every export plus `SHA256SUMS`.
-- `az role assignment list --scope <container-scope> -o table` shows Storage Blob Data Reader for
-  exactly three principals, and write access for nobody once the upload is done.
+- The container lists every export (steps 1–4) plus each folder's `SHA256SUMS`.
+- `az role assignment list --scope "$SCOPE" -o table` shows Storage Blob Data Reader for exactly
+  three principals, and no Storage Blob Data Contributor: write access for nobody once the
+  upload is done.
+- The CanNotDelete lock is back: `az lock list -g rg-bcr-ir-evidence -o table`.
 - The immutability policy shows the retention date the IOD set.
 - The laptop copies are deleted, and their hashes are in the incident's status table.
 
@@ -205,7 +283,7 @@ These must be done before H-12:
 - **T-5** (lock and version the Client Directory), because H-12 edits the rows, and versioning
   is the record of that edit.
 
-The Directory row edits themselves wait for H-12.
+Row edits other than the `0002` status change in H-7 wait for H-12.
 
 ### H-5: Create the quarantine site
 
@@ -323,8 +401,8 @@ chmod 600 "$H6B/fallback-before.json"
 jq -r '.[].name' "$H6B/fallback-before.json"               # the names only
 ```
 
-Upload `$H6B` to the evidence store as in H-2 step 3 (`--upload-dir "$H6B"`), then delete the
-local copy.
+Upload `$H6B` to the evidence store as in H-2 steps 5 and 6 (`--upload-dir "$H6B"`, then take
+the write access away again), and delete the local copy.
 
 **2. Re-point.** The same site, library and folder as `QUARANTINE_*` in H-8. `FALLBACK_CLIENT_ID`
 is only a label and stays as it is. `appsettings set` merges, so nothing else changes.
@@ -352,8 +430,10 @@ why. H-14 deletes all `FALLBACK_*` settings once the Phase-0 build is live.
 
 ### H-7: Check the Directory before the deploy, and add the new columns
 
-**Owner:** Yahor, with Roman for the decisions. **When:** day 1. Read-only, except for the two
-new columns.
+**Owner:** Yahor, with Roman for the decisions. **When:** day 1, after IR-0 C is in the evidence
+store (H-2 step 4) and T-5's Verify shows versioning on (`EnableVersioning` is `true`).
+Read-only, except for the two new columns and the one `Status` edit on the duplicate `0002` row
+below. Both change the Directory, so both wait for that export and that versioning.
 
 `tools/directory-bindings.mjs` runs with a delegated Graph token. By default it reads and
 changes nothing. The flags below match [`tools/README.md`](../../tools/README.md);
@@ -378,8 +458,9 @@ status table:
 
 - **The duplicate `0002`.** Two live rows carry PESKOVOI's ClientId. The tool refuses to change
   rows with a duplicate ClientId. Roman decides which row is PESKOVOI's: it is the one whose
-  `SitePath` is PESKOVOI's site. Set the other row to `Status = Inactive` by hand. Versioning (T-5)
-  records the edit. Then run `check` again.
+  `SitePath` is PESKOVOI's site. Set the other row to `Status = Inactive` by hand, only once IR-0
+  C is stored and T-5 has turned versioning on; versioning then records the edit. Then run
+  `check` again.
 - **Onboarded clients whose site has no ingestion grant.** Today the ingestion identity can write
   only to TEST, BCR GROUP and PESKOVOI. For each other onboarded client, record either that it
   gets a grant in H-12 so it can be bound there, or that it stays quarantined, and why. **Do not

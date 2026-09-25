@@ -19,6 +19,10 @@
 >   Sprawę jego dostępu do cudzego dokumentu opisuje rejestr naruszeń.
 > - Przed wysłaniem sprawdzić umowę powierzenia: może przewidywać krótszy termin albo
 >   określoną formę powiadomienia.
+> - Akapit o logowaniach w punkcie 4 podaje tylko to, co wynika z eksportów logowań z IR-0
+>   (zdarzenia logowania z dziennika audytu i pobrany 7-dniowy dziennik Entra, `human-steps.md`
+>   H-2). Jeśli nie zostały jeszcze przeanalizowane, napisać, że analiza trwa; nigdy nie pisać,
+>   że dzienniki logowania nie istnieją.
 > - Wersja angielska do porównania: [`processor-notice-2026-09.en.md`](processor-notice-2026-09.en.md).
 
 ---
@@ -85,9 +89,12 @@ operacji na plikach Microsoft 365 trwa; dotychczas nie stwierdziliśmy otwarcia 
 Państwa dokumentów przez osobę spoza personelu BCR.” albo „Stwierdziliśmy, że dnia … dokument
 został otwarty przez osobę spoza personelu BCR.”}}
 
-Nasza licencja Microsoft 365 nie rejestruje dzienników logowania. Ustalenia opieramy na dzienniku
-operacji na plikach, który obejmuje okres od {{POCZĄTEK_DZIENNIKA_AUDYTU}}. Dla wcześniejszego
-okresu nie da się ustalić, czy ktoś otworzył dokument.
+Bez licencji Microsoft Entra ID P1 dziennik logowań Entra obejmuje tylko 7 dni. Dziennik audytu
+Microsoft 365 rejestruje operacje na plikach i logowania interaktywne przez około 180 dni.
+Ustalenia opieramy na tym dzienniku, który obejmuje okres od
+{{POCZĄTEK_DZIENNIKA_AUDYTU}}{{USTALENIA_LOGOWAŃ — np. „; w tym okresie nie stwierdziliśmy
+logowania na konta skrzynek pocztowych przypisanych klientom”}}. Dla wcześniejszego okresu nie
+da się ustalić, czy ktoś otworzył dokument.
 
 ## 5. Możliwe konsekwencje
 

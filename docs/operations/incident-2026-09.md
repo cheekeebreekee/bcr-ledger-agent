@@ -93,9 +93,12 @@ whether anyone used it. Dates marked *record* are filled in from the IR-0 export
 | W6 | **The upload register in App Insights** | File names, client titles, site paths, user ids | Anyone with read on the App Insights resource | First deploy | P0-9 logs ids only. Old lines age out after 30 days, except the copy IR-0 takes deliberately. |
 | W7 | **Bricore team Public** | Its `Dokumenty księgowe` channel | Any internal account | Unknown | [Tenant hardening T-6](tenant-hardening.md#t-6-the-bricore-team) |
 
-⚠️ **What the accounts *did* reach is only partly knowable.** The tenant has no Entra ID P1,
-so there are no sign-in logs. File-level events in the Purview unified audit log are the only
-access evidence, which is why IR-0 exports them first.
+⚠️ **What the accounts *did* reach is only partly knowable.** The tenant has no Entra ID P1, so
+the Entra sign-in log keeps only about 7 days and cannot be read through Graph **[verify]**. The
+Purview unified audit log is the longer record: it holds file-level events and the
+`UserLoggedIn` / `UserLoginFailed` sign-in events for about 180 days on Audit Standard
+**[verify]**. IR-0 exports both, and the 7 days of Entra sign-ins, first. Whether the `{NIP}@`
+accounts and `AuthoriseMe@` signed in (W2, W3) is answered from those exports, not assumed.
 
 ---
 
@@ -211,7 +214,17 @@ one-hour window and returns a result that looks complete. Pass a start older tha
 the service simply returns what it still holds.
 
 `tools/ir0/` holds the scripted version of these exports; the query above is the reference for
-what it must return.
+what it must return. Run it with `--all-traces`
+([`human-steps.md` H-2](human-steps.md#h-2-preserve-the-evidence-ir-0-before-anything-changes-the-logs)),
+so the bot's own traces are kept too.
+
+**W5, the Personal Tab lookup.** Purview cannot see an anonymous Function call, so App Insights is
+the only record of W5. Before Phase 0 the bot logged `personal tab resolved` (`userObjectId`,
+`clientId`, `source`) and ingestion logged `user target resolved`. Both are in the
+`--all-traces` export. The script also always exports the `requests` rows for `/api/mydocs` and
+`/api/user-target`, which are not sampled, so they give the full count of calls, with time,
+result code and the looked-up id in the URL. `client_IP` is masked by default, so only the
+country and city columns say where a call came from **[verify]**.
 
 **How the lines join, and where they don't:**
 
@@ -243,34 +256,64 @@ what it must return.
 not depend on it, so prefer them.
 
 **B. The Purview unified audit log.** Confirm it is on, then export file operations on the
-three sites the ingestion identity could write to, and the group events for BCR GROUP.
+three sites the ingestion identity could write to, the group events for BCR GROUP, and the
+sign-in events of the `{NIP}@` accounts and `AuthoriseMe@`.
+
+**Use the script:** `tools/ir0/export-purview.ps1`, exactly as in
+[`human-steps.md` H-2](human-steps.md#h-2-preserve-the-evidence-ir-0-before-anything-changes-the-logs)
+(with `-FileOperations` and `-SignInUpn`). It gathers every page, starts a new session for every
+window, and splits a window that reaches the 50,000-record session cap. The manual commands
+below are the reference for what it does. They collect **all** pages into one variable and
+export once: `Export-Csv` overwrites its file, so exporting page by page keeps only the last
+page, and an empty final page leaves an empty file.
 
 ```powershell
 Connect-ExchangeOnline
 Get-AdminAuditLogConfig | Format-List UnifiedAuditLogIngestionEnabled   # must be True
 
-# One run per site; ReturnLargeSet pages up to 50,000 records per session.
-Search-UnifiedAuditLog -StartDate 2026-03-01 -EndDate (Get-Date) `
-  -RecordType SharePointFileOperation `
-  -Operations FileUploaded,FileAccessed,FilePreviewed,FileDownloaded,FileSyncDownloadedFull,FileModified,FileMoved,FileCopied,FileDeleted `
-  -SessionId ir0-bcrgroup -SessionCommand ReturnLargeSet -ResultSize 5000 |
-  Where-Object { ($_.AuditData | ConvertFrom-Json).SiteUrl -like '*/sites/BCRGROUPSp.zo.o*' } |
-  Export-Csv ir0-purview-bcrgroup.csv -NoTypeInformation -Encoding UTF8
+# Collect every page of one ReturnLargeSet session. A new SessionId per search, always:
+# re-using one continues the old session instead of starting a new result set.
+function Get-AllPages([hashtable] $Search) {
+  $sid = [guid]::NewGuid().ToString(); $all = @()
+  do {
+    $page = @(Search-UnifiedAuditLog @Search -SessionId $sid -SessionCommand ReturnLargeSet -ResultSize 5000)
+    $all += $page
+  } while ($page.Count -gt 0 -and $all.Count -lt $page[0].ResultCount)
+  $all
+}
 
-# Group events for BCR GROUP: who joined, who was added, when visibility changed.
-Search-UnifiedAuditLog -StartDate 2026-03-01 -EndDate (Get-Date) `
-  -Operations 'Add member to group.','Remove member from group.','Update group.',MemberAdded,MemberRemoved,TeamSettingChanged `
-  -SessionId ir0-groups -SessionCommand ReturnLargeSet -ResultSize 5000 |
+$files = Get-AllPages @{ StartDate = '2026-03-01'; EndDate = (Get-Date).ToUniversalTime()
+  RecordType = 'SharePointFileOperation'
+  Operations = 'FileUploaded','FileAccessed','FilePreviewed','FileDownloaded','FileSyncDownloadedFull',
+    'FileSyncDownloadedPartial','FileModified','FileMoved','FileCopied','FileRenamed','FileDeleted',
+    'FileRecycled','FileDeletedFirstStageRecycleBin','FileDeletedSecondStageRecycleBin' }
+foreach ($site in 'BCRGROUPSp.zo.o', '<PESKOVOI site>', '<TEST site>') {
+  $files | Where-Object { ($_.AuditData | ConvertFrom-Json).SiteUrl -like "*/sites/$site*" } |
+    Export-Csv "ir0-purview-$site.csv" -NoTypeInformation -Encoding UTF8
+}
+
+# Group events: who joined, who was added, when visibility changed.
+Get-AllPages @{ StartDate = '2026-03-01'; EndDate = (Get-Date).ToUniversalTime()
+  Operations = 'Add member to group.','Remove member from group.','Update group.','MemberAdded','MemberRemoved','TeamSettingChanged' } |
   Export-Csv ir0-purview-groups.csv -NoTypeInformation -Encoding UTF8
+
+# Sign-ins of the accounts in W2/W3 [verify that the tenant records them].
+Get-AllPages @{ StartDate = '2026-03-01'; EndDate = (Get-Date).ToUniversalTime()
+  RecordType = 'AzureActiveDirectoryStsLogon'; Operations = 'UserLoggedIn','UserLoginFailed'
+  UserIds = '<nip-1>@bcr-group.pl','<nip-2>@bcr-group.pl','<nip-3>@bcr-group.pl','AuthoriseMe@bcr-group.pl' } |
+  Export-Csv ir0-purview-signins.csv -NoTypeInformation -Encoding UTF8
 ```
 
-Repeat the first search for PESKOVOI and TEST, and for Bricore if it held client documents.
-Keep paging each session until it returns nothing. The role needed is Audit Reader or View-Only
-Audit Logs (Global Admin has it). Audit Standard keeps about 180 days, *verify in the tenant*;
-anything older than that is gone.
+Add Bricore's site to the loop if it held client documents. The role needed is Audit Reader or
+View-Only Audit Logs (Global Admin has it). Audit Standard keeps about 180 days, *verify in the
+tenant*; anything older than that is gone. The Entra admin centre's own sign-in log keeps only
+about 7 days without P1; H-2 step 3 downloads it.
 
-**C. The Client Directory as it stood.** Export the list, with its version history if any, so
-that "which ids were on which row, when" can be answered later.
+**C. The Client Directory as it stood.** Export the list, every row with all its fields and
+each item's version history, so that "which ids were on which row, when" can be answered later.
+It must happen before any Directory change: the H-7 status edit, `--add-columns`, and the H-12
+bindings. The commands are
+[`human-steps.md` H-2 step 4](human-steps.md#h-2-preserve-the-evidence-ir-0-before-anything-changes-the-logs).
 
 ### Where it goes
 
@@ -281,7 +324,9 @@ outside the ledger resource group's shared storage**, with:
   retention date. The IOD confirms the period; leave the policy unlocked until then, and lock it
   as soon as it is confirmed, because an unlocked policy can still be removed by an Owner;
 - **Storage Blob Data Reader** for Roman, the IOD and `yahor.simak@bcr-group.pl`, and nobody
-  else. Write access is held only for the upload and removed afterwards;
+  else. Write access is held only for the upload, and removed afterwards by hand: the script
+  grants it but never removes it
+  ([`human-steps.md` H-2 step 6](human-steps.md#h-2-preserve-the-evidence-ir-0-before-anything-changes-the-logs));
 - a `SHA256SUMS` file listing every export, so a later reader can prove nothing changed.
 
 The laptop copies are personal data. Delete them once the upload is verified, and record the
@@ -480,9 +525,10 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-1: IR-3 (1), processor notice phase 1 to PESKOVOI | Roman + IOD | todo | | |
 | H-1: IR-3 (2), breach-register entry | IOD | todo | | register entry id |
 | H-2: IR-0 A, trace export | Yahor | todo | | `SHA256SUMS` |
-| H-2: IR-0 B, Purview export and audit-log state | Global Admin | todo | | `SHA256SUMS` |
+| H-2: IR-0 B, Purview export (file operations, group events, sign-in events) and audit-log state | Global Admin | todo | | `SHA256SUMS` |
+| H-2: Entra sign-in log, last 7 days, for the `{NIP}@` accounts and `AuthoriseMe@` | Global Admin | todo | | `SHA256SUMS` |
 | H-2: IR-0 C, Directory export | Yahor | todo | | `SHA256SUMS` |
-| H-2: evidence store created, readers verified, laptop copies deleted | Roman, Yahor | todo | | |
+| H-2: evidence store created, readers verified, uploader write removed, laptop copies deleted | Roman, Yahor | todo | | |
 | H-3: `ANTHROPIC_ENABLED=false` (mandatory) | Yahor | todo | | |
 | BCR GROUP made Private (time from Purview) | — | done | *record* | T-3 |
 | H-4: tenant hardening T-1 … T-9 | per step | todo | | [`tenant-hardening.md`](tenant-hardening.md#status) |

@@ -22,6 +22,10 @@
 >   access to another controller's document is recorded in the breach register.
 > - Before sending, check the entrustment agreement (*umowa powierzenia*). It may set a shorter
 >   deadline or a required form.
+> - The sign-in paragraph in section 4 states only what the IR-0 sign-in exports show (the
+>   audit-log sign-in events and the 7-day Entra download, `human-steps.md` H-2). If they have
+>   not been read yet, say that the analysis is continuing; never write that no sign-in record
+>   exists.
 
 ---
 
@@ -87,9 +91,11 @@ Microsoft 365 file-operation log is continuing; so far we have found no opening 
 your documents by anyone outside BCR staff." or "We found that on … a document was opened by a
 person outside BCR staff."}}
 
-Our Microsoft 365 licence does not record sign-in logs. Our findings rest on the file-operation
-log, which covers the period from {{AUDIT_LOG_START}}. For any earlier period it cannot be
-established whether anyone opened a document.
+Without the Microsoft Entra ID P1 licence, the Entra sign-in log keeps only 7 days. The
+Microsoft 365 audit log records file operations and interactive sign-ins for about 180 days. Our
+findings rest on that log, which covers the period from {{AUDIT_LOG_START}}{{SIGN_IN_FINDINGS —
+e.g. ", and in that period we found no sign-in to the mailbox accounts assigned to clients"}}. For
+any earlier period it cannot be established whether anyone opened a document.
 
 ## 5. Likely consequences
 
