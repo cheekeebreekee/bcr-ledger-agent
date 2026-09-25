@@ -1,0 +1,3 @@
+# Plans, apply logs, IR-0 exports and IR-1 registers hold client names, file
+# names and user ids. They go to the evidence store, never into git.
+out/
