@@ -12,6 +12,8 @@
     "test": "jest --passWithNoTests",
     "test:coverage": "jest --coverage --passWithNoTests",
     "type-check": "tsc --noEmit",
+    "eval": "tsc -b && node dist/evaluation/main.js run",
+    "eval:truth": "tsc -b && node dist/evaluation/main.js truth",
     "package": "rimraf ../../artifacts/document-ingestion.zip dist tsconfig.tsbuildinfo ../shared/dist ../shared/tsconfig.tsbuildinfo && yarn build && node ../../tools/package-function.mjs document-ingestion"
   },
   "dependencies": {
