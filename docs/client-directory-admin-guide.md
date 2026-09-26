@@ -37,7 +37,11 @@ Two rules follow from that, and they are the ones that were broken:
    target: `SiteHostname`, `SitePath`, `DriveName` and `RootFolder`. The drive the path resolves
    to must have the row's `DriveId`, and the site Graph resolves must not be BCR GROUP or the
    quarantine site.
-4. **Anything else goes to quarantine**, with a reason:
+4. **The row's Team is the uploader's only Team.** Ingestion reads the uploader's Teams from
+   Entra at upload time (their direct memberships, counting a group as a Team the way the binding
+   tool does) and routes only if they are exactly the row's `TeamId`. A successful read is reused
+   for 5 minutes per user.
+5. **Anything else goes to quarantine**, with a reason:
 
 | Reason | When |
 |---|---|
@@ -47,9 +51,11 @@ Two rules follow from that, and they are the ones that were broken:
 | `stale_directory` | The list could not be refreshed for longer than the stale cap, or the row's `DriveId` does not match. |
 | `forbidden_target` | The id's only row was excluded because it points at a forbidden site: BCR GROUP, the quarantine site, a host other than the tenant's (`QUARANTINE_SITE_HOSTNAME`), or a `SitePath` that is not exactly `/sites/<name>` or `/teams/<name>`. Or the row's site, as Graph resolved it at upload time, is BCR GROUP or the quarantine site. |
 | `unbound_target` | The id's only row lacks `RootFolder`, `DriveId` or `TeamId`: the binding tool has not bound it. A row that is not bound routes nobody. |
+| `membership_mismatch` | The id's row is bound, but the uploader's Teams, read at upload time, are not exactly its `TeamId`: they are no longer in that Team, or they are also in another Team (for example, a guest bound to client A who was later added to client B's Team). See [Keeping the bindings current](#keeping-the-bindings-current). |
+| `membership_unverified` | The uploader's Teams could not be read: the ingestion identity lacks `Directory.Read.All` (or its token does not carry it yet), the user no longer exists, or Graph failed after retries. If every bound upload shows it, the grant is missing or not yet in the token ([human-steps H-8b](operations/human-steps.md#h-8b-grant-the-ingestion-identity-directoryreadall-then-verify)). |
 | `target_unwritable` | The client's site refused the write after retries, usually because the ingestion managed identity has no `write` grant there (or the grant went to the Ingestion API app registration instead). |
 
-5. **Content never changes the client.** After classification, the only thing content can change
+6. **Content never changes the client.** After classification, the only thing content can change
    is the direction of an invoice (sales ⇄ purchase), and only inside the client the uploader is
    bound to. It is decided by comparing the parties on the invoice with that client's `NIP`.
 
@@ -108,7 +114,7 @@ grant is read-only, and ingestion can never write to BCR GROUP again.
 | `DriveName` | Single line | Onboarding | The library name. `Dokumenty` on this Polish tenant. |
 | `RootFolder` | Single line | **The tool** | The channel folder's name, exactly as Graph returns it for the "Dokumenty księgowe" channel (`GET /teams/{id}/channels/{id}/filesFolder`). Documents then appear in the channel's files tab. **Required:** an empty `RootFolder` means the row is not bound, and it routes nobody (`unbound_target`). Before Phase 0, empty meant the library root, which is where the incident's documents went and where clients never look. |
 | `DriveId` | Single line | **The tool** | New, **required** (`unbound_target` without it). The id of the drive holding the channel folder. Ingestion checks that the path still resolves to this drive; if not, the upload goes to quarantine as `stale_directory`. This protects against a deleted Team whose site URL is later reused by a new Team. No two `Active` client rows may share it. |
-| `TeamId` | Single line | **The tool** | New, **required** (`unbound_target` without it). The client's Team id. No two `Active` client rows may share it. Logged as `teamId` when an upload is routed and filed, and used by the tools and audits. Routing does not check the uploader's Team membership against it; see [Keeping the bindings current](#keeping-the-bindings-current). |
+| `TeamId` | Single line | **The tool** | New, **required** (`unbound_target` without it). The client's Team id. No two `Active` client rows may share it. Logged as `teamId` when an upload is routed and filed, and used by the tools and audits. An upload routes only while this is the uploader's one and only Team, read at upload time (`membership_mismatch` otherwise); see [Keeping the bindings current](#keeping-the-bindings-current). |
 | `IsAdmin` | Yes/No | By hand | `Yes` only on the staff row. See [Staff](#staff). |
 | `Status` | `Active` / `Inactive` | By hand | Only `Active` rows route. |
 | `TeamsChannelId` | Single line | Onboarding | Written by onboarding, read by nothing. Channel uploads never reach a bot, so channels do not route. |
@@ -210,18 +216,27 @@ but slow, so bind soon after onboarding:
 
 ## Keeping the bindings current
 
-Routing reads only the Directory. Nothing checks, when a document arrives, that the uploader is
-still a guest of that row's Team and of no other Team. The tool checks that when it runs, so a
-binding is only as current as the last applied plan:
+The tool binds a guest only when the row's Team is the only Team they belong to, and ingestion
+checks the same thing again **when each document arrives** (R46, closed at runtime). A binding
+can still go stale in the Directory; what changed is that a stale one no longer files anything:
 
-- **A guest bound to client A who is later added to client B's Team** keeps routing everything
-  into A's channel folder, B's documents included, and nothing raises a conflict. This happens on
-  an ordinary business event: one person runs two client companies, and B's onboarding invites
-  the same email, which returns the same guest. Only a new `propose` and an apply of the whole
-  plan take that guest off A's row; from then on their uploads go to quarantine.
-- **A guest removed from A's Team** keeps writing into A's folder until the tool runs again.
+- **A guest bound to client A who is later added to client B's Team.** This happens on an
+  ordinary business event: one person runs two client companies, and B's onboarding invites the
+  same email, which returns the same guest. Their uploads, B's documents included, used to keep
+  filing into A's channel folder until the plan was applied again. Now, from their first upload
+  after they join B's Team (at most 5 minutes later, the cache), everything they send is
+  quarantined as `membership_mismatch`, and staff triage it by identity. A new `propose` and an
+  apply of the whole plan take them off A's row.
+- **A guest removed from A's Team** is quarantined as `membership_mismatch` in the same way,
+  instead of writing into A's folder.
+- **If the Teams cannot be read** (the grant is missing or not yet in the identity's token, Graph
+  is down), every bound upload is quarantined as `membership_unverified`: nothing is filed on a
+  guess.
 
-So:
+`MEMBERSHIP_CHECK_MODE=off` switches the check off. It is an emergency escape only, and it
+reopens the gap above; `/api/health` then reports `build.membershipCheck: "off"`.
+
+The Directory should still say what routing does, so:
 
 1. After **any** onboarding, run `check` and `propose`, and apply the whole plan (steps 2 to 4
    above), even when the new client's own row is not ready to bind yet.
@@ -233,10 +248,11 @@ So:
    bound row could not be fully assessed; the `incomplete` rows are listed) both need action that
    day ([human-steps → Standing checks](operations/human-steps.md#standing-checks)).
 
-Until then this is an accepted residual risk of Phase 0, and the three rules above are its
-mitigation. The robust fix, a Team-membership check at upload time (or a registry that keeps
-memberships in sync), is Phase 2. Onboarding writing the new guest's id onto the new row, which
-would make a shared guest a Directory conflict at once, waits on Roman's re-ruling of Q21.
+These rules are now defence in depth, not the only control: they keep the Directory truthful,
+they catch drift on rows whose guests have not uploaded since, and the tool's `check` stays the
+way to see it. A Team-membership registry kept in sync is Phase 2. Onboarding writing the new
+guest's id onto the new row, which would make a shared guest a Directory conflict at once, waits
+on Roman's re-ruling of Q21.
 
 ## Staff
 

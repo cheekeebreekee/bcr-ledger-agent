@@ -27,6 +27,7 @@ const ingestionEnvMap = {
   quarantineDriveName: 'QUARANTINE_DRIVE_NAME',
   quarantineRootFolder: 'QUARANTINE_ROOT_FOLDER',
   forbiddenTargetSitePaths: 'FORBIDDEN_TARGET_SITE_PATHS',
+  membershipCheckMode: 'MEMBERSHIP_CHECK_MODE',
   anthropicEnabled: 'ANTHROPIC_ENABLED',
   anthropicApiKey: 'ANTHROPIC_API_KEY',
   anthropicModel: 'ANTHROPIC_MODEL',
@@ -123,7 +124,33 @@ describe('ingestionConfigSchema', () => {
     expect(cfg.anthropicModel).toBe('claude-opus-4-5-20251101');
     expect(cfg.anthropicMaxContentBytes).toBe(10 * 1024 * 1024);
     expect(cfg.anthropicConfidenceThreshold).toBe(0.6);
+    expect(cfg.membershipCheckMode).toBe('enforce');
   });
+
+  // The runtime Team-membership check closes R46; only an exact `off` may
+  // switch it off. Empty is the default, and anything else stops cold start.
+  it.each([
+    [undefined, 'enforce'],
+    ['', 'enforce'],
+    ['  ', 'enforce'],
+    ['enforce', 'enforce'],
+    ['off', 'off'],
+  ])('reads MEMBERSHIP_CHECK_MODE=%j as %s', (value, expected) => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      MEMBERSHIP_CHECK_MODE: value,
+    });
+    expect(cfg.membershipCheckMode).toBe(expected);
+  });
+
+  it.each(['OFF', 'of', 'false', '0', 'log', 'disabled'])(
+    'rejects MEMBERSHIP_CHECK_MODE=%j, naming the variable',
+    (value) => {
+      expect(() =>
+        loadConfig(ingestionConfigSchema, ingestionEnvMap, { ...baseEnv, MEMBERSHIP_CHECK_MODE: value }),
+      ).toThrow(/MEMBERSHIP_CHECK_MODE: must be 'enforce' or 'off'/);
+    },
+  );
 
   it('parses a CSV roles list', () => {
     const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {

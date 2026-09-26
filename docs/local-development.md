@@ -91,7 +91,10 @@ A user id that is on no row of your test Directory comes back as `quarantined`, 
 That is the expected answer for an unbound uploader. To see a document filed, the test row must be
 bound (`RootFolder`, `DriveId` and `TeamId` set, `SitePath` exactly `/sites/<name>`, and
 `SiteHostname` equal to your local `QUARANTINE_SITE_HOSTNAME`); otherwise it is quarantined as
-`unbound_target` or `forbidden_target`.
+`unbound_target` or `forbidden_target`. The uploader must also be a member of the row's Team and
+of no other Team, and your local credential (`az login`) must be able to read their `memberOf`;
+otherwise it is quarantined as `membership_mismatch` or `membership_unverified`. Do not set
+`MEMBERSHIP_CHECK_MODE=off` to get round it, even locally: test the check, not around it.
 
 ## Useful Kusto
 
@@ -100,7 +103,7 @@ bound (`RootFolder`, `DriveId` and `TeamId` set, `SitePath` exactly `/sites/<nam
 traces
 | where timestamp > ago(1h) and cloud_RoleName startswith "func-bcr-ingest"
 | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
-| where msg in ("document.filed", "document.quarantined", "directory.conflict", "ingestion.caller.rejected")
+| where msg in ("document.filed", "document.quarantined", "directory.conflict", "ingestion.caller.rejected", "membership.mismatch", "membership.unverified")
 | summarize count() by msg, reason = tostring(m.quarantineReason)
 ```
 

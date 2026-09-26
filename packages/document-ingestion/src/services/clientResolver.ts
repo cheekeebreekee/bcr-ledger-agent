@@ -12,6 +12,7 @@ import {
   type SharePointTarget,
 } from '@bcr/shared';
 import { isBoundRow, type ClientDirectoryReader } from './clientDirectoryReader';
+import { TeamMembershipReadError, type MembershipCheck } from './teamMembership';
 
 export interface ClientResolverOptions {
   /**
@@ -20,6 +21,12 @@ export interface ClientResolverOptions {
    * BCR GROUP.
    */
   readonly quarantineTarget: SharePointTarget;
+  /**
+   * Whether a bound uploader must be in their row's Team and no other, read
+   * at upload time (`MEMBERSHIP_CHECK_MODE`). Required, so no resolver can be
+   * built that silently skips it; build it with `membershipCheckFor`.
+   */
+  readonly membership: MembershipCheck;
   /** Injected in tests; defaults to the `ingestion/clientResolver` logger. */
   readonly log?: Logger;
 }
@@ -47,7 +54,10 @@ export interface PostClassificationResolution {
  * client's space. It is gone, and a source test keeps it gone.
  *
  *  - {@link resolve} runs before classification and returns either the one
- *    client the uploader is bound to, or the quarantine with a reason.
+ *    client the uploader is bound to, or the quarantine with a reason. A
+ *    bound uploader routes only while their Teams, read from Entra at upload
+ *    time, are exactly their row's TeamId: a guest added to a second client's
+ *    Team after binding would otherwise file that client's documents here.
  *  - {@link resolvePostClassification} only corrects invoice direction inside
  *    the bound client (sales ⇄ purchase, from the client's own NIP).
  */
@@ -83,8 +93,12 @@ export class ClientResolver {
     const teamId = row.teamId;
     if (!teamId || !isBoundRow(row)) return this.quarantine('unbound_target');
 
+    const ids = { clientId: row.clientId, listItemId: row.listItemId, teamId };
+    const refused = await this.checkMembership(oid, ids);
+    if (refused) return refused;
+
     this.log.info(
-      { clientId: row.clientId, listItemId: row.listItemId, teamId },
+      { ...ids, membership: this.opts.membership.mode === 'off' ? 'unchecked' : 'verified' },
       'routed to client via userAadObjectId',
     );
     return {
@@ -98,6 +112,41 @@ export class ClientResolver {
       nip: row.nip,
       companyName: row.companyNameAliases[0] ?? row.title,
     };
+  }
+
+  /**
+   * The row's Team must be the uploader's only Team. `null` when it is (or
+   * the check is off); otherwise the quarantine, with the reason logged by
+   * ids and counts only — never another Team's id or name.
+   */
+  private async checkMembership(
+    oid: string,
+    ids: { readonly clientId: string; readonly listItemId: string; readonly teamId: string },
+  ): Promise<ResolvedClient | null> {
+    const check = this.opts.membership;
+    if (check.mode === 'off') return null;
+
+    let teams: ReadonlySet<string>;
+    try {
+      teams = new Set([...(await check.source.teamsOf(oid))].map((t) => t.trim().toLowerCase()));
+    } catch (err) {
+      const status = err instanceof TeamMembershipReadError ? err.status : undefined;
+      this.log.warn(
+        { event: 'membership.unverified', ...ids, ...(status !== undefined ? { status } : {}) },
+        'membership.unverified',
+      );
+      return this.quarantine('membership_unverified');
+    }
+
+    const inRowTeam = teams.has(ids.teamId.trim().toLowerCase());
+    const otherTeamCount = teams.size - (inRowTeam ? 1 : 0);
+    if (inRowTeam && otherTeamCount === 0) return null;
+
+    this.log.warn(
+      { event: 'membership.mismatch', ...ids, teamCount: teams.size, inRowTeam, otherTeamCount },
+      'membership.mismatch',
+    );
+    return this.quarantine('membership_mismatch');
   }
 
   /** The quarantine resolution for a reason. Also used when a client target turns out unwritable. */

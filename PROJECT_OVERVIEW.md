@@ -113,6 +113,10 @@ Two-step SharePoint grant (see lessons 1–5):
 1. `Sites.Selected` app role on Microsoft Graph → MI (role id `883ea226-0bf2-4a8f-9f9d-92c9162a727d`)
 2. `write` (or `read`) on each site → MI app id `d5226274-…`, via `POST /sites/{id}/permissions`
 
+The Phase-0 membership check needs one more app role on the same MI: `Directory.Read.All`, to
+read each bound uploader's `memberOf` (`docs/operations/human-steps.md` H-8b,
+`infrastructure/identity/grant-ingestion-membership-read.sh`). **Not granted yet**: pending H-8b.
+
 ---
 
 ## Azure environment (dev, which is production)
@@ -556,12 +560,13 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
     identity that files for many clients holds write on all of their sites. Design as if the
     ingestion identity can reach every client, because it can (`docs/security.md` T3).
 
-24. **A guest binding is checked when the tool runs, never at upload.** Routing reads only the
-    Directory. When an onboarding invites someone who is already a guest of another client (one
-    owner, two companies), Entra returns the same user, onboarding adds them to the new Team, and
-    their existing row keeps routing everything, the new company's documents included, into the
-    first client's space. Only a fresh `directory-bindings.mjs propose` and an apply of the whole
-    plan take them off it. After every onboarding, apply the whole plan, never `--only` the new
-    row, and run `check` at least weekly
-    ([admin guide](docs/client-directory-admin-guide.md#keeping-the-bindings-current)). Phase 2
-    checks membership at upload time.
+24. **A guest binding checked only when the tool runs goes stale (R46).** When an onboarding
+    invites someone who is already a guest of another client (one owner, two companies), Entra
+    returns the same user, onboarding adds them to the new Team, and their existing row used to
+    keep routing everything, the new company's documents included, into the first client's
+    space until a fresh `directory-bindings.mjs propose` and an apply of the whole plan. Ingestion
+    now reads the uploader's Teams at upload time and quarantines them as `membership_mismatch`
+    unless they are exactly the row's `TeamId` (`MEMBERSHIP_CHECK_MODE`, needs Graph
+    `Directory.Read.All` on the ingestion identity). Still apply the whole plan after every
+    onboarding, never `--only` the new row, and run `check` at least weekly
+    ([admin guide](docs/client-directory-admin-guide.md#keeping-the-bindings-current)).

@@ -87,7 +87,8 @@ versions with install scripts disabled (checking each top-level version against 
 `node_modules`), and vendors the just-built `@bcr/shared`. `artifacts/*.zip` are git-ignored build
 output: never commit one, and deploy only a zip built for that deploy. Before deploying, still
 check the vendored copy: `unzip -p artifacts/<pkg>.zip node_modules/@bcr/shared/dist/config.js |
-grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths`) must be greater than 0.
+grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths` and `membershipCheckMode`) must be
+greater than 0.
 
 CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test, plus `bicep build` and
 `bicep lint`.
@@ -121,10 +122,13 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
    `userAadObjectId`, and the BCR tenant are accepted; filename has no path separators, base64
    shape, ≤25 docs per batch, ≤100 MiB decoded.
 3. **Resolve the client** — `services/clientResolver.ts#resolve()` maps `source.userAadObjectId` to
-   exactly one bound Client Directory row, else returns the **staff-only quarantine** with a reason:
-   `unmapped`, `staff`, `conflict`, `stale_directory`, `forbidden_target` or `unbound_target` (the
-   row lacks `RootFolder`, `DriveId` or `TeamId`). The upload step adds `target_unwritable`.
-   Quarantined documents are never classified.
+   exactly one bound Client Directory row, then (`MEMBERSHIP_CHECK_MODE=enforce`, the default)
+   reads the uploader's Teams from Entra via `services/teamMembership.ts` and routes only if they
+   are exactly `{row.teamId}`. Otherwise it returns the **staff-only quarantine** with a reason:
+   `unmapped`, `staff`, `conflict`, `stale_directory`, `forbidden_target`, `unbound_target` (the
+   row lacks `RootFolder`, `DriveId` or `TeamId`), `membership_mismatch` (the Teams read differ
+   from the row's) or `membership_unverified` (they could not be read). The upload step adds
+   `target_unwritable`. Quarantined documents are never classified.
 4. **Classify** — `services/classificationService.ts` runs classifiers in order and returns the
    first result at/above 0.8 confidence, else the best one. Chain is
    `ClaudeClassifier → FallbackClassifier` (Claude only if `ANTHROPIC_ENABLED` + key). Only the
@@ -173,13 +177,21 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
   `tools/lib/bindings.mjs` must agree exactly and share one edge-case table in their tests; change
   both or neither. `QUARANTINE_SITE_PATH` and `FORBIDDEN_TARGET_SITE_PATHS` must pass it at cold
   start.
-- **A guest binding is only as fresh as the last tool run.** Routing never checks Team
-  membership: a guest bound to client A and later added to client B's Team (B's onboarding
-  re-invited the same email) keeps routing everything, B's documents included, into A until
-  `tools/directory-bindings.mjs` runs again and the **whole** plan is applied. After any
-  onboarding, apply the whole plan, never `--only <new row>`, and run `check` at least weekly
-  (`docs/client-directory-admin-guide.md` → Keeping the bindings current). The runtime `memberOf`
-  check is Phase 2; until then, never describe or build a flow that binds only the new row.
+- **Routing requires the uploader's Teams to be exactly `{row.TeamId}`, read at upload time.**
+  A guest bound to client A and later added to client B's Team (B's onboarding re-invited the
+  same email) used to keep routing B's documents into A (R46). `ClientResolver.resolve` now reads
+  the uploader's direct memberships (`GET /users/{id}/memberOf`, as the ingestion managed identity
+  with `Directory.Read.All`) and routes only when the Teams among them — by the binding tool's
+  rule in `teamIdsIn`, kept identical by a test — are exactly the row's `TeamId`
+  (case-insensitive); anything else is `membership_mismatch`, a failed read is
+  `membership_unverified`. Fail closed: never route on a read that failed, never cache a
+  failure (successes are cached 5 min per user), and keep the check in the resolver, not beside
+  it. Staff and already-quarantined uploads are not read. `MEMBERSHIP_CHECK_MODE=off` is an
+  emergency escape that reopens R46; it warns at cold start and shows in `/api/health`
+  (`build.membershipCheck`). Keep `build.phase: 'p0'` and `build.routing: 'identity-only'`
+  exactly: the operator tools gate on them. The binding tool's whole-plan apply after every
+  onboarding and weekly `check` stay as defence in depth; still never build a flow that binds
+  only the new row.
 - **Nothing is written into BCR GROUP or the quarantine site as a client target, whatever a row
   says.** The path checks compare spellings; `SharePointService` also compares the *resolved*
   site-collection id with BCR GROUP's (from `CLIENT_DIRECTORY_SITE_ID`) and the quarantine site's
@@ -290,6 +302,11 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
   per-site grants take ~5 min to propagate. Every grant names the MI's app id (`INGEST_MI_APPID`);
   a grant to the API app registration does nothing. See `docs/setup-guide.md` §5 and
   `infrastructure/quarantine/README.md` (the old `grant-sharepoint-permission.sh` is deleted).
+  The membership check also needs Graph `Directory.Read.All` on that identity, granted only by
+  `infrastructure/identity/grant-ingestion-membership-read.sh` (dry run by default; Graph calls
+  use a delegated `GRAPH_TOKEN`, since the CLI's token hits `AADSTS65002` here). A managed
+  identity's token carries its roles and the platform caches it ~24 h with no forced refresh,
+  so grant a day before the deploy; until then bound uploads are `membership_unverified`.
 - `MICROSOFT_APP_TYPE` must be `SingleTenant` (the app registration is `AzureADMyOrg`); the wrong
   value is a 401 at Bot Framework auth.
 - `@anthropic-ai/sdk` must stay ≥ 0.40 for typed PDF `document` content blocks

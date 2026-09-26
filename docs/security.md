@@ -21,7 +21,7 @@ one SharePoint site. Each threat now has a status:
 |---|---|---|---|
 | Teams client → bot | Bot Framework | JWT signed by `login.botframework.com` | `CloudAdapter`, then the bot's gate on **every** activity type: a 1:1 chat, from the BCR tenant, with a GUID user object id (P0) |
 | Bot → ingestion | The bot's app registration | Client secret (Key Vault, and laptop copies: see T15) → token for `api://<ingestion-app-id>` | `AuthMiddleware`: issuer, audience, the `Documents.Ingest` role, and **the caller's app id** (`appid`, else `azp`) in `BOT_CALLER_APP_IDS` (P0). Then the request body: `conversationType` must be `personal`, the user id must be a UUID, and the tenant must be BCR's (P0). |
-| Ingestion → Microsoft Graph | The ingestion Function App's system-assigned managed identity | Managed identity token | Graph. `Sites.Selected`, plus a per-site grant on every site it files into (see T3). |
+| Ingestion → Microsoft Graph | The ingestion Function App's system-assigned managed identity | Managed identity token | Graph. `Sites.Selected`, plus a per-site grant on every site it files into (see T3). `Directory.Read.All` (read-only), to read the uploader's Team memberships at upload time (see T10). |
 | Bot, ingestion → Key Vault | Each app's managed identity | *Key Vault Secrets User*, assigned at **resource-group** scope | Key Vault (see T11) |
 | Ingestion → Claude | Anthropic API key (Key Vault) | TLS and bearer key | `api.anthropic.com` (see T16) |
 
@@ -89,6 +89,8 @@ Anything that controls what that identity writes can write into every one of tho
 - a row routes only once the binding tool has set its `RootFolder`, `DriveId` and `TeamId`
   (`unbound_target` otherwise);
 - one client per Team: rows sharing a site, a `DriveId` or a `TeamId` are all excluded;
+- the uploader's Teams, read from Entra at upload time, must be exactly the row's `TeamId`
+  (`membership_mismatch`, or `membership_unverified` if they cannot be read; see T10);
 - a `SitePath` must be exactly `/sites/<name>` or `/teams/<name>` on the tenant's one host, so
   a sub-site or a look-alike spelling of another site is refused, not normalised;
 - no BCR GROUP or quarantine target, checked twice: by path in the Directory, and by the
@@ -104,6 +106,17 @@ Anything that controls what that identity writes can write into every one of tho
 
 Parsing untrusted files inside this identity is its own risk: a parser bug is a write to every
 client. Splitting it out is in the plan.
+
+The membership check adds one read permission to the same identity: `Directory.Read.All`, the
+least privileged application permission Microsoft Learn lists for reading another user's
+`memberOf`. It lets the identity read the whole directory (users, groups, their members), not
+only memberships. Code that controls the identity could therefore enumerate the tenant's users
+and groups, and read their profiles; it could not change anything with it. Ingestion reads only
+`id`, `description` and `resourceProvisioningOptions` of the uploader's own groups, and logs none
+of them. Granted by `infrastructure/identity/grant-ingestion-membership-read.sh` and nothing else.
+Narrower options were weighed: `/users/{id}/joinedTeams` needs only `Team.ReadBasic.All`, but
+reads Teams, which can lag a membership added through the group by up to 24 hours, the window the
+check exists to close (T10).
 
 ### T4. A malicious file name or path
 
@@ -174,16 +187,30 @@ version history, and the duplicate check failed open once three rows shared a ke
 - routing fields written by `tools/directory-bindings.mjs` from Graph, with a before/after log,
   not typed by hand.
 
-**Not covered in Phase 0: a binding goes stale.** The tool checks each guest's Team memberships
-when it runs; ingestion never re-checks them. A guest bound to client A and later added to client
-B's Team, for example because B's onboarding invited the same email, keeps routing everything
-into A's space, B's documents included, until the tool runs again and the whole plan is applied.
-A guest removed from A's Team keeps writing into A's folder until then. Meanwhile the whole plan
-is applied after every onboarding, never only the new row, and `check` runs at least weekly
-([admin guide](client-directory-admin-guide.md#keeping-the-bindings-current)).
+**A binding going stale (R46): closed at runtime in P0.** The tool checks each guest's Team
+memberships when it binds them. A guest bound to client A and later added to client B's Team,
+for example because B's onboarding invited the same email, used to keep routing everything into
+A's space, B's documents included, until the tool ran again and the whole plan was applied.
+Ingestion now reads the uploader's Teams from Entra at upload time (`GET /users/{id}/memberOf`,
+the tool's Team rule) and routes only while they are exactly the row's `TeamId`:
 
-**Status: Partly mitigated in P0; Phase 2** replaces the list with a registry whose bindings
-cannot change without two approvals, and checks Team membership when a document arrives.
+- a guest also in another Team, or no longer in the row's Team, is quarantined as
+  `membership_mismatch` (`membership.mismatch`, ids and counts only);
+- if the Teams cannot be read (no grant, the grant not yet in the token, the user gone, Graph
+  down after retries), the upload is quarantined as `membership_unverified` — fail closed;
+- a successful read is cached for 5 minutes per user, so a Team joined since shows up by the
+  upload after that; a failure is never cached.
+
+`MEMBERSHIP_CHECK_MODE=off` removes the check. It is an emergency escape only, reopens R46, and
+is visible: `membership.check_off` at every cold start and `build.membershipCheck: "off"` in
+`/api/health`. The whole plan is still applied after every onboarding, and `check` still runs at
+least weekly, as defence in depth
+([admin guide](client-directory-admin-guide.md#keeping-the-bindings-current)). One gap remains in
+both layers: Microsoft notes that "certain unused old teams" have no `resourceProvisioningOptions`;
+such a Team without the onboarding marker is not counted.
+
+**Status: P0** for stale bindings (the runtime check). **Phase 2** replaces the list with a
+registry whose bindings cannot change without two approvals.
 
 ### T11. Key Vault readable at resource-group scope
 
@@ -285,7 +312,7 @@ check that every setting the code reads exists in Bicep, `what-if`, and environm
 |---|---|---|---|---|
 | **Secret rotation deferred** (T15, and the Anthropic key). Plaintext copies of both secrets are on developer laptops. | New credentials come from Roman, who will provide them soon. Rotating twice gains nothing. | Roman | New credentials arrive. Then rotate and delete the laptop copies the same day. | Caller pinning: only the bot's app id is accepted. A forged upload needs a real guest's id, lands only in that guest's own client, and is logged under that id. The secret cannot read documents, because the bot holds no SharePoint permission. |
 | **Yahor's dual role.** He is the developer, the operator who deploys, and a Global Administrator. One person can change the code, ship it and change tenant permissions. That is also a bus factor of one. | BCR has one technical person today. | Roman | A second admin or a formal approval path exists. | Roman reviews every binding plan before it is applied. IR-2 moves need two people. Every tenant and Azure change is a recorded command with its before and after state. The IR evidence is immutable and readable by Roman and the IOD. Yahor does not upload through the bot. Planned: Roman approves production deploys through GitHub environment protection, and a `HANDOVER.md`. |
-| **One identity writes every client site** (T3). | Inherent to the current design. | Yahor | Phase 2 (upload by id, attestation, nightly audit). | Identity-only routing, only bound rows route, one client per site, drive and Team, canonical site paths, forbidden targets checked by path and by resolved site id, `DriveId` check, `conflictBehavior=fail`. |
+| **One identity writes every client site** (T3). | Inherent to the current design. | Yahor | Phase 2 (upload by id, attestation, nightly audit). | Identity-only routing, only bound rows route, the uploader's Teams checked at upload time against the row's Team, one client per site, drive and Team, canonical site paths, forbidden targets checked by path and by resolved site id, `DriveId` check, `conflictBehavior=fail`. |
 | **No P1: 7-day Entra sign-in log, no Conditional Access** (T14). | Needs a licence purchase. | Roman | Decision 5. | Purview audit log: file operations and sign-in events, about 180 days. `{NIP}@` accounts blocked (T-1). |
 
 ## 4. Data residency and retention

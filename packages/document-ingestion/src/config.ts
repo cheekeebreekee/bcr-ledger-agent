@@ -15,6 +15,7 @@ const envMap = {
   quarantineDriveName: 'QUARANTINE_DRIVE_NAME',
   quarantineRootFolder: 'QUARANTINE_ROOT_FOLDER',
   forbiddenTargetSitePaths: 'FORBIDDEN_TARGET_SITE_PATHS',
+  membershipCheckMode: 'MEMBERSHIP_CHECK_MODE',
   anthropicEnabled: 'ANTHROPIC_ENABLED',
   anthropicApiKey: 'ANTHROPIC_API_KEY',
   anthropicModel: 'ANTHROPIC_MODEL',

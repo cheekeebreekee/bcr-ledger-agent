@@ -110,10 +110,11 @@ Graph and SharePoint tokens are set up as described in
 | H-6b | Running build's fallback re-pointed at the quarantine | Yahor | the working day of H-3 | H-3, H-5b, H-6 verified |
 | H-7 | Directory check and new columns (no new site grants) | Yahor | day 1 | H-2 (IR-0 C stored), H-4a, T-5 |
 | H-8 | New app settings, added | Yahor | day 1 | H-5 |
+| H-8b | Ingestion identity: Graph `Directory.Read.All` (the membership check), granted and verified | Global Admin; Yahor runs the dry run | day 1, **at least 24 h before H-12** | H-4a |
 | H-9 | Bot deploy, gate in `log` | Yahor | day 1 | H-2, H-8 |
 | H-10 | Manifest 0.2.0, availability *Everyone* | Teams Admin | day 1 | H-9, T-1 |
 | H-11 | Gate to `enforce` | Yahor | day 2 | 24 h of clean logs |
-| H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-5b, H-6, H-6b, H-7, H-11, T-4, T-4b, T-5 |
+| H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-5b, H-6, H-6b, H-7, H-8b, H-11, T-4, T-4b, T-5 |
 | H-13 | Ingestion grant on BCR GROUP to `read` | Global Admin | after H-12 | H-12 verified |
 | H-14 | `FALLBACK_*` settings and saved pre-Phase-0 packages removed | Yahor | ≥ 24 h after H-12 | H-12 verified |
 | H-15 | Exit criteria checked | Yahor, Roman | end of phase | all |
@@ -355,7 +356,8 @@ permissions → Add a permission → Microsoft Graph → Delegated permissions**
 | `Sites.Read.All` | H-2 step 4 (the Directory export), `check`, `propose`, IR-1 |
 | `Sites.ReadWrite.All` | `directory-bindings.mjs apply` and `rollback`: they write the Directory rows |
 | `Sites.Manage.All` (already there) | `--add-columns`; H-5's four columns |
-| `User.ReadWrite.All`, `Directory.Read.All` | T-1's `audit-client-access.mjs --apply` (it blocks sign-in); T-2's licence removal; T-7's sign-in block |
+| `User.ReadWrite.All`, `Directory.Read.All` | T-1's `audit-client-access.mjs --apply` (it blocks sign-in); T-2's licence removal; T-7's sign-in block; H-8b's dry run and verify |
+| `AppRoleAssignment.ReadWrite.All` *(optional, only for H-8b's `--apply`)* | H-8b's grant of `Directory.Read.All` to the ingestion identity, by the Global Admin. Remove it again afterwards; Graph Explorer is the alternative (H-8b) |
 
 Do **not** add SharePoint `AllSites.FullControl`. Only the scripted SharePoint changes in
 tenant-hardening (T-4, T-4b, T-5) need it, and each of them has a browser path, which needs none
@@ -857,6 +859,86 @@ Only needed if a value was wrong. The running ingestion does not read its new se
 running bot does read `MICROSOFT_APP_TYPE`: restore the value noted above, or delete the
 setting if it was not set.
 
+### H-8b: Grant the ingestion identity Directory.Read.All, then verify
+
+**Owner:** Global Admin (or a Privileged Role Administrator) for `--apply`; Yahor runs the dry
+run. **When:** day 1, after H-8, and **at least 24 hours before H-12** if the timeline allows
+(why: *The token* below).
+
+The Phase-0 ingestion checks every bound upload against the uploader's Teams at upload time: it
+routes only if they are exactly the row's `TeamId`, so a guest later added to a second client's
+Team (R46) is quarantined instead of filing that client's documents into the first. It reads the
+Teams as its managed identity, with `GET /users/{id}/memberOf`, and Microsoft Learn lists
+**`Directory.Read.All`** as the least privileged application permission for that call. Without
+it every bound upload is quarantined as `membership_unverified`: nothing is mis-filed, but no
+client document is filed either. The running pre-Phase-0 ingestion does not use it, so granting
+it now changes nothing that runs today.
+
+This is an **application** permission on the ingestion's managed identity, unlike H-4a's
+delegated permissions for the operator tools, and it is granted by
+`infrastructure/identity/grant-ingestion-membership-read.sh` and nothing else. The script grants
+exactly one app role, `Directory.Read.All` on Microsoft Graph, to exactly one principal, the
+Function App's system-assigned managed identity. It refuses any principal that is not a managed
+identity, and it removes nothing.
+
+**Tokens.** `az`, signed in as for the Variables above, is used only to read the Function App's
+identity. Every Graph call uses `GRAPH_TOKEN`, the delegated token from H-4a's registration,
+because the Azure CLI's own token cannot write app role assignments in this tenant
+(`AADSTS65002`). The dry run needs only what H-4a consented (`Directory.Read.All`). `--apply` also needs
+`AppRoleAssignment.ReadWrite.All` consented on that registration, and a token of the Global
+Admin: the script refuses `--apply` without that scope. If you would rather not consent it, use
+Graph Explorer as in [`admin-sharepoint-grant.md`](../admin-sharepoint-grant.md) Step 1, with the
+exact URL and body the dry run prints, and verify with the dry run below.
+
+The dry run changes nothing. It prints the identity, what it holds now, and the exact request
+`--apply` would send:
+
+```bash
+export GRAPH_TOKEN=$(node ../bcr-onboarding-agent/tools/graph-login.mjs)
+infrastructure/identity/grant-ingestion-membership-read.sh --resource-group "$RG" --function-app "$INGEST"
+```
+
+Check the output before applying: the managed identity's app id is `$INGEST_MI_APPID`, and the
+only request is one `POST …/appRoleAssignedTo` for `Directory.Read.All`. Then the Global Admin,
+signed in to the BCR tenant with `az login` and with their own `GRAPH_TOKEN`, runs the same
+command with `--apply`:
+
+```bash
+export GRAPH_TOKEN=$(node ../bcr-onboarding-agent/tools/graph-login.mjs)
+infrastructure/identity/grant-ingestion-membership-read.sh --resource-group "$RG" --function-app "$INGEST" --apply
+```
+
+It prints the identity's application permissions after the grant, which now include
+`Directory.Read.All`, and the rollback commands. A `403 Authorization_RequestDenied` means the
+signed-in person is not a Global Administrator or Privileged Role Administrator.
+
+**Verify.** Run the dry run again, with any operator's `GRAPH_TOKEN`. It must print
+`✔ Directory.Read.All is already assigned: nothing to do.` and list `Directory.Read.All` among the
+identity's permissions:
+
+```bash
+infrastructure/identity/grant-ingestion-membership-read.sh --resource-group "$RG" --function-app "$INGEST"
+```
+
+If `AppRoleAssignment.ReadWrite.All` was consented only for this step, remove it from the
+registration again (H-4a's **Rollback**); the dry run does not need it.
+
+The functional proof comes in H-12: the first canary that files normally (step 7) shows the
+running build read the uploader's Teams.
+
+**The token.** A managed identity's token carries its roles. Microsoft documents that the
+platform caches managed-identity tokens for around 24 hours, and that a refresh cannot be forced
+([managed identity best practices](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/managed-identity-best-practice-recommendations#limitation-of-using-managed-identities-for-authorization)).
+Restarting the app, as the H-12 deploy does, drops only its own in-process token. So the Phase-0
+build may keep getting a token without the role for up to a day after this grant, and in that
+time every bound upload is quarantined as `membership_unverified`. Granting a day ahead avoids
+that. If H-12 has to run sooner, expect it, and see the troubleshooting row in H-12 step 13.
+
+**Rollback.** The script prints the two Graph calls, for the Global Admin's `GRAPH_TOKEN`: find
+the assignment's id, then `DELETE` it. After a rollback every bound upload goes to quarantine as `membership_unverified`
+again. `MEMBERSHIP_CHECK_MODE=off` would file them without the check, and reopen R46: that is
+Roman's decision, never a fix for a missing grant.
+
 ### H-9: Deploy the bot with the gate in log mode
 
 **Owner:** Yahor. **When:** day 1, after H-2 and H-8.
@@ -1039,6 +1121,10 @@ These steps go in **one** window because each fixes a failure the others would c
 - `ANTHROPIC_ENABLED=false` (H-3) and the fallback points at the quarantine (H-6b).
 - H-6's grant is in place.
 - H-8's settings are present, and H-8's check of them, run again now, prints nothing.
+- H-8b's grant is in place (its dry run prints `already assigned`), ideally made at least 24
+  hours ago. `MEMBERSHIP_CHECK_MODE` is not set, or is `enforce`:
+  `az functionapp config appsettings list -g $RG -n $INGEST --query "[?name=='MEMBERSHIP_CHECK_MODE'].value | [0]" -o tsv`
+  prints nothing or `enforce`.
 - The gate is in `enforce` (H-11).
 - T-4 (and its check after H-6b), T-4b and T-5 are done.
 - Every H-7 finding has a decision.
@@ -1056,18 +1142,26 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    # Must print a count greater than 0.
    unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js \
      | grep -c forbiddenTargetSitePaths
+   # Must print a count greater than 0 too: the shared config with the membership check.
+   unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js \
+     | grep -c membershipCheckMode
    ```
 
-   A count of `0` means a pre-Phase-0 `@bcr/shared`: that build fails at cold start, because the
-   old schema requires `FALLBACK_SITE_*`. Do not deploy it. The `package` script cleans `dist`,
+   A count of `0` from the first means a pre-Phase-0 `@bcr/shared`: that build fails at cold
+   start, because the old schema requires `FALLBACK_SITE_*`. A `0` from the second means a
+   Phase-0 `@bcr/shared` from before the membership check. Do not deploy either. The `package` script cleans `dist`,
    deletes the old zip first and builds a new one (H-9 step 2), so after a failed run there is
    no zip at all: build again, and never take a zip from git. The package saved first is the
    pre-Phase-0 build: it is a record of what ran, and **never** a rollback (standing rules).
 2. **Check that it is the Phase-0 build.**
-   `curl -s https://$INGEST.azurewebsites.net/api/health` reports the Phase-0 build:
-   `"build":{"phase":"p0","routing":"identity-only"}`. `directory-bindings.mjs apply` checks
-   this itself: it refuses to write unless the `--health-url` it is given reports
-   `build.routing=identity-only`. `--expect-health` only adds further checks.
+   `curl -s https://$INGEST.azurewebsites.net/api/health` reports the Phase-0 build with the
+   membership check on:
+   `"build":{"phase":"p0","routing":"identity-only","membershipCheck":"enforce"}`.
+   `directory-bindings.mjs apply` checks the routing itself: it refuses to write unless the
+   `--health-url` it is given reports `build.routing=identity-only`. `--expect-health` only adds
+   further checks; `--expect-health build.membershipCheck=enforce` makes an apply refuse while
+   the check is off. `"membershipCheck":"off"` here means `MEMBERSHIP_CHECK_MODE=off` is set:
+   stop, and delete that setting unless Roman decided it.
 
    **If `/api/health` does not answer within a few minutes** of the deploy, the new build did not
    start. It checks its settings when it loads, and one missing or malformed setting stops every
@@ -1160,9 +1254,15 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
 7. **Canary on TEST.** The TEST guest uploads a synthetic PDF. Expect:
    - it lands in TEST's `Dokumenty księgowe/…`, visible in the channel's files tab;
    - the card's link opens it there;
-   - a `document.filed` line appears.
+   - a `document.filed` line appears, after a `routed to client via userAadObjectId` line with
+     `membership: verified`.
 
-   Then delete the canary file.
+   Then delete the canary file. **This canary is also the proof that the membership check
+   works:** the build read the TEST guest's Teams as its managed identity and found exactly
+   TEST's Team. If it is quarantined as `membership_unverified` instead, H-8b's grant is not in
+   the token yet (step 13's table). If it is quarantined as `membership_mismatch`, the TEST guest
+   is in another Team as well, or not in TEST's: `check` shows which, and the row must not route
+   until that is resolved.
 8. **Apply PESKOVOI, then canary.** The same `apply` with `--only <PESKOVOI listItemId>`. It
    takes Yahor's id off the row because step 5 ran `propose` with `--confirm-remove-staff` for
    that row; check that the printed after-state no longer holds it. For a real client, the
@@ -1231,10 +1331,16 @@ aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
   | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
   | where msg in ("document.filed", "document.quarantined", "document.quarantine_failed",
       "directory.conflict", "ingestion.caller.rejected",
-      "sharepoint.forbidden_site", "sharepoint.possible_duplicate")
-  | summarize count() by msg, reason = tostring(m.quarantineReason), kind = tostring(m.kind)' \
+      "sharepoint.forbidden_site", "sharepoint.possible_duplicate",
+      "membership.mismatch", "membership.unverified", "membership.check_off")
+  | summarize count() by msg, reason = tostring(m.quarantineReason), kind = tostring(m.kind),
+      status = tostring(m.status)' \
   <start of the window>
 ```
+
+`membership.check_off` must be empty: it means `MEMBERSHIP_CHECK_MODE=off` at a cold start.
+`membership.mismatch` and `membership.unverified` carry `clientId`, `listItemId` and `teamId`,
+so the row is known without any name; `membership.unverified` also carries Graph's `status`.
 
 `directory.conflict` should be empty, or explained by a decision from H-7.
 `ingestion.caller.rejected` and `document.quarantine_failed` should be empty.
@@ -1258,6 +1364,9 @@ What each `quarantineReason` means, and what to do:
 | `stale_directory` | The Directory could not be read recently enough, or the row's drive no longer matches its `DriveId` | Check T-5's `directory refresh failed` query and the row |
 | `forbidden_target` | The row names BCR GROUP, the quarantine, another host or a path that is not exactly `/sites/<name>`, or its site resolved to BCR GROUP's or the quarantine's collection (`sharepoint.forbidden_site`) | Never "fix" it by pointing the row elsewhere by hand; tell Roman, run `check` |
 | `target_unwritable` | The client's site could not be written: no grant, or the site or drive is gone | Check that client's grant for `$INGEST_MI_APPID` (step 3) |
+| `membership_mismatch` | The uploader's row is bound, but their Teams, read at upload time, are not exactly its `TeamId`: they are also in another Team (R46: for example a guest bound to one client and since added to another client's Team), or no longer in the row's Team | The check did its job: nothing was filed. Run `check`, then `propose` and apply the **whole** plan the same day (standing checks); staff triage the held documents by `UploaderOid` |
+| `membership_unverified` on **every** bound upload | The ingestion identity cannot read Teams: H-8b's `Directory.Read.All` is missing, or not yet in its token (`status` 403 in `membership.unverified`) | Run H-8b's dry run: if it would still `POST`, the grant is missing, so make it. If it prints `already assigned`, the token predates the grant: restart the app (`az functionapp restart -g $RG -n $INGEST`), then send the TEST canary again. If that still fails, wait: the platform can keep the old token for up to 24 hours, and a refresh cannot be forced. The documents are held, not lost. Do not set `MEMBERSHIP_CHECK_MODE=off` to get past it: that reopens R46, and it is Roman's decision |
+| `membership_unverified` on **some** uploads | One uploader's Teams could not be read: `status` 404 (the user was deleted) or 5xx (Graph failed after retries) | Nothing to fix in the app. A failure is never cached, so the next upload reads again; staff triage the held ones |
 
 A batch that runs longer than 150 seconds returns the documents it had not started as rejected,
 with the generic "spróbuj ponownie" code, rather than uploading them late. The user resends
@@ -1373,6 +1482,7 @@ Bicep drift fix (gate G1), not here.
 | `conflictBehavior=fail` everywhere | Unit tests; a second canary upload with the same name gets `_1` |
 | App-id pinning is live | `BOT_CALLER_APP_IDS` set (H-8 verify); the `authMiddleware` unit test "rejects the right role held by an app that is not on the allow-list" passes in CI; a live token from another app registration is refused with 403. Such a token lacks `Documents.Ingest`, so the role check refuses it first and logs no `ingestion.caller.rejected`. Do not grant `Documents.Ingest` to a test app to produce one. |
 | Every onboarded client's guest is bound, or quarantined with a known reason | H-7 and H-12 records in the incident's status table |
+| The runtime membership check is on (R46 closed) | `/api/health` reports `"membershipCheck":"enforce"`; H-8b's dry run prints `already assigned`; the H-12 TEST canary filed with `membership: verified`; the resolver's membership tests pass in CI |
 | The IR-0 export is stored | H-2 verification |
 | The taxonomy folders at the library root of every client site the ingestion identity could write to are Owners-only | T-4b's status row lists every such site (PESKOVOI, TEST and each site IR-1 added); **Check permissions** for each client's guest returns *None*; T-4b's check of the items outside those folders, after IR-1, is recorded for each site |
 | The BCR GROUP root folders are Owners-only, including any created after the first lock | T-4's status row records the lock and the check after H-6b |
@@ -1385,18 +1495,24 @@ Bicep drift fix (gate G1), not here.
 
 **Owner:** Yahor. **From:** H-12, until Phase 2 replaces the Directory.
 
-Phase 0 checks a guest's Team membership only when `propose` and `apply` bind a row, and it has
-no alert rule. Ingestion routes on the Directory row alone. So a bound guest who is later added
-to a second client's Team keeps routing everything, the second company's documents included,
-into the first client's channel, until the next `check` and apply of the whole plan take the id
-off. That is an ordinary business event: one person running two companies. Onboarding invites
-the same email, gets the same guest back, adds it to the new Team, and writes the new row with
-no user ids, so no conflict is raised either.
+A bound guest who is later added to a second client's Team (R46) is an ordinary business event:
+one person running two companies. Onboarding invites the same email, gets the same guest back,
+adds it to the new Team, and writes the new row with no user ids, so no Directory conflict is
+raised. Before the runtime check, that guest kept routing everything, the second company's
+documents included, into the first client's channel until the next `check` and apply of the
+whole plan took the id off.
 
-**This is an accepted residual risk of Phase 0.** The mitigation is the schedule below: `check`
-and an apply of the **whole** plan after **every** onboarding, a `check` at least weekly, and
-action the same day whenever `check` exits `3` or `4`. The robust fix, a runtime `memberOf` check
-at upload time (or a membership registry kept in sync), is Phase 2. Onboarding writing the
+**R46 is now closed at runtime.** Ingestion reads each bound uploader's Teams from Entra at
+upload time and routes only if they are exactly the row's `TeamId` (`MEMBERSHIP_CHECK_MODE`,
+`enforce` by default; H-8b's grant). From at most 5 minutes after the guest joins the second
+Team (the read is cached that long), their uploads are quarantined as `membership_mismatch`.
+If the Teams cannot be read, uploads are quarantined as `membership_unverified`.
+
+**The schedule below stays, as defence in depth.** It keeps the Directory saying what routing
+does, it catches drift on rows whose guests have not uploaded since, and it is the only check
+left if `MEMBERSHIP_CHECK_MODE=off` is ever set in an emergency. So still: `check` and an apply of
+the **whole** plan after **every** onboarding, a `check` at least weekly, and action the same day
+whenever `check` exits `3` or `4`. Phase 0 still has no alert rule. Onboarding writing the
 guest's id into the new row itself (R1) waits on Roman's re-ruling of Q21.
 
 | When | What | Why |
@@ -1404,13 +1520,15 @@ guest's id into the new row itself (R1) waits on Roman's re-ruling of Q21.
 | After **any** onboarding | `propose` with H-12 step 5's flags, reviewed, then `apply` of the **whole** plan (a dry run, then `--apply`): never `--only <new row>`. Then `check`, acted on as in the next row | The whole plan carries the PATCH that takes a reused guest's id off the first client's row. A guest in two Teams is then bound to neither, and their uploads go to quarantine until a person decides |
 | **Weekly**, and after any onboarding that reuses an existing guest | `check`. **Exit `3` and exit `4` both need action, the same day.** `3` is drift on a bound row: a row id marked *not eligible* (now in another Team, or no longer in the row's Team) or a staff id; `propose` and apply the whole plan. `4` is incomplete: a bound row could not be fully assessed, and the `incomplete` rows are listed; fix what stopped the read (a 403 is a missing permission, H-4a; or a site the signed-in person cannot read) and run `check` again until it exits `0`, or `3` and is acted on. A guest reported as `guest_in_other_team` also means: `propose` and apply the whole plan the same day | Catches Team changes made outside onboarding, and a guest who left their client's Team but can still file into its channel. An exit `4` hides whether that happened on the rows it lists |
 | Before any negative canary | H-12 step 4's `check \| grep -ci <canary id>` prints `0` | A canary guest left on a row files into that client's channel |
-| Every working day | The query below. A `document.quarantine_failed` row means: check H-6's grant and the quarantine library name first. A `sharepoint.forbidden_site` row is an incident indicator (H-12 step 13) | A failed quarantine write is fail-closed (the user gets "spróbuj ponownie", nothing is written anywhere else), but if the quarantine grant or `QUARANTINE_DRIVE_NAME` breaks, every unbound, staff and stale upload is refused and nobody is told |
+| Every working day | The query below. A `document.quarantine_failed` row means: check H-6's grant and the quarantine library name first. A `sharepoint.forbidden_site` row is an incident indicator (H-12 step 13). A `membership.mismatch` row names a bound row one of whose guests is now in another Team, or no longer in its own: run `check`, then `propose` and apply the whole plan that day. Many `membership.unverified` rows with `status` 403, or any `membership.check_off`, mean the check is not working: H-12 step 13's table | A failed quarantine write is fail-closed (the user gets "spróbuj ponownie", nothing is written anywhere else), but if the quarantine grant or `QUARANTINE_DRIVE_NAME` breaks, every unbound, staff and stale upload is refused and nobody is told. A lost membership grant holds every client's uploads just as quietly |
 
 ```bash
 aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
   | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
-  | where msg in ("document.quarantine_failed", "sharepoint.forbidden_site")
-  | project timestamp, itemCount, msg, quarantineReason = tostring(m.quarantineReason)' \
+  | where msg in ("document.quarantine_failed", "sharepoint.forbidden_site",
+      "membership.mismatch", "membership.unverified", "membership.check_off")
+  | project timestamp, itemCount, msg, quarantineReason = tostring(m.quarantineReason),
+      listItemId = tostring(m.listItemId), status = tostring(m.status)' \
   <24 hours ago, UTC>
 ```
 

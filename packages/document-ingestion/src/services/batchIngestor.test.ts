@@ -283,6 +283,26 @@ describe('BatchIngestor — quarantine', () => {
     ]);
   });
 
+  // The runtime Team check (R46): a bound guest who is not in their row's
+  // Team alone, or whose Teams cannot be read, is held like any other reason.
+  it.each(['membership_mismatch', 'membership_unverified'] as const)(
+    'holds a %s upload unclassified, and records the reason on the item',
+    async (reason) => {
+      const held: ResolvedClient = { source: 'quarantine', reason, target: quarantineTarget };
+      const { ingestor, sp, classify } = setup(held);
+      const { log, lines } = recordingLogger();
+      const [result] = await ingestor.ingestBatch(payload(['skan.pdf']), log);
+
+      expect(result).toEqual({ filename: 'skan.pdf', status: 'quarantined' });
+      expect(classify).not.toHaveBeenCalled();
+      expect(sp.uploads.map((u) => u.factory)).toEqual(['quarantine']);
+      expect(sp.fields[0]!.fields['QuarantineReason']).toBe(reason);
+      expect(lines.find((l) => l['event'] === 'document.quarantined')).toMatchObject({
+        quarantineReason: reason,
+      });
+    },
+  );
+
   it('returns nothing about where the document went', async () => {
     const { ingestor } = setup(unmapped);
     const results = await ingestor.ingestBatch(payload(['skan.pdf']), recordingLogger().log);

@@ -468,6 +468,16 @@ equals `$INGEST_MI_APPID`, with the role from the table. An entry for the Ingest
 registration does not count: record it for deletion. Per-site grants take about 5 minutes to
 apply.
 
+3. **The Graph app role `Directory.Read.All`**, once for this identity, for the Team-membership
+   check (`MEMBERSHIP_CHECK_MODE=enforce`, the default): ingestion reads each bound uploader's
+   `memberOf`, and Microsoft Learn lists `Directory.Read.All` as the least privileged application
+   permission for that. Without it every bound upload is quarantined as `membership_unverified`.
+   Grant it with `infrastructure/identity/grant-ingestion-membership-read.sh` (dry run by
+   default, then `--apply` by a Global Administrator; it uses a delegated `GRAPH_TOKEN`, see
+   [`human-steps.md` H-8b](operations/human-steps.md#h-8b-grant-the-ingestion-identity-directoryreadall-then-verify)),
+   at least a day before ingestion first takes traffic: the platform caches a managed identity's
+   token for about 24 hours, and the role reaches the app only in a new token.
+
 ---
 
 ## 6. Reference: every `.env` / `local.settings.json` variable
@@ -528,6 +538,7 @@ for the design.
 | `QUARANTINE_DRIVE_NAME` | *(optional)* Default `Documents`. `Dokumenty` on Polish tenants. |
 | `QUARANTINE_ROOT_FOLDER` | *(optional)* Default `Kwarantanna`. |
 | `FORBIDDEN_TARGET_SITE_PATHS` | **Required.** Comma-separated site paths no Directory row may route to: at least the site that holds the Client Directory, e.g. `/sites/BCRGROUP`. Each entry exactly `/sites/<name>` or `/teams/<name>`; a URL or a sub-site fails at cold start. The quarantine path is added automatically. |
+| `MEMBERSHIP_CHECK_MODE` | *(optional)* `enforce` (the default, also when empty) or `off`. In `enforce`, a bound uploader routes only while their Teams, read from Entra at upload time, are exactly their row's `TeamId` (`membership_mismatch` / `membership_unverified` otherwise). Needs Graph `Directory.Read.All` on the ingestion managed identity (§5). `off` is an emergency escape only: it reopens R46, warns at every cold start and shows in `/api/health`. Any other value fails at cold start. |
 
 The `FALLBACK_*` settings were removed in Phase 0. The fallback bucket they described (the BCR
 GROUP library root, readable by the whole team) is replaced by the quarantine.
@@ -677,6 +688,7 @@ union requests, exceptions, traces
 | `QUARANTINE_SITE_HOSTNAME` / `_SITE_PATH` | the quarantine communication site | Ingestion Function App setting |
 | `QUARANTINE_DRIVE_NAME` / `_ROOT_FOLDER` | *(optional)* `Dokumenty` on Polish tenants / `Kwarantanna` | Ingestion Function App setting |
 | `FORBIDDEN_TARGET_SITE_PATHS` | BCR GROUP site path | Ingestion Function App setting |
+| `MEMBERSHIP_CHECK_MODE` | *(optional)* `enforce` (default); `off` only in an emergency | Ingestion Function App setting |
 | `BOT_GATE_MODE` | `enforce` (or `log` for the first 24 h) | Bot Function App setting |
 | `ANTHROPIC_ENABLED` | feature flag | Ingestion Function App setting |
 | `ANTHROPIC_API_KEY` | Anthropic Console | **Key Vault** secret `anthropic-api-key` |
