@@ -739,6 +739,7 @@ __metadata:
     "@azure/functions": "npm:^4.5.0"
     "@azure/identity": "npm:^4.4.1"
     "@azure/keyvault-secrets": "npm:^4.8.0"
+    "@bcr/ledger-db": "workspace:*"
     "@bcr/shared": "workspace:*"
     "@microsoft/microsoft-graph-client": "npm:^3.0.7"
     "@types/jest": "npm:^29.5.12"
@@ -748,6 +749,7 @@ __metadata:
     jest: "npm:^29.7.0"
     jose: "npm:^5.8.0"
     pdf-lib: "npm:^1.17.1"
+    pg: "npm:^8.16.3"
     rimraf: "npm:^6.0.1"
     ts-jest: "npm:^29.2.5"
     typescript: "npm:^5.5.4"
@@ -756,7 +758,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@bcr/ledger-db@workspace:packages/ledger-db":
+"@bcr/ledger-db@workspace:*, @bcr/ledger-db@workspace:packages/ledger-db":
   version: 0.0.0-use.local
   resolution: "@bcr/ledger-db@workspace:packages/ledger-db"
   dependencies:

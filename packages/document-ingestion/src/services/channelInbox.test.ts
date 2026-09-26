@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Client } from '@microsoft/microsoft-graph-client';
 import type {
   Classification,
@@ -23,6 +24,7 @@ import {
 import { ClassificationService, FallbackClassifier } from './classificationService';
 import { ClaudeClassifier } from './claudeClassifier';
 import { buildSnapshot, type ClientDirectorySnapshot } from './clientDirectoryReader';
+import type { DocumentIndex, IndexedDocument } from './documentIndex';
 import type { InboxItem } from './sharePointService';
 import { createSharePointWiring } from './sharePointWiring';
 import { TeamMembershipReader } from './teamMembership';
@@ -2231,5 +2233,90 @@ describe('selectCandidates', () => {
       beforeCutoff: 0,
       noCreator: 0,
     });
+  });
+});
+
+describe('ChannelInbox: the document index', () => {
+  const recording = (): DocumentIndex & { docs: IndexedDocument[] } => {
+    const docs: IndexedDocument[] = [];
+    return {
+      mode: 'write',
+      docs,
+      record: jest.fn(async (doc: IndexedDocument) => {
+        docs.push(doc);
+      }),
+    };
+  };
+
+  it("records a filed file under the row whose channel folder holds it, with the classified bytes' hash", async () => {
+    const index = recording();
+    const content = Buffer.from('%PDF synthetic for the index');
+    const { tenant, inbox } = setup({
+      classification: serviceOf(contentReadingClassifier(invoice)),
+      deps: { index },
+    });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf', content });
+
+    await inbox.sweep();
+
+    expect(index.docs).toHaveLength(1);
+    const doc = index.docs[0] as IndexedDocument;
+    expect(doc).toMatchObject({
+      source: 'inbox',
+      client: {
+        listItemId: '11',
+        clientNo: '0011',
+        nip: NIP_A,
+        legalName: 'Client 11 Sp. z o.o.',
+      },
+      driveId: 'drive-a',
+      driveItemId: id,
+      uploadedByOid: GUEST_A,
+      sizeBytes: content.length,
+      contentSha256: createHash('sha256').update(content).digest('hex'),
+    });
+    expect(doc.documentId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(doc.decision).toMatchObject({ review: false, category: 'faktury_zakupu' });
+  });
+
+  it('records a file sorted to review unclassified after repeated failures', async () => {
+    const index = recording();
+    const { tenant, inbox } = setup({ deps: { index } });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    tenant.overrides.push([
+      /^POST \/drives\/drive-a\/items\/inbox-a\/children$/,
+      (call, next) => {
+        if ((call.body as { name: string }).name === '01_Faktury') throw graphError(400);
+        return next();
+      },
+    ]);
+
+    await inbox.sweep();
+    await inbox.sweep();
+    expect(index.record).not.toHaveBeenCalled();
+    await inbox.sweep();
+
+    expect(
+      index.docs.map((d) => [d.driveItemId, d.decision.review, d.decision.reviewReasons]),
+    ).toEqual([[id, true, ['PROCESSING_FAILED']]]);
+  });
+
+  it('records nothing in shadow, and nothing for a file it leaves', async () => {
+    const index = recording();
+    const shadow = setup({ mode: 'shadow', deps: { index } });
+    shadow.tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    await shadow.inbox.sweep();
+
+    const staff = setup({ deps: { index } });
+    staff.tenant.addFile('inbox-a', { name: 'faktura.pdf', createdBy: STAFF });
+    await staff.inbox.sweep();
+
+    expect(index.record).not.toHaveBeenCalled();
+  });
+
+  it('files the same with the index off (the default)', async () => {
+    const { tenant, inbox } = setup();
+    tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    expect((await inbox.sweep()).filed).toBe(1);
   });
 });

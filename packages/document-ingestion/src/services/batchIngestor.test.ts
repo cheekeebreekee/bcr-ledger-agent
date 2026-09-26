@@ -28,6 +28,7 @@ import {
   type ClassificationOutcome,
 } from './classificationService';
 import { ClaudeClassifier } from './claudeClassifier';
+import type { DocumentIndex, IndexedDocument } from './documentIndex';
 import {
   cachedSiteIdLookup,
   SharePointTargetError,
@@ -132,7 +133,12 @@ interface FakeSharePoint {
 
 function setup(
   resolved: ResolvedClient,
-  opts: { classify?: jest.Mock; now?: () => Date; batchDeadlineMs?: number } = {},
+  opts: {
+    classify?: jest.Mock;
+    now?: () => Date;
+    batchDeadlineMs?: number;
+    index?: DocumentIndex;
+  } = {},
 ) {
   const sp: FakeSharePoint = { uploads: [], fields: [], failFor: new Map() };
   let n = 0;
@@ -172,6 +178,7 @@ function setup(
     now: opts.now ?? (() => new Date('2026-09-25T10:00:00Z')),
     newId: () => `id-${++n}`,
     ...(opts.batchDeadlineMs !== undefined ? { batchDeadlineMs: opts.batchDeadlineMs } : {}),
+    ...(opts.index ? { index: opts.index } : {}),
   };
   return { ingestor: new BatchIngestor(deps), deps, sp, classify };
 }
@@ -855,5 +862,113 @@ describe('BatchIngestor — real SharePoint services and forbidden sites', () =>
     expect(calls.filter((c) => c.method === 'put').map((c) => c.path)).toEqual([
       '/drives/drive-unknown/root:/Dokumenty%20ksi%C4%99gowe/01_Faktury/02_Faktury_zakupu/2026/09/faktura.pdf:/content',
     ]);
+  });
+});
+
+describe('BatchIngestor — the document index', () => {
+  const bound: DirectoryClientResolution = {
+    ...clientA,
+    target: { ...clientTarget, expectedDriveId: 'b!client-a-drive' },
+  };
+  const recording = (): DocumentIndex & { docs: IndexedDocument[] } => {
+    const docs: IndexedDocument[] = [];
+    return {
+      mode: 'write',
+      docs,
+      record: jest.fn(async (doc: IndexedDocument) => {
+        docs.push(doc);
+      }),
+    };
+  };
+
+  it('records a filed document under the bound row, with its id, drive item and decision', async () => {
+    const index = recording();
+    const { ingestor } = setup(bound, { index });
+    const { log } = recordingLogger();
+    const [result] = await ingestor.ingestBatch(payload(), log);
+
+    expect(result?.status).toBe('uploaded');
+    expect(index.docs).toHaveLength(1);
+    const doc = index.docs[0] as IndexedDocument;
+    expect(doc).toMatchObject({
+      documentId: 'id-2',
+      source: 'bot',
+      client: {
+        listItemId: '11',
+        clientNo: '0002',
+        nip: '1111111111',
+        legalName: 'Client A Sp. z o.o.',
+      },
+      driveId: 'b!client-a-drive',
+      driveItemId: 'item-1',
+      uploadedByOid: OID,
+      sizeBytes: Buffer.from('bytes of faktura.pdf').length,
+    });
+    expect(doc.decision).toMatchObject({ review: false, category: 'faktury_zakupu' });
+    expect(doc.content?.toString()).toBe('bytes of faktura.pdf');
+  });
+
+  it('records a document filed for review, too', async () => {
+    const index = recording();
+    const low: Classification = { ...invoice, confidence: 0.4 };
+    const { ingestor } = setup(bound, { index, classify: jest.fn(async () => decided(low)) });
+    await ingestor.ingestBatch(payload(), recordingLogger().log);
+    expect(index.docs.map((d) => [d.decision.review, d.decision.category])).toEqual([
+      [true, 'nieposortowane'],
+    ]);
+  });
+
+  it('records nothing for a quarantined upload, and nothing for a retry later', async () => {
+    const index = recording();
+    const quarantined = setup(
+      { source: 'quarantine', reason: 'unmapped', target: quarantineTarget },
+      { index },
+    );
+    await quarantined.ingestor.ingestBatch(payload(), recordingLogger().log);
+    const busy = setup(bound, {
+      index,
+      classify: jest.fn(
+        async (): Promise<ClassificationOutcome> => ({
+          kind: 'retry_later',
+          classifier: 'claude',
+          reason: 'overloaded',
+          status: 529,
+        }),
+      ),
+    });
+    await busy.ingestor.ingestBatch(payload(), recordingLogger().log);
+    expect(index.record).not.toHaveBeenCalled();
+  });
+
+  it('records after the upload, never before: a failed upload records nothing', async () => {
+    const index = recording();
+    const { ingestor, sp } = setup(bound, { index });
+    sp.failFor.set(bound.target, new SharePointError('down', 503));
+    const [result] = await ingestor.ingestBatch(payload(), recordingLogger().log);
+    // Held in the quarantine instead: never indexed, having no client.
+    expect(result?.status).toBe('quarantined');
+    expect(index.docs).toEqual([]);
+  });
+
+  it('files the same with the index off (the default)', async () => {
+    const { ingestor } = setup(bound);
+    const [result] = await ingestor.ingestBatch(payload(), recordingLogger().log);
+    expect(result?.status).toBe('uploaded');
+  });
+
+  it('takes the drive from the uploaded item when the target has no recorded drive id', async () => {
+    const index = recording();
+    const { ingestor, deps } = setup(clientA, { index });
+    const upload = deps.clientSharePointFactory.forTarget(clientTarget);
+    const original = upload.uploadDocument;
+    deps.clientSharePointFactory.forTarget = () => ({
+      ...upload,
+      uploadDocument: async (args: UploadDocumentArgs) => ({
+        ...(await original(args)),
+        parentReference: { driveId: 'b!from-graph', path: '/drive/root:' },
+      }),
+    });
+    await ingestor.ingestBatch(payload(), recordingLogger().log);
+    expect(index.docs[0]?.driveId).toBe('b!from-graph');
   });
 });

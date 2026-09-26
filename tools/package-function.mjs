@@ -6,8 +6,9 @@
  *     corepack yarn workspace @bcr/<teams-bot|document-ingestion> package
  *
  * which first deletes `artifacts/<pkg>.zip`, then `dist/` and the tsbuildinfo
- * of the app and of `@bcr/shared` (`tsc -b` skips emitting when a tsbuildinfo
- * survives), rebuilds both with `tsc -b`, and only then runs this script.
+ * of the app and of the workspace packages it ships (`@bcr/shared`, and
+ * `@bcr/ledger-db` for ingestion; `tsc -b` skips emitting when a tsbuildinfo
+ * survives), rebuilds them with `tsc -b`, and only then runs this script.
  * Run the two package scripts one after the other, never in parallel: each
  * cleans `packages/shared/dist`.
  *
@@ -41,16 +42,18 @@
  *   1. deletes `artifacts/<pkg>.zip` before anything else, and again on any
  *      failure, so a failed run leaves no archive at the path the deploy
  *      commands use
- *   2. checks the build: the app's and `@bcr/shared`'s `dist/` hold exactly one
- *      `.js` per non-test `src/**\/*.ts` (an orphan or a missing file fails),
- *      `src/` holds nothing but `.ts`, and the Phase-0 markers are present
+ *   2. checks the build: the app's `dist/`, and that of every workspace package
+ *      it depends on (`@bcr/shared`, and `@bcr/ledger-db` for ingestion), hold
+ *      exactly one `.js` per non-test `src/**\/*.ts` (an orphan or a missing
+ *      file fails), `src/` holds nothing but `.ts`, and the Phase-0 markers
+ *      are present
  *   3. stages `dist/**\/*.js` and `host.json` only: no source maps,
  *      declarations or tsbuildinfo
  *   4. installs the production dependencies from yarn.lock: a throwaway copy of
  *      the root manifest, yarn.lock, .yarnrc.yml and the workspace manifests,
  *      `yarn workspaces focus --production`, install scripts disabled,
  *      immutable lockfile, checksums enforced
- *   5. vendors `@bcr/shared` from its fresh `dist` (`.js` only)
+ *   5. vendors those workspace packages from their fresh `dist` (`.js` only)
  *   6. verifies before zipping: every top-level dependency is the version
  *      yarn.lock pins AND the version installed in the root node_modules (what
  *      the tests ran against); every installed package is a yarn.lock
@@ -96,6 +99,32 @@ export const APPS = {
     ],
   },
 };
+/**
+ * The `@bcr/*` workspace packages an app ships, vendored from their `dist`:
+ * `@bcr/shared` always, plus every `workspace:` dependency in the app's
+ * package.json (`@bcr/ledger-db` for ingestion), each with its own
+ * `workspace:` dependencies, in a stable order. A workspace package is
+ * `packages/<name without @bcr/>`.
+ */
+export function workspaceDependencies(appManifest, readManifest = () => ({})) {
+  const found = new Set(['@bcr/shared']);
+  const visit = (manifest) => {
+    for (const [dep, range] of Object.entries(manifest.dependencies ?? {})) {
+      if (!dep.startsWith('@bcr/') || !String(range).startsWith('workspace:')) continue;
+      if (found.has(dep)) continue;
+      found.add(dep);
+      visit(readManifest(dep));
+    }
+  };
+  visit(appManifest);
+  return [...found].sort();
+}
+
+/** `packages/<dir>` of a workspace package name. */
+export function workspaceDir(name) {
+  return name.replace(/^@bcr\//, '');
+}
+
 export const SHARED_MARKERS = [
   ['config.js', 'botGateMode'],
   ['config.js', 'forbiddenTargetSitePaths'],
@@ -377,6 +406,16 @@ export function packageFunction({ root, name, keepStaging = false, log = console
 function build({ root, name, keepStaging, log, ARTIFACTS, ZIP }) {
   const APP = join(root, 'packages', name);
   const SHARED = join(root, 'packages/shared');
+  const appManifest = JSON.parse(readFileSync(join(APP, 'package.json'), 'utf8'));
+  const readManifest = (dep) => {
+    const file = join(root, 'packages', workspaceDir(dep), 'package.json');
+    return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+  };
+  // @bcr/shared and the app's other workspace dependencies, vendored below.
+  const WORKSPACE = workspaceDependencies(appManifest, readManifest).map((dep) => ({
+    name: dep,
+    dir: join(root, 'packages', workspaceDir(dep)),
+  }));
   const STAGING = join(ARTIFACTS, `staging-${name}`);
   const YARN_DIR = join(ARTIFACTS, `staging-${name}-yarn`);
   const rebuild = `Run: corepack yarn workspace @bcr/${name} package`;
@@ -393,10 +432,7 @@ function build({ root, name, keepStaging, log, ARTIFACTS, ZIP }) {
     fail(`packages/${name}/dist/index.js is missing. ${rebuild}`);
   }
   const expected = {};
-  for (const [label, dir] of [
-    [`@bcr/${name}`, APP],
-    ['@bcr/shared', SHARED],
-  ]) {
+  for (const [label, dir] of [[`@bcr/${name}`, APP], ...WORKSPACE.map((w) => [w.name, w.dir])]) {
     const {
       expected: js,
       orphans,
@@ -510,36 +546,41 @@ function build({ root, name, keepStaging, log, ARTIFACTS, ZIP }) {
   }
   renameSync(yarnModules, join(STAGING, 'node_modules'));
 
-  // --- 5. vendor @bcr/shared from its fresh build -----------------------------
-  const sharedPkg = JSON.parse(readFileSync(join(SHARED, 'package.json'), 'utf8'));
+  // --- 5. vendor the workspace packages from their fresh builds -------------------
+  const vendoredPaths = new Set();
+  for (const w of WORKSPACE) {
+    const manifest = JSON.parse(readFileSync(join(w.dir, 'package.json'), 'utf8'));
+    const target = join(STAGING, 'node_modules', w.name);
+    vendoredPaths.add(target);
+    mkdirSync(target, { recursive: true });
+    cpSync(join(w.dir, 'dist'), join(target, 'dist'), { recursive: true, filter: jsOnly });
+    writeFileSync(
+      join(target, 'package.json'),
+      `${JSON.stringify(
+        {
+          name: manifest.name,
+          version: manifest.version,
+          private: true,
+          main: 'dist/index.js',
+          dependencies: manifest.dependencies ?? {},
+        },
+        null,
+        2,
+      )}\n`,
+    );
+  }
   const vendored = join(STAGING, 'node_modules/@bcr/shared');
-  mkdirSync(vendored, { recursive: true });
-  cpSync(join(SHARED, 'dist'), join(vendored, 'dist'), { recursive: true, filter: jsOnly });
-  writeFileSync(
-    join(vendored, 'package.json'),
-    `${JSON.stringify(
-      {
-        name: sharedPkg.name,
-        version: sharedPkg.version,
-        private: true,
-        main: 'dist/index.js',
-        dependencies: sharedPkg.dependencies ?? {},
-      },
-      null,
-      2,
-    )}\n`,
-  );
 
   // --- 6. verify before zipping ---------------------------------------------------
   const lock = parseYarnLock(readFileSync(join(root, 'yarn.lock'), 'utf8'));
-  const appPkg = JSON.parse(readFileSync(join(APP, 'package.json'), 'utf8'));
+  const appPkg = appManifest;
   const wanted = new Map();
   for (const [deps, workspace] of [
     [appPkg.dependencies ?? {}, APP],
-    [sharedPkg.dependencies ?? {}, SHARED],
+    ...WORKSPACE.map((w) => [readManifest(w.name).dependencies ?? {}, w.dir]),
   ]) {
     for (const [dep, range] of Object.entries(deps)) {
-      if (dep === '@bcr/shared') continue;
+      if (String(range).startsWith('workspace:')) continue;
       const key = `${dep}@${range}`;
       if (!wanted.has(key)) wanted.set(key, { dep, range, workspace });
     }
@@ -564,7 +605,9 @@ function build({ root, name, keepStaging, log, ARTIFACTS, ZIP }) {
         ` Run: corepack yarn install --immutable`,
     );
   }
-  const installed = listInstalled(join(STAGING, 'node_modules')).filter((p) => p.path !== vendored);
+  const installed = listInstalled(join(STAGING, 'node_modules')).filter(
+    (p) => !vendoredPaths.has(p.path),
+  );
   const strangers = installed.filter(
     (p) => p.problem || !lock.resolved.has(`${p.name}@${p.version}`),
   );
@@ -583,14 +626,15 @@ function build({ root, name, keepStaging, log, ARTIFACTS, ZIP }) {
   }
   const shippedCode = [
     ...expected[`@bcr/${name}`].map((f) => `dist/${f}`),
-    ...expected['@bcr/shared'].map((f) => `node_modules/@bcr/shared/dist/${f}`),
+    ...WORKSPACE.flatMap((w) => expected[w.name].map((f) => `node_modules/${w.name}/dist/${f}`)),
   ];
   const unresolved = findUnresolvedRequires(STAGING, shippedCode);
   if (unresolved.length > 0) {
     fail(
       `the shipped code requires modules the package does not contain:\n` +
         unresolved.map((u) => `    ${u.file}: require("${u.spec}") ${u.problem}`).join('\n') +
-        `\n  Declare them in packages/${name}/package.json or packages/shared/package.json.`,
+        `\n  Declare them in the package.json of the app or of the workspace package that` +
+        ' requires them.',
     );
   }
 
@@ -642,7 +686,7 @@ function build({ root, name, keepStaging, log, ARTIFACTS, ZIP }) {
     entries.filter((e) => e.startsWith(prefix)).map((e) => e.slice(prefix.length));
   for (const [label, prefix] of [
     [`@bcr/${name}`, 'dist/'],
-    ['@bcr/shared', 'node_modules/@bcr/shared/dist/'],
+    ...WORKSPACE.map((w) => [w.name, `node_modules/${w.name}/dist/`]),
   ]) {
     const got = under(prefix).sort();
     if (JSON.stringify(got) !== JSON.stringify(expected[label])) {

@@ -19,6 +19,7 @@ import {
 } from './acceptancePolicy';
 import type { ClassificationOutcome } from './classificationService';
 import type { ClientResolver } from './clientResolver';
+import { INDEX_OFF, type DocumentIndex } from './documentIndex';
 import { RetryLaterBound, type RetryLaterLast } from './retryLaterBound';
 import { SharePointTargetError, type SharePointService } from './sharePointService';
 
@@ -73,6 +74,12 @@ export interface BatchIngestorDeps {
    * guard, which would refuse the quarantine site itself.
    */
   readonly quarantineSharePointFactory: SharePointFactoryLike;
+  /**
+   * The document index (`LEDGER_INDEX_MODE`). Told about every document filed
+   * into a client's space, after the upload; never about a quarantined one.
+   * It never throws. Defaults to off.
+   */
+  readonly index?: DocumentIndex;
   readonly now?: () => Date;
   readonly newId?: () => string;
   /** Defaults to {@link BATCH_DEADLINE_MS}. */
@@ -99,6 +106,10 @@ export interface BatchIngestorDeps {
  * the model was overloaded. Only a document that keeps getting a "retry
  * later" it may cause itself is, at the {@link MAX_RETRY_LATER_ATTEMPTS}-th
  * send, filed for review (`RETRY_EXHAUSTED`) rather than refused forever.
+ *
+ * Each document filed into the client's space (in its category or for
+ * review) is then recorded in the document index under that client, with the
+ * same `documentId`; an index failure is logged and changes nothing here.
  */
 export class BatchIngestor {
   private readonly now: () => Date;
@@ -109,8 +120,10 @@ export class BatchIngestor {
    * on this worker: a resend that reaches another worker starts again there.
    */
   private readonly retryLaters: RetryLaterBound;
+  private readonly index: DocumentIndex;
 
   constructor(private readonly deps: BatchIngestorDeps) {
+    this.index = deps.index ?? INDEX_OFF;
     this.now = deps.now ?? (() => new Date());
     this.newId = deps.newId ?? randomUUID;
     this.deadlineMs = deps.batchDeadlineMs ?? BATCH_DEADLINE_MS;
@@ -194,7 +207,7 @@ export class BatchIngestor {
         );
       }
       try {
-        return await this.fileForClient(document, content, resolved, documentId, docLog, at);
+        return await this.fileForClient(document, content, resolved, documentId, batch, docLog, at);
       } catch (err) {
         // A client whose space can't be written must not lose the document,
         // and must not have it written anywhere else. Hold it for staff.
@@ -231,6 +244,7 @@ export class BatchIngestor {
     content: Buffer,
     client: DirectoryClientResolution,
     documentId: string,
+    batch: BatchContext,
     docLog: Logger,
     at: Date,
   ): Promise<IngestionBatchItemResult> {
@@ -318,6 +332,26 @@ export class BatchIngestor {
           : {}),
       },
       'document.filed',
+    );
+    // Filed: the index follows, in this client's scope. Never throws.
+    await this.index.record(
+      {
+        documentId,
+        source: 'bot',
+        client: {
+          listItemId: client.listItemId,
+          clientNo: client.clientId,
+          nip: client.nip,
+          legalName: client.companyName,
+        },
+        driveId: client.target.expectedDriveId ?? item.parentReference?.driveId ?? '',
+        driveItemId: item.id,
+        decision,
+        ...(batch.uploaderOid ? { uploadedByOid: batch.uploaderOid } : {}),
+        content,
+        sizeBytes: content.length,
+      },
+      docLog,
     );
 
     return {

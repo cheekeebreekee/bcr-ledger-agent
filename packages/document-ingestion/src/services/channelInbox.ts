@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import {
   createLogger,
   LedgerAgentError,
@@ -15,6 +16,7 @@ import {
 } from './acceptancePolicy';
 import type { ClassificationOutcome } from './classificationService';
 import { boundClientRows, type ClientDirectorySnapshot } from './clientDirectoryReader';
+import { INDEX_OFF, type DocumentIndex, type IndexedClient } from './documentIndex';
 import { doublingBackoff, RetryLaterBound } from './retryLaterBound';
 import {
   ContentTooLargeError,
@@ -141,6 +143,11 @@ export interface ChannelInboxDeps {
    * where it is. Absent: no cutoff.
    */
   readonly createdAfterMs?: number;
+  /**
+   * The document index (`LEDGER_INDEX_MODE`): told about every file moved in
+   * `enforce`, never in `shadow`. It never throws. Defaults to off.
+   */
+  readonly index?: DocumentIndex;
   /** Defaults to {@link INBOX_TICK_DEADLINE_MS}. */
   readonly tickDeadlineMs?: number;
   /** Defaults to {@link INBOX_TICK_HARD_LIMIT_MS}. */
@@ -247,6 +254,8 @@ interface CachedPlacement {
   readonly eTag: string;
   readonly decision: AcceptanceDecision;
   readonly at: number;
+  /** Hex SHA-256 of the bytes the classifier read, when it read them. */
+  readonly contentSha256?: string;
 }
 
 interface RowIds {
@@ -293,6 +302,10 @@ interface Tick {
  * file waits out a backoff, and after {@link MAX_RETRY_LATER_ATTEMPTS} such
  * answers it goes to review (`RETRY_EXHAUSTED`) instead of being retried
  * forever. Logs carry ids, codes, counts and taxonomy paths only.
+ *
+ * In `enforce`, each file moved (filed, or sorted to review) is then recorded
+ * in the document index under this row's client; an index failure is logged
+ * and changes nothing here. `shadow` records nothing.
  */
 export class ChannelInbox {
   private readonly log: Logger;
@@ -302,6 +315,7 @@ export class ChannelInbox {
   private readonly cacheTtlMs: number;
   private readonly maxAttempts: number;
   private readonly onlyRows: ReadonlySet<string> | undefined;
+  private readonly index: DocumentIndex;
   private readonly placements = new Map<string, CachedPlacement>();
   private readonly failures = new Map<string, number>();
   private readonly reportedSkips = new Set<string>();
@@ -321,6 +335,7 @@ export class ChannelInbox {
     this.cacheTtlMs = deps.classificationCacheTtlMs ?? CLASSIFICATION_CACHE_TTL_MS;
     this.maxAttempts = deps.maxAttempts ?? MAX_PROCESSING_ATTEMPTS;
     this.onlyRows = deps.onlyRows?.length ? new Set(deps.onlyRows) : undefined;
+    this.index = deps.index ?? INDEX_OFF;
     this.retryLaters = new RetryLaterBound({
       maxAttempts: deps.maxRetryLaterAttempts ?? MAX_RETRY_LATER_ATTEMPTS,
       backoffMs: doublingBackoff(
@@ -571,19 +586,22 @@ export class ChannelInbox {
     const driveItemId = candidate.item.id;
     const attemptsBefore = this.failures.get(driveItemId) ?? 0;
     if (attemptsBefore >= this.maxAttempts) {
-      await this.sortUnclassified(ids, sharePoint, inbox, candidate, tick, { counted: false });
+      await this.sortUnclassified(row, ids, sharePoint, inbox, candidate, tick, {
+        counted: false,
+      });
       return;
     }
     // Reached its bound on an earlier tick, and the move did not happen then.
     const exhausted = this.retryLaters.exhausted(versionKey(candidate), this.now().getTime());
     if (exhausted) {
-      await this.sortRetryExhausted(ids, sharePoint, inbox, candidate, tick, exhausted);
+      await this.sortRetryExhausted(row, ids, sharePoint, inbox, candidate, tick, exhausted);
       return;
     }
 
     let stage: Stage = 'check';
     try {
-      const decision = await this.placementFor(row, sharePoint, inbox, candidate, tick);
+      const placement = await this.placementFor(row, sharePoint, inbox, candidate, tick);
+      const decision = placement.decision;
       if (this.deps.mode === 'shadow') {
         this.reportWouldMove(tick, ids, candidate, decision);
         return;
@@ -612,9 +630,10 @@ export class ChannelInbox {
         },
         event,
       );
+      await this.recordInIndex(row, inbox, candidate, moved.id, decision, tick, placement);
     } catch (err) {
       if (err instanceof ClassificationDeferred) {
-        await this.deferClassification(err, ids, sharePoint, inbox, candidate, tick);
+        await this.deferClassification(err, row, ids, sharePoint, inbox, candidate, tick);
         return;
       }
       if (this.leftForLater(err, tick, ids, candidate)) return;
@@ -636,7 +655,9 @@ export class ChannelInbox {
         'inbox.failed',
       );
       if (attempt >= this.maxAttempts) {
-        await this.sortUnclassified(ids, sharePoint, inbox, candidate, tick, { counted: true });
+        await this.sortUnclassified(row, ids, sharePoint, inbox, candidate, tick, {
+          counted: true,
+        });
       }
     }
   }
@@ -649,6 +670,7 @@ export class ChannelInbox {
    */
   private async deferClassification(
     err: ClassificationDeferred,
+    row: ClientDirectoryEntry,
     ids: RowIds,
     sharePoint: InboxSharePoint,
     inbox: InboxFolder,
@@ -675,7 +697,7 @@ export class ChannelInbox {
       'inbox.retry_later',
     );
     if (verdict.exhausted) {
-      await this.sortRetryExhausted(ids, sharePoint, inbox, candidate, tick, {
+      await this.sortRetryExhausted(row, ids, sharePoint, inbox, candidate, tick, {
         attempts: verdict.attempts,
         reason: err.reason,
         ...(err.status !== undefined ? { status: err.status } : {}),
@@ -751,11 +773,11 @@ export class ChannelInbox {
     inbox: InboxFolder,
     candidate: InboxCandidate,
     tick: Tick,
-  ): Promise<AcceptanceDecision> {
+  ): Promise<CachedPlacement> {
     const now = this.now();
     const cached = this.placements.get(candidate.item.id);
     if (cached && cached.eTag === candidate.eTag && now.getTime() - cached.at < this.cacheTtlMs) {
-      return cached.decision;
+      return cached;
     }
 
     if (!this.hasTimeFor(tick, CLASSIFY_RESERVE_MS)) throw new OutOfTime();
@@ -766,9 +788,15 @@ export class ChannelInbox {
     // file for manual review; a file too big for the classifier is.
     let downloadFailure: unknown;
     let content: Promise<Buffer> | undefined;
+    let contentSha256: string | undefined;
     const readContent = (): Promise<Buffer> => {
       content ??= sharePoint
         .downloadInboxItem(inbox, candidate.item.id, this.deps.maxDownloadBytes)
+        .then((bytes) => {
+          // For the index only: which bytes were classified.
+          contentSha256 = createHash('sha256').update(bytes).digest('hex');
+          return bytes;
+        })
         .catch((err: unknown) => {
           if (!(err instanceof ContentTooLargeError)) downloadFailure = err;
           throw err;
@@ -795,16 +823,49 @@ export class ChannelInbox {
     // Classified: earlier "retry later" answers no longer count.
     this.retryLaters.forget(versionKey(candidate));
 
-    remember(this.placements, candidate.item.id, {
+    const placement: CachedPlacement = {
       eTag: candidate.eTag,
       decision: outcome.decision,
       at: now.getTime(),
-    });
-    return outcome.decision;
+      ...(contentSha256 ? { contentSha256 } : {}),
+    };
+    remember(this.placements, candidate.item.id, placement);
+    return placement;
+  }
+
+  /**
+   * After a move in `enforce`: the file's row in the document index, under
+   * this row's client (the row whose channel folder holds the file — never
+   * anything the file says). Never throws; a failure is `index.write_failed`.
+   */
+  private async recordInIndex(
+    row: ClientDirectoryEntry,
+    inbox: InboxFolder,
+    candidate: InboxCandidate,
+    movedId: string,
+    decision: AcceptanceDecision,
+    tick: Tick,
+    placement?: CachedPlacement,
+  ): Promise<void> {
+    await this.index.record(
+      {
+        documentId: randomUUID(),
+        source: 'inbox',
+        client: indexedClient(row),
+        driveId: inbox.driveId,
+        driveItemId: movedId,
+        decision,
+        uploadedByOid: candidate.creatorId,
+        ...(placement?.contentSha256 ? { contentSha256: placement.contentSha256 } : {}),
+        ...(typeof candidate.item.size === 'number' ? { sizeBytes: candidate.item.size } : {}),
+      },
+      tick.log,
+    );
   }
 
   /** At the retry-later bound: into review with `RETRY_EXHAUSTED` and the last status. */
   private async sortRetryExhausted(
+    row: ClientDirectoryEntry,
     ids: RowIds,
     sharePoint: InboxSharePoint,
     inbox: InboxFolder,
@@ -812,7 +873,7 @@ export class ChannelInbox {
     tick: Tick,
     last: { readonly attempts: number; readonly reason: string; readonly status?: number },
   ): Promise<void> {
-    await this.sortUnclassified(ids, sharePoint, inbox, candidate, tick, {
+    await this.sortUnclassified(row, ids, sharePoint, inbox, candidate, tick, {
       counted: false,
       decision: retryExhaustedDecision(this.now(), last.reason),
       extra: {
@@ -829,6 +890,7 @@ export class ChannelInbox {
    * check, `If-Match` and time limit apply as to any move.
    */
   private async sortUnclassified(
+    row: ClientDirectoryEntry,
     ids: RowIds,
     sharePoint: InboxSharePoint,
     inbox: InboxFolder,
@@ -869,6 +931,7 @@ export class ChannelInbox {
         },
         'inbox.sorted_to_review',
       );
+      await this.recordInIndex(row, inbox, candidate, moved.id, decision, tick);
     } catch (err) {
       // A file already counted as failed this tick is not also deferred.
       if (this.leftForLater(err, tick, ids, candidate, { countDeferred: !opts.counted })) return;
@@ -991,6 +1054,16 @@ export function selectCandidates(
     ineligible,
     beforeCutoff,
     noCreator,
+  };
+}
+
+/** The index's view of a bound row: its ids and the client's own identity. */
+function indexedClient(row: ClientDirectoryEntry): IndexedClient {
+  return {
+    listItemId: row.listItemId,
+    clientNo: row.clientId,
+    nip: row.nip,
+    legalName: row.companyNameAliases[0] ?? row.title,
   };
 }
 

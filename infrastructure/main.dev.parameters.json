@@ -26,6 +26,9 @@
     "enableAnthropic": { "value": true },
     "anthropicModel": { "value": "claude-opus-5" },
     "classificationAcceptThreshold": { "value": "0.70" },
+    "ledgerIndexMode": { "value": "off" },
+    "ledgerDbHost": { "value": "" },
+    "ledgerDbUser": { "value": "" },
     "botGateMode": { "value": "enforce" },
     "logLevel": { "value": "debug" }
   }

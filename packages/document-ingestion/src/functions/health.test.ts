@@ -6,11 +6,13 @@ jest.mock('@azure/functions', () => ({ app: { http: mockHttp } }));
 let mockMode: 'enforce' | 'off' = 'enforce';
 let mockInbox: 'off' | 'shadow' | 'enforce' = 'off';
 let mockRows: string[] = [];
+let mockIndex: 'off' | 'write' = 'off';
 jest.mock('../config', () => ({
   loadIngestionConfig: () => ({
     membershipCheckMode: mockMode,
     inboxSweepMode: mockInbox,
     inboxSweepRows: mockRows,
+    ledgerIndexMode: mockIndex,
   }),
 }));
 
@@ -21,6 +23,7 @@ describe('health', () => {
     mockMode = 'enforce';
     mockInbox = 'off';
     mockRows = [];
+    mockIndex = 'off';
   });
 
   it('registers GET /api/health anonymously, with handleHealth as the handler', () => {
@@ -48,6 +51,7 @@ describe('health', () => {
         membershipCheck: m,
         inboxSweep: 'off',
         inboxSweepRows: 'all',
+        ledgerIndex: 'off',
       });
       expect(body.status).toBe('ok');
       expect(body.service).toBe('document-ingestion');
@@ -65,9 +69,20 @@ describe('health', () => {
         membershipCheck: 'enforce',
         inboxSweep: m,
         inboxSweepRows: 'all',
+        ledgerIndex: 'off',
       });
     },
   );
+
+  it('reports ledgerIndex=write without touching phase or routing', async () => {
+    mockIndex = 'write';
+    const body = (await handleHealth()).jsonBody as ReturnType<typeof healthBody>;
+    expect(body.build).toMatchObject({
+      phase: 'p0',
+      routing: 'identity-only',
+      ledgerIndex: 'write',
+    });
+  });
 
   it('says the sweep is limited to listed rows, without naming them', async () => {
     mockInbox = 'shadow';
@@ -79,7 +94,12 @@ describe('health', () => {
 
   it('stamps the time it was asked', () => {
     const now = new Date('2026-09-26T10:00:00.000Z');
-    const build = { membershipCheck: 'enforce', inboxSweep: 'off', inboxSweepRows: 'all' } as const;
+    const build = {
+      membershipCheck: 'enforce',
+      inboxSweep: 'off',
+      inboxSweepRows: 'all',
+      ledgerIndex: 'off',
+    } as const;
     expect(healthBody(build, now).timestamp).toBe('2026-09-26T10:00:00.000Z');
   });
 });

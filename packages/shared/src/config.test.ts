@@ -4,6 +4,7 @@ import {
   CLASSIFICATION_ACCEPT_THRESHOLD_MIN,
   ingestionConfigSchema,
   loadConfig,
+  missingLedgerIndexSettings,
 } from './config';
 
 const botEnvMap = {
@@ -44,6 +45,10 @@ const ingestionEnvMap = {
   anthropicModel: 'ANTHROPIC_MODEL',
   anthropicMaxContentBytes: 'ANTHROPIC_MAX_CONTENT_BYTES',
   classificationAcceptThreshold: 'CLASSIFICATION_ACCEPT_THRESHOLD',
+  ledgerIndexMode: 'LEDGER_INDEX_MODE',
+  ledgerDbHost: 'LEDGER_DB_HOST',
+  ledgerDbName: 'LEDGER_DB_NAME',
+  ledgerDbUser: 'LEDGER_DB_USER',
   applicationInsightsConnectionString: 'APPLICATIONINSIGHTS_CONNECTION_STRING',
   logLevel: 'LOG_LEVEL',
 } as const;
@@ -141,6 +146,69 @@ describe('ingestionConfigSchema', () => {
     expect(cfg.inboxMaxFilesPerTick).toBe(20);
     expect(cfg.inboxSweepRows).toEqual([]);
     expect(cfg.inboxCreatedAfter).toBeUndefined();
+    expect(cfg.ledgerIndexMode).toBe('off');
+    expect(cfg.ledgerDbHost).toBe('');
+    expect(cfg.ledgerDbName).toBe('ledger');
+    expect(cfg.ledgerDbUser).toBe('');
+  });
+
+  describe('the document index settings', () => {
+    it('reads LEDGER_INDEX_MODE=write with the host, database and login', () => {
+      const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+        ...baseEnv,
+        LEDGER_INDEX_MODE: 'write',
+        LEDGER_DB_HOST: 'psql-bcr-dev-abc.postgres.database.azure.com',
+        LEDGER_DB_NAME: 'ledger_test',
+        LEDGER_DB_USER: 'func-bcr-ingest-dev-abc',
+      });
+      expect(cfg.ledgerIndexMode).toBe('write');
+      expect(cfg.ledgerDbHost).toBe('psql-bcr-dev-abc.postgres.database.azure.com');
+      expect(cfg.ledgerDbName).toBe('ledger_test');
+      expect(cfg.ledgerDbUser).toBe('func-bcr-ingest-dev-abc');
+      expect(missingLedgerIndexSettings(cfg)).toEqual([]);
+    });
+
+    it('treats an empty LEDGER_INDEX_MODE as off', () => {
+      const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+        ...baseEnv,
+        LEDGER_INDEX_MODE: ' ',
+      });
+      expect(cfg.ledgerIndexMode).toBe('off');
+    });
+
+    it.each(['on', 'enforce', 'WRITE', 'shadow'])(
+      'fails at cold start on LEDGER_INDEX_MODE=%j: a typo never switches writes on',
+      (value) => {
+        expect(() =>
+          loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+            ...baseEnv,
+            LEDGER_INDEX_MODE: value,
+          }),
+        ).toThrow(/LEDGER_INDEX_MODE/);
+      },
+    );
+
+    it.each([
+      ['LEDGER_DB_HOST', 'https://psql.postgres.database.azure.com'],
+      ['LEDGER_DB_HOST', 'psql.postgres.database.azure.com:5432'],
+      ['LEDGER_DB_NAME', 'Ledger'],
+      ['LEDGER_DB_NAME', 'ledger;drop'],
+      ['LEDGER_DB_USER', 'func bcr'],
+      ['LEDGER_DB_USER', '"func"'],
+    ])('rejects %s=%j', (name, value) => {
+      expect(() =>
+        loadConfig(ingestionConfigSchema, ingestionEnvMap, { ...baseEnv, [name]: value }),
+      ).toThrow(new RegExp(name));
+    });
+
+    it('names what write mode still needs, and nothing with off', () => {
+      const off = loadConfig(ingestionConfigSchema, ingestionEnvMap, baseEnv);
+      expect(missingLedgerIndexSettings(off)).toEqual([]);
+      expect(missingLedgerIndexSettings({ ...off, ledgerIndexMode: 'write' })).toEqual([
+        'LEDGER_DB_HOST',
+        'LEDGER_DB_USER',
+      ]);
+    });
   });
 
   // A first `shadow`/`enforce` can be limited to a canary row. Only list item

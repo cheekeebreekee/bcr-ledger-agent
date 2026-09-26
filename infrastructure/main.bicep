@@ -102,6 +102,21 @@ param anthropicModel string = 'claude-opus-5'
 @description('CLASSIFICATION_ACCEPT_THRESHOLD: the one acceptance threshold, 0.70-0.95; below it a document goes to 98_Nieposortowane for review. Ingestion refuses to start outside that range.')
 param classificationAcceptThreshold string = '0.70'
 
+// ---- Ingestion: the document index -----------------------------------------
+// The database itself is infrastructure/db.bicep, a separate template deployed
+// on its own: this template never creates or changes it, and db.bicep never
+// touches these settings.
+
+@description('LEDGER_INDEX_MODE: off (nothing written, no connection) or write (every filed document is recorded in the index, client-scoped). Ingestion refuses to start in write without LEDGER_DB_HOST.')
+@allowed(['off', 'write'])
+param ledgerIndexMode string = 'off'
+
+@description('LEDGER_DB_HOST: the index server, <server>.postgres.database.azure.com (db.bicep output serverFqdn). Empty while LEDGER_INDEX_MODE is off.')
+param ledgerDbHost string = ''
+
+@description('LEDGER_DB_USER: the PostgreSQL login of the ingestion managed identity, which pgaadauth_create_principal names after the Function App. Empty while LEDGER_INDEX_MODE is off.')
+param ledgerDbUser string = ''
+
 // ---- Bot --------------------------------------------------------------------
 
 @description('BOT_GATE_MODE: what the bot does with an activity that fails the gate. enforce refuses it; log only records it.')
@@ -222,6 +237,10 @@ var ingestionAppSettings = union(
     // Not string(enableAnthropic): ARM spells that 'True'. The code reads either,
     // but the running value is 'true', and this template records it.
     ANTHROPIC_ENABLED: enableAnthropic ? 'true' : 'false'
+    LEDGER_INDEX_MODE: ledgerIndexMode
+    LEDGER_DB_HOST: ledgerDbHost
+    LEDGER_DB_NAME: 'ledger'
+    LEDGER_DB_USER: ledgerDbUser
     LOG_LEVEL: logLevel
   },
   enableAnthropic
