@@ -157,8 +157,11 @@ Both apps load their settings once at cold start, with a zod schema, and refuse 
 required one is missing. A setting's name is the env var; the schema is in
 [`packages/shared/src/config.ts`](packages/shared/src/config.ts).
 
-⚠️ Settings are added with `az functionapp config appsettings set … -o none`, which merges. A
-Bicep deploy replaces them all, and the template has drifted (lesson 20).
+⚠️ A Bicep deploy replaces every app setting, so `main.bicep` with `main.<env>.parameters.json`
+is the record of them all (lesson 20). A setting changed by hand with
+`az functionapp config appsettings set … -o none` (which merges) must be recorded in the
+parameters file in the same change; `node tools/check-app-settings.mjs --live` shows any
+difference, and CI checks that Bicep sets every setting the code needs.
 
 **Bot (`func-bcr-bot-…`)**
 
@@ -195,9 +198,10 @@ they are first pointed at the quarantine site
 and deleted from the app once the Phase-0 build is verified
 ([human-steps H-14](docs/operations/human-steps.md#h-14-remove-the-fallback_-settings)).
 
-**Stale, still set by Bicep, read by nothing:** `SHAREPOINT_SITE_HOSTNAME`,
-`SHAREPOINT_SITE_PATH`, `SHAREPOINT_DRIVE_NAME`, `SHAREPOINT_ROOT_FOLDER`, `CLIENT_NIP` and
-`CLIENT_COMPANY_NAME`. They go with the Bicep drift fix.
+**Removed with the Bicep drift fix (G1):** `SHAREPOINT_SITE_HOSTNAME`, `SHAREPOINT_SITE_PATH`,
+`SHAREPOINT_DRIVE_NAME`, `SHAREPOINT_ROOT_FOLDER`, `CLIENT_NIP` and `CLIENT_COMPANY_NAME`, read by
+nothing. Neither they nor the `FALLBACK_*` settings were still set on dev when it was read on
+26 September.
 
 ---
 
@@ -215,9 +219,10 @@ bcr-ledger-agent/
 │   └── document-ingestion/      # @bcr/document-ingestion: Functions v4 app, Graph client
 │       └── src/services/clientResolver.ts   ⭐ identity-only routing and quarantine
 ├── infrastructure/
-│   ├── main.bicep                       # Azure resources (drifted from dev; see lesson 20)
+│   ├── main.bicep                       # Azure resources and every app setting (lesson 20)
 │   ├── main.dev.parameters.json
 │   ├── deploy.sh                        # Bicep + zip-deploy wrapper. New environments only; refuses dev.
+│   ├── app-settings-gate.sh             # before any Bicep deploy: template vs running app settings
 │   ├── quarantine/                      # quarantine site script, and the managed identity's site grant
 │   └── ir/                              # IR evidence store
 ├── tools/                               # operator tools: directory-bindings, inventory-misfiled, ir0/
@@ -543,11 +548,18 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
     rotating the key. Before switching, download the previous package from the old URL into a
     file (human-steps H-9, step 1): that file is the rollback, not the URL.
 
-20. **Never deploy Bicep to "dev" until the drift fix.** `main.bicep`'s app settings do not match
-    what runs: the routing settings were set by hand and are missing from the template. A Bicep
-    deploy replaces every app setting, so ingestion fails at cold start. The push-to-`main`
-    deploy was removed for this reason (`f5a2bd4`). Add settings with
-    `az functionapp config appsettings set`, which merges.
+20. **A Bicep deploy replaces every app setting, and what-if does not show it.** What-if masks
+    `siteConfig.appSettings` and cannot read the `appsettings` config values, so it reports no
+    change whatever they hold. During Phase 0 the routing settings were set by hand and missing
+    from the template, and one deploy would have taken ingestion down; the push-to-`main` deploy
+    was removed for this reason (`f5a2bd4`). The template now records them (gate G1), CI checks
+    that Bicep sets every setting the code reads (`yarn check:app-settings`), and
+    `node tools/check-app-settings.mjs --live` compares the template with the running apps
+    (`--expect` for the changes a deploy is meant to make). Bicep deploys to "dev" stay refused
+    until [Lifting gate G1](docs/operations/human-steps.md#lifting-gate-g1) is done: the
+    `WEBSITE_RUN_FROM_PACKAGE` carry-over has never run against a real app, so it is rehearsed
+    on a throwaway resource group first. Any setting changed by hand must go into the parameters
+    file too.
 
 21. **`az functionapp config appsettings set` prints every setting**, including the storage
     account key in `AzureWebJobsStorage` and any SAS URL. Always pass `-o none`, and list

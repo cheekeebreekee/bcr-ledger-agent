@@ -42,6 +42,7 @@ yarn build                   # topological build of every workspace (tsc -b)
 yarn test                    # Jest in every workspace
 yarn test:coverage           # Jest + per-package coverage thresholds (what CI runs)
 yarn test:tools              # node:test suites for the operator tools in tools/ (offline)
+yarn check:app-settings      # app settings the code reads vs the ones Bicep sets (offline, CI)
 yarn lint                    # ESLint over packages/**/src/**/*.ts
 yarn type-check              # tsc --noEmit per workspace
 yarn format                  # Prettier over sources + infrastructure/**/*.bicep
@@ -76,18 +77,31 @@ from the BCR tenant with a GUID `aadObjectId`, which Emulator activities lack (s
 turns with `TestAdapter` (`ledgerBot.test.ts`) and ingestion with a direct call, as in
 `docs/local-development.md`.
 
-Deploy: `infrastructure/deploy.sh <env>` (`yarn deploy:prod`) deploys Bicep, then zip-deploys both
-Function Apps; `deploy.yml` does the same via Azure OIDC. Both are for a **new** environment only,
-and both refuse `dev` (`deploy.sh` in any spelling, and `rg-bcr-ledger-dev`). A new environment
-then needs the Phase-0 ingestion settings the template lacks, set once with `appsettings set`
-(`docs/setup-guide.md` §3d); until then ingestion refuses to start.
+Deploy: `infrastructure/deploy.sh <env>` (`yarn deploy:prod`) packages both apps, deploys Bicep,
+then zip-deploys both Function Apps; `deploy.yml` does the same via Azure OIDC. A Bicep deploy
+**replaces every app setting**, so the template is the record of them all (the G1 fix): each
+app's settings are a separate `Microsoft.Web/sites/config` `appsettings` resource in
+`modules/functionApp.bicep` (not `siteConfig.appSettings`, which what-if masks), built from the
+runtime settings, the app's map in `main.bicep` fed by `main.<env>.parameters.json`, and the
+running `WEBSITE_RUN_FROM_PACKAGE`, read back with `list()` because the zip deploy owns it. A
+setting changed by hand (`az functionapp config appsettings set … -o none`, which merges) goes
+into the parameter file (and `main.bicep` if new) in the same change. `yarn check:app-settings`
+fails when the code reads a setting Bicep does not set, Bicep sets one no code reads, or a line
+holds two settings; `node tools/check-app-settings.mjs --live -g <rg> -p <params>` compares what
+a deploy would write with the running apps (read-only; secrets and the package URL are never
+read). Both deploy paths run `--live` through `infrastructure/app-settings-gate.sh` before any
+Bicep deploy to existing apps and stop on any difference, or on any `az` failure; a deploy meant
+to change settings names them in `EXPECTED_SETTING_CHANGES` (the workflow input
+`expected_setting_changes`), passed on as `--expect` (`docs/deployment.md` §3a).
 
-> ⚠️ **"dev" is production: it serves PESKOVOI.** Until the Bicep drift fix (gate G1), never run
-> `yarn deploy:*`, `infrastructure/deploy.sh` or the Deploy workflow against it. `main.bicep`
-> lacks the hand-set app settings, a Bicep deploy replaces every setting, and ingestion then
-> fails at cold start. Deploy code only, one app at a time, in the order in
-> `docs/operations/human-steps.md` (Phase 0), and add settings with
-> `az functionapp config appsettings set … -o none`, which merges.
+> ⚠️ **"dev" is production: it serves PESKOVOI.** `deploy.sh` (dev in any spelling, and
+> `rg-bcr-ledger-dev`) and `deploy.yml` still refuse it, and stay that way until the **"Lifting
+> gate G1"** checklist in `docs/operations/human-steps.md` is done: the
+> `WEBSITE_RUN_FROM_PACKAGE` carry-over has never run against a real app, so it is rehearsed on
+> a throwaway resource group first (never on dev); then a clean `--live` against dev, a reviewed
+> what-if, and a reviewed commit of its own that lifts the refusal. Never lift it in passing.
+> Until then deploy code only, one app at a time, in the order in
+> `docs/operations/human-steps.md` (Phase 0).
 
 `yarn workspace @bcr/<pkg> package` builds a fresh zip into `artifacts/`. It cleans `dist` and the
 `tsbuildinfo`, rebuilds, then runs `tools/package-function.mjs`, which deletes the old zip first,
@@ -100,8 +114,8 @@ check the vendored copy: `unzip -p artifacts/<pkg>.zip node_modules/@bcr/shared/
 grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths`, `membershipCheckMode`,
 `inboxSweepMode` and `inboxSweepRows`) must be greater than 0.
 
-CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test, plus `bicep build` and
-`bicep lint`.
+CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test (and `test:tools`), plus
+`bicep build`, `bicep lint` and the static `check-app-settings`.
 
 ---
 
@@ -401,10 +415,11 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
 | `ARCHITECTURE.md` | Component/sequence detail; §4.2 multi-tenant routing, §5 auth model |
 | `PROJECT_OVERVIEW.md` | Current deployed state, tooling versions, lessons learned |
 | `docs/setup-guide.md` | First-time setup: app registrations, every env var and where to find it |
+| `docs/deployment.md` | A new environment end to end; §3a how to change an app setting through a deploy (`--expect`) |
 | `docs/client-directory-admin-guide.md` | The Client Directory list — columns and admin workflow |
 | `docs/admin-sharepoint-grant.md` | `Sites.Selected` via Graph Explorer |
 | `docs/security.md` | Threat model + secrets inventory |
-| `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback |
+| `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback; "Lifting gate G1" |
 | `docs/operations/incident-2026-09.md` | The cross-client routing incident: causes, IR-0..IR-3, status |
 | `docs/operations/tenant-hardening.md` | Tenant settings that keep clients apart (BCR GROUP stays Private, read-only check) |
 | `docs/diagrams/` | Mermaid: as-is, Phase-0 routing, target business logic/architecture/data flow, sequences, data model |

@@ -96,3 +96,14 @@ jobs:
 
       - name: bicep lint
         run: bicep lint infrastructure/main.bicep
+
+      # A Bicep deploy replaces every app setting, so a setting the code needs
+      # and the template lacks is an outage at the next deploy, and one the
+      # template still sets after the code stopped reading it lingers for
+      # ever. Offline: the config envMaps and schema vs the Bicep settings.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: App settings (code vs Bicep)
+        run: node tools/check-app-settings.mjs

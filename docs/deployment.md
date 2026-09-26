@@ -8,11 +8,14 @@ subscription and Microsoft 365 tenant.
 > [`PROJECT_OVERVIEW.md` → Build and deploy](../PROJECT_OVERVIEW.md#build-and-deploy)).
 
 > ⚠️ **This guide is for a brand-new environment. Never run it against "dev".** "dev" is
-> production: it serves a real client, and `main.bicep` has drifted from the app settings running
-> there. A Bicep deploy replaces every setting and takes ingestion down, so
-> `infrastructure/deploy.sh` refuses `dev` in any spelling, and the `rg-bcr-ledger-dev` resource
-> group. Until the Bicep drift fix (gate G1), "dev" gets code only, in the order given in
-> [`operations/human-steps.md`](operations/human-steps.md#phase-0).
+> production: it serves a real client, and a Bicep deploy replaces every app setting.
+> `main.bicep` with `main.dev.parameters.json` now records the settings dev runs with (gate G1),
+> but `infrastructure/deploy.sh` and the Deploy workflow still refuse `dev` in any spelling,
+> and the `rg-bcr-ledger-dev` resource group, until
+> [Lifting gate G1](operations/human-steps.md#lifting-gate-g1) is done: a rehearsal on a
+> throwaway resource group, a clean `node tools/check-app-settings.mjs --live`, a reviewed
+> what-if, then the refusal removed in a reviewed commit of its own. Until then "dev" gets code
+> only, in the order given in [`operations/human-steps.md`](operations/human-steps.md#phase-0).
 
 ---
 
@@ -74,13 +77,18 @@ app-only.
 
 The new environment is named `<env>` below (for example `qa`, or `prod`). Fill in
 `infrastructure/main.<env>.parameters.json`; for any name but `prod`, copy it from
-`main.prod.parameters.json` first. Never edit `main.dev.parameters.json`.
+`main.prod.parameters.json` first. Never reuse `main.dev.parameters.json`: it records what
+production ("dev") runs with.
 
-- `botAppId`
-- `ingestionAppId`
-- `sharePointSiteHostname` and `sharePointSitePath`: the template still requires them, but they
-  only feed settings nothing reads any more, so any placeholder will do
-  ([`setup-guide.md` §3a](setup-guide.md#3a-fill-in-parameter-file)).
+- `botAppId`, `botCallerAppIds` (the bot's app id again) and `ingestionAppId`
+- `clientDirectorySiteId` and `clientDirectoryListId`, `quarantineSiteHostname`,
+  `quarantineSitePath`, `quarantineDriveName`, and `forbiddenTargetSitePaths`: the Phase-0
+  ingestion settings, described in
+  [`setup-guide.md` §3a](setup-guide.md#3a-fill-in-parameter-file). Each parameter becomes one
+  app setting, and ingestion refuses to start on a missing or malformed one.
+
+Every app setting the apps run with comes from this file: a later deploy replaces them all, so
+a setting changed by hand in Azure must be changed here too.
 
 ---
 
@@ -103,14 +111,45 @@ The script:
    [`PROJECT_OVERVIEW.md` → Build and deploy](../PROJECT_OVERVIEW.md#build-and-deploy));
 4. zip-deploys both Function Apps.
 
-### 3a. Add the settings the template lacks
+### 3a. App settings
 
-`main.bicep` does not yet set the Phase-0 ingestion settings (`BOT_CALLER_APP_IDS`,
-`CLIENT_DIRECTORY_*`, `QUARANTINE_*`, `FORBIDDEN_TARGET_SITE_PATHS`), so after the deploy
-ingestion refuses to start, naming the first one missing. Add them once, with
-`az functionapp config appsettings set … -o none`, exactly as in
-[`setup-guide.md` §3d](setup-guide.md#3d-add-the-phase-0-settings-the-template-lacks). Never add
-them by re-running a Bicep deploy: until the drift fix, the template does not carry them.
+The template sets every app setting from the parameter file, the Phase-0 ingestion settings
+included, so there is nothing to add by hand. A deploy replaces them all: a setting changed only
+in Azure is reverted by the next deploy, and what-if cannot show it (it reads no app-setting
+values). So before any deploy to an environment that already runs, `deploy.sh` and the Deploy
+workflow compare the template's settings with the running apps
+(`infrastructure/app-settings-gate.sh`, which runs `node tools/check-app-settings.mjs --live`,
+read-only) and stop on any difference they were not told to expect. They skip the comparison
+only for a resource group that does not exist yet or holds no Function Apps; an `az` failure
+stops the deploy.
+
+To change a setting in an environment that runs:
+
+1. **Change the parameter file**, `infrastructure/main.<env>.parameters.json`. A new setting
+   also needs its parameter and its line in `main.bicep`, and `corepack yarn check:app-settings`
+   must pass.
+2. **Compare, naming what you changed** with `--expect` (comma-separated or repeated; one name
+   covers both apps):
+
+   ```bash
+   node tools/check-app-settings.mjs --live -g rg-bcr-ledger-<env> \
+     -p infrastructure/main.<env>.parameters.json --expect LOG_LEVEL,INBOX_SWEEP_MODE
+   ```
+
+   A difference in a named setting prints as a `note`, with the running and the new value;
+   any other difference is `drift` and fails. A named setting with no difference is a warning:
+   check that you edited the right file.
+3. **Review.** Every `note` is a change you meant, to the value you meant, and there is no
+   `drift`. A `drift` line is a setting someone changed in Azure and did not record: record it
+   in the parameter file, or, if the deploy should revert it, add it to the list and review
+   again. Values only the deployment knows (the storage and App Insights connection strings,
+   `INGESTION_BASE_URL`) are not compared, and Key Vault references are compared by secret
+   name only.
+4. **Deploy with the same names:**
+   `EXPECTED_SETTING_CHANGES=LOG_LEVEL,INBOX_SWEEP_MODE ./infrastructure/deploy.sh <env>`, or the
+   Deploy workflow with the input `expected_setting_changes` set to the same list. The deploy
+   runs the comparison again and stops on any difference not in the list. With no list, it
+   stops on every difference.
 
 ---
 

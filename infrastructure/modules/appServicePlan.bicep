@@ -10,7 +10,8 @@ resource plan 'Microsoft.Web/serverfarms@2024-04-01' = {
   location: location
   tags: tags
   sku: { name: skuName, tier: skuName == 'Y1' ? 'Dynamic' : 'ElasticPremium' }
-  kind: 'linux'
+  // `functionapp`, as the running plan is; `reserved` is what makes it Linux.
+  kind: 'functionapp'
   properties: {
     reserved: true // Linux
   }

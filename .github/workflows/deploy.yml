@@ -8,13 +8,21 @@ on:
         description: Target environment
         required: true
         options: [dev, qa, prod]
+      expected_setting_changes:
+        type: string
+        description: >-
+          App settings this deploy is meant to change: names, comma-separated, after
+          reviewing `check-app-settings --live --expect` (docs/deployment.md §3a). Empty: none.
+        required: false
+        default: ''
   # No `push` trigger, and a manual run against dev is refused too (first step
-  # below). "dev" serves a real client, and main.bicep has drifted from the app
-  # settings that are actually running (CLIENT_DIRECTORY_*, QUARANTINE_*,
-  # BOT_CALLER_APP_IDS, FORBIDDEN_TARGET_SITE_PATHS, BOT_GATE_MODE are set by
-  # hand and absent from the template). A Bicep deploy replaces every setting,
-  # so ingestion would fail at cold start. Until the drift fix (gate G1), dev
-  # is deployed as code-only zips: docs/operations/human-steps.md.
+  # below). "dev" serves a real client, and a Bicep deploy replaces every app
+  # setting. The template and main.dev.parameters.json now record the settings
+  # dev runs with (gate G1), but the refusal goes only in a reviewed commit of
+  # its own, after the "Lifting gate G1" checklist in
+  # docs/operations/human-steps.md (a rehearsal on a throwaway resource group,
+  # a clean `tools/check-app-settings.mjs --live`, a reviewed what-if). Until
+  # then dev is deployed as code-only zips (the same page).
 
 permissions:
   id-token: write   # OIDC federation to Azure
@@ -30,10 +38,10 @@ jobs:
       ENV_NAME: ${{ inputs.environment || 'dev' }}
 
     steps:
-      - name: Refuse dev until the Bicep drift fix (G1)
+      - name: Refuse dev until the G1 review
         if: env.ENV_NAME == 'dev'
         run: |
-          echo "::error::dev is production (it serves a real client). Bicep deploys to it are blocked until the drift fix (G1): deploy code-only zips as in docs/operations/human-steps.md."
+          echo "::error::dev is production (it serves a real client). Bicep deploys to it are blocked until the 'Lifting gate G1' checklist in docs/operations/human-steps.md is done: deploy code-only zips as described there."
           exit 1
 
       - uses: actions/checkout@v4
@@ -97,6 +105,23 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # The template replaces every app setting, and what-if cannot show that.
+      # If the apps already run, a setting set by hand and not recorded in the
+      # parameters file would be deleted or reverted: the gate compares them
+      # and stops on any difference (read-only). It passes a resource group
+      # that does not exist yet, or has no Function Apps; any az failure stops
+      # the run. The same script as deploy.sh. The settings this deploy is
+      # meant to change come from the input, as notes to review.
+      - name: App settings (template vs running apps)
+        shell: bash
+        env:
+          # Through the environment, never `${{ }}` inside the script: the
+          # input is free text, and the check accepts only setting names.
+          EXPECTED_SETTING_CHANGES: ${{ inputs.expected_setting_changes }}
+        run: |
+          bash infrastructure/app-settings-gate.sh "rg-bcr-ledger-${ENV_NAME}" \
+            "infrastructure/main.${ENV_NAME}.parameters.json"
 
       - name: Deploy Bicep
         uses: azure/arm-deploy@v2

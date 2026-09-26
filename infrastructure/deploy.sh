@@ -3,7 +3,12 @@
 # Deploys the bcr-ledger-agent infrastructure and code to one environment.
 #
 # Usage:
-#   ./infrastructure/deploy.sh <env> [<resource-group>]
+#   [EXPECTED_SETTING_CHANGES=NAME[,NAME...]] ./infrastructure/deploy.sh <env> [<resource-group>]
+#
+# EXPECTED_SETTING_CHANGES names the app settings this deploy is meant to
+# change, after reviewing `tools/check-app-settings.mjs --live --expect` with
+# the same names (docs/deployment.md §3a). Any other difference between the
+# template and the running apps stops the deploy.
 #
 # Prerequisites:
 #   - `az login` already executed with rights on the subscription / RG
@@ -35,15 +40,20 @@ if [[ ! -f "$PARAMS" ]]; then
 fi
 PARAM_ENV="$(lower "$(jq -r '.parameters.environmentName.value // empty' "$PARAMS")")"
 
-# "dev" is production (it serves a real client), and main.bicep has drifted
-# from its hand-set app settings: this deploy would replace them all and
-# ingestion would fail at cold start. Until the drift fix (gate G1), deploy
-# dev as code-only zips (docs/operations/human-steps.md). Dev is recognised by
-# the environment name, by its resource group (an explicit second argument
-# too) and by the parameter file's environmentName, all case-insensitively.
+# "dev" is production (it serves a real client), and this deploy replaces
+# every app setting of both apps. main.bicep with main.dev.parameters.json now
+# records the settings dev runs with (gate G1), but the WEBSITE_RUN_FROM_PACKAGE
+# carry-over in modules/functionApp.bicep has never run against a real app.
+# This refusal goes only in a reviewed commit of its own, after the "Lifting
+# gate G1" checklist in docs/operations/human-steps.md: a rehearsal on a
+# throwaway resource group, a clean `tools/check-app-settings.mjs --live`
+# against rg-bcr-ledger-dev, a reviewed what-if. Until then, deploy dev as
+# code-only zips (the same page). Dev is recognised by the environment name,
+# by its resource group (an explicit second argument too) and by the parameter
+# file's environmentName, all case-insensitively.
 if [[ "${ALLOW_DEV_BICEP:-}" != "i-have-fixed-the-drift" ]] &&
   [[ "$ENV_NAME" == "dev" || "$(lower "$RG")" == "rg-bcr-ledger-dev" || "$PARAM_ENV" == "dev" ]]; then
-  echo "Refusing: dev is production and main.bicep has drifted (gate G1)." >&2
+  echo "Refusing: dev is production; Bicep deploys to it wait for 'Lifting gate G1'." >&2
   echo "Deploy code-only zips as in docs/operations/human-steps.md." >&2
   exit 1
 fi
@@ -67,6 +77,15 @@ for pkg in teams-bot document-ingestion; do
     exit 1
   fi
 done
+
+# The template replaces every app setting, and what-if cannot show that. If
+# the apps already run, a setting set by hand and not recorded in the
+# parameters file would be deleted or reverted: the gate compares them
+# (read-only) and stops on any difference not named in
+# EXPECTED_SETTING_CHANGES, which it reads from the environment. It passes a
+# resource group that does not exist yet, or has no Function Apps; any az
+# failure stops here.
+bash "$ROOT/infrastructure/app-settings-gate.sh" "$RG" "$PARAMS"
 
 echo "==> Ensuring resource group $RG exists in $LOCATION"
 az group create --name "$RG" --location "$LOCATION" --output none
@@ -101,6 +120,8 @@ echo "✅ Deployment complete."
 echo "Don't forget:"
 echo "  1. Put the bot's client secret into Key Vault under 'bot-app-password'."
 echo "  2. Put the Anthropic key under 'anthropic-api-key' (only if ANTHROPIC_ENABLED=true)."
-echo "  3. Set the Phase-0 app settings the template lacks (docs/deployment.md) before the first request."
+echo "  3. Change app settings in main.${ENV_NAME}.parameters.json, never only in Azure: the next deploy"
+echo "     replaces them all (tools/check-app-settings.mjs --live shows any difference). A deploy meant"
+echo "     to change some names them in EXPECTED_SETTING_CHANGES (docs/deployment.md §3a)."
 echo "  4. Grant write to the ingestion Function App's managed identity on the quarantine site and on"
 echo "     each client site only (infrastructure/quarantine/README.md), never on BCR GROUP."

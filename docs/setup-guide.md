@@ -264,7 +264,8 @@ and creates everything in one resource group:
 This guide builds a **new** environment, named here `<env>` (for example `qa`, or `prod`, which
 does not exist yet). Fill in `infrastructure/main.<env>.parameters.json`; for any name but
 `prod`, copy it from [`main.prod.parameters.json`](../infrastructure/main.prod.parameters.json)
-first. Never edit or deploy the `dev` file: "dev" is production.
+first. Never deploy the `dev` file this way: "dev" is production. It is edited only to record a
+change to dev's settings.
 
 ```jsonc
 {
@@ -273,31 +274,50 @@ first. Never edit or deploy the `dev` file: "dev" is production.
     "location":                   { "value": "westeurope" },
     "botAppId":                   { "value": "<Bot App ID from §2a>" },
     "ingestionAppId":             { "value": "<Ingestion App ID from §2b>" },
-    "sharePointSiteHostname":     { "value": "contoso.sharepoint.com" },
-    "sharePointSitePath":         { "value": "/sites/BCR-Ledger" },
-    "sharePointDriveName":        { "value": "Documents" },
-    "sharePointRootFolder":       { "value": "" },
+    "botCallerAppIds":            { "value": "<Bot App ID from §2a>" },
+    "clientDirectorySiteId":      { "value": "<hostname>,<siteGuid>,<webGuid>" },
+    "clientDirectoryListId":      { "value": "<Client Directory list id>" },
+    "clientDirectoryCacheTtlMs":  { "value": "300000" },
+    "clientDirectoryMaxStaleMs":  { "value": "900000" },
+    "quarantineSiteHostname":     { "value": "<tenant>.sharepoint.com" },
+    "quarantineSitePath":         { "value": "/sites/<quarantine site name>" },
+    "quarantineDriveName":        { "value": "<the quarantine site's library name>" },
+    "quarantineRootFolder":       { "value": "Kwarantanna" },
+    "forbiddenTargetSitePaths":   { "value": "/sites/<site that holds the Client Directory>" },
+    "inboxSweepMode":             { "value": "off" },
+    "inboxSweepRows":             { "value": "" },
+    "inboxCreatedAfter":          { "value": "" },
+    "inboxMaxFilesPerTick":       { "value": "" },
     "enableAnthropic":            { "value": true },
     "anthropicModel":             { "value": "claude-opus-4-5-20251101" },
     "anthropicConfidenceThreshold": { "value": "0.6" },
-    "clientCompanyName":          { "value": "" },
-    "clientNip":                  { "value": "" }
+    "botGateMode":                { "value": "enforce" },
+    "logLevel":                   { "value": "info" }
   }
 }
 ```
 
-The `sharePoint*`, `clientCompanyName` and `clientNip` parameters only feed app settings that
-nothing reads any more (see `PROJECT_OVERVIEW.md` → Configuration). The template still requires
-the first two; any placeholder will do. They go with the Bicep drift fix (gate G1).
+Each parameter after `ingestionAppId` becomes one app setting of the same name in
+SCREAMING_SNAKE case (`clientDirectorySiteId` → `CLIENT_DIRECTORY_SITE_ID`). What each must look
+like is in §6c and §3d, and ingestion checks every shape at cold start. They need three things to exist
+first: the quarantine site
+([`infrastructure/quarantine/README.md`](../infrastructure/quarantine/README.md)), the Client
+Directory list ([admin guide → Creating the list from scratch](client-directory-admin-guide.md#creating-the-list-from-scratch)),
+and the bot's app id from §2a. An empty value means the code's default.
+
+This file is the record of every app setting: a deploy replaces them all, so a setting changed
+only in Azure is reverted by the next deploy. Change it here.
 
 ### 3b. Deploy
 
-> ⚠️ **For a brand-new environment only. Never deploy "dev" this way before the Bicep drift
-> fix (gate G1).** "dev" is production: it serves a real client. A template deploy replaces
-> every app setting with the template's, and the template lacks the settings set by hand there,
-> so ingestion would fail at cold start. `infrastructure/deploy.sh` refuses `dev` in any
-> spelling, and the `rg-bcr-ledger-dev` resource group. To ship code to "dev", deploy code only,
-> in the order in [`operations/human-steps.md`](operations/human-steps.md#phase-0).
+> ⚠️ **For a brand-new environment only. Never deploy "dev" this way.** "dev" is production: it
+> serves a real client, and a template deploy replaces every app setting with the template's.
+> The template now records dev's settings (gate G1), but `infrastructure/deploy.sh` still refuses
+> `dev` in any spelling, and the `rg-bcr-ledger-dev` resource group, until
+> [Lifting gate G1](operations/human-steps.md#lifting-gate-g1) is done (a rehearsal on a
+> throwaway resource group, a clean `node tools/check-app-settings.mjs --live`, a reviewed
+> what-if, then a reviewed commit that lifts the refusal). To ship code to "dev", deploy code
+> only, in the order in [`operations/human-steps.md`](operations/human-steps.md#phase-0).
 
 ```bash
 az login
@@ -321,8 +341,8 @@ template gave (`XXXX` is a suffix derived from the resource group):
 | `kv-bcr-<env>-XXXX` | Key Vault for the secrets (§4): `az keyvault list -g rg-bcr-ledger-<env> --query "[].name" -o tsv` |
 | `appi-bcr-<env>-XXXX` | Application Insights |
 
-Nothing works yet. Ingestion refuses to start until it has the settings in §3d, both apps need
-the secrets in §4, and ingestion can reach no SharePoint site until §5.
+Nothing works yet. Both apps need the secrets in §4, and ingestion can reach no SharePoint site
+until §5. If ingestion refuses to start, a parameter from §3a is malformed: §3d.
 
 ### 3c. Bot messaging endpoint
 
@@ -336,54 +356,28 @@ UI path: **Azure Portal → Azure Bot resource → *Configuration* → *Messagin
 
 The Bicep template attempts this automatically — verify the field is set.
 
-### 3d. Add the Phase-0 settings the template lacks
+### 3d. Check the Phase-0 settings
 
-`main.bicep` does not set the Phase-0 ingestion settings yet (gate G1). Until they are set,
-ingestion refuses to start, and its cold-start error names the first missing or malformed
-setting. Add them once, before any traffic. `appsettings set` merges and never removes a
-setting, and `-o none` keeps the storage account key out of your terminal.
-
-They need three things to exist first: the quarantine site
-([`infrastructure/quarantine/README.md`](../infrastructure/quarantine/README.md)), the Client
-Directory list ([admin guide → Creating the list from scratch](client-directory-admin-guide.md#creating-the-list-from-scratch)),
-and the bot's app id from §2a. What each value must look like is in §6c; ingestion checks every
-shape at cold start.
-
-```bash
-RG=rg-bcr-ledger-<env>
-INGEST=func-bcr-ingest-<env>-XXXX                 # from §3b
-SP_HOST=<tenant>.sharepoint.com                   # lower case: no https://, no path
-
-az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
-  "BOT_CALLER_APP_IDS=<Bot App ID from §2a>" \
-  "CLIENT_DIRECTORY_SITE_ID=<hostname>,<siteGuid>,<webGuid>" \
-  "CLIENT_DIRECTORY_LIST_ID=<Client Directory list id>" \
-  "QUARANTINE_SITE_HOSTNAME=$SP_HOST" \
-  "QUARANTINE_SITE_PATH=/sites/<quarantine site name>" \
-  "QUARANTINE_DRIVE_NAME=<the quarantine site's library name>" \
-  "QUARANTINE_ROOT_FOLDER=Kwarantanna" \
-  "FORBIDDEN_TARGET_SITE_PATHS=/sites/<site that holds the Client Directory>" \
-  "CLIENT_DIRECTORY_MAX_STALE_MS=900000"
-```
+The template sets the Phase-0 ingestion settings from the parameters in §3a
+(`BOT_CALLER_APP_IDS`, `CLIENT_DIRECTORY_*`, `QUARANTINE_*`, `FORBIDDEN_TARGET_SITE_PATHS`,
+`INBOX_*`) and the bot's (`MICROSOFT_APP_TYPE=SingleTenant`, `BOT_GATE_MODE`). If one is
+missing or malformed, ingestion refuses to start and its cold-start error names it. Fix the
+parameter and redeploy: never with `appsettings set` alone, which the next deploy reverts.
 
 `QUARANTINE_SITE_HOSTNAME` is also the only SharePoint host a Client Directory row may name: a
 row on any other host routes nobody. `FORBIDDEN_TARGET_SITE_PATHS` must name the site that holds
 the Client Directory; the quarantine path is added to it automatically.
 
-The bot needs nothing extra: the template sets `MICROSOFT_APP_TYPE=SingleTenant`, and an unset
-`BOT_GATE_MODE` means `enforce`.
-
-**Verify.** List only the settings you set, never every setting (the list includes the storage
-account key):
+**Verify.** Compare the template with what runs (read-only; no secret is read or printed):
 
 ```bash
-az functionapp config appsettings list -g $RG -n $INGEST -o table --query \
-  "[?starts_with(name,'QUARANTINE_') || starts_with(name,'CLIENT_DIRECTORY_') || name=='BOT_CALLER_APP_IDS' || name=='FORBIDDEN_TARGET_SITE_PATHS'].{name:name,value:value}"
+node tools/check-app-settings.mjs --live -g rg-bcr-ledger-<env> \
+  -p infrastructure/main.<env>.parameters.json
 ```
 
-Then restart ingestion (§4 does). `GET https://$INGEST.azurewebsites.net/api/health` must answer
-200, and Application Insights `exceptions` must hold no `ValidationError`, whose message names
-the setting it refused.
+Then restart ingestion (§4 does). `GET https://func-bcr-ingest-<env>-XXXX.azurewebsites.net/api/health`
+must answer 200, and Application Insights `exceptions` must hold no `ValidationError`, whose
+message names the setting it refused.
 
 ---
 
@@ -714,8 +708,10 @@ union requests, exceptions, traces
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Bot times out in Teams, no logs | Messaging endpoint wrong on Bot resource | Set it to `https://func-bcr-bot-<env>-XXXX.azurewebsites.net/api/messages` |
-| Ingestion's `/api/health` fails after a deploy, and `exceptions` hold a `ValidationError` | A setting the template does not set is missing or malformed; the message names it | Set it as in §3d, with `-o none`. Never with a Bicep deploy |
+| Ingestion's `/api/health` fails after a deploy, and `exceptions` hold a `ValidationError` | A setting is missing or malformed; the message names it | Fix its parameter (§3a, §3d) and redeploy. A setting fixed only with `appsettings set` is reverted by the next deploy |
 | `deploy.sh` refuses to deploy `dev` (or `rg-bcr-ledger-dev`) | Deliberate: "dev" serves a real client, and a template deploy replaces its hand-set settings | Deploy code only, as in [`operations/human-steps.md`](operations/human-steps.md#phase-0) |
+| The deploy stops on `drift` lines from `check-app-settings --live` | The running apps differ from what the template would write: a setting changed in Azure and not recorded, or a change in the parameter file nobody named | Follow [`deployment.md` §3a](deployment.md#3a-app-settings): record a hand-set value in the parameter file, and name every change the deploy is meant to make in `EXPECTED_SETTING_CHANGES` (the workflow's `expected_setting_changes`) after reviewing it with `--expect` |
+| The deploy stops with `Refusing: could not tell whether resource group … exists` or `could not list the Function Apps` | `az` failed (not signed in, the wrong subscription, no read access on the resource group); its own error is printed just above | Fix that and run again. The app-settings gate never takes an `az` failure for "no apps yet" |
 | `+ Add a permission → My APIs` shows **No results** | Ingestion API has no *Application ID URI* and/or no *app role*, **or** you're signed in to a different tenant | Run the preflight in §2b (`az ad app show --id …`); fix whichever array is empty, then **Refresh** the *My APIs* tab |
 | `401 Unauthorized` from ingestion | Bot’s token has no `Documents.Ingest` role | Re-check §2c (Bot app reg → *API permissions* → application permission + admin consent) |
 | Ingestion logs `Token missing required role` but portal shows *✅ Granted* | CLI script used `az ad app permission admin-consent` (creates only delegated grants, **not** app-role assignments) | Run the `az rest --method POST … /appRoleAssignments` from §2c, then verify the GET returns one entry |

@@ -30,11 +30,18 @@ database. The containment has three strands, and this checklist puts them in one
 ### Standing rules for the whole phase
 
 - ⚠️ **Deploy code only: never Bicep.** Do not run `infrastructure/deploy.sh`, `yarn deploy:*`,
-  or the *Deploy* GitHub workflow. All three deploy `main.bicep` first. Its app settings have
-  drifted from what is running, and a Bicep deploy replaces every setting, which takes
-  ingestion down at cold start. Phase-0 deploys are zip deploys ([H-9](#h-9-deploy-the-bot-with-the-gate-in-log-mode),
-  [H-12](#h-12-the-change-window-ingestion-deploy-bindings-canaries)), and settings are added with
-  `az functionapp config appsettings set`, which merges rather than replaces.
+  or the *Deploy* GitHub workflow. All three deploy `main.bicep` first, and a Bicep deploy
+  replaces every app setting. The template now records the settings dev runs with (gate G1),
+  but Bicep deploys to dev stay refused until [Lifting gate G1](#lifting-gate-g1) is done: a
+  rehearsal on a throwaway resource group, a clean
+  `node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json`,
+  a reviewed what-if, then the refusal removed in a commit of its own.
+  Phase-0 deploys are zip deploys ([H-9](#h-9-deploy-the-bot-with-the-gate-in-log-mode),
+  [H-12](#h-12-the-change-window-ingestion-deploy-bindings-canaries)), and settings are changed with
+  `az functionapp config appsettings set … -o none`, which merges rather than replaces. **Record
+  every such change in `infrastructure/main.dev.parameters.json` (and `main.bicep` for a new
+  setting) in the same change**, or the first Bicep deploy reverts it; `--live` shows any
+  difference.
 - ⚠️ **Never roll ingestion back to a pre-Phase-0 build.** That build contains content promotion,
   the cross-client write path. A rollback reverts individual commits and is deployed as a new
   build. For an emergency there is a stop switch that files nothing anywhere
@@ -142,11 +149,11 @@ that site's folders are locked (T-4, T-4b).
 **Owner:** Yahor. **Status:** done, commit `f5a2bd4` (gate G0).
 
 A push to `main` used to deploy Bicep and both apps to "dev", which serves PESKOVOI. Because the
-template has drifted from what is running, one merge would have taken ingestion down.
+template had drifted from what was running, one merge would have taken ingestion down.
 
 **Verify.** `grep -n 'push' .github/workflows/deploy.yml` shows only the comment explaining why
-there is no push trigger. **Rollback.** None. The trigger comes back only after the Bicep drift
-fix (gate G1).
+there is no push trigger. **Rollback.** None. The trigger comes back, if ever, only after
+[Lifting gate G1](#lifting-gate-g1) is done.
 
 ### H-1: Start the GDPR notices (IR-3, day 0)
 
@@ -1791,8 +1798,9 @@ built fresh by the `package` script and checked as in H-9 step 3 and H-12 step 1
 is empty, and `/api/health` answers. **Rollback.** Not needed: the settings and the packages are
 only used by builds that must not come back.
 
-The stale `SHAREPOINT_*`, `CLIENT_NIP` and `CLIENT_COMPANY_NAME` settings are removed with the
-Bicep drift fix (gate G1), not here.
+The stale `SHAREPOINT_*`, `CLIENT_NIP` and `CLIENT_COMPANY_NAME` settings are gone from the
+template with the Bicep drift fix (gate G1). On 26 September neither they nor the `FALLBACK_*`
+settings were set on dev any more; the verify query above confirms it.
 
 ### H-15: Exit criteria
 
@@ -1901,3 +1909,192 @@ aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
 
 Record the date of each weekly `check` and each post-onboarding apply, with the apply log's
 hash, in the incident's status table.
+
+---
+
+## Lifting gate G1
+
+**Owner:** Yahor runs the steps; Roman (subscription Owner) creates the rehearsal resource group
+and reviews the commit that lifts the gate. **When:** after the G1 branch is merged, outside the
+1st–10th freeze, and not in the same window as any other change.
+
+`infrastructure/deploy.sh` and the *Deploy* workflow refuse "dev" until every step below is done,
+in this order, and recorded in the incident's
+[status table](incident-2026-09.md#status). The template now records every setting dev runs
+with, and `check-app-settings --live` compares each with what runs (by value wherever the
+value is not a secret). One setting is outside what the template sets:
+`WEBSITE_RUN_FROM_PACKAGE`, the package the app runs. `modules/functionApp.bicep` reads it from
+the running app with `list()` and writes it back, and **that has never run against a real
+app**. If it does not work,
+a template deploy deletes the setting and the app has no code (every function answers 404)
+until the next zip deploy. So it is rehearsed first, on apps that serve nobody. **Never rehearse
+on dev.**
+
+### G1-a: Rehearse on a throwaway resource group
+
+**1. Roman creates the group and makes Yahor its Owner.** Owner, not Contributor, because the
+template creates role assignments. Nothing outside this group changes.
+
+```bash
+G1_RG=rg-bcr-ledger-g1-rehearsal
+az group create -n $G1_RG -l westeurope -o none
+az role assignment create --assignee yahor.simak@bcr-group.pl --role Owner \
+  --scope "$(az group show -n $G1_RG --query id -o tsv)" -o none
+```
+
+**2. A bot app registration for the rehearsal only.** An Azure Bot resource must never carry
+dev's bot app id: that id belongs to the bot PESKOVOI talks to.
+
+```bash
+G1_BOT_APP_ID=$(az ad app create --display-name "BCR Ledger G1 rehearsal" \
+  --sign-in-audience AzureADMyOrg --query appId -o tsv)
+```
+
+**3. A rehearsal parameter file:** dev's values, so every setting passes the same checks, as
+environment `qa`, with the rehearsal bot and the sweep off. It is never committed (step 9
+deletes it). The rehearsal's managed identities get no Graph or SharePoint grant, so nothing in
+it can read or write client data.
+
+```bash
+jq --arg bot "$G1_BOT_APP_ID" '
+  .parameters.environmentName.value = "qa"
+  | .parameters.botAppId.value = $bot
+  | .parameters.botCallerAppIds.value = $bot
+  | .parameters.inboxSweepMode.value = "off"' \
+  infrastructure/main.dev.parameters.json > infrastructure/main.qa.parameters.json
+```
+
+**4. Deploy it the way a new environment is deployed:** the template, then a fresh zip of each
+app. The gate reports no Function Apps yet.
+
+```bash
+./infrastructure/deploy.sh qa $G1_RG
+```
+
+**5. Record the state before the redeploy.** The package setting is a SAS URL, a credential:
+`pkg_hash` prints only its sha256, or `NONE`. Do not run this with `set -x`.
+
+```bash
+# Prints the sha256 of the app's WEBSITE_RUN_FROM_PACKAGE, or NONE. Never the value.
+pkg_hash() {
+  local v
+  v=$(az functionapp config appsettings list -g $G1_RG -n "$1" \
+    --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'].value | [0]" -o tsv) || return 1
+  if [[ -z "$v" ]]; then echo NONE; else printf '%s' "$v" | shasum -a 256 | cut -c1-64; fi
+}
+G1_BOT=$(az functionapp list -g $G1_RG --query "[?starts_with(name,'func-bcr-bot-')].name | [0]" -o tsv)
+G1_INGEST=$(az functionapp list -g $G1_RG --query "[?starts_with(name,'func-bcr-ingest-')].name | [0]" -o tsv)
+BEFORE_BOT=$(pkg_hash $G1_BOT)
+BEFORE_INGEST=$(pkg_hash $G1_INGEST)
+echo "$BEFORE_BOT $BEFORE_INGEST"
+# health, ingestDocumentsBatch and inboxSweep; then messages and mydocs.
+az functionapp function list -g $G1_RG -n $G1_INGEST --query "[].name" -o tsv
+az functionapp function list -g $G1_RG -n $G1_BOT --query "[].name" -o tsv
+# Must print 200.
+curl -s -o /dev/null -w '%{http_code}\n' "https://$G1_INGEST.azurewebsites.net/api/health"
+```
+
+Both hashes must be hashes, not `NONE`: on Linux Consumption `config-zip` points the setting at
+a blob. `NONE` means the rehearsal does not test what dev needs: stop and find out why.
+
+**6. The comparison is clean against apps the template made:**
+
+```bash
+node tools/check-app-settings.mjs --live -g $G1_RG -p infrastructure/main.qa.parameters.json
+```
+
+It must end with `✔ no errors, no drift`.
+
+**7. Redeploy the template alone.** Not `deploy.sh`: its zip deploy at the end sets the package
+again and would hide the result.
+
+```bash
+az deployment group create -g $G1_RG --name g1-rehearsal-redeploy \
+  --template-file infrastructure/main.bicep \
+  --parameters @infrastructure/main.qa.parameters.json -o none
+```
+
+**8. Compare.** Wait a minute: a settings write restarts the apps.
+
+```bash
+[[ "$(pkg_hash $G1_BOT)" == "$BEFORE_BOT" && "$(pkg_hash $G1_INGEST)" == "$BEFORE_INGEST" ]] \
+  && echo 'SAME: the package setting was carried over' \
+  || echo 'STOP: the package setting changed or is gone'
+```
+
+Then step 5's two function lists and the health check again (the same functions, `200`), and
+step 6's comparison (clean). **If any of these fails, G1 stays closed.** The fix goes into
+`modules/functionApp.bicep` as a reviewed change, and the rehearsal runs again from step 1 on a
+new group. Nothing is tried on dev.
+
+**9. Tear down,** whatever the result:
+
+```bash
+az group delete -n $G1_RG --yes
+az ad app delete --id $G1_BOT_APP_ID
+rm infrastructure/main.qa.parameters.json
+```
+
+The rehearsal's Key Vault stays soft-deleted for its retention period (purge protection is on);
+its name is unique to the deleted group, so it blocks nothing.
+
+**Record** in the status table: `SAME` for both apps, the functions listed and `200` before and
+after, both clean `--live` runs, the commit the rehearsal ran from, and the teardown.
+
+### G1-b: A clean comparison against dev
+
+On the day of the lift, from the commit that will be deployed:
+
+```bash
+node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json
+```
+
+It must end with `✔ no errors, no drift`. If the first deploy is also meant to change settings,
+add `--expect` with exactly those names ([`deployment.md` §3a](../deployment.md#3a-app-settings)):
+then every `note` must be a change Roman has agreed to, and there must be no `drift` line. A
+`drift` line is a setting changed by hand and not recorded: record it in
+`main.dev.parameters.json` first, as the standing rule requires.
+
+### G1-c: The what-if, reviewed
+
+```bash
+mkdir -p tools/out && chmod 700 tools/out
+az deployment group what-if -g $RG --template-file infrastructure/main.bicep \
+  --parameters @infrastructure/main.dev.parameters.json --no-pretty-print \
+  > tools/out/g1-what-if.json
+# Must print 0 before anyone reads or shares the file.
+grep -cE 'AccountKey=|[?&]sig=' tools/out/g1-what-if.json
+```
+
+A count above `0` means the output holds a key or a SAS URL: do not share it; delete the file,
+and read the what-if in the terminal instead. Review it against
+[lesson 20 in `PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md#lessons-learned-must-know-gotchas-for-the-next-developer):
+what-if masks the app settings and cannot read the `appsettings` values, so its "no change"
+there proves nothing (that is what G1-b is for). Beyond that:
+
+- no `Delete` of any resource;
+- no `Create` of a resource dev already has: a new name means the wrong group or parameter file;
+- every `Modify` is understood and intended. The G1 branch set out to make the whole template
+  match what runs, so each property what-if would change is either a change someone made on
+  purpose (write down which) or a stop.
+
+Record the review, and who did it, in the status table.
+
+### G1-d: Remove the refusal, in a commit of its own
+
+Only after G1-a to G1-c are recorded. The G1 branch keeps the refusal; lifting it is a separate
+commit, reviewed by Roman before it is merged. It changes:
+
+- `infrastructure/deploy.sh`: the dev refusal (and its `ALLOW_DEV_BICEP` escape);
+- `.github/workflows/deploy.yml`: the *Refuse dev until the G1 review* step. Before it merges,
+  give the GitHub `dev` environment a required reviewer, so a Deploy run against dev waits for
+  approval ([`security.md` T17](../security.md#t17-deployment-drift));
+- `tools/test/deploy-gate.test.mjs`, which pins both refusals;
+- every page that says dev is refused: `CLAUDE.md`, `README.md`, `ARCHITECTURE.md` §7,
+  `PROJECT_OVERVIEW.md` lesson 20, `docs/deployment.md`, `docs/setup-guide.md` §3b and its
+  troubleshooting table, `docs/security.md` T17, and this page's standing rules and H-0.
+
+The first Bicep deploy to dev after that is a change window of its own: save both running
+packages first (H-9 step 1's `save_running`, under new file names), since a zip deploy of them
+is the rollback if the package setting is ever lost; deploy with `EXPECTED_SETTING_CHANGES` set
+to G1-b's names, if any; then `/api/health` as in H-12, and `--live` clean again.

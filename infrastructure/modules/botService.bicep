@@ -13,6 +13,9 @@ resource bot 'Microsoft.BotService/botServices@2022-09-15' = {
   kind: 'azurebot'
   properties: {
     displayName: name
+    // The values the running bot has. Left out, a PUT would clear them.
+    iconUrl: 'https://docs.botframework.com/static/devportal/client/images/bot-framework-default.png'
+    schemaTransformationVersion: '1.3'
     endpoint: messagingEndpoint
     msaAppId: botAppId
     msaAppType: 'SingleTenant'
@@ -29,8 +32,12 @@ resource teamsChannel 'Microsoft.BotService/botServices/channels@2022-09-15' = {
   location: location
   properties: {
     channelName: 'MsTeamsChannel'
+    // The running channel's values: no calling, commercial cloud.
     properties: {
       isEnabled: true
+      acceptedTerms: false
+      enableCalling: false
+      deploymentEnvironment: 'CommercialDeployment'
     }
   }
 }

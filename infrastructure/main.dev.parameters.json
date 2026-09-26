@@ -5,15 +5,28 @@
     "environmentName": { "value": "dev" },
     "location": { "value": "westeurope" },
     "botAppId": { "value": "3ee1ba6c-2501-4e2d-9971-ab156a9a6f9a" },
+    "botTenantId": { "value": "379013e4-7d25-4668-b99f-3cfa2264dc71" },
     "ingestionAppId": { "value": "b8b90018-9af0-4d7a-ada2-71559952ebbe" },
-    "sharePointSiteHostname": { "value": "bcrgroupeu.sharepoint.com" },
-    "sharePointSitePath": { "value": "/sites/0000TESTSp.zo.o.-Ksigowo" },
-    "sharePointDriveName": { "value": "Dokumenty" },
-    "sharePointRootFolder": { "value": "" },
+    "botCallerAppIds": { "value": "3ee1ba6c-2501-4e2d-9971-ab156a9a6f9a" },
+    "clientDirectorySiteId": {
+      "value": "bcrgroupeu.sharepoint.com,c2b2fedb-12e3-47f1-93f4-c22b2e361a68,fa306584-d50a-4e44-89c0-baa5bf265c69"
+    },
+    "clientDirectoryListId": { "value": "2a5613f1-6193-4c04-8a3d-d606617fb411" },
+    "clientDirectoryCacheTtlMs": { "value": "300000" },
+    "clientDirectoryMaxStaleMs": { "value": "900000" },
+    "quarantineSiteHostname": { "value": "bcrgroupeu.sharepoint.com" },
+    "quarantineSitePath": { "value": "/sites/BCRLedgerKwarantanna" },
+    "quarantineDriveName": { "value": "Dokumenty" },
+    "quarantineRootFolder": { "value": "Kwarantanna" },
+    "forbiddenTargetSitePaths": { "value": "/sites/BCRGROUPSp.zo.o" },
+    "inboxSweepMode": { "value": "shadow" },
+    "inboxSweepRows": { "value": "10,2" },
+    "inboxCreatedAfter": { "value": "2026-09-26T17:42:04Z" },
+    "inboxMaxFilesPerTick": { "value": "50" },
     "enableAnthropic": { "value": true },
     "anthropicModel": { "value": "claude-opus-4-5-20251101" },
     "anthropicConfidenceThreshold": { "value": "0.6" },
-    "clientCompanyName": { "value": "0000 TEST Sp. z o.o." },
-    "clientNip": { "value": "0000000000" }
+    "botGateMode": { "value": "enforce" },
+    "logLevel": { "value": "debug" }
   }
 }

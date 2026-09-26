@@ -683,6 +683,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | Step | Owner | Status | Date | Reference |
 |---|---|---|---|---|
 | H-0: G0, deploy trigger removed | Yahor | done | 2026-09-25 | `f5a2bd4` |
+| G1: Bicep deploys to dev ([Lifting gate G1](human-steps.md#lifting-gate-g1)): rehearsal, clean `--live`, what-if reviewed, refusal lifted in its own commit | Yahor; Roman creates the rehearsal group and reviews the lift | todo: the template records every running setting (G1 branch); dev still refused | | per step: `SAME` for both apps' package hash, functions listed and `200` before and after, both `--live` runs clean, the rehearsal's commit and teardown; the dev `--live` result; who reviewed the what-if; the lifting commit |
 | Phase-0 contract committed | Yahor | done | 2026-09-25 | `21b0883` |
 | H-1: IR-3 (1), processor notice phase 1 to PESKOVOI | Yahor (CTO) | not sent: decided no notification | 2026-09-26 | Yahor's decision: the July documents were used for testing by BCR staff (Yahor, Roman) only; IR-0/IR-1 show no client-side access path used. Recorded here as the Art. 33(5) documentation; the IOD may review |
 | H-1: IR-3 (2), breach-register entry | Yahor (CTO) | this table is the record | 2026-09-26 | assessed as not notifiable (see H-1 row); no UODO notification |
