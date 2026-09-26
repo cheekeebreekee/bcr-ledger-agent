@@ -22,7 +22,10 @@ import { loadIngestionConfig } from '../config';
  * `build.inboxSweep` is `INBOX_SWEEP_MODE`: `off`, `shadow` (reads, and logs
  * what it would move) or `enforce` (moves client uploads inside their channel
  * folder). An operator checks a mode change took effect here before reading
- * the sweep's logs.
+ * the sweep's logs. `build.inboxSweepRows` is `listed` while
+ * `INBOX_SWEEP_ROWS` limits the sweep to named rows (a canary first), and
+ * `all` otherwise; the ids themselves are in the cold-start `inbox.sweep_mode`
+ * line, not here.
  */
 app.http('health', {
   route: 'health',
@@ -35,19 +38,34 @@ export async function handleHealth(): Promise<HttpResponseInit> {
   const config = loadIngestionConfig();
   return {
     status: 200,
-    jsonBody: healthBody(config.membershipCheckMode, config.inboxSweepMode, new Date()),
+    jsonBody: healthBody(
+      {
+        membershipCheck: config.membershipCheckMode,
+        inboxSweep: config.inboxSweepMode,
+        inboxSweepRows: config.inboxSweepRows.length > 0 ? 'listed' : 'all',
+      },
+      new Date(),
+    ),
   };
 }
 
-export function healthBody(
-  membershipCheck: MembershipCheckMode,
-  inboxSweep: InboxSweepMode,
-  now: Date,
-) {
+export interface HealthBuild {
+  readonly membershipCheck: MembershipCheckMode;
+  readonly inboxSweep: InboxSweepMode;
+  readonly inboxSweepRows: 'all' | 'listed';
+}
+
+export function healthBody(build: HealthBuild, now: Date) {
   return {
     status: 'ok',
     service: 'document-ingestion',
-    build: { phase: 'p0', routing: 'identity-only', membershipCheck, inboxSweep },
+    build: {
+      phase: 'p0',
+      routing: 'identity-only',
+      membershipCheck: build.membershipCheck,
+      inboxSweep: build.inboxSweep,
+      inboxSweepRows: build.inboxSweepRows,
+    },
     timestamp: now.toISOString(),
   } as const;
 }

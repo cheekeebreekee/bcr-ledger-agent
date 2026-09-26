@@ -19,6 +19,8 @@ const envMap = {
   inboxSweepMode: 'INBOX_SWEEP_MODE',
   inboxMinAgeMs: 'INBOX_MIN_AGE_MS',
   inboxMaxFilesPerTick: 'INBOX_MAX_FILES_PER_TICK',
+  inboxSweepRows: 'INBOX_SWEEP_ROWS',
+  inboxCreatedAfter: 'INBOX_CREATED_AFTER',
   anthropicEnabled: 'ANTHROPIC_ENABLED',
   anthropicApiKey: 'ANTHROPIC_API_KEY',
   anthropicModel: 'ANTHROPIC_MODEL',

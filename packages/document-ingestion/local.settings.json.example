@@ -23,6 +23,8 @@
     "INBOX_SWEEP_MODE": "off",
     "INBOX_MIN_AGE_MS": "120000",
     "INBOX_MAX_FILES_PER_TICK": "20",
+    "INBOX_SWEEP_ROWS": "",
+    "INBOX_CREATED_AFTER": "",
     "ANTHROPIC_ENABLED": "true",
     "ANTHROPIC_API_KEY": "",
     "ANTHROPIC_MODEL": "claude-opus-4-5-20251101",

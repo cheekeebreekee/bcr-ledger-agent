@@ -77,6 +77,9 @@ const toCanonicalSitePaths =
 
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** A UTC time, to the minute or finer, ending in `Z`: no offset to misread. */
+const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z$/;
+
 /** Optional string: missing, empty or whitespace-only all give the default. */
 const optionalStr = (defaultValue = '') =>
   z
@@ -289,6 +292,40 @@ export const ingestionConfigSchema = z.object({
   inboxMinAgeMs: wholeNumber(2 * 60 * 1000, 0),
   /** Most files taken into processing per sweep tick, across all clients. Default 20. */
   inboxMaxFilesPerTick: wholeNumber(20, 1),
+  /**
+   * Which bound rows the sweep may touch, as Client Directory list item ids
+   * (the `listItemId` in the logs), comma-separated. Empty (the default):
+   * every row the Directory routes to. Set: only those of them, so a first
+   * `shadow`/`enforce` can be limited to a canary Team's row before a real
+   * client's channel is swept. It only ever narrows: a listed row that is not
+   * bound or is excluded is still not swept. A value that is not a list of
+   * whole numbers fails at cold start.
+   */
+  inboxSweepRows: csvList([]).refine(
+    (ids) => ids.every((id) => /^[1-9][0-9]*$/.test(id)),
+    'must be Client Directory list item ids (whole numbers), comma-separated',
+  ),
+  /**
+   * Files the sweep leaves where they are because they were created at or
+   * before this time: an ISO 8601 UTC time such as `2026-10-01T00:00:00Z`.
+   * Empty (the default): no cutoff. For a channel whose older attachments
+   * the owner decided to leave in place when the sweep was turned on.
+   */
+  inboxCreatedAfter: z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      if (v === undefined || v.trim() === '') return undefined;
+      const ms = ISO_UTC.test(v.trim()) ? Date.parse(v.trim()) : NaN;
+      if (!Number.isFinite(ms)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'must be an ISO 8601 UTC time, e.g. 2026-10-01T00:00:00Z',
+        });
+        return z.NEVER;
+      }
+      return ms;
+    }),
   // --- Claude (Anthropic) content classification ---
   anthropicEnabled: boolish(false),
   anthropicApiKey: optionalStr(),

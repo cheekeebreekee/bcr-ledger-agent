@@ -37,10 +37,14 @@ describe('loadIngestionConfig', () => {
       INBOX_SWEEP_MODE: 'shadow',
       INBOX_MIN_AGE_MS: '60000',
       INBOX_MAX_FILES_PER_TICK: '3',
+      INBOX_SWEEP_ROWS: '7',
+      INBOX_CREATED_AFTER: '2026-10-01T00:00:00Z',
     });
     expect(cfg.inboxSweepMode).toBe('shadow');
     expect(cfg.inboxMinAgeMs).toBe(60000);
     expect(cfg.inboxMaxFilesPerTick).toBe(3);
+    expect(cfg.inboxSweepRows).toEqual(['7']);
+    expect(cfg.inboxCreatedAfter).toBe(Date.UTC(2026, 9, 1));
   });
 
   it('refuses to start on an INBOX_SWEEP_MODE it does not know', () => {

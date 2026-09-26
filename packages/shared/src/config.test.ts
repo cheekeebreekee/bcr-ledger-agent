@@ -31,6 +31,8 @@ const ingestionEnvMap = {
   inboxSweepMode: 'INBOX_SWEEP_MODE',
   inboxMinAgeMs: 'INBOX_MIN_AGE_MS',
   inboxMaxFilesPerTick: 'INBOX_MAX_FILES_PER_TICK',
+  inboxSweepRows: 'INBOX_SWEEP_ROWS',
+  inboxCreatedAfter: 'INBOX_CREATED_AFTER',
   anthropicEnabled: 'ANTHROPIC_ENABLED',
   anthropicApiKey: 'ANTHROPIC_API_KEY',
   anthropicModel: 'ANTHROPIC_MODEL',
@@ -131,7 +133,54 @@ describe('ingestionConfigSchema', () => {
     expect(cfg.inboxSweepMode).toBe('off');
     expect(cfg.inboxMinAgeMs).toBe(2 * 60 * 1000);
     expect(cfg.inboxMaxFilesPerTick).toBe(20);
+    expect(cfg.inboxSweepRows).toEqual([]);
+    expect(cfg.inboxCreatedAfter).toBeUndefined();
   });
+
+  // A first `shadow`/`enforce` can be limited to a canary row. Only list item
+  // ids are accepted: a ClientId or a name would match no row, silently.
+  it('reads INBOX_SWEEP_ROWS as list item ids', () => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      INBOX_SWEEP_ROWS: ' 7, 12 ,',
+    });
+    expect(cfg.inboxSweepRows).toEqual(['7', '12']);
+  });
+
+  it.each(['0002', 'PESKOVOI', '7;12', '-1', '1.5'])(
+    'rejects INBOX_SWEEP_ROWS=%j, naming the variable',
+    (value) => {
+      expect(() =>
+        loadConfig(ingestionConfigSchema, ingestionEnvMap, { ...baseEnv, INBOX_SWEEP_ROWS: value }),
+      ).toThrow(/INBOX_SWEEP_ROWS: must be Client Directory list item ids/);
+    },
+  );
+
+  it.each([
+    ['2026-10-01T00:00:00Z', Date.UTC(2026, 9, 1)],
+    ['2026-10-01T08:30Z', Date.UTC(2026, 9, 1, 8, 30)],
+    ['2026-10-01T08:30:15.250Z', Date.UTC(2026, 9, 1, 8, 30, 15, 250)],
+    ['  ', undefined],
+  ])('reads INBOX_CREATED_AFTER=%j', (value, expected) => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      INBOX_CREATED_AFTER: value,
+    });
+    expect(cfg.inboxCreatedAfter).toBe(expected);
+  });
+
+  // An offset or a bare date could be read in another zone than meant.
+  it.each(['2026-10-01', '2026-10-01T00:00:00+02:00', '01.10.2026', 'yesterday', '2026-13-01T00:00Z'])(
+    'rejects INBOX_CREATED_AFTER=%j, naming the variable',
+    (value) => {
+      expect(() =>
+        loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+          ...baseEnv,
+          INBOX_CREATED_AFTER: value,
+        }),
+      ).toThrow(/INBOX_CREATED_AFTER: must be an ISO 8601 UTC time/);
+    },
+  );
 
   // The inbox sweep moves files in client channels. It is off unless set,
   // and only an exact mode switches it on: a typo stops cold start instead.
