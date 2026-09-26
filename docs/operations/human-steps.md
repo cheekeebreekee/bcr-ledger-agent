@@ -2320,12 +2320,7 @@ gets a row, for search (point 5) and later billing
   `check-app-settings --live` against dev reports exactly these four names as settings a
   deploy would add; no Bicep deploy to dev and no G1-b may run in between.
 
-**Cost.** About **USD 15–17 a month**, at approximate West Europe list prices (September 2026;
-check the [pricing calculator](https://azure.microsoft.com/pricing/calculator/) before step 2):
-Burstable **B1ms** compute about USD 12–13 (about USD 0.017 an hour), **32 GiB** of storage
-about USD 4 (about USD 0.13 per GiB-month), and backups nothing extra while they stay within the
-free allowance of 100% of the provisioned storage (geo-redundant copies included). No HA
-(Burstable has none), no private endpoint, no VNet. Roman approves this before step 2.
+**Cost.** About **USD 19 a month** at West Europe list prices (September 2026; the East US price is lower, so check the [pricing calculator](https://azure.microsoft.com/pricing/calculator/) for West Europe before step 2): Burstable **B1ms** compute and **32 GiB** of storage, with backups at no extra charge while they stay within the free allowance of 100% of the provisioned storage (geo-redundant copies included). No HA (Burstable has none), no private endpoint, no VNet. Yahor (CTO) approves the spend before step 2.
 
 **The network trade-off, in one line.** The ingestion app runs on a Y1 Consumption plan, which has
 no VNet integration and no fixed outbound IP, so the server keeps public network access with the

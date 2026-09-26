@@ -28,12 +28,12 @@ jobs:
       - name: Lint
         run: yarn lint
 
-      - name: Type-check
-        run: yarn type-check
-
       - name: Build all workspaces
         id: build
         run: yarn build
+
+      - name: Type-check
+        run: yarn type-check
 
       # Coverage thresholds are per package (coverageThreshold in each
       # packages/*/jest.config.js) and a package below its threshold fails this
