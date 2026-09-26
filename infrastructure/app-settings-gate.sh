@@ -3,12 +3,18 @@
 # The app-settings gate that runs before every Bicep deploy. Read-only.
 #
 # Usage:
-#   infrastructure/app-settings-gate.sh <resource-group> <parameters.json>
+#   [EXPECTED_SETTING_CHANGES=NAME[,NAME...]] \
+#     infrastructure/app-settings-gate.sh <resource-group> <parameters.json>
 #
 # A Bicep deploy replaces every app setting of both Function Apps, and what-if
 # cannot show that. So before a deploy to apps that already run, this compares
 # what the deploy would write with what runs (tools/check-app-settings.mjs
 # --live) and fails on any difference.
+#
+# A deploy meant to change settings names them in EXPECTED_SETTING_CHANGES,
+# after reviewing the same comparison (docs/deployment.md §3a). They reach the
+# check as --expect: their differences print as notes, and any other
+# difference still stops the deploy.
 #
 # The comparison is skipped only when there is provably nothing to compare:
 # `az group exists` answers false (a new environment), or the resource group
@@ -52,4 +58,10 @@ if [[ -z "$APPS" ]]; then
 fi
 
 echo "==> Comparing the template's app settings with the running apps in $RG (read-only)"
-node "$ROOT/tools/check-app-settings.mjs" --live -g "$RG" -p "$PARAMS"
+LIVE_ARGS=(--live -g "$RG" -p "$PARAMS")
+# Not echoed here: it is free text until the check has refused anything but
+# setting names, and the check prints each expected change it finds.
+if [[ -n "${EXPECTED_SETTING_CHANGES:-}" ]]; then
+  LIVE_ARGS+=(--expect "$EXPECTED_SETTING_CHANGES")
+fi
+node "$ROOT/tools/check-app-settings.mjs" "${LIVE_ARGS[@]}"

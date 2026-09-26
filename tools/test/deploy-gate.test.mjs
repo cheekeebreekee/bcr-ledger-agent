@@ -146,6 +146,18 @@ describe('app-settings-gate.sh', () => {
     const drift = gate({ ...apps, FAKE_CHECK_EXIT: '1' });
     assert.equal(drift.code, 1);
   });
+
+  test('EXPECTED_SETTING_CHANGES reaches the check as one --expect; empty adds nothing', () => {
+    const apps = { FAKE_GROUP_EXISTS: 'true', FAKE_APPS: 'func-bcr-bot-x func-bcr-ingest-x' };
+    const named = gate({ ...apps, EXPECTED_SETTING_CHANGES: 'LOG_LEVEL,INBOX_SWEEP_MODE' });
+    assert.equal(named.code, 0, named.stderr);
+    assert.equal(
+      named.calls.at(-1),
+      'check --live -g rg-x -p p.json --expect LOG_LEVEL,INBOX_SWEEP_MODE',
+    );
+    const empty = gate({ ...apps, EXPECTED_SETTING_CHANGES: '' });
+    assert.equal(empty.calls.at(-1), 'check --live -g rg-x -p p.json');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -202,6 +214,12 @@ describe('deploy.sh', () => {
     }
   });
 
+  test('deploy.sh hands EXPECTED_SETTING_CHANGES to the gate', () => {
+    const r = deploy(['qa'], { ...running, EXPECTED_SETTING_CHANGES: 'LOG_LEVEL' });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.calls[5], /^check --live .* --expect LOG_LEVEL$/);
+  });
+
   test('a new environment deploys without a comparison', () => {
     const r = deploy(['qa'], { FAKE_GROUP_EXISTS: 'false' });
     assert.equal(r.code, 0, r.stderr);
@@ -232,5 +250,20 @@ describe('deploy.yml', () => {
 
   test('no az error is hidden', () => {
     assert.doesNotMatch(workflow, /2>\s*\/dev\/null/);
+  });
+
+  test('expected_setting_changes reaches the gate through the environment, never the script', () => {
+    assert.match(workflow, /^ {6}expected_setting_changes:\n {8}type: string\n/m);
+    const gateStep = steps[index(/^App settings/)].text;
+    assert.match(
+      gateStep,
+      /env:\n(?: {10}#.*\n)* {10}EXPECTED_SETTING_CHANGES: \$\{\{ inputs\.expected_setting_changes \}\}\n/,
+    );
+    // An input interpolated into a run: script is a shell injection.
+    const inScripts = steps.filter((s) => /run: [|>]?[\s\S]*\$\{\{\s*inputs\./.test(s.text));
+    assert.deepEqual(
+      inScripts.map((s) => s.name),
+      [],
+    );
   });
 });

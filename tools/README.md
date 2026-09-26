@@ -653,6 +653,9 @@ away from deletion (gate G1). This check has two halves.
 corepack yarn check:app-settings        # static; CI runs it on every push
 node tools/check-app-settings.mjs --live -g rg-bcr-ledger-dev \
   -p infrastructure/main.dev.parameters.json   # read-only, needs az login
+# ... and for a deploy meant to change LOG_LEVEL:
+node tools/check-app-settings.mjs --live -g rg-bcr-ledger-dev \
+  -p infrastructure/main.dev.parameters.json --expect LOG_LEVEL
 ```
 
 **Static** (offline). For each Function App, every setting its code reads (its
@@ -683,8 +686,17 @@ Deploy workflow run it through `infrastructure/app-settings-gate.sh`, which
 skips it only when `az group exists` answers `false` or the resource group
 holds no Function Apps, and stops the deploy on any `az` failure.
 
-Exit codes: `0` clean (warnings allowed); `1` an error or drift; `2` a usage
-error.
+Every difference fails, including the ones a deploy is meant to make.
+`--expect NAME[,NAME...]` (repeatable; one name covers both apps) names those:
+their differences print as `note` lines, with both values, for the person
+deploying to review, and every other difference still fails. A named setting
+with no difference is a warning. An empty or malformed name is a usage error.
+The deploy scripts take the list from `EXPECTED_SETTING_CHANGES` (the Deploy
+workflow's `expected_setting_changes` input); the flow is in
+[`docs/deployment.md` §3a](../docs/deployment.md#3a-app-settings).
+
+Exit codes: `0` clean (warnings and expected changes allowed); `1` an error or
+drift; `2` a usage error.
 
 ## Tests
 

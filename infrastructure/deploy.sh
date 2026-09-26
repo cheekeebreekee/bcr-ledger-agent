@@ -3,7 +3,12 @@
 # Deploys the bcr-ledger-agent infrastructure and code to one environment.
 #
 # Usage:
-#   ./infrastructure/deploy.sh <env> [<resource-group>]
+#   [EXPECTED_SETTING_CHANGES=NAME[,NAME...]] ./infrastructure/deploy.sh <env> [<resource-group>]
+#
+# EXPECTED_SETTING_CHANGES names the app settings this deploy is meant to
+# change, after reviewing `tools/check-app-settings.mjs --live --expect` with
+# the same names (docs/deployment.md §3a). Any other difference between the
+# template and the running apps stops the deploy.
 #
 # Prerequisites:
 #   - `az login` already executed with rights on the subscription / RG
@@ -73,9 +78,11 @@ done
 
 # The template replaces every app setting, and what-if cannot show that. If
 # the apps already run, a setting set by hand and not recorded in the
-# parameters file would be deleted or reverted: the gate compares them and
-# stops on any difference (read-only). It passes a resource group that does
-# not exist yet, or has no Function Apps; any az failure stops here.
+# parameters file would be deleted or reverted: the gate compares them
+# (read-only) and stops on any difference not named in
+# EXPECTED_SETTING_CHANGES, which it reads from the environment. It passes a
+# resource group that does not exist yet, or has no Function Apps; any az
+# failure stops here.
 bash "$ROOT/infrastructure/app-settings-gate.sh" "$RG" "$PARAMS"
 
 echo "==> Ensuring resource group $RG exists in $LOCATION"
@@ -112,6 +119,7 @@ echo "Don't forget:"
 echo "  1. Put the bot's client secret into Key Vault under 'bot-app-password'."
 echo "  2. Put the Anthropic key under 'anthropic-api-key' (only if ANTHROPIC_ENABLED=true)."
 echo "  3. Change app settings in main.${ENV_NAME}.parameters.json, never only in Azure: the next deploy"
-echo "     replaces them all (tools/check-app-settings.mjs --live shows any difference)."
+echo "     replaces them all (tools/check-app-settings.mjs --live shows any difference). A deploy meant"
+echo "     to change some names them in EXPECTED_SETTING_CHANGES (docs/deployment.md §3a)."
 echo "  4. Grant write to the ingestion Function App's managed identity on the quarantine site and on"
 echo "     each client site only (infrastructure/quarantine/README.md), never on BCR GROUP."

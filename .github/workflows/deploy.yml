@@ -8,6 +8,13 @@ on:
         description: Target environment
         required: true
         options: [dev, qa, prod]
+      expected_setting_changes:
+        type: string
+        description: >-
+          App settings this deploy is meant to change: names, comma-separated, after
+          reviewing `check-app-settings --live --expect` (docs/deployment.md §3a). Empty: none.
+        required: false
+        default: ''
   # No `push` trigger, and a manual run against dev is refused too (first step
   # below). "dev" serves a real client, and a Bicep deploy replaces every app
   # setting. The template and main.dev.parameters.json now record the settings
@@ -103,9 +110,14 @@ jobs:
       # parameters file would be deleted or reverted: the gate compares them
       # and stops on any difference (read-only). It passes a resource group
       # that does not exist yet, or has no Function Apps; any az failure stops
-      # the run. The same script as deploy.sh.
+      # the run. The same script as deploy.sh. The settings this deploy is
+      # meant to change come from the input, as notes to review.
       - name: App settings (template vs running apps)
         shell: bash
+        env:
+          # Through the environment, never `${{ }}` inside the script: the
+          # input is free text, and the check accepts only setting names.
+          EXPECTED_SETTING_CHANGES: ${{ inputs.expected_setting_changes }}
         run: |
           bash infrastructure/app-settings-gate.sh "rg-bcr-ledger-${ENV_NAME}" \
             "infrastructure/main.${ENV_NAME}.parameters.json"

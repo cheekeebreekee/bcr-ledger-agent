@@ -37,12 +37,18 @@
  * package URL and the Key Vault secrets are checked by name or as booleans in
  * the `az` query itself, so they never reach this process.
  *
+ * Every difference fails, so a deploy cannot change a setting nobody meant it
+ * to. A deploy that is meant to change some names them with `--expect`: their
+ * findings print as notes, for the person deploying to review, and any other
+ * difference still fails. A name covers both apps (LOG_LEVEL is on both).
+ *
  * Usage:
  *   node tools/check-app-settings.mjs
  *   node tools/check-app-settings.mjs --live -g rg-bcr-ledger-dev \
- *     -p infrastructure/main.dev.parameters.json
+ *     -p infrastructure/main.dev.parameters.json [--expect NAME[,NAME...]]...
  *
- * Exit: 0 clean (warnings allowed), 1 a finding, 2 a usage error.
+ * Exit: 0 clean (warnings and expected changes allowed), 1 a finding, 2 a
+ * usage error.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -879,7 +885,48 @@ const USAGE = `Usage:
   node tools/check-app-settings.mjs
       Static: the settings the code reads vs the settings Bicep sets. Offline.
   node tools/check-app-settings.mjs --live -g <resource-group> -p <parameters.json>
-      Also compares what a deploy would write with the running apps (read-only, az login).`;
+                                   [--expect NAME[,NAME...]]...
+      Also compares what a deploy would write with the running apps (read-only, az login).
+      Every difference fails. --expect names the settings this deploy is meant to
+      change (repeatable; a name covers both apps): their differences print as
+      notes to review, and every other difference still fails.`;
+
+/** An app-setting name as `--expect` takes it. */
+const SETTING_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * The names given with `--expect` (each value a comma-separated list). An
+ * empty or malformed entry is a usage error, never dropped: `A,,B` or `A B`
+ * is a typo, not a smaller list. A well-formed name no difference matches is
+ * only a warning (main).
+ */
+export function parseExpected(values = []) {
+  const names = new Set();
+  for (const value of values) {
+    for (const raw of value.split(',')) {
+      const name = raw.trim();
+      if (!SETTING_NAME.test(name)) {
+        // Quoted as JSON: the value may come from a workflow input, and a raw
+        // newline in it could start a line the CI runner reads as a command.
+        throw new CliError(`--expect: ${JSON.stringify(raw)} is not an app-setting name`, 2);
+      }
+      names.add(name);
+    }
+  }
+  return names;
+}
+
+/**
+ * Splits live findings into `drift` (fails) and `expected` (a name given with
+ * --expect, for either app), and lists the expected names with no finding.
+ */
+export function splitExpected(findings, expected) {
+  const drift = [];
+  const hits = [];
+  for (const f of findings) (expected.has(f.setting) ? hits : drift).push(f);
+  const unmatched = [...expected].filter((n) => !hits.some((f) => f.setting === n)).sort();
+  return { drift, expected: hits, unmatched };
+}
 
 const line = (level, f) => `  ${level}  ${f.app.padEnd(18)} ${f.setting.padEnd(38)} ${f.message}`;
 
@@ -888,6 +935,7 @@ export async function main(argv, { repo = REPO, az = runAz, log = console.log } 
     live: { type: 'boolean' },
     'resource-group': { type: 'string', short: 'g' },
     parameters: { type: 'string', short: 'p' },
+    expect: { type: 'string', multiple: true },
     help: { type: 'boolean', short: 'h' },
   });
   if (values.help) {
@@ -896,12 +944,13 @@ export async function main(argv, { repo = REPO, az = runAz, log = console.log } 
   }
   if (positionals.length)
     throw new CliError(`unexpected argument '${positionals[0]}'\n${USAGE}`, 2);
-  if (!values.live && (values['resource-group'] || values.parameters)) {
-    throw new CliError(`-g and -p need --live\n${USAGE}`, 2);
+  if (!values.live && (values['resource-group'] || values.parameters || values.expect)) {
+    throw new CliError(`-g, -p and --expect need --live\n${USAGE}`, 2);
   }
   if (values.live && !(values['resource-group'] && values.parameters)) {
     throw new CliError(`--live needs -g <resource-group> and -p <parameters.json>\n${USAGE}`, 2);
   }
+  const expected = parseExpected(values.expect);
 
   const { errors, warnings, apps } = staticCheck(repo);
   log(bold('App settings: the code vs Bicep'));
@@ -912,6 +961,8 @@ export async function main(argv, { repo = REPO, az = runAz, log = console.log } 
   for (const e of errors) log(line(bad('error'), e));
 
   let findings = [];
+  let expectedChanges = [];
+  let unmatched = [];
   if (values.live) {
     log(bold(`\nApp settings: a deploy vs what runs in ${values['resource-group']}`));
     const live = liveCheck({
@@ -925,16 +976,37 @@ export async function main(argv, { repo = REPO, az = runAz, log = console.log } 
       log(dim(`  ${r.app} (${r.functionApp}): ${r.compared} values compared`));
       for (const n of r.notes) log(dim(`    ${n}`));
     }
-    findings = live.findings;
+    ({
+      drift: findings,
+      expected: expectedChanges,
+      unmatched,
+    } = splitExpected(live.findings, expected));
+    for (const f of expectedChanges) {
+      log(line(warn('note '), { ...f, message: `expected (--expect): ${f.message}` }));
+    }
+    for (const name of unmatched) {
+      log(
+        line(warn('warn '), {
+          app: '(--expect)',
+          setting: name,
+          message:
+            'expected a change, found none (a value only the deployment knows is not compared)',
+        }),
+      );
+    }
     for (const f of findings) log(line(bad('drift'), f));
   }
 
   const failed = errors.length + findings.length;
+  const warned = warnings.length + unmatched.length;
+  const toReview = expectedChanges.length
+    ? `, ${expectedChanges.length} expected change(s) to review`
+    : '';
   log(
     failed
-      ? bad(`\n✖ ${errors.length} error(s), ${findings.length} drift finding(s)`)
+      ? bad(`\n✖ ${errors.length} error(s), ${findings.length} drift finding(s)${toReview}`)
       : ok(
-          `\n✔ no errors${values.live ? ', no drift' : ''}${warnings.length ? `, ${warnings.length} warning(s)` : ''}`,
+          `\n✔ no errors${values.live ? (expected.size ? ', no unexpected drift' : ', no drift') : ''}${toReview}${warned ? `, ${warned} warning(s)` : ''}`,
         ),
   );
   return failed ? 1 : 0;

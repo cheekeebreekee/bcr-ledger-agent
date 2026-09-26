@@ -14,8 +14,10 @@ import {
   liveCheck,
   main,
   parseEnvMap,
+  parseExpected,
   resolveParams,
   schemaDefaults,
+  splitExpected,
   staticCheck,
 } from '../check-app-settings.mjs';
 import { CliError } from '../lib/cli.mjs';
@@ -841,8 +843,98 @@ describe('cli', () => {
     assert.match(r.out, /EXTRA.*would delete it/);
   });
 
+  // A deploy meant to change LOG_LEVEL (on both apps) and GATE_MODE, next to
+  // a hand-set EXTRA nobody meant to delete.
+  const driftingApps = () => ({
+    [BOT]: { ...runningBot(), GATE_MODE: 'log', LOG_LEVEL: 'info', EXTRA: 'x' },
+    [INGEST]: { ...runningIngestion(), LOG_LEVEL: 'info' },
+  });
+  const runLive = async (expect, apps = driftingApps()) => {
+    const repo = fakeRepo();
+    const fake = fakeAz(apps);
+    const params = join(repo, 'infrastructure/main.dev.parameters.json');
+    return run(['--live', '-g', 'rg-test', '-p', params, ...expect], { repo, az: fake.az });
+  };
+
+  test('live --expect: the named changes print as notes, any other difference still fails', async () => {
+    const r = await runLive(['--expect', 'GATE_MODE,LOG_LEVEL']);
+    assert.equal(r.code, 1);
+    assert.match(
+      r.out,
+      /drift\s+teams-bot\s+EXTRA\s+running, not in Bicep: a deploy would delete it/,
+    );
+    // Both values stay visible for the review; one name covers both apps.
+    assert.match(
+      r.out,
+      /note\s+teams-bot\s+GATE_MODE\s+expected \(--expect\): .*running "log", Bicep "enforce"/,
+    );
+    assert.match(r.out, /note\s+teams-bot\s+LOG_LEVEL\s+expected/);
+    assert.match(r.out, /note\s+document-ingestion\s+LOG_LEVEL\s+expected/);
+    assert.doesNotMatch(r.out, /drift\s+\S+\s+(GATE_MODE|LOG_LEVEL)/);
+    assert.match(r.out, /✖ 0 error\(s\), 1 drift finding\(s\), 3 expected change\(s\) to review/);
+  });
+
+  test('live --expect: repeatable, spaces trimmed; clean once every difference is expected', async () => {
+    const r = await runLive(['--expect', 'GATE_MODE, LOG_LEVEL', '--expect', 'EXTRA']);
+    assert.equal(r.code, 0);
+    assert.match(r.out, /note\s+teams-bot\s+EXTRA\s+expected \(--expect\): .*would delete it/);
+    assert.match(r.out, /✔ no errors, no unexpected drift, 4 expected change\(s\) to review/);
+  });
+
+  test('live --expect: a name with no difference is a warning, not a pass for anything else', async () => {
+    const clean = { [BOT]: runningBot(), [INGEST]: runningIngestion() };
+    const r = await runLive(['--expect', 'TTL_MS'], clean);
+    assert.equal(r.code, 0);
+    assert.match(r.out, /warn\s+\(--expect\)\s+TTL_MS\s+expected a change, found none/);
+    assert.match(r.out, /✔ no errors, no unexpected drift, 2 warning\(s\)/);
+  });
+
+  test('parseExpected and splitExpected', () => {
+    assert.deepEqual([...parseExpected(['A, B', 'C', 'A'])], ['A', 'B', 'C']);
+    assert.deepEqual([...parseExpected()], []);
+    for (const bad of ['', ' ', 'A,,B', 'A,', 'A B', '-', 'A=1', '1A']) {
+      assert.throws(
+        () => parseExpected([bad]),
+        (err) => err instanceof CliError && err.exitCode === 2,
+        JSON.stringify(bad),
+      );
+    }
+    const f = (app, setting) => ({ app, setting, message: 'm' });
+    assert.deepEqual(
+      splitExpected(
+        [f('bot', 'A'), f('ingest', 'A'), f('bot', 'B'), f('bot', '-')],
+        new Set(['A', 'Z']),
+      ),
+      {
+        drift: [f('bot', 'B'), f('bot', '-')],
+        expected: [f('bot', 'A'), f('ingest', 'A')],
+        unmatched: ['Z'],
+      },
+    );
+  });
+
+  test('a refused --expect value is quoted: a newline in it cannot start a line of output', () => {
+    // A workflow input reaches --expect; a line starting with :: is a runner command.
+    assert.throws(
+      () => parseExpected(['LOG_LEVEL\n::error::injected']),
+      (err) =>
+        err instanceof CliError &&
+        err.message.includes('"LOG_LEVEL\\n::error::injected"') &&
+        !/\n::/.test(err.message),
+    );
+  });
+
   test('usage errors are refused with exit 2', async () => {
-    for (const argv of [['--live'], ['--live', '-g', 'rg'], ['-g', 'rg'], ['extra'], ['--aply']]) {
+    for (const argv of [
+      ['--live'],
+      ['--live', '-g', 'rg'],
+      ['-g', 'rg'],
+      ['extra'],
+      ['--aply'],
+      ['--expect', 'GATE_MODE'],
+      ['--live', '-g', 'rg', '-p', 'p.json', '--expect', ''],
+      ['--live', '-g', 'rg', '-p', 'p.json', '--expect', 'A,,B'],
+    ]) {
       await assert.rejects(
         run(argv, { repo: fakeRepo() }),
         (err) => err instanceof CliError,
@@ -850,5 +942,9 @@ describe('cli', () => {
       );
     }
     await assert.rejects(run(['--live'], { repo: fakeRepo() }), (err) => err.exitCode === 2);
+    await assert.rejects(
+      run(['--expect', 'GATE_MODE'], { repo: fakeRepo() }),
+      (err) => err.exitCode === 2 && /need --live/.test(err.message),
+    );
   });
 });

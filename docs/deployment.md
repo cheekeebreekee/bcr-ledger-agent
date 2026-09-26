@@ -113,11 +113,42 @@ The script:
 ### 3a. App settings
 
 The template sets every app setting from the parameter file, the Phase-0 ingestion settings
-included, so there is nothing to add by hand. Change a setting in the parameter file and
-redeploy; a setting changed only in Azure is reverted by the next deploy. Before any deploy to
-an environment that already runs, the script compares the template's settings with the running
-apps (`node tools/check-app-settings.mjs --live`, read-only) and stops on any difference:
-what-if cannot show app-setting changes.
+included, so there is nothing to add by hand. A deploy replaces them all: a setting changed only
+in Azure is reverted by the next deploy, and what-if cannot show it (it reads no app-setting
+values). So before any deploy to an environment that already runs, `deploy.sh` and the Deploy
+workflow compare the template's settings with the running apps
+(`infrastructure/app-settings-gate.sh`, which runs `node tools/check-app-settings.mjs --live`,
+read-only) and stop on any difference they were not told to expect. They skip the comparison
+only for a resource group that does not exist yet or holds no Function Apps; an `az` failure
+stops the deploy.
+
+To change a setting in an environment that runs:
+
+1. **Change the parameter file**, `infrastructure/main.<env>.parameters.json`. A new setting
+   also needs its parameter and its line in `main.bicep`, and `corepack yarn check:app-settings`
+   must pass.
+2. **Compare, naming what you changed** with `--expect` (comma-separated or repeated; one name
+   covers both apps):
+
+   ```bash
+   node tools/check-app-settings.mjs --live -g rg-bcr-ledger-<env> \
+     -p infrastructure/main.<env>.parameters.json --expect LOG_LEVEL,INBOX_SWEEP_MODE
+   ```
+
+   A difference in a named setting prints as a `note`, with the running and the new value;
+   any other difference is `drift` and fails. A named setting with no difference is a warning:
+   check that you edited the right file.
+3. **Review.** Every `note` is a change you meant, to the value you meant, and there is no
+   `drift`. A `drift` line is a setting someone changed in Azure and did not record: record it
+   in the parameter file, or, if the deploy should revert it, add it to the list and review
+   again. Values only the deployment knows (the storage and App Insights connection strings,
+   `INGESTION_BASE_URL`) are not compared, and Key Vault references are compared by secret
+   name only.
+4. **Deploy with the same names:**
+   `EXPECTED_SETTING_CHANGES=LOG_LEVEL,INBOX_SWEEP_MODE ./infrastructure/deploy.sh <env>`, or the
+   Deploy workflow with the input `expected_setting_changes` set to the same list. The deploy
+   runs the comparison again and stops on any difference not in the list. With no list, it
+   stops on every difference.
 
 ---
 

@@ -122,7 +122,7 @@ bot's `TestAdapter` tests for card work, and a direct call to the ingestion API.
 | `yarn start:ingestion` | Start the document-ingestion Function App locally |
 | `yarn deploy:dev` | **Refused.** "dev" is production, and a template deploy replaces every app setting. The template now records dev's settings (gate G1), but `infrastructure/deploy.sh` refuses dev until a person has reviewed a what-if and a clean `check-app-settings --live`. Deploy code only, as in [`human-steps.md`](./docs/operations/human-steps.md#phase-0). |
 | `yarn deploy:prod` | Deploy infra + code to a **new** `prod` environment, with every app setting from `main.prod.parameters.json` ([`setup-guide.md` §3a](./docs/setup-guide.md#3a-fill-in-parameter-file)). |
-| `yarn check:app-settings` | The app settings the code reads vs the ones Bicep sets (CI runs it). `node tools/check-app-settings.mjs --live -g <rg> -p <params>` also compares with the running apps, read-only. |
+| `yarn check:app-settings` | The app settings the code reads vs the ones Bicep sets (CI runs it). `node tools/check-app-settings.mjs --live -g <rg> -p <params>` also compares with the running apps, read-only; `--expect NAME[,NAME...]` names the changes a deploy is meant to make ([`deployment.md` §3a](./docs/deployment.md#3a-app-settings)). |
 
 ---
 
