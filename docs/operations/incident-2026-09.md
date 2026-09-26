@@ -644,7 +644,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-2: IR-0 A, trace export | Yahor | done (local; not yet in the store) | 2026-09-26 | `ir0-appinsights-2026-09-26T12-04-00Z/SHA256SUMS` sha256 `59f6a338105ea2ed…`; 273 routing rows, 30 × 24 h chunks, `--all-traces` |
 | H-2: IR-0 B, Purview export (file operations, group events, sign-in events) and audit-log state | Global Admin | todo | | `SHA256SUMS` |
 | H-2: Entra sign-in log, last 7 days, for the `{NIP}@` accounts and `AuthoriseMe@` | Global Admin | todo | | `SHA256SUMS` |
-| H-2: IR-0 C, Directory export | Yahor | todo | | `SHA256SUMS` |
+| H-2: IR-0 C, Directory export | Yahor | done (local; not yet in the store) | 2026-09-26 13:23Z | `ir0-directory-20260926T132344Z/SHA256SUMS` sha256 `73c91c57e1624de8…`; 1 row (0002, Active) with 2 versions, fields included |
 | H-2: evidence store created, readers verified, uploader write removed, laptop copies deleted | Roman, Yahor | todo | | |
 | H-3: `ANTHROPIC_ENABLED=false` (mandatory) | Yahor | done | 2026-09-26 11:58:09Z | H-5/H-6/H-6b not done the same day (Saturday): interim writes to BCR GROUP's `98_Nieposortowane` accepted until H-6b, pending Roman's confirmation |
 | BCR GROUP made Private (time from Purview) | — | done | *record* | T-3 |
@@ -656,7 +656,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-5, H-6: quarantine site and ingestion write grant | Yahor (Global Admin) | done | 2026-09-26 | communication site, Polish, sharing off, owners Yahor + Roman; four columns; Grant-TeamSiteAccess job `eced5ff6` → `granted` to the ingestion managed identity |
 | H-5b: canary guest invited, in no Team; whether it reached the bot before H-10 | Global Admin | todo | | the canary guest's object id (the one object id this page holds; see the top) |
 | H-6b: running build's fallback re-pointed at the quarantine | Yahor | done 13:12:17Z; upload check pending | 2026-09-26 | names `FALLBACK_CLIENT_ID`, `FALLBACK_SITE_HOSTNAME`, `FALLBACK_SITE_PATH`, `FALLBACK_DRIVE_NAME` saved locally (mode 600) until the store exists; no ingestion traffic between H-3 and H-6b |
-| H-7: Directory check; duplicate `0002` resolved; per-row decisions, incl. which sites get a grant in H-12 | Yahor, Roman | todo | | |
+| H-7: Directory check; duplicate `0002` resolved; per-row decisions, incl. which sites get a grant in H-12 | Yahor, Roman | check done (exit 0); decisions pending | 2026-09-26 | one Active row (0002), no duplicate; unbound (`not routing`); staff id to remove at H-12; PESKOVOI write grant `unknown` (verify at H-12 step 3); new columns not yet added |
 | H-8: app settings added | Yahor | done | 2026-09-26 | shape check clean; `MICROSOFT_APP_TYPE` was already `SingleTenant` (no live change) |
 | H-8b: ingestion identity `Directory.Read.All` (runtime Team check) | Yahor (Global Admin) | done | 2026-09-26 12:34:35Z | app role assignment verified on the ingestion managed identity; H-12 not before 2026-09-27 12:35Z (token cache) |
 | H-9: bot deploy, gate in `log` | Yahor | deployed 12:16:59Z; TEST guest `pomoc` pending | 2026-09-26 | pre-Phase-0 bot `b1c74ec5…29cfa`, ingestion `19e4f769…1dc14a` (saved); deployed zip `56963ff9…a5278` from `b742acc`; `bot runtime initialised` with `botGateMode=log` |
