@@ -189,6 +189,8 @@ difference, and CI checks that Bicep sets every setting the code needs.
 | `FORBIDDEN_TARGET_SITE_PATHS` | **New, required.** Sites no row may route to: at least `/sites/BCRGROUPSp.zo.o`. Each entry exactly `/sites/<name>` or `/teams/<name>`. The quarantine path is added automatically. |
 | `ANTHROPIC_ENABLED`, `ANTHROPIC_API_KEY` (Key Vault), `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_CONTENT_BYTES` | Classification. The model defaults to `claude-opus-5`, in the code and in `main.bicep` and both parameter files; the running app was set to `claude-opus-4-5-20251101` and is switched at the classification release. |
 | `CLASSIFICATION_ACCEPT_THRESHOLD` | **New.** The one acceptance threshold: default `0.70`, and anything outside 0.70–0.95 stops ingestion at cold start. Bicep sets it from `classificationAcceptThreshold` (`0.70`). It replaces `ANTHROPIC_CONFIDENCE_THRESHOLD`, which is no longer read (a set value only logs `config.retired_setting`; the classification release deletes it, and the template no longer sets it). |
+| `LEDGER_INDEX_MODE` | **New.** The document index: `off` (default; no connection) or `write` (every filed document gets a client-scoped row). Anything else stops ingestion at cold start, and so does `write` without `LEDGER_DB_HOST` or `LEDGER_DB_USER`. The template and both parameter files record `off` until the [Document index release](docs/operations/human-steps.md#document-index-release). |
+| `LEDGER_DB_HOST`, `LEDGER_DB_NAME`, `LEDGER_DB_USER` | **New.** The index server (`<server>.postgres.database.azure.com`), the database (default `ledger`) and the managed identity's PostgreSQL login, named after the Function App. No password: an Entra token per connection. |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING`, `LOG_LEVEL` | |
 
 **Removed in Phase 0:** `FALLBACK_CLIENT_ID`, `FALLBACK_SITE_HOSTNAME`, `FALLBACK_SITE_PATH`,
@@ -217,11 +219,14 @@ bcr-ledger-agent/
 │   │   └── src/parsers/folderTaxonomy.ts   ⭐ single source of truth for SharePoint paths
 │   ├── teams-bot/               # @bcr/teams-bot: Functions v4 app, Bot Framework, the gate
 │   │   └── src/bot/responseBuilder.ts       ⭐ Polish Adaptive Cards (cardText.ts escapes)
-│   └── document-ingestion/      # @bcr/document-ingestion: Functions v4 app, Graph client
-│       └── src/services/clientResolver.ts   ⭐ identity-only routing and quarantine
+│   ├── document-ingestion/      # @bcr/document-ingestion: Functions v4 app, Graph client
+│   │   └── src/services/clientResolver.ts   ⭐ identity-only routing and quarantine
+│   └── ledger-db/               # @bcr/ledger-db: the document index (PostgreSQL, RLS per client)
+│       └── src/tx.ts                        ⭐ withClientTx: the one place the scope is set
 ├── infrastructure/
 │   ├── main.bicep                       # Azure resources and every app setting (lesson 20)
 │   ├── main.dev.parameters.json
+│   ├── db.bicep, db-deploy.sh           # the index database: a separate template, never main.bicep
 │   ├── deploy.sh                        # Bicep + zip-deploy wrapper. New environments only; refuses dev.
 │   ├── app-settings-gate.sh             # before any Bicep deploy: template vs running app settings
 │   ├── quarantine/                      # quarantine site script, and the managed identity's site grant
@@ -233,7 +238,7 @@ bcr-ledger-agent/
 ├── docs/
 │   ├── operations/                      # incident, human steps, tenant hardening, GDPR drafts
 │   ├── client-directory-admin-guide.md  # the routing list and its rules
-│   ├── security.md                      # threat model T1–T17 and accepted risks
+│   ├── security.md                      # threat model T1–T19 and accepted risks
 │   ├── setup-guide.md, admin-sharepoint-grant.md, deployment.md, local-development.md
 ├── artifacts/                           # build output, git-ignored: fresh zips per deploy
 ├── .env.example                         # Documented env var template

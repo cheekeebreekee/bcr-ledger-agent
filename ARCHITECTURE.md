@@ -51,6 +51,7 @@
 | Secrets | Azure Key Vault | Microsoft.KeyVault |
 | Document classification | Claude (Anthropic Messages API) | api.anthropic.com (external) |
 | Routing directory | "Client Directory" SharePoint list on the BCR GROUP site | Microsoft 365 tenant |
+| Document index | PostgreSQL 16 (`packages/ledger-db`): row-level security per client, Entra-only login (§4.5) | Azure Database for PostgreSQL Flexible Server, Burstable B1ms |
 | File store | Each client's Team site, channel "Dokumenty księgowe" (Microsoft Graph) | Microsoft 365 tenant |
 | Quarantine | "BCR Ledger – Kwarantanna" communication site, staff only | Microsoft 365 tenant |
 | Telemetry | Application Insights | Microsoft.Insights |
@@ -695,6 +696,69 @@ Graph semantics this relies on, and their limits:
   and the owner decides before a real client's channel is swept whether older attachments move
   too (`INBOX_CREATED_AFTER` otherwise) and what the client is told.
 
+### 4.5 The document index
+
+Every document filed into a client's space — in its category or in `98_` for review, by the bot
+path or by the channel inbox in `enforce` — also gets one row in the **document index**, an Azure
+Database for PostgreSQL Flexible Server (`infrastructure/db.bicep`, a template of its own; §7).
+It is what search (v2 point 5) and billing will read. Quarantined documents have no client and
+are never indexed; `shadow` writes nothing, so it indexes nothing.
+
+**The isolation boundary is the database's row-level security**, not the application code
+([`packages/ledger-db`](./packages/ledger-db/README.md)):
+
+- every table in schema `ledger` (`clients`, `documents`) has `ENABLE` + `FORCE ROW LEVEL
+  SECURITY` and one policy, `client_id = ledger.current_client_id()`, for reading and writing.
+  `current_client_id()` is `NULL` unless the transaction set its scope: no scope, no rows, no
+  writes;
+- the scope is set in one place only, `LedgerDb.withClientTx(clientId, fn)`:
+  `BEGIN; SET LOCAL ROLE ledger_app; SELECT set_config('app.client_id', $1, true); fn; COMMIT`.
+  Both the role and the setting end with the transaction, so a pooled connection goes back
+  holding neither. A source scan fails the build if anything else names the setting;
+- `ledger_app` owns nothing, cannot create, has no `BYPASSRLS` and no `DELETE`; the app's login
+  (the ingestion managed identity, named after the Function App) is granted it
+  `WITH INHERIT FALSE, SET TRUE`, so outside a client transaction it holds no privilege. The
+  objects belong to `ledger_owner`, which nobody logs in as;
+- `client_id` is immutable; every statement is an `sql`-tagged template with bind parameters.
+
+```
+batchIngestor (after the upload) ──┐
+                                   ├─▶ documentIndex.record ─▶ withClientTx(scope) ─▶ PostgreSQL
+channelInbox (after an enforce move)┘   (never throws)        scope = UUIDv5(list id,   RLS: client_id
+                                                                       row's item id)   = current_client_id()
+```
+
+**Who the client is.** The same bound Directory row the document was filed for: on the bot path
+the uploader's row, in the channel inbox the row whose channel folder holds the file. Its
+`client_id` is derived, not looked up: a UUIDv5 of the Directory list's id and the row's list
+item id (`clientIdForDirectoryRow`). So the transaction's scope is known before anything is
+read, and nothing in the document can choose it. Inside that transaction the client row is
+upserted by `directory_list_item_id` (with the row's `ClientId`, name and NIP, stored only when
+its checksum is valid), then the document row is written, idempotent on (`client_id`,
+`drive_item_id`): a retried write updates the row and keeps its first `document_id`, which on the
+bot path is the `documentId` of the logs.
+
+**What a row holds.** Source (`bot`/`inbox`), drive and item ids, status `FILED` or
+`NEEDS_REVIEW`, the category filed under and the suggested one, confidence, classifier, model,
+review reasons, the document's month, the taxonomy folder, the uploader's id, the SHA-256 and
+size of the bytes, and for the `01_Faktury` categories the invoice fields: number, issue and
+sale dates, currency (ISO 4217), net/VAT/gross (`numeric(14,2)`), seller and buyer NIP
+(checksum-valid) and name, KSeF number. The classifier reads those in the same call as the
+category (the `invoice` block of its structured output; seller and buyer from its parties) and
+validates each after the call: an invalid value is `NULL`, never a guess.
+
+**Failures.** `LEDGER_INDEX_MODE` is `off` (default: no pool, no connection) or `write`. In
+`write`, an index write that fails is logged as `index.write_failed` with ids, a reason code
+(`unavailable`, `constraint`, `row_security`, `scope`, `invalid_record`) and the SQLSTATE, and
+the filing is unaffected: the upload's result, the move and their log lines are the same with
+the index off, on or down. After a connection failure writes are skipped for a minute. The pool
+is small (2 connections per instance), every connection and statement has a timeout, and each
+connection gets its own Entra token (TLS verified).
+
+**Reads.** `documentsRepo.monthlyCounts(tx)` and `documentsRepo.search(tx, filter, page)`
+(category, month range, gross range, counterparty NIP; keyset paging, newest first) run inside
+a client transaction like everything else. The search API and its UX are point 5.
+
 ---
 
 ## 5. Auth model
@@ -789,6 +853,12 @@ token for around 24 hours with no way to force a refresh, so grant it well befor
 turns the check on. Until the token carries it, every bound upload is quarantined as
 `membership_unverified`.
 
+The same managed identity logs in to the **document index** (§4.5): a PostgreSQL login named
+after the Function App, created by the server's Entra administrator with
+`pgaadauth_create_principal`, whose password is an Entra token for
+`https://ossrdbms-aad.database.windows.net` fetched per connection. The server has password
+authentication disabled; the login is granted `ledger_app` and nothing else.
+
 Every grant names the **managed identity's app id** (`INGEST_MI_APPID`), never the Ingestion
 API app registration's. The registration is only the token audience of §5.2; ingestion never
 authenticates to Graph as it, so a site grant to it does nothing. The procedure is in
@@ -828,6 +898,8 @@ and site grants through the onboarding repo's `Grant-TeamSiteAccess.ps1` runbook
 | Channel inbox: a download, folder or move fails | `inbox.failed` with the `stage`; the file stays and is tried again next tick, with its classification reused. After three failures it is moved to `98_Nieposortowane/YYYY/MM` unclassified. |
 | Channel inbox: a move comes back in another drive or folder | Refused (`sharepoint.drive_mismatch`, `inbox.failed` stage `move`). |
 | Channel inbox: more files than the budget, or the 150 s deadline | The rest wait for the next tick (`deferred`); rows take turns. |
+| Document index unreachable (timeout, refused connection, no token, the server restarting) | The document is filed as ever; `index.write_failed` with `reason` `unavailable`, and writes are skipped for a minute. The missing rows can be backfilled. |
+| Document index refuses a row (two bound rows sharing a NIP: `23505`; anything RLS refuses: `42501`) | Filed as ever; `index.write_failed` with the reason and SQLSTATE, never the database's message (it quotes values). `row_security` or `scope` is an incident. |
 
 Every request is logged with the Teams `activityId` and `conversationId`, and from Phase 0 with a
 server-minted `documentId` per document. Routing outcomes are the events `document.filed` and
@@ -859,15 +931,27 @@ rg-bcr-ledger-<env>
 ├── bot-bcr-<env>-<sfx>       (Azure Bot, Teams channel enabled)
 ├── kv-bcr-<env>-<sfx>        (Key Vault, RBAC mode)
 ├── appi-bcr-<env>-<sfx>      (Application Insights)
-└── log-bcr-<env>-<sfx>       (Log Analytics workspace)
+├── log-bcr-<env>-<sfx>       (Log Analytics workspace)
+└── psql-bcr-<env>-<sfx>      (PostgreSQL Flexible Server, the document index: db.bicep)
 ```
 
-All of it is declared in [`infrastructure/main.bicep`](./infrastructure/main.bicep), every app
-setting included: `main.<env>.parameters.json` holds each environment's values
+All of it but the database is declared in
+[`infrastructure/main.bicep`](./infrastructure/main.bicep), every app setting included (the
+index's `LEDGER_*` settings too): `main.<env>.parameters.json` holds each environment's values
 ([`docs/setup-guide.md` §3a](./docs/setup-guide.md#3a-fill-in-parameter-file)). A deploy replaces
 every app setting, and what-if cannot show app-setting changes, so
 `tools/check-app-settings.mjs` checks the template against the code (CI) and, with `--live`,
 against the running apps (before any deploy to an existing environment).
+
+The document index database is **not** in `main.bicep`. `infrastructure/db.bicep` (with
+`modules/postgres.bicep`) declares only the PostgreSQL server and its children, and is
+deployed on its own, in incremental mode, by `infrastructure/db-deploy.sh` (what-if first; it
+refuses a template or a what-if that touches anything else). It sets no app setting, so the
+settings rule above and gate G1 do not apply to it. The server: Burstable B1ms, PostgreSQL 16,
+32 GiB, 7-day geo-redundant backups, Microsoft Entra authentication only, TLS 1.2+, and public
+access admitting Azure services only (`0.0.0.0`) — a Y1 Consumption app has no VNet
+integration or fixed egress IP, so that is the one network trade-off, covered in
+[`docs/security.md` T19](./docs/security.md#t19-the-document-index-database).
 
 ⚠️ **"dev" is production: it serves PESKOVOI.** Its routing settings were set by hand during
 Phase 0; the template now records them (v2 gate G1), but there is still no deploy on push, and

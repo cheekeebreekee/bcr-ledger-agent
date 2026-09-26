@@ -22,6 +22,10 @@ site — all via Azure Functions + Microsoft Graph. There are **two intakes**:
 - **The bot's 1:1 DM (whoever can attach there).** The bot receives attachments, and ingestion
   files them the same way.
 
+Every document filed into a client's space also gets a row in the **document index**, a
+PostgreSQL database whose row-level security keeps each client's rows to that client
+(`packages/ledger-db`; search and billing read it later).
+
 UI strings are **Polish**; code, comments and logs are English.
 
 One deployment serves many clients. Which client a document belongs to is decided by a **Client
@@ -42,8 +46,9 @@ yarn build                   # topological build of every workspace (tsc -b)
 yarn test                    # Jest in every workspace
 yarn test:coverage           # Jest + per-package coverage thresholds (what CI runs)
 yarn test:tools              # node:test suites for the operator tools in tools/ (offline)
+yarn test:db                 # the index's RLS matrix etc. on postgres:16 (Docker or CI service)
 yarn check:app-settings      # app settings the code reads vs the ones Bicep sets (offline, CI)
-yarn lint                    # ESLint over packages/**/src/**/*.ts
+yarn lint                    # ESLint over packages/**/src/**/*.ts and packages/**/itest/**/*.ts
 yarn type-check              # tsc --noEmit per workspace
 yarn format                  # Prettier over sources + infrastructure/**/*.bicep
 ```
@@ -57,7 +62,13 @@ yarn workspace @bcr/shared test:coverage        # enforces per-package threshold
 ```
 
 Coverage thresholds are **per package and they fail the run**: `shared` 85/85/80/80
-(lines/statements/functions/branches), `document-ingestion` 85/85/80/75, `teams-bot` 80/80/75/70.
+(lines/statements/functions/branches), `document-ingestion` 85/85/80/75, `teams-bot` 80/80/75/70,
+`ledger-db` 90/90/85/85 (unit tests with fakes; `src/cli/**` excluded). `test:db` is separate:
+`packages/ledger-db/itest/*.itest.ts` start a throwaway `postgres:16` container with Docker (or
+use the superuser URL in `LEDGER_TEST_DATABASE_URL`, as CI's `db-integration` job does), run
+the migrations as a superuser, then assert the RLS matrix for every table in schema `ledger`,
+`verify.sql` and its negatives, `client_id` immutability, the pooled connection a transaction
+leaves behind, and the repositories — as a non-superuser login granted `ledger_app`.
 `src/functions/**`, `src/index.ts` and `src/runtime.ts` are excluded from coverage in the two
 Function App packages — they are HTTP registration and cold-start wiring. The logic lives in services
 with injected collaborators (e.g. `services/batchIngestor.ts`) and is tested there.
@@ -71,9 +82,10 @@ corepack yarn workspace @bcr/document-ingestion eval --dir <folder> --truth <tru
   [--client-name <name>] [--client-nip <nip>] [--out <report.md>]
 ```
 
-`truth.json` is `[{file, category, month, direction?}]` (`category` may be `faktura`: an invoice,
-either direction). Keep documents, truth and reports under the git-ignored `tools/out/`: they are
-client data. Test fixtures are synthetic only. The code is `src/evaluation/`.
+`truth.json` is `[{file, category, month, direction?, fields?}]` (`category` may be `faktura`: an
+invoice, either direction; `fields` optionally gives invoice fields — `invoiceNumber`,
+`grossAmount`, `sellerNip`, … — scored where given, reported, not part of the verdict). Keep
+documents, truth and reports under the git-ignored `tools/out/`: they are client data. Test fixtures are synthetic only. The code is `src/evaluation/`.
 
 Local run (two processes; `prestart` builds, and `@bcr/shared` must be built first):
 
@@ -89,6 +101,14 @@ from the BCR tenant with a GUID `aadObjectId`, which Emulator activities lack (s
 `enforce`; in a local `BOT_GATE_MODE=log`, ingestion's source check still answers 400). Test bot
 turns with `TestAdapter` (`ledgerBot.test.ts`) and ingestion with a direct call, as in
 `docs/local-development.md`.
+
+The index database's operator tool, as the server's Entra administrator after `az login`
+(`LEDGER_DB_HOST`, `LEDGER_DB_ADMIN_USER`; the release runbook is *Document index release* in
+`docs/operations/human-steps.md`):
+
+```bash
+corepack yarn workspace @bcr/ledger-db migrate [status|verify|grant-app <login>|client-id <listItemId>]
+```
 
 Deploy: `infrastructure/deploy.sh <env>` (`yarn deploy:prod`) packages both apps, deploys Bicep,
 then zip-deploys both Function Apps; `deploy.yml` does the same via Azure OIDC. A Bicep deploy
@@ -116,26 +136,40 @@ to change settings names them in `EXPECTED_SETTING_CHANGES` (the workflow input
 > Until then deploy code only, one app at a time, in the order in
 > `docs/operations/human-steps.md` (Phase 0).
 
+`infrastructure/db.bicep` (the index database) is **not** `main.bicep` and does not replace app
+settings: PostgreSQL resources only, deployed alone in incremental mode by
+`infrastructure/db-deploy.sh <env>` (what-if first; `--apply` then deploys after the resource
+group's name is typed back; it refuses a template or a what-if touching anything else). So it is
+not held by gate G1. The index's app settings (`LEDGER_INDEX_MODE`, `LEDGER_DB_*`) live in
+`main.bicep` and the parameter files like every other.
+
 `yarn workspace @bcr/<pkg> package` builds a fresh zip into `artifacts/`. It cleans `dist` and the
 `tsbuildinfo`, rebuilds, then runs `tools/package-function.mjs`, which deletes the old zip first,
-fails if any `dist/**/*.js` (the app's or `@bcr/shared`'s) has no `src/**/*.ts` behind it, ships
+fails if any `dist/**/*.js` (the app's, or that of a workspace package it ships: `@bcr/shared`,
+and `@bcr/ledger-db` for ingestion) has no `src/**/*.ts` behind it, ships
 no `*.map`/`*.d.ts`/`*.tsbuildinfo`, installs production dependencies at the exact `yarn.lock`
 versions with install scripts disabled (checking each top-level version against the root
-`node_modules`), and vendors the just-built `@bcr/shared`. `artifacts/*.zip` are git-ignored build
+`node_modules`), and vendors the just-built workspace packages (`@bcr/shared`, and
+`@bcr/ledger-db` for ingestion). `artifacts/*.zip` are git-ignored build
 output: never commit one, and deploy only a zip built for that deploy. Before deploying, still
 check the vendored copy: `unzip -p artifacts/<pkg>.zip node_modules/@bcr/shared/dist/config.js |
 grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths`, `membershipCheckMode`,
-`inboxSweepMode`, `inboxSweepRows` and `classificationAcceptThreshold`) must be greater than 0.
+`inboxSweepMode`, `inboxSweepRows`, `classificationAcceptThreshold` and `ledgerIndexMode`) must be
+greater than 0.
 
-CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test (and `test:tools`), plus
-`bicep build`, `bicep lint` and the static `check-app-settings`.
+CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test (and `test:tools`), the
+`db-integration` job (`test:db` against a `postgres:16` service container), plus `bicep build`,
+`bicep lint` (main.bicep and db.bicep) and the static `check-app-settings`.
 
 ---
 
 ## Architecture
 
-Three workspaces. `@bcr/shared` is the contract between the two Function Apps — **both deployables
-depend on it and neither depends on the other**; they talk over HTTP.
+Four workspaces. `@bcr/shared` is the contract between the two Function Apps — **both deployables
+depend on it and neither depends on the other**; they talk over HTTP. `@bcr/ledger-db` is the
+document index (pool, the client-scoped transaction, repositories, migrations); only
+`@bcr/document-ingestion` depends on it, and it depends on `@bcr/shared` only. Deployables depend
+on `shared` and `ledger-db`, never on each other.
 
 ```
 Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
@@ -144,7 +178,8 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
 Teams channel post / „Udostępnione”   @bcr/document-ingestion (Func App)
   └─▶ channel folder ◀── timer: inboxSweep (every 2 min)
                                       ├─▶ Claude (classify content)
-                                      └─▶ Microsoft Graph (managed identity) ──▶ SharePoint
+                                      ├─▶ Microsoft Graph (managed identity) ──▶ SharePoint
+                                      └─▶ PostgreSQL (managed identity, RLS) — the document index
 ```
 
 ### The ingestion pipeline (the part that needs several files to understand)
@@ -176,6 +211,12 @@ Two intakes share the classifier, the taxonomy, the client SharePoint factory an
    sends the content to `ANTHROPIC_MODEL` (default `claude-opus-5`) with structured output
    (`output_config.format`, the category enum from the taxonomy) at effort `low`; a PDF over 100
    pages is sent as a copy of its first 20 (`services/pdfPreview.ts`; the original is filed).
+   For the `01_Faktury` categories (`invoiceFields` in the taxonomy) the same answer carries an
+   `invoice` block (number, dates, currency, net/VAT/gross as strings, KSeF number; seller and
+   buyer come from the parties), validated field by field after the call with the
+   `@bcr/shared` `invoiceFields` validators — a NIP with a bad checksum, an ambiguous amount, an
+   impossible date or a non-ISO-4217 currency becomes `null` — and carried to the index as the
+   decision's `extraction`, never logged.
    Only the bound client's own identity is primed into the prompt. A classifier's
    **retry later** (429, 529, 5xx, timeout, connection, 401–404) stops the chain: the document is
    `rejected` with `RetryLater` (the card's Polish text says to send it again), never filed —
@@ -199,6 +240,12 @@ Two intakes share the classifier, the taxonomy, the client SharePoint factory an
    stack the two. A batch starts no document after 150 s (the rest are `rejected`, generic retry
    code), and a suffixed name taken after a retried network failure logs
    `sharepoint.possible_duplicate`.
+7. **Index** — `services/documentIndex.ts`, after the upload (`LEDGER_INDEX_MODE=write`; `off`
+   by default connects to nothing): one row in the document index, in a transaction scoped to
+   the bound row's client (`@bcr/ledger-db`, §*The document index* below). Never for a
+   quarantined document. It never throws: a failure is `index.write_failed` (ids, reason code,
+   SQLSTATE) and changes nothing about the filing. The channel inbox does the same after each
+   move in `enforce`, never in `shadow`.
 
 ### The channel inbox (clients' intake)
 
@@ -246,6 +293,20 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
    restarts the worker and every bot upload on it). Logs `inbox.filed|sorted_to_review|
    would_move|retry_later|failed|skipped|row_failed|tick`, ids, codes, counts and taxonomy paths
    only.
+
+### The document index (`packages/ledger-db`)
+
+PostgreSQL 16 on Azure Database for PostgreSQL Flexible Server (`infrastructure/db.bicep`), one
+database `ledger`, schema `ledger`: `clients` (keyed by `client_id`, upserted by the Directory
+row's list item id) and `documents` (one row per filed document, unique per client and drive
+item; the invoice fields the classifier read in the same call). Migrations are numbered SQL in
+`packages/ledger-db/migrations`, applied by the Entra admin with `migrate`, checksummed;
+`sql/verify.sql` is the isolation check (no rows = pass). The pool fetches an Entra token per
+connection (`ManagedIdentityCredential` in Azure, `DefaultAzureCredential` locally), TLS
+verified, every wait bounded. The ingestion's `client_id` for a row is a UUIDv5 of
+`CLIENT_DIRECTORY_LIST_ID` and the row's list item id (`clientIdForDirectoryRow`), so the scope
+is known before any read. Search (`documentsRepo.search`, keyset paging) exists as a repository
+only; its API is point 5.
 
 ### Invariants — break these and documents mis-file
 
@@ -363,6 +424,24 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
   `decisionLogFields()`: `category`, `suggestedCategory` (review), `confidence` (2 decimals),
   `classifier`, `model`, `month`, `reviewReasons`, and `folder` — the **taxonomy** path only,
   never the channel folder or a file name.
+- **Row-level security is the document index's isolation boundary.** Every table in schema
+  `ledger` has `ENABLE` + `FORCE ROW LEVEL SECURITY` and exactly one permissive policy,
+  `client_id = ledger.current_client_id()` (`USING` and `WITH CHECK`); `current_client_id()` is
+  `NULL` without a scope, so an unscoped statement reads nothing and writes nothing. The app's
+  role `ledger_app` owns nothing, cannot create, has no `BYPASSRLS` and no `DELETE`; the app's
+  login is granted it `WITH INHERIT FALSE, SET TRUE` and holds nothing outside a transaction;
+  `client_id` is immutable. A new table needs `client_id uuid NOT NULL`, RLS forced, the one
+  policy, the `guard_row_update` trigger and a case in `itest/rls.itest.ts`: `verify.sql` and the
+  matrix fail otherwise. Never grant a role `BYPASSRLS`, never add a policy with another
+  predicate, never put a non-client table in schema `ledger`.
+- **`app.client_id` is set in one place: `LedgerDb.withClientTx` in `packages/ledger-db/src/tx.ts`**
+  (`BEGIN; SET LOCAL ROLE ledger_app; SELECT set_config('app.client_id', $1, true); fn; COMMIT`),
+  transaction-local, so a pooled connection goes back holding no role and no scope.
+  `tx.test.ts` scans every package's `src` and `tools/` and fails if anything else names it or
+  calls `set_config`; repositories take only a `ClientTx` that `withClientTx` minted (a forged
+  or ended one throws), and `ClientTx.query` runs only `sql`-tagged templates, whose values are
+  always bind parameters. The scope comes from the bound Directory row the document was filed
+  for — never from the document, a request body or a model.
 - **The bot processes only 1:1 chats.** Teams *channel* uploads never reach a bot (drag-drop
   bypasses Bot Framework; `@mention` activities carry only mention HTML) — they reach ingestion
   through the channel inbox instead — and group chats are refused. Every activity passes the bot
@@ -475,6 +554,14 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
   parameter files already record the release (`claude-opus-5`, `CLASSIFICATION_ACCEPT_THRESHOLD`,
   no `ANTHROPIC_CONFIDENCE_THRESHOLD`), so until that switch `--live` against dev reports exactly
   those three names, and no Bicep deploy to dev may run in between.
+- **The index database takes Microsoft Entra logins only** (password authentication is off). The
+  ingestion's login is created by the Entra admin in the `postgres` database with
+  `SELECT * FROM pgaadauth_create_principal('<func-app-name>', false, false);` — the role name is
+  the Function App's name, the display name of its system-assigned identity — then
+  `migrate grant-app <func-app-name>`; its password is a token for
+  `https://ossrdbms-aad.database.windows.net/.default`. The server admits Azure addresses only
+  (the `0.0.0.0` rule, because a Y1 app has no fixed egress IP): an operator's laptop needs a
+  dated firewall rule for its IP, deleted after the session.
 - If `tsc -b` keeps seeing stale `@bcr/shared` types, delete the physical copy Yarn sometimes leaves
   at `packages/<pkg>/node_modules/@bcr/shared` so resolution falls back to the root symlink.
 
@@ -489,8 +576,9 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
 | `docs/client-directory-admin-guide.md` | The Client Directory list — columns and admin workflow |
 | `docs/admin-sharepoint-grant.md` | `Sites.Selected` via Graph Explorer |
 | `docs/security.md` | Threat model + secrets inventory |
-| `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback; "Lifting gate G1"; the *Classification release* runbook (evaluate, deploy, switch the model, go/no-go) |
+| `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback; "Lifting gate G1"; the *Classification release* runbook (evaluate, deploy, switch the model, go/no-go); the *Document index release* runbook (cost, db.bicep, the login, migrations, settings, canary, rollback) |
 | `docs/operations/incident-2026-09.md` | The cross-client routing incident: causes, IR-0..IR-3, status |
 | `docs/operations/tenant-hardening.md` | Tenant settings that keep clients apart (BCR GROUP stays Private, read-only check) |
 | `docs/diagrams/` | Mermaid: as-is, Phase-0 routing, target business logic/architecture/data flow, sequences, data model |
+| `packages/ledger-db/README.md` | The document index: RLS model, commands, how to add a migration |
 | `tools/README.md` | Operator tools (directory bindings, IR-0/IR-1): dry-run by default, `--apply` to write |

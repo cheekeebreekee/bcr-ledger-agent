@@ -111,6 +111,14 @@ The script:
    [`PROJECT_OVERVIEW.md` → Build and deploy](../PROJECT_OVERVIEW.md#build-and-deploy));
 4. zip-deploys both Function Apps.
 
+It does not deploy the document index database. That is `infrastructure/db.bicep`, a separate
+template that is **not** `main.bicep` and does not replace app settings: PostgreSQL resources
+only, deployed alone in incremental mode by `infrastructure/db-deploy.sh <env>` (what-if first,
+then `--apply`), with a `db.<env>.parameters.json` of its own. The ingestion app runs with the
+index off (`LEDGER_INDEX_MODE=off`, the template's default) until the steps of the
+[Document index release](operations/human-steps.md#document-index-release) are done: the
+login, the migrations and the settings.
+
 ### 3a. App settings
 
 The template sets every app setting from the parameter file, the Phase-0 ingestion settings

@@ -25,6 +25,8 @@ one SharePoint site. Each threat now has a status:
 | Channel inbox timer → ingestion logic | None: a timer trigger | None | Not a route. It takes no input, so nothing outside can name a user, a row or a target to it (T18). |
 | Bot, ingestion → Key Vault | Each app's managed identity | *Key Vault Secrets User*, assigned at **resource-group** scope | Key Vault (see T11) |
 | Ingestion → Claude | Anthropic API key (Key Vault) | TLS and bearer key | `api.anthropic.com` (see T16) |
+| Ingestion → document index (PostgreSQL) | The ingestion Function App's managed identity, as a login named after the app (`pgaadauth_create_principal`) | An Entra token per connection; the server has password authentication disabled | The server (Entra only, TLS 1.2+); then `SET LOCAL ROLE ledger_app` and row-level security per client transaction (see T19) |
+| Operator → document index | The server's Entra administrator (a person) | A token from `az login` | The server; a firewall rule for the operator's IP, for one session (see T19) |
 
 **The ingestion identity's site grants.** Before Phase 0, it had `write` on TEST, PESKOVOI and
 BCR GROUP. Phase 0 adds `write` on the quarantine site, and on each client site bound in the
@@ -42,6 +44,7 @@ entries are recorded for deletion.
 | `anthropic-api-key` | Key Vault; **also plaintext in developers' `.env` files** | Ingestion, as `ANTHROPIC_API_KEY` | Rotation deferred ([accepted](#accepted-risks)). |
 | Storage account key | **In plain text in the `AzureWebJobsStorage` app setting** of both apps (`functionApp.bicep` reads it with `listKeys()`) | The Functions runtime | `az functionapp config appsettings set` prints it unless you pass `-o none`. The fix is identity-based storage access, or at least a Key Vault reference: [follow-up F1](#follow-ups-from-the-g1-review). The Bicep drift fix (G1) only records what runs, so it is a change of its own. |
 | Function keys | Azure platform | Not used | Functions are `authLevel: 'anonymous'`; each handler checks the JWT itself. |
+| Document index database | — | — | **No secret exists.** Password authentication is disabled; the ingestion and the operator log in with Entra tokens (T19). `LEDGER_DB_*` settings are configuration. |
 
 Everything else in the app settings is configuration, not a secret. Key Vault values reach the
 apps as `@Microsoft.KeyVault(SecretUri=...)` references. A rotation is `az keyvault secret set`
@@ -386,6 +389,70 @@ keeps them in place) and what the client is told.
 **Status: Mitigated by design; off until H-12's channel-inbox step** sets
 `INBOX_SWEEP_MODE=shadow`, then `enforce`, first for the canary Team's row only.
 
+### T19. The document index database
+
+The index (`packages/ledger-db`, `infrastructure/db.bicep`) holds one row per document filed into
+a client's space: ids, the category and review reasons, the month, and for invoices the number,
+dates, currency, amounts, seller and buyer NIPs and names, and the KSeF number. That is client
+data, some of it personal (a sole trader's name is a person's name), so it gets the same
+isolation as the documents themselves. Quarantined documents are never in it.
+
+**A client reading or writing another client's rows.** The boundary is the database, not the
+application code:
+
+- every table in schema `ledger` has `ENABLE` + `FORCE ROW LEVEL SECURITY` and one permissive
+  policy, `client_id = ledger.current_client_id()` for `USING` and `WITH CHECK`. The function
+  is `NULL` unless the transaction set its scope, so a statement without one reads 0 rows and
+  cannot insert; `FORCE` holds the tables' owner to the same rule;
+- the scope is set in exactly one place, `LedgerDb.withClientTx` (`SET LOCAL ROLE ledger_app`,
+  then the transaction-local setting): a source scan over every package and `tools/` fails the
+  build if anything else names it. Both are transaction-local, so a pooled connection goes back
+  to the pool holding no role and no scope (tested);
+- the ingestion derives the scope from the bound Directory row it filed the document for (a
+  UUIDv5 of the list id and the row id), never from the document; the channel inbox, from the
+  row whose channel folder holds the file. Content never picks the scope, as it never picks the
+  client;
+- the app's role `ledger_app` owns nothing, cannot create anything, has no `BYPASSRLS`, and has
+  only `SELECT`, `INSERT`, `UPDATE` (no `DELETE`) on the two tables. The app's login (the
+  ingestion managed identity) is granted it `WITH INHERIT FALSE, SET TRUE`: outside a client
+  transaction it can read nothing at all;
+- `client_id` is immutable (a trigger, even for a superuser); a document row is unique per
+  client and drive item;
+- every statement is an `sql`-tagged template whose values are bind parameters, and a client
+  transaction runs nothing else (checked at run time, not only by the compiler);
+- `packages/ledger-db/sql/verify.sql` reports any table without forced RLS or with another
+  policy, a privileged or owning app role, and any login that could use the app role while
+  privileged or inheriting it. It runs after every migration, in CI (`test:db`, with the RLS
+  matrix for every table read from the catalog), and daily by hand.
+
+**Credentials.** None stored. Password authentication is disabled on the server: the only
+logins are Microsoft Entra principals. The ingestion connects as its managed identity with an
+access token fetched per connection (TLS verified); the operator, as the server's Entra
+administrator, with a token from `az login`. A token for the database is only obtainable by
+those principals. The administrator is a person (Yahor), passed at deploy time; see the
+dual-role risk under [Accepted risks](#accepted-risks).
+
+**The public endpoint: the one network trade-off.** The Function Apps are on a Y1 Consumption
+plan, which has no VNet integration and no fixed outbound IP. So the server keeps public network
+access, with one firewall rule, `AllowAllAzureServicesAndResourcesWithinAzureIps`
+(`0.0.0.0`–`0.0.0.0`), which admits **every Azure address, other tenants' included**. Nothing
+there can log in: Entra-only authentication (no password to guess or leak), a token issued by
+BCR's tenant for a principal created on this server, TLS 1.2 or later required, and RLS inside.
+What is left: exposure to a flaw in the server or Azure's gateway before authentication, and
+connection slots (about 50 on B1ms) that a flood from Azure could exhaust — the index then
+fails, and filing goes on (`index.write_failed`, `unavailable`). The operator's own access is a
+firewall rule for one IP, named with the date, added for a session and deleted after it. The
+fix is a private endpoint once the apps move to Flex Consumption with VNet integration (T12,
+Phase 1–2).
+
+**Availability.** An index failure never blocks or undoes a filing: it is logged with ids, a
+reason code and the SQLSTATE only (a PostgreSQL message quotes the values it refused), and the
+missing rows can be backfilled. After a connection failure, writes are skipped for a minute.
+
+**Status: Mitigated by design; off until the
+[Document index release](operations/human-steps.md#document-index-release)** sets
+`LEDGER_INDEX_MODE=write`. The public endpoint is an [accepted risk](#accepted-risks).
+
 ### Also fixed in Phase 0
 
 - **Model text on cards.** The classifier's free-text reasoning was rendered as Markdown on the
@@ -434,6 +501,7 @@ first.
 | **Secret rotation deferred** (T15, and the Anthropic key). Plaintext copies of both secrets are on developer laptops. | New credentials come from Roman, who will provide them soon. Rotating twice gains nothing. | Roman | New credentials arrive. Then rotate and delete the laptop copies the same day. | Caller pinning: only the bot's app id is accepted. A forged upload needs a real guest's id, lands only in that guest's own client, and is logged under that id. The secret cannot read documents, because the bot holds no SharePoint permission. |
 | **Yahor's dual role.** He is the developer, the operator who deploys, and a Global Administrator. One person can change the code, ship it and change tenant permissions. That is also a bus factor of one. | BCR has one technical person today. | Roman | A second admin or a formal approval path exists. | Roman reviews every binding plan before it is applied. IR-2 moves need two people. Every tenant and Azure change is a recorded command with its before and after state. The IR evidence is immutable and readable by Roman and the IOD. Yahor does not upload through the bot. Planned: Roman approves production deploys through GitHub environment protection, and a `HANDOVER.md`. |
 | **One identity writes every client site** (T3). | Inherent to the current design. | Yahor | Phase 2 (upload by id, attestation, nightly audit). | Identity-only routing, only bound rows route, the uploader's Teams checked at upload time against the row's Team, one client per site, drive and Team, canonical site paths, forbidden targets checked by path and by resolved site id, `DriveId` check, `conflictBehavior=fail`. The channel inbox moves only within the channel folder it is sweeping, by id, and checks where each move ended (T18). |
+| **The index database has a public endpoint** (T19): the Azure-services rule admits every Azure address, other tenants' too. | A Y1 Consumption app has no VNet integration and no fixed outbound IP; a VNet, NAT gateway and private endpoint cost more than the whole index. | Yahor | The move to Flex Consumption with VNet integration (T12, Phase 1–2): then a private endpoint, and public access off. | Entra-only authentication (no password exists), TLS 1.2+, the login's token issued by BCR's tenant for a principal created on the server, row-level security with the scope set in one place, `verify.sql` daily. An outage of the index never stops filing. |
 | **No P1: 7-day Entra sign-in log, no Conditional Access** (T14). | Needs a licence purchase. | Roman | Decision 5. | Purview audit log: file operations and sign-in events, about 180 days. `{NIP}@` accounts blocked (T-1). |
 
 ## 4. Data residency and retention
@@ -451,6 +519,10 @@ first.
   Guests have Edit rights there, so a Purview retention policy is planned to stop client
   documents being lost by deletion.
 - **Anthropic:** see T16. Document content is never logged by the ledger.
+- **Document index** (T19): PostgreSQL in West Europe; backups kept 7 days (point-in-time
+  restore), geo-redundant to the paired region (North Europe), both in the EU. Rows stay as long
+  as the documents they describe; deleting a client's rows at offboarding is part of the
+  offboarding runbook (v2 plan, Operations), not yet built. The index holds no file content.
 
 ## 5. Compliance checklist
 
@@ -469,6 +541,9 @@ first.
       and last changed are processed; moves by id inside the channel folder, only on the version
       listed (`If-Match`), never across drives, never overwriting (T18)
 - [x] Structured logging with secrets redacted, and from Phase 0 also file names, titles, URLs,
-      paths, parties and NIPs
+      paths, parties and NIPs (and invoice fields)
+- [x] Document index: Entra-only authentication, TLS required, `FORCE ROW LEVEL SECURITY` on
+      every table with the scope set in one place, an app role that owns nothing and cannot
+      bypass RLS, `verify.sql` in CI and daily (T19)
 - [x] No secrets in source: `.env` and `local.settings.json` are git-ignored, and the `*.example`
       files are the templates. The laptop copies are an accepted risk.
