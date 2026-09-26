@@ -9,12 +9,12 @@ on:
         required: true
         options: [dev, qa, prod]
   # No `push` trigger, and a manual run against dev is refused too (first step
-  # below). "dev" serves a real client, and main.bicep has drifted from the app
-  # settings that are actually running (CLIENT_DIRECTORY_*, QUARANTINE_*,
-  # BOT_CALLER_APP_IDS, FORBIDDEN_TARGET_SITE_PATHS, BOT_GATE_MODE are set by
-  # hand and absent from the template). A Bicep deploy replaces every setting,
-  # so ingestion would fail at cold start. Until the drift fix (gate G1), dev
-  # is deployed as code-only zips: docs/operations/human-steps.md.
+  # below). "dev" serves a real client, and a Bicep deploy replaces every app
+  # setting. The template and main.dev.parameters.json now record the settings
+  # dev runs with (gate G1), but lifting the refusal is a person's decision,
+  # after reviewing a what-if and a clean `tools/check-app-settings.mjs --live`
+  # against rg-bcr-ledger-dev. Until then dev is deployed as code-only zips:
+  # docs/operations/human-steps.md.
 
 permissions:
   id-token: write   # OIDC federation to Azure
@@ -30,10 +30,10 @@ jobs:
       ENV_NAME: ${{ inputs.environment || 'dev' }}
 
     steps:
-      - name: Refuse dev until the Bicep drift fix (G1)
+      - name: Refuse dev until the G1 review
         if: env.ENV_NAME == 'dev'
         run: |
-          echo "::error::dev is production (it serves a real client). Bicep deploys to it are blocked until the drift fix (G1): deploy code-only zips as in docs/operations/human-steps.md."
+          echo "::error::dev is production (it serves a real client). Bicep deploys to it are blocked until a person has reviewed the G1 drift fix (what-if and check-app-settings --live): deploy code-only zips as in docs/operations/human-steps.md."
           exit 1
 
       - uses: actions/checkout@v4
@@ -97,6 +97,19 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # The template replaces every app setting, and what-if cannot show that.
+      # If the apps already run, a setting set by hand and not recorded in the
+      # parameters file would be deleted or reverted: stop here. Read-only.
+      - name: App settings (template vs running apps)
+        shell: bash
+        run: |
+          RG="rg-bcr-ledger-${ENV_NAME}"
+          if [[ -n "$(az functionapp list -g "$RG" --query "[].name" -o tsv 2>/dev/null)" ]]; then
+            node tools/check-app-settings.mjs --live -g "$RG" -p "infrastructure/main.${ENV_NAME}.parameters.json"
+          else
+            echo "No Function Apps in $RG yet: nothing to compare."
+          fi
 
       - name: Deploy Bicep
         uses: azure/arm-deploy@v2
