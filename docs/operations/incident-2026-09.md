@@ -670,6 +670,9 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | IR-2 relocation complete, allow-lists issued | Roman + second person | todo | | |
 | IR-3: phase-2 notices to every affected client | Roman + IOD | todo | | |
 | IR-3 (3): UODO decision for BCR-controlled data recorded | Roman + IOD | todo | | |
+| H-12 channel-inbox step: build deployed; canary Team and row; canary `shadow`, then `enforce`; same-name `_1`; what the moved attachment's post showed | Yahor | todo | | sha256 of the `*-p0-<stamp>.zip` packages saved; the canary row's list item id; times of the canary's `inbox.filed` and of its `nameSuffix` `1`; whether the post's attachment still opened; `check \| grep -ci <canary id>` `0` after clean-up |
+| H-12 channel-inbox step: PESKOVOI's older channel attachments (all moved, or kept with `INBOX_CREATED_AFTER`), and what the client was told | Roman decides | todo | | the decision; the cutoff time, if any; PESKOVOI's `shadow` count and first `inbox.filed` time; `INBOX_SWEEP_ROWS` removed |
+| H-12/H-15: bot-path proofs dropped, because no guest can send a file through the bot: (1) a TEST canary routed with `membership: verified` (H-12 step 7; the R46 exit criterion), (2) a same-name bot upload stored as `_1`. Replaced by the channel-inbox canary: its guest and Team read (H-8b's grant in the token) and its same-name move `_1` | Roman accepts | todo | | who accepted, and when |
 | H-15: Phase-0 exit criteria signed off | Yahor, Roman | todo | | |
 | Standing checks: whole plan applied after each onboarding; weekly `check` | Yahor | from H-12 | | date of each run; apply-log hash ([`human-steps.md`](human-steps.md#standing-checks)) |
 
