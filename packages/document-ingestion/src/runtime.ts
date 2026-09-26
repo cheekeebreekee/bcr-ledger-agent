@@ -16,6 +16,8 @@ import { membershipCheckFor, TeamMembershipReader } from './services/teamMembers
 import { ClassificationService, FallbackClassifier } from './services/classificationService';
 import { ClaudeClassifier } from './services/claudeClassifier';
 import { BatchIngestor } from './services/batchIngestor';
+import { UserTypeReader } from './services/userDirectory';
+import { ChannelInbox, MAX_INBOX_FILE_BYTES } from './services/channelInbox';
 
 export const config = loadIngestionConfig();
 
@@ -88,3 +90,43 @@ export const batchIngestor = new BatchIngestor({
   clientSharePointFactory,
   quarantineSharePointFactory,
 });
+
+/**
+ * The channel-inbox sweep (functions/inboxSweep.ts). It files client uploads
+ * inside each bound row's channel folder through the CLIENT factory, whose
+ * guard refuses BCR GROUP and the quarantine. `INBOX_SWEEP_MODE` is said once
+ * per cold start when it is not `off`, with the row allow-list and cutoff.
+ *
+ * Its user and Team readers are its own, with the Graph SDK's retries off
+ * (as are its SharePoint calls): a tick must end well inside the timer's
+ * 5-minute limit, and the SDK would sleep through `Retry-After` for minutes.
+ * The upload path keeps its reader, cache and retries as they were.
+ */
+export const channelInbox = new ChannelInbox({
+  mode: config.inboxSweepMode,
+  directory: clientDirectory,
+  sharePointFactory: clientSharePointFactory,
+  users: new UserTypeReader(graph, { sdkRetries: false }),
+  membership: new TeamMembershipReader(graph, { sdkRetries: false }),
+  classification,
+  minAgeMs: config.inboxMinAgeMs,
+  maxFilesPerTick: config.inboxMaxFilesPerTick,
+  // Only the classifier reads the bytes, and it reads no more than this.
+  maxDownloadBytes: Math.min(config.anthropicMaxContentBytes, MAX_INBOX_FILE_BYTES),
+  onlyRows: config.inboxSweepRows,
+  ...(config.inboxCreatedAfter !== undefined ? { createdAfterMs: config.inboxCreatedAfter } : {}),
+});
+if (config.inboxSweepMode !== 'off') {
+  createLogger('ingestion/runtime').info(
+    {
+      event: 'inbox.sweep_mode',
+      mode: config.inboxSweepMode,
+      rows: config.inboxSweepRows.length ? config.inboxSweepRows : 'all',
+      createdAfter:
+        config.inboxCreatedAfter !== undefined
+          ? new Date(config.inboxCreatedAfter).toISOString()
+          : 'none',
+    },
+    'inbox.sweep_mode',
+  );
+}

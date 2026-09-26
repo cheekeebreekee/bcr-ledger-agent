@@ -96,6 +96,11 @@ of no other Team, and your local credential (`az login`) must be able to read th
 otherwise it is quarantined as `membership_mismatch` or `membership_unverified`. Do not set
 `MEMBERSHIP_CHECK_MODE=off` to get round it, even locally: test the check, not around it.
 
+The channel-inbox timer is registered locally too, and with `INBOX_SWEEP_MODE=off` (the example
+setting) each tick returns at once. Do not set `shadow` or `enforce` against a real tenant from a
+laptop: `enforce` moves files in client channels. The sweep is tested with fake Graph doubles
+(`channelInbox.test.ts`), which is where to try a change.
+
 ## Useful Kusto
 
 ```kusto

@@ -2,12 +2,17 @@ import { RetryHandlerOptions, type Client } from '@microsoft/microsoft-graph-cli
 import { SharePointError, ValidationError, type Logger, type SharePointTarget } from '@bcr/shared';
 import {
   cachedSiteIdLookup,
+  ContentTooLargeError,
   forbiddenSiteKeys,
   graphStatus,
+  InboxItemChangedError,
+  readCapped,
   SharePointService,
   SharePointTargetError,
   siteCollectionKey,
   splitExtension,
+  withoutSdkRetries,
+  type InboxFolder,
 } from './sharePointService';
 
 const target: SharePointTarget = {
@@ -24,6 +29,8 @@ interface Call {
   body: unknown;
   /** Per-request middleware options, e.g. RetryHandlerOptions. */
   middleware: unknown[];
+  /** Request headers set with `.header()`. */
+  headers: Record<string, string>;
 }
 
 type Handler = (call: Call) => unknown;
@@ -34,12 +41,14 @@ function fakeGraph(handlers: [RegExp, Handler][]): { client: Client; calls: Call
   const api = (path: string) => {
     const query: Record<string, string> = {};
     const middleware: unknown[] = [];
+    const headers: Record<string, string> = {};
     const request = {
       query(q: Record<string, string>) {
         Object.assign(query, q);
         return request;
       },
-      header() {
+      header(key: string, value: string) {
+        headers[key] = value;
         return request;
       },
       middlewareOptions(options: unknown[]) {
@@ -47,12 +56,13 @@ function fakeGraph(handlers: [RegExp, Handler][]): { client: Client; calls: Call
         return request;
       },
       get: () => respond('get'),
+      getStream: () => respond('get'),
       post: (body: unknown) => respond('post', body),
       put: (body: unknown) => respond('put', body),
       patch: (body: unknown) => respond('patch', body),
     };
     const respond = async (method: Call['method'], body?: unknown) => {
-      const call: Call = { method, path, query, body, middleware };
+      const call: Call = { method, path, query, body, middleware, headers };
       calls.push(call);
       const handler = handlers.find(([pattern]) => pattern.test(`${method.toUpperCase()} ${path}`));
       if (!handler) throw Object.assign(new Error(`unhandled ${method} ${path}`), { statusCode: 500 });
@@ -692,6 +702,499 @@ describe('SharePointService.setListItemFields', () => {
     const svc = new SharePointService(client, target, { retry: { retries: 1, minTimeoutMs: 0 } });
     await expect(svc.setListItemFields('item-9', { a: 'b' })).resolves.toBe(true);
     expect(patches).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Channel inbox
+// ---------------------------------------------------------------------------
+
+const bound: SharePointTarget = { ...target, expectedDriveId: 'drive-1' };
+const inboxOf: InboxFolder = { driveId: 'drive-1', folderId: 'inbox-1' };
+const CHANNEL_PATH = '/drives/drive-1/root:/Dokumenty%20ksi%C4%99gowe';
+const channelFolder = { id: 'inbox-1', folder: { childCount: 3 }, parentReference: { driveId: 'drive-1', id: 'root-1' } };
+const siteAndDriveOnly = siteAndDrive.slice(0, 2);
+
+describe('SharePointService.resolveInbox', () => {
+  it("resolves the row's channel folder by path in the recorded drive", async () => {
+    const { client, calls } = fakeGraph([
+      ...siteAndDriveOnly,
+      [new RegExp(`^GET ${CHANNEL_PATH.replace(/[%]/g, '%')}$`), () => channelFolder],
+    ]);
+    await expect(new SharePointService(client, bound, noRetry).resolveInbox()).resolves.toEqual(inboxOf);
+    expect(calls.at(-1)?.path).toBe(CHANNEL_PATH);
+    expect(calls.some((c) => c.method !== 'get')).toBe(false);
+  });
+
+  it.each([
+    ['no channel folder', { ...bound, rootFolder: undefined }],
+    ['no recorded drive', { ...target }],
+    ['a nested folder', { ...bound, rootFolder: 'Dokumenty księgowe/Podfolder' }],
+  ])('refuses a target with %s before reading any folder', async (_label, t) => {
+    const clean = Object.fromEntries(Object.entries(t).filter(([, v]) => v !== undefined)) as SharePointTarget;
+    const { client, calls } = fakeGraph([...siteAndDriveOnly, [/root:/, () => channelFolder]]);
+    await expect(new SharePointService(client, clean, noRetry).resolveInbox()).rejects.toMatchObject({
+      kind: 'inbox_unusable',
+    });
+    expect(calls.some((c) => c.path.includes('root:'))).toBe(false);
+  });
+
+  it('refuses a recorded drive the path no longer resolves to', async () => {
+    const { client, calls } = fakeGraph([...siteAndDriveOnly, [/root:/, () => channelFolder]]);
+    const svc = new SharePointService(client, { ...bound, expectedDriveId: 'drive-old' }, noRetry);
+    await expect(svc.resolveInbox()).rejects.toMatchObject({ kind: 'drive_mismatch' });
+    expect(calls.some((c) => c.path.includes('root:'))).toBe(false);
+  });
+
+  it('refuses a channel folder that Graph reports in another drive', async () => {
+    const { client } = fakeGraph([
+      ...siteAndDriveOnly,
+      [/root:/, () => ({ ...channelFolder, parentReference: { driveId: 'drive-other' } })],
+    ]);
+    await expect(new SharePointService(client, bound, noRetry).resolveInbox()).rejects.toMatchObject({
+      kind: 'drive_mismatch',
+    });
+  });
+
+  it('refuses a channel path that is a file, not a folder', async () => {
+    const { client } = fakeGraph([
+      ...siteAndDriveOnly,
+      [/root:/, () => ({ id: 'f', file: {}, parentReference: { driveId: 'drive-1' } })],
+    ]);
+    await expect(new SharePointService(client, bound, noRetry).resolveInbox()).rejects.toMatchObject({
+      kind: 'inbox_unusable',
+    });
+  });
+
+  it.each([
+    [404, 'inbox_unusable'],
+    [403, 'forbidden'],
+  ])('maps a %i on the channel folder to %s', async (status, kind) => {
+    const { client } = fakeGraph([...siteAndDriveOnly, [/root:/, () => { throw graphError(status); }]]);
+    await expect(new SharePointService(client, bound, noRetry).resolveInbox()).rejects.toMatchObject({ kind });
+  });
+
+  it('reports any other failure as a SharePointError', async () => {
+    const { client } = fakeGraph([...siteAndDriveOnly, [/root:/, () => { throw graphError(400); }]]);
+    const err = await new SharePointService(client, bound, noRetry).resolveInbox().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SharePointError);
+    expect(err).not.toBeInstanceOf(SharePointTargetError);
+  });
+
+  it('refuses the forbidden site before reading the channel folder', async () => {
+    const { client, calls } = fakeGraph([
+      [/^GET \/sites\/contoso\.sharepoint\.com:\/sites\/ClientA$/, () => ({ id: siteId(BCR_GROUP) })],
+      [/root:/, () => channelFolder],
+    ]);
+    const svc = new SharePointService(client, bound, { ...noRetry, forbiddenSiteIds: [siteId(BCR_GROUP)] });
+    await expect(svc.resolveInbox()).rejects.toMatchObject({ kind: 'forbidden_site' });
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe('SharePointService.listInboxChildren', () => {
+  const child = (id: string, parent = { driveId: 'drive-1', id: 'inbox-1' }) => ({
+    id,
+    name: `${id}.pdf`,
+    file: {},
+    parentReference: parent,
+  });
+
+  it('lists the direct children with the fields the sweep needs, following nextLink', async () => {
+    const next = 'https://graph.microsoft.com/v1.0/drives/drive-1/items/inbox-1/children?$skiptoken=2';
+    const { client, calls } = fakeGraph([
+      [/skiptoken=2$/, () => ({ value: [child('c')] })],
+      [/^GET \/drives\/drive-1\/items\/inbox-1\/children\?/, () => ({ value: [child('a'), child('b')], '@odata.nextLink': next })],
+    ]);
+    const items = await new SharePointService(client, bound, noRetry).listInboxChildren(inboxOf);
+    expect(items.map((i) => i.id)).toEqual(['a', 'b', 'c']);
+    expect(calls[0]?.path).toBe(
+      '/drives/drive-1/items/inbox-1/children' +
+        '?$select=id,name,eTag,size,file,folder,package,createdBy,createdDateTime,lastModifiedBy,' +
+        'lastModifiedDateTime,parentReference&$top=200',
+    );
+    expect(calls[1]?.path).toBe(next);
+  });
+
+  it('drops any child whose parent or drive is not the channel folder', async () => {
+    const { client } = fakeGraph([
+      [
+        /children/,
+        () => ({
+          value: [
+            child('ok'),
+            child('other-parent', { driveId: 'drive-1', id: 'sub' }),
+            child('other-drive', { driveId: 'drive-2', id: 'inbox-1' }),
+            { id: 'no-parent', file: {} },
+            { name: 'no-id', parentReference: { driveId: 'drive-1', id: 'inbox-1' } },
+            null,
+          ],
+        }),
+      ],
+    ]);
+    const items = await new SharePointService(client, bound, noRetry).listInboxChildren(inboxOf);
+    expect(items.map((i) => i.id)).toEqual(['ok']);
+  });
+
+  it('refuses a next page outside Graph', async () => {
+    const { client } = fakeGraph([
+      [/children/, () => ({ value: [], '@odata.nextLink': 'https://evil.example/next' })],
+    ]);
+    await expect(new SharePointService(client, bound, noRetry).listInboxChildren(inboxOf)).rejects.toBeInstanceOf(
+      SharePointError,
+    );
+  });
+
+  it('refuses a listing without a value', async () => {
+    const { client } = fakeGraph([[/children/, () => ({})]]);
+    await expect(new SharePointService(client, bound, noRetry).listInboxChildren(inboxOf)).rejects.toBeInstanceOf(
+      SharePointError,
+    );
+  });
+
+  it('stops after 25 pages', async () => {
+    const { client, calls } = fakeGraph([
+      [
+        /children/,
+        () => ({
+          value: [child(`p${calls.length}`)],
+          '@odata.nextLink': `https://graph.microsoft.com/v1.0/drives/drive-1/items/inbox-1/children?$skiptoken=${calls.length}`,
+        }),
+      ],
+    ]);
+    const items = await new SharePointService(client, bound, noRetry).listInboxChildren(inboxOf);
+    expect(items).toHaveLength(25);
+    expect(calls).toHaveLength(25);
+  });
+
+  it.each([
+    [404, 'inbox_unusable'],
+    [403, 'forbidden'],
+  ])('maps a %i on the listing to %s', async (status, kind) => {
+    const { client } = fakeGraph([[/children/, () => { throw graphError(status); }]]);
+    await expect(new SharePointService(client, bound, noRetry).listInboxChildren(inboxOf)).rejects.toMatchObject({
+      kind,
+    });
+  });
+});
+
+describe('SharePointService.downloadInboxItem', () => {
+  it('reads the item by id, up to the limit', async () => {
+    const { client, calls } = fakeGraph([
+      [/^GET \/drives\/drive-1\/items\/item-1\/content$/, () => new Response(Buffer.from('%PDF-1.7')).body],
+    ]);
+    const bytes = await new SharePointService(client, bound, noRetry).downloadInboxItem(inboxOf, 'item-1', 100);
+    expect(bytes.toString()).toBe('%PDF-1.7');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('stops reading once the limit is passed', async () => {
+    const { client } = fakeGraph([[/content$/, () => new Response(Buffer.alloc(32)).body]]);
+    await expect(
+      new SharePointService(client, bound, noRetry).downloadInboxItem(inboxOf, 'item-1', 16),
+    ).rejects.toBeInstanceOf(ContentTooLargeError);
+  });
+
+  it.each([
+    [403, SharePointTargetError],
+    [404, SharePointError],
+  ])('maps a %i on the download', async (status, type) => {
+    const { client } = fakeGraph([[/content$/, () => { throw graphError(status); }]]);
+    const err = await new SharePointService(client, bound, noRetry)
+      .downloadInboxItem(inboxOf, 'item-1', 16)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(type);
+  });
+});
+
+describe('readCapped', () => {
+  async function* chunks(...parts: string[]) {
+    for (const p of parts) yield Buffer.from(p);
+  }
+
+  it.each([
+    ['bytes', () => Buffer.from('abcd')],
+    ['an ArrayBuffer', () => new Uint8Array(Buffer.from('abcd')).buffer],
+    ['a web stream', () => new Response('abcd').body],
+    ['a Node stream', () => chunks('ab', 'cd')],
+    ['string chunks', () => (async function* () { yield 'ab'; yield 'cd'; })()],
+  ])('reads %s', async (_label, body) => {
+    expect((await readCapped(body(), 4)).toString()).toBe('abcd');
+  });
+
+  it.each([
+    ['bytes', () => Buffer.from('abcde')],
+    ['a web stream', () => new Response('abcde').body],
+    ['a Node stream', () => chunks('abc', 'de')],
+  ])('refuses %s over the limit', async (_label, body) => {
+    await expect(readCapped(body(), 4)).rejects.toMatchObject({ code: 'ContentTooLarge', limitBytes: 4 });
+  });
+
+  it('refuses a body with nothing to read', async () => {
+    await expect(readCapped(undefined, 4)).rejects.toBeInstanceOf(SharePointError);
+  });
+});
+
+describe('SharePointService.ensureInboxFolder', () => {
+  it('creates the taxonomy chain under the channel folder and returns the last folder id', async () => {
+    const { client, calls } = fakeGraph([
+      [/^POST \/drives\/drive-1\/items\/[^/]+\/children$/, () => ({})],
+      [/^GET \/drives\/drive-1\/items\/[^/]+:\/.+$/, (c) => ({ id: `folder:${c.path.split(':/')[1]}` })],
+    ]);
+    const id = await new SharePointService(client, bound, noRetry).ensureInboxFolder(inboxOf, '04_Umowy/Aneksy');
+    expect(id).toBe('folder:Aneksy');
+    expect(calls.filter((c) => c.method === 'post').map((c) => c.path)).toEqual([
+      '/drives/drive-1/items/inbox-1/children',
+      '/drives/drive-1/items/folder:04_Umowy/children',
+    ]);
+  });
+
+  it('refuses a traversal in the folder path', async () => {
+    const { client, calls } = fakeGraph([]);
+    await expect(
+      new SharePointService(client, bound, noRetry).ensureInboxFolder(inboxOf, '../escape'),
+    ).rejects.toBeInstanceOf(ValidationError);
+    expect(calls).toEqual([]);
+  });
+});
+
+const ITEM_ETAG = '"{AAAA0000-0000-4000-8000-000000000001},3"';
+const listedItem = { id: 'item-1', eTag: ITEM_ETAG };
+const CHECK_PATH = '/drives/drive-1/items/item-1?$select=id,eTag,parentReference';
+/** The item as a re-read finds it: by default still the listed version, at the top of the inbox. */
+const stillListed = (over: Record<string, unknown> = {}) => ({
+  id: 'item-1',
+  eTag: ITEM_ETAG,
+  parentReference: { driveId: 'drive-1', id: 'inbox-1' },
+  ...over,
+});
+const checkAnswer: [RegExp, Handler] = [/^GET \/drives\/drive-1\/items\/item-1\?\$select=/, () => stillListed()];
+
+describe('SharePointService.checkInboxItem', () => {
+  it('re-reads the item by id and accepts it while it is the listed version in the inbox', async () => {
+    const { client, calls } = fakeGraph([checkAnswer]);
+    await expect(
+      new SharePointService(client, bound, noRetry).checkInboxItem(inboxOf, listedItem),
+    ).resolves.toBeUndefined();
+    expect(calls.map((c) => c.path)).toEqual([CHECK_PATH]);
+  });
+
+  it.each([
+    ['moved to another folder', stillListed({ parentReference: { driveId: 'drive-1', id: 'owners-only' } })],
+    ['in another drive', stillListed({ parentReference: { driveId: 'drive-2', id: 'inbox-1' } })],
+    ['renamed or replaced (another eTag)', stillListed({ eTag: '"{AAAA0000-0000-4000-8000-000000000001},4"' })],
+    ['another item', stillListed({ id: 'item-2' })],
+    ['nothing', undefined],
+  ])('reports an item %s as changed', async (_label, answer) => {
+    const { client } = fakeGraph([[/^GET /, () => answer]]);
+    await expect(
+      new SharePointService(client, bound, noRetry).checkInboxItem(inboxOf, listedItem),
+    ).rejects.toBeInstanceOf(InboxItemChangedError);
+  });
+
+  it('reports a listed item without an eTag as changed: there is nothing to hold it to', async () => {
+    const { client } = fakeGraph([checkAnswer]);
+    await expect(
+      new SharePointService(client, bound, noRetry).checkInboxItem(inboxOf, { id: 'item-1', eTag: '' }),
+    ).rejects.toBeInstanceOf(InboxItemChangedError);
+  });
+
+  it.each([
+    [404, InboxItemChangedError],
+    [403, SharePointTargetError],
+    [400, SharePointError],
+  ])('maps a %i on the re-read', async (status, type) => {
+    const { client } = fakeGraph([[/^GET /, () => { throw graphError(status); }]]);
+    const err = await new SharePointService(client, bound, noRetry)
+      .checkInboxItem(inboxOf, listedItem)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(type);
+  });
+});
+
+describe('SharePointService.moveWithinInbox', () => {
+  const moved = (name: string, parent = { driveId: 'drive-1', id: 'target-1' }) => ({
+    id: 'item-1',
+    name,
+    parentReference: parent,
+  });
+
+  it('re-checks the item, then moves it by id with PATCH, If-Match, conflictBehavior=fail, the target parent and the name', async () => {
+    const { client, calls } = fakeGraph([
+      checkAnswer,
+      [/^PATCH \/drives\/drive-1\/items\/item-1$/, (c) => moved((c.body as { name: string }).name)],
+    ]);
+    const result = await new SharePointService(client, bound, noRetry).moveWithinInbox(
+      inboxOf,
+      listedItem,
+      'faktura.pdf',
+      'target-1',
+    );
+    expect(result).toEqual({ id: 'item-1', nameSuffix: 0 });
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      `get ${CHECK_PATH}`,
+      'patch /drives/drive-1/items/item-1',
+    ]);
+    const patch = calls[1];
+    expect(patch?.headers).toEqual({ 'If-Match': ITEM_ETAG });
+    expect(patch?.query).toEqual({ '@microsoft.graph.conflictBehavior': 'fail' });
+    expect(patch?.body).toEqual({ parentReference: { id: 'target-1' }, name: 'faktura.pdf' });
+  });
+
+  it('never sends the PATCH for an item that left the inbox since it was listed', async () => {
+    const { client, calls } = fakeGraph([
+      [/^GET /, () => stillListed({ parentReference: { driveId: 'drive-1', id: 'owners-only' } })],
+      [/^PATCH /, (c) => moved((c.body as { name: string }).name)],
+    ]);
+    await expect(
+      new SharePointService(client, bound, noRetry).moveWithinInbox(inboxOf, listedItem, 'f.pdf', 'target-1'),
+    ).rejects.toBeInstanceOf(InboxItemChangedError);
+    expect(calls.filter((c) => c.method === 'patch')).toEqual([]);
+  });
+
+  it('reads a 412 on the PATCH as "changed since listed", not as a failed move', async () => {
+    const { client } = fakeGraph([checkAnswer, [/^PATCH /, () => { throw graphError(412); }]]);
+    await expect(
+      new SharePointService(client, bound, noRetry).moveWithinInbox(inboxOf, listedItem, 'f.pdf', 'target-1'),
+    ).rejects.toBeInstanceOf(InboxItemChangedError);
+  });
+
+  it('takes the next free _n name on a 409, with the same If-Match, and gives up after ten', async () => {
+    let patches = 0;
+    const { client, calls } = fakeGraph([
+      checkAnswer,
+      [/^PATCH /, (c) => {
+        patches += 1;
+        if (patches <= 2) throw graphError(409);
+        return moved((c.body as { name: string }).name);
+      }],
+    ]);
+    const svc = new SharePointService(client, bound, noRetry);
+    await expect(svc.moveWithinInbox(inboxOf, listedItem, 'faktura.pdf', 'target-1')).resolves.toEqual({
+      id: 'item-1',
+      nameSuffix: 2,
+    });
+    const patchCalls = calls.filter((c) => c.method === 'patch');
+    expect(patchCalls.map((c) => (c.body as { name: string }).name)).toEqual([
+      'faktura.pdf',
+      'faktura_1.pdf',
+      'faktura_2.pdf',
+    ]);
+    expect(patchCalls.every((c) => c.headers['If-Match'] === ITEM_ETAG)).toBe(true);
+
+    const { client: full } = fakeGraph([checkAnswer, [/^PATCH /, () => { throw graphError(409); }]]);
+    await expect(
+      new SharePointService(full, bound, noRetry).moveWithinInbox(inboxOf, listedItem, 'faktura.pdf', 'target-1'),
+    ).rejects.toMatchObject({ httpStatus: 409 });
+  });
+
+  it('sanitises the name it sends', async () => {
+    const { client, calls } = fakeGraph([checkAnswer, [/^PATCH /, (c) => moved((c.body as { name: string }).name)]]);
+    await new SharePointService(client, bound, noRetry).moveWithinInbox(inboxOf, listedItem, 'a:b*c.pdf', 'target-1');
+    expect((calls.find((c) => c.method === 'patch')?.body as { name: string }).name).toBe('a_b_c.pdf');
+  });
+
+  it.each([
+    ['another drive', moved('f.pdf', { driveId: 'drive-2', id: 'target-1' })],
+    ['another folder', moved('f.pdf', { driveId: 'drive-1', id: 'elsewhere' })],
+    ['another item', { ...moved('f.pdf'), id: 'item-2' }],
+    ['no parent reference', { id: 'item-1', name: 'f.pdf' }],
+    ['nothing', undefined],
+  ])('refuses a move that comes back in %s', async (_label, answer) => {
+    const { client } = fakeGraph([checkAnswer, [/^PATCH /, () => answer]]);
+    await expect(
+      new SharePointService(client, bound, noRetry).moveWithinInbox(inboxOf, listedItem, 'f.pdf', 'target-1'),
+    ).rejects.toMatchObject({ kind: 'drive_mismatch' });
+  });
+
+  it.each([
+    [403, SharePointTargetError],
+    [400, SharePointError],
+  ])('maps a %i on the move', async (status, type) => {
+    const { client } = fakeGraph([checkAnswer, [/^PATCH /, () => { throw graphError(status); }]]);
+    const err = await new SharePointService(client, bound, noRetry)
+      .moveWithinInbox(inboxOf, listedItem, 'f.pdf', 'target-1')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(type);
+  });
+});
+
+// A sweep tick must end inside the timer's 5-minute limit. The SDK's
+// RetryHandler sleeps through Retry-After (up to 180 s, three times), so it is
+// off for every inbox call, and our own bounded retry takes throttling.
+describe('channel-inbox Graph calls: SDK retries off, bounded retry of our own', () => {
+  const sdkRetriesOff = (c: Call) =>
+    c.middleware.length === 1 &&
+    c.middleware[0] instanceof RetryHandlerOptions &&
+    (c.middleware[0] as RetryHandlerOptions).maxRetries === 0;
+
+  it('switches the SDK retries off on every inbox request', async () => {
+    const { client, calls } = fakeGraph([
+      ...siteAndDriveOnly,
+      [new RegExp(`^GET ${CHANNEL_PATH}$`), () => channelFolder],
+      [/^GET \/drives\/drive-1\/items\/inbox-1\/children\?/, () => ({ value: [] })],
+      checkAnswer,
+      [/^GET \/drives\/drive-1\/items\/item-1\/content$/, () => Buffer.from('%PDF')],
+      [/^POST \/drives\/drive-1\/items\/[^/]+\/children$/, () => ({})],
+      [/^GET \/drives\/drive-1\/items\/[^/]+:\/.+$/, (c) => ({ id: `folder:${c.path.split(':/')[1]}` })],
+      [/^PATCH /, () => ({ id: 'item-1', parentReference: { driveId: 'drive-1', id: 'folder:09' } })],
+    ]);
+    const svc = new SharePointService(client, bound, noRetry);
+    const inbox = await svc.resolveInbox();
+    await svc.listInboxChildren(inbox);
+    await svc.checkInboxItem(inbox, listedItem);
+    await svc.downloadInboxItem(inbox, 'item-1', 100);
+    const folder = await svc.ensureInboxFolder(inbox, '98_Nieposortowane/2026/09');
+    await svc.moveWithinInbox(inbox, listedItem, 'f.pdf', folder);
+
+    // The site and drive lookups are the upload path's, cached per target.
+    const inboxCalls = calls.slice(2);
+    expect(inboxCalls.length).toBeGreaterThan(8);
+    expect(inboxCalls.filter((c) => !sdkRetriesOff(c)).map((c) => `${c.method} ${c.path}`)).toEqual([]);
+  });
+
+  it('keeps the SDK retries of the upload path as they were', async () => {
+    const { client, calls } = fakeGraph([
+      ...siteAndDrive,
+      [/^PUT /, () => ({ id: 'item-1', name: 'faktura.pdf', webUrl: 'u' })],
+    ]);
+    await new SharePointService(client, target, noRetry).uploadDocument(doc);
+    const folderCalls = calls.filter((c) => c.path.includes('/items/'));
+    expect(folderCalls.length).toBeGreaterThan(0);
+    expect(folderCalls.every((c) => c.middleware.length === 0)).toBe(true);
+  });
+
+  it.each([429, 503, 504])('retries a %i itself on an inbox call, a bounded number of times', async (status) => {
+    let lists = 0;
+    const { client } = fakeGraph([
+      [/children/, () => {
+        lists += 1;
+        if (lists === 1) throw graphError(status);
+        return { value: [] };
+      }],
+    ]);
+    const svc = new SharePointService(client, bound, { retry: { retries: 2, minTimeoutMs: 0 } });
+    await expect(svc.listInboxChildren(inboxOf)).resolves.toEqual([]);
+    expect(lists).toBe(2);
+
+    const { client: always, calls } = fakeGraph([[/children/, () => { throw graphError(status); }]]);
+    const svc2 = new SharePointService(always, bound, { retry: { retries: 2, minTimeoutMs: 0 } });
+    await expect(svc2.listInboxChildren(inboxOf)).rejects.toBeInstanceOf(SharePointError);
+    expect(calls).toHaveLength(3);
+  });
+});
+
+describe('withoutSdkRetries', () => {
+  it('sets a RetryHandlerOptions with no retries on the request', () => {
+    const seen: unknown[] = [];
+    const request = {
+      middlewareOptions(options: RetryHandlerOptions[]) {
+        seen.push(...options);
+        return request;
+      },
+    };
+    expect(withoutSdkRetries(request)).toBe(request);
+    expect((seen[0] as RetryHandlerOptions).maxRetries).toBe(0);
   });
 });
 

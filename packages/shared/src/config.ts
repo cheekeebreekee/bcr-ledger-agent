@@ -77,6 +77,9 @@ const toCanonicalSitePaths =
 
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** A UTC time, to the minute or finer, ending in `Z`: no offset to misread. */
+const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z$/;
+
 /** Optional string: missing, empty or whitespace-only all give the default. */
 const optionalStr = (defaultValue = '') =>
   z
@@ -101,6 +104,18 @@ const numeric = (defaultValue: number) =>
       }
       return n;
     });
+
+/**
+ * A whole number of at least `min`, from an env var, with a default.
+ * Empty/undefined → default. A fraction, a negative or a non-number fails
+ * at cold start: a budget or an age that parses to something else would
+ * silently change what the sweep does.
+ */
+const wholeNumber = (defaultValue: number, min: number) =>
+  numeric(defaultValue).refine(
+    (n) => Number.isInteger(n) && n >= min,
+    `must be a whole number of at least ${min}`,
+  );
 
 const logLevel = z
   .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace'])
@@ -251,6 +266,66 @@ export const ingestionConfigSchema = z.object({
         .optional(),
     )
     .transform((v) => v ?? 'enforce'),
+  // --- Channel-inbox intake (the client's Team → "Dokumenty księgowe") ---
+  /**
+   * What the inbox sweep timer does. `off` (the default, also when empty):
+   * returns at once. `shadow`: reads the inboxes, checks each uploader and
+   * classifies, then only logs what it would move; it creates no folder and
+   * moves nothing. `enforce`: moves each client upload into its taxonomy
+   * folder inside the same channel folder. Anything else fails at cold start,
+   * so a typo can never switch writes on.
+   */
+  inboxSweepMode: z
+    .preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z
+        .enum(['off', 'shadow', 'enforce'], {
+          errorMap: () => ({ message: "must be 'off', 'shadow' or 'enforce'" }),
+        })
+        .optional(),
+    )
+    .transform((v) => v ?? 'off'),
+  /**
+   * How long a file must be unmodified before the sweep touches it (ms).
+   * Younger files may still be uploading or being edited. Default 2 min.
+   */
+  inboxMinAgeMs: wholeNumber(2 * 60 * 1000, 0),
+  /** Most files taken into processing per sweep tick, across all clients. Default 20. */
+  inboxMaxFilesPerTick: wholeNumber(20, 1),
+  /**
+   * Which bound rows the sweep may touch, as Client Directory list item ids
+   * (the `listItemId` in the logs), comma-separated. Empty (the default):
+   * every row the Directory routes to. Set: only those of them, so a first
+   * `shadow`/`enforce` can be limited to a canary Team's row before a real
+   * client's channel is swept. It only ever narrows: a listed row that is not
+   * bound or is excluded is still not swept. A value that is not a list of
+   * whole numbers fails at cold start.
+   */
+  inboxSweepRows: csvList([]).refine(
+    (ids) => ids.every((id) => /^[1-9][0-9]*$/.test(id)),
+    'must be Client Directory list item ids (whole numbers), comma-separated',
+  ),
+  /**
+   * Files the sweep leaves where they are because they were created at or
+   * before this time: an ISO 8601 UTC time such as `2026-10-01T00:00:00Z`.
+   * Empty (the default): no cutoff. For a channel whose older attachments
+   * the owner decided to leave in place when the sweep was turned on.
+   */
+  inboxCreatedAfter: z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      if (v === undefined || v.trim() === '') return undefined;
+      const ms = ISO_UTC.test(v.trim()) ? Date.parse(v.trim()) : NaN;
+      if (!Number.isFinite(ms)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'must be an ISO 8601 UTC time, e.g. 2026-10-01T00:00:00Z',
+        });
+        return z.NEVER;
+      }
+      return ms;
+    }),
   // --- Claude (Anthropic) content classification ---
   anthropicEnabled: boolish(false),
   anthropicApiKey: optionalStr(),
@@ -267,6 +342,9 @@ export type IngestionConfig = z.infer<typeof ingestionConfigSchema>;
 
 /** `MEMBERSHIP_CHECK_MODE`: see {@link ingestionConfigSchema}. */
 export type MembershipCheckMode = IngestionConfig['membershipCheckMode'];
+
+/** `INBOX_SWEEP_MODE`: see {@link ingestionConfigSchema}. */
+export type InboxSweepMode = IngestionConfig['inboxSweepMode'];
 
 // ---------------------------------------------------------------------------
 // Loader

@@ -247,7 +247,25 @@ describe('buildHelpCard', () => {
     expect(text).toContain('kanał „Dokumenty księgowe” → karta „Udostępnione”');
   });
 
-  it('asks for documents in the private chat', () => {
-    expect(text).toContain('prywatnym czacie');
+  // Teams lets a guest attach files to channel posts only, so clients are
+  // sent to their channel first; the chat is for whoever can attach.
+  it('sends clients to their Team’s Dokumenty księgowe channel: a post with an attachment, or Udostępnione', () => {
+    const blocks = (buildHelpCard() as Card).body.map((b) => b.text ?? '');
+    const first = blocks[1] ?? '';
+    expect(first).toContain('w kanale „Dokumenty księgowe”');
+    expect(first).toContain('załącznik do wpisu w kanale');
+    expect(first).toContain('na karcie „Udostępnione”');
+    expect(first).toContain('w tym samym kanale');
+  });
+
+  it('says guests cannot attach files in this chat, and keeps the chat for whoever can', () => {
+    expect(text).toContain('Goście (konta spoza BCR) nie mogą dołączać plików w tym czacie');
+    expect(text).toContain('Jeśli możesz dołączyć plik tutaj, wyślij go w tym prywatnym czacie');
+  });
+
+  it('inserts nothing: every block is fixed text with no markdown link', () => {
+    const blocks = (buildHelpCard() as Card).body.map((b) => b.text ?? '');
+    const offenders = blocks.filter((t) => /\]\(|<|\{/.test(t));
+    expect(offenders).toEqual([]);
   });
 });

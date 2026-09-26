@@ -539,6 +539,11 @@ for the design.
 | `QUARANTINE_ROOT_FOLDER` | *(optional)* Default `Kwarantanna`. |
 | `FORBIDDEN_TARGET_SITE_PATHS` | **Required.** Comma-separated site paths no Directory row may route to: at least the site that holds the Client Directory, e.g. `/sites/BCRGROUP`. Each entry exactly `/sites/<name>` or `/teams/<name>`; a URL or a sub-site fails at cold start. The quarantine path is added automatically. |
 | `MEMBERSHIP_CHECK_MODE` | *(optional)* `enforce` (the default, also when empty) or `off`. In `enforce`, a bound uploader routes only while their Teams, read from Entra at upload time, are exactly their row's `TeamId` (`membership_mismatch` / `membership_unverified` otherwise). Needs Graph `Directory.Read.All` on the ingestion managed identity (§5). `off` is an emergency escape only: it reopens R46, warns at every cold start and shows in `/api/health`. Any other value fails at cold start. |
+| `INBOX_SWEEP_MODE` | *(optional)* `off` (the default, also when empty), `shadow` or `enforce`. The channel-inbox timer ([`ARCHITECTURE.md` §4.4](../ARCHITECTURE.md#44-channel-inbox-intake-clients)): `off` returns at once; `shadow` lists each bound client's channel folder, checks uploaders and classifies, and only logs what it would move; `enforce` moves client uploads into their taxonomy folders inside the same channel folder. Shows in `/api/health` as `build.inboxSweep`. Any other value fails at cold start. Turn on as in `docs/operations/human-steps.md` H-12, the channel-inbox step after step 8. |
+| `INBOX_MIN_AGE_MS` | *(optional)* Default `120000` (2 minutes). A file changed more recently is left for a later tick. A whole number ≥ 0. |
+| `INBOX_MAX_FILES_PER_TICK` | *(optional)* Default `20`. Most files the sweep processes per tick, across all clients. A whole number ≥ 1. |
+| `INBOX_SWEEP_ROWS` | *(optional)* Empty (the default): the sweep takes every bound row the Directory routes to. Otherwise comma-separated Client Directory **list item ids** (the `listItemId` in the logs, not the `ClientId`), and only those rows are swept: how the first `shadow` and `enforce` are limited to a canary Team's row before a real client's channel ([human-steps H-12](operations/human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries), the channel-inbox step). It only narrows: a listed row the Directory does not route to is still not swept. While it is set, a newly bound client is **not** swept until its id is added. Shows in `/api/health` as `build.inboxSweepRows` (`all` or `listed`). Anything but whole numbers fails at cold start. |
+| `INBOX_CREATED_AFTER` | *(optional)* Empty (the default): no cutoff. Otherwise a UTC time such as `2026-10-01T00:00:00Z`: files created at or before it stay where they are, counted as `skippedBeforeCutoff`. For a channel whose earlier post attachments the owner decided to leave in place when the sweep went on. Only a time ending in `Z` is accepted. |
 
 The `FALLBACK_*` settings were removed in Phase 0. The fallback bucket they described (the BCR
 GROUP library root, readable by the whole team) is replaced by the quarantine.
@@ -689,6 +694,9 @@ union requests, exceptions, traces
 | `QUARANTINE_DRIVE_NAME` / `_ROOT_FOLDER` | *(optional)* `Dokumenty` on Polish tenants / `Kwarantanna` | Ingestion Function App setting |
 | `FORBIDDEN_TARGET_SITE_PATHS` | BCR GROUP site path | Ingestion Function App setting |
 | `MEMBERSHIP_CHECK_MODE` | *(optional)* `enforce` (default); `off` only in an emergency | Ingestion Function App setting |
+| `INBOX_SWEEP_MODE` | *(optional)* `off` (default), `shadow`, `enforce` | Ingestion Function App setting |
+| `INBOX_MIN_AGE_MS` / `INBOX_MAX_FILES_PER_TICK` | *(optional)* `120000` / `20` | Ingestion Function App setting |
+| `INBOX_SWEEP_ROWS` / `INBOX_CREATED_AFTER` | *(optional)* empty (every routed row) / empty (no cutoff) | Ingestion Function App setting |
 | `BOT_GATE_MODE` | `enforce` (or `log` for the first 24 h) | Bot Function App setting |
 | `ANTHROPIC_ENABLED` | feature flag | Ingestion Function App setting |
 | `ANTHROPIC_API_KEY` | Anthropic Console | **Key Vault** secret `anthropic-api-key` |

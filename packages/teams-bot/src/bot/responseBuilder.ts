@@ -17,6 +17,13 @@ import { QUARANTINED_TEXT, escapeMarkdown, rejectionText } from './cardText';
 const ADAPTIVE_CARD_VERSION = '1.5';
 const SCHEMA = 'http://adaptivecards.io/schemas/adaptive-card.json';
 
+/**
+ * The help card. Clients are Teams guests, and Teams lets a guest attach a
+ * file only to a channel post, never in a chat: so the card sends clients to
+ * their Team's „Dokumenty księgowe” channel (the channel inbox), and keeps
+ * the chat for whoever can attach here. Every string is fixed; nothing is
+ * inserted.
+ */
 export function buildHelpCard(): unknown {
   return {
     type: 'AdaptiveCard',
@@ -32,9 +39,20 @@ export function buildHelpCard(): unknown {
       {
         type: 'TextBlock',
         text:
-          'Wyślij mi dokument w załączniku (PDF, JPG, PNG lub tekst) w tym prywatnym czacie — ' +
-          'przeanalizuję jego treść i umieszczę go w odpowiednim folderze Twojej firmy.',
+          'Dokumenty (PDF, JPG, PNG lub tekst) dodawaj w swoim zespole w Teams, w kanale ' +
+          '„Dokumenty księgowe”: jako załącznik do wpisu w kanale albo na karcie ' +
+          '„Udostępnione”. Przeanalizuję treść każdego pliku i przeniosę go do odpowiedniego ' +
+          'folderu w tym samym kanale.',
         wrap: true,
+      },
+      {
+        type: 'TextBlock',
+        text:
+          'Goście (konta spoza BCR) nie mogą dołączać plików w tym czacie — to ograniczenie ' +
+          'Microsoft Teams. Jeśli możesz dołączyć plik tutaj, wyślij go w tym prywatnym czacie, ' +
+          'a odpowiem kartą z kategorią i folderem docelowym każdego pliku.',
+        wrap: true,
+        spacing: 'Medium',
       },
       {
         type: 'TextBlock',
@@ -50,8 +68,7 @@ export function buildHelpCard(): unknown {
         type: 'TextBlock',
         text:
           'Dokumenty, których nie da się jednoznacznie sklasyfikować, trafiają do folderu ' +
-          '„Nieposortowane” w Twoim zespole i są sprawdzane przez księgowego. ' +
-          'W odpowiedzi otrzymasz kartę z kategorią i folderem docelowym każdego pliku.',
+          '„Nieposortowane” w Twoim zespole i są sprawdzane przez księgowego.',
         wrap: true,
         isSubtle: true,
         spacing: 'Medium',

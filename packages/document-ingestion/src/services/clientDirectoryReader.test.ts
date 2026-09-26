@@ -1,6 +1,7 @@
 import type { Client } from '@microsoft/microsoft-graph-client';
 import type { ClientDirectoryEntry } from '@bcr/shared';
 import {
+  boundClientRows,
   buildSnapshot,
   ClientDirectoryReader,
   normalizeAadId,
@@ -592,6 +593,37 @@ const activeRow = (id: string, fields: Record<string, unknown>) => ({
     TeamId: `team-${id}`,
     ...fields,
   },
+});
+
+describe('boundClientRows (the rows the channel inbox sweeps)', () => {
+  it('keeps active, bound, routed client rows, with or without user ids, in list item order', () => {
+    const { snapshot } = build([
+      row({ listItemId: '10', userAadObjectIds: [OID_1] }),
+      row({ listItemId: '9' }),
+      row({ listItemId: '100' }),
+    ]);
+    expect(boundClientRows(snapshot).map((r) => r.listItemId)).toEqual(['9', '10', '100']);
+  });
+
+  it('drops admin, inactive, unbound, forbidden and conflicting rows', () => {
+    const { snapshot } = build([
+      row({ listItemId: '1' }),
+      row({ listItemId: '2', isAdmin: true }),
+      row({ listItemId: '3', active: false }),
+      withoutTeamId(row({ listItemId: '4' })),
+      onPath(row({ listItemId: '5' }), '/sites/BCRGROUP'),
+      onPath(row({ listItemId: '6' }), '/sites/Kwarantanna'),
+      row({ listItemId: '7', target: { ...row({ listItemId: '7' }).target, siteHostname: 'evil.sharepoint.com' } }),
+      onPath(row({ listItemId: '8' }), '/sites/Shared'),
+      onPath(row({ listItemId: '9' }), '/sites/Shared'),
+    ]);
+    expect(boundClientRows(snapshot).map((r) => r.listItemId)).toEqual(['1']);
+  });
+
+  it('has no rows on an unavailable snapshot', () => {
+    const { snapshot } = build([row({ listItemId: '1' })]);
+    expect(boundClientRows({ ...snapshot, health: 'unavailable' })).toEqual([]);
+  });
 });
 
 function readerOptions(overrides: Partial<ClientDirectoryReaderOptions> = {}): ClientDirectoryReaderOptions {

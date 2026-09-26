@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Client } from '@microsoft/microsoft-graph-client';
+import type { Client, RetryHandlerOptions } from '@microsoft/microsoft-graph-client';
 import type { Logger } from '@bcr/shared';
 import {
   CLIENT_TEAM_MARKER,
@@ -281,6 +281,59 @@ describe('TeamMembershipReader.teamsOf', () => {
       await reader.teamsOf(oid(3));
       expect(g.calls()).toBe(7);
     });
+  });
+});
+
+// The channel-inbox sweep has its own reader: a tick must end inside the
+// timer's limit, so the SDK may not sleep through Retry-After. The upload
+// path's reader keeps the SDK's retries.
+describe('TeamMembershipReader with sdkRetries: false', () => {
+  function recordingGraph(answers: (() => unknown)[]) {
+    const middleware: unknown[][] = [];
+    const api = () => {
+      const seen: unknown[] = [];
+      const request = {
+        middlewareOptions(options: unknown[]) {
+          seen.push(...options);
+          return request;
+        },
+        get: async () => {
+          middleware.push(seen);
+          const next = answers.shift();
+          return next ? next() : { value: [team(TEAM_A)] };
+        },
+      };
+      return request;
+    };
+    return { client: { api } as unknown as Client, middleware };
+  }
+
+  it.each([429, 503, 504])('switches the SDK retries off and retries a %i itself', async (status) => {
+    const { client, middleware } = recordingGraph([
+      () => {
+        throw graphError(status);
+      },
+    ]);
+    const reader = new TeamMembershipReader(client, {
+      sdkRetries: false,
+      retry: { retries: 1, minTimeoutMs: 0 },
+    });
+    await expect(reader.teamsOf(OID)).resolves.toEqual(new Set([TEAM_A]));
+    expect(middleware).toHaveLength(2);
+    for (const options of middleware) {
+      expect((options[0] as RetryHandlerOptions).maxRetries).toBe(0);
+    }
+  });
+
+  it('by default leaves a 503 to the SDK, as the upload path always has', async () => {
+    const { client, middleware } = recordingGraph([
+      () => {
+        throw graphError(503);
+      },
+    ]);
+    const reader = new TeamMembershipReader(client, { retry: { retries: 1, minTimeoutMs: 0 } });
+    await expect(reader.teamsOf(OID)).rejects.toMatchObject({ status: 503 });
+    expect(middleware).toEqual([[]]);
   });
 });
 

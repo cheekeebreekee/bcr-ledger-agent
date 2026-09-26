@@ -4,13 +4,25 @@ const mockHttp = jest.fn();
 jest.mock('@azure/functions', () => ({ app: { http: mockHttp } }));
 
 let mockMode: 'enforce' | 'off' = 'enforce';
+let mockInbox: 'off' | 'shadow' | 'enforce' = 'off';
+let mockRows: string[] = [];
 jest.mock('../config', () => ({
-  loadIngestionConfig: () => ({ membershipCheckMode: mockMode }),
+  loadIngestionConfig: () => ({
+    membershipCheckMode: mockMode,
+    inboxSweepMode: mockInbox,
+    inboxSweepRows: mockRows,
+  }),
 }));
 
 import { handleHealth, healthBody } from './health';
 
 describe('health', () => {
+  beforeEach(() => {
+    mockMode = 'enforce';
+    mockInbox = 'off';
+    mockRows = [];
+  });
+
   it('registers GET /api/health anonymously, with handleHealth as the handler', () => {
     expect(mockHttp).toHaveBeenCalledWith(
       'health',
@@ -30,14 +42,44 @@ describe('health', () => {
       const res = await handleHealth();
       expect(res.status).toBe(200);
       const body = res.jsonBody as ReturnType<typeof healthBody>;
-      expect(body.build).toEqual({ phase: 'p0', routing: 'identity-only', membershipCheck: m });
+      expect(body.build).toEqual({
+        phase: 'p0',
+        routing: 'identity-only',
+        membershipCheck: m,
+        inboxSweep: 'off',
+        inboxSweepRows: 'all',
+      });
       expect(body.status).toBe('ok');
       expect(body.service).toBe('document-ingestion');
     },
   );
 
+  it.each(['off', 'shadow', 'enforce'] as const)(
+    'reports inboxSweep=%s without touching phase or routing',
+    async (m) => {
+      mockInbox = m;
+      const body = (await handleHealth()).jsonBody as ReturnType<typeof healthBody>;
+      expect(body.build).toEqual({
+        phase: 'p0',
+        routing: 'identity-only',
+        membershipCheck: 'enforce',
+        inboxSweep: m,
+        inboxSweepRows: 'all',
+      });
+    },
+  );
+
+  it('says the sweep is limited to listed rows, without naming them', async () => {
+    mockInbox = 'shadow';
+    mockRows = ['7', '12'];
+    const body = (await handleHealth()).jsonBody as ReturnType<typeof healthBody>;
+    expect(body.build.inboxSweepRows).toBe('listed');
+    expect(JSON.stringify(body)).not.toMatch(/"7"|"12"/);
+  });
+
   it('stamps the time it was asked', () => {
     const now = new Date('2026-09-26T10:00:00.000Z');
-    expect(healthBody('enforce', now).timestamp).toBe('2026-09-26T10:00:00.000Z');
+    const build = { membershipCheck: 'enforce', inboxSweep: 'off', inboxSweepRows: 'all' } as const;
+    expect(healthBody(build, now).timestamp).toBe('2026-09-26T10:00:00.000Z');
   });
 });

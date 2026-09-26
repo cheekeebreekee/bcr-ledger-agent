@@ -14,6 +14,12 @@ describe('buildMyDocsResponse (static "Moje dokumenty" page)', () => {
     );
   });
 
+  // Guests cannot attach files in a chat with the bot; the channel is the inbox.
+  it('sends new documents to the channel, not the private chat', () => {
+    expect(body).toContain('Nowe dokumenty dodawaj w tym samym kanale');
+    expect(body).not.toContain('prywatnym czacie');
+  });
+
   it('is the same bytes on every call — nothing is looked up or reflected', () => {
     expect(buildMyDocsResponse().body).toBe(body);
     expect(body).not.toMatch(/\$\{|userObjectId|sharepoint\.com|clientId/i);
