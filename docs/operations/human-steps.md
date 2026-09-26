@@ -2347,7 +2347,9 @@ LIST_ID=$(jq -r .parameters.clientDirectoryListId.value infrastructure/main.dev.
 
 Tools: `az` (signed in, Owner or Contributor on `$RG`), `jq`, Node 22 with `corepack`, and
 `psql` from libpq 16 or later (`brew install libpq`), which can verify the server's certificate
-against the system's CAs (`sslrootcert=system`).
+against the system's CAs (`sslrootcert=system`). Homebrew's `libpq` is keg-only: it puts no
+`psql` on your `PATH`, so step 3 adds it (`export PATH="$(brew --prefix libpq)/bin:$PATH"`)
+in every new shell.
 
 1. **Evaluate, before anything is deployed.** The classifier's prompt and output schema changed
    (the `invoice` block), so this is a classification change too. Run the evaluation exactly as
@@ -2387,8 +2389,8 @@ against the system's CAs (`sslrootcert=system`).
      sku:sku.name, entra:authConfig.activeDirectoryAuth, password:authConfig.passwordAuth,
      public:network.publicNetworkAccess, days:backup.backupRetentionDays,
      geo:backup.geoRedundantBackup}" -o json
-   az postgres flexible-server firewall-rule list -g $RG -n $DB_SERVER -o table
-   az postgres flexible-server ad-admin list -g $RG -s $DB_SERVER -o table
+   az postgres flexible-server firewall-rule list -g $RG -s $DB_SERVER -o table
+   az postgres flexible-server microsoft-entra-admin list -g $RG -s $DB_SERVER -o table
    ```
 
    `Ready`, `16`, `Standard_B1ms`, `Enabled`, `Disabled`, `Enabled`, `7`, `Enabled`; exactly one
@@ -2409,11 +2411,17 @@ against the system's CAs (`sslrootcert=system`).
    MY_IP=$(curl -s https://api.ipify.org)
    [[ $MY_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || echo "STOP: MY_IP is not an IPv4 address"
    OP_RULE="operator-$(date -u +%Y%m%d)"
-   az postgres flexible-server firewall-rule create -g $RG -n $DB_SERVER --rule-name $OP_RULE \
+   # -s is the server, -n the rule.
+   az postgres flexible-server firewall-rule create -g $RG -s $DB_SERVER -n $OP_RULE \
      --start-ip-address $MY_IP --end-ip-address $MY_IP -o none
+   # Homebrew's libpq is keg-only: its psql is not on PATH until this. Must print 16 or later.
+   export PATH="$(brew --prefix libpq)/bin:$PATH"
+   psql --version
    # psql as the Entra administrator: the password is a token (about an hour), never printed.
+   # pg_token fetches a fresh one; run it again before psql whenever time has passed.
    export PGHOST=$DB_HOST PGUSER=$ADMIN_UPN PGSSLMODE=verify-full PGSSLROOTCERT=system
-   export PGPASSWORD=$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)
+   pg_token() { export PGPASSWORD=$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv); }
+   pg_token
    psql -d postgres -c 'SELECT current_user'
    ```
 
@@ -2452,6 +2460,7 @@ against the system's CAs (`sslrootcert=system`).
    refuses a login that is a superuser, has BYPASSRLS or cannot log in. **Verify** by hand too:
 
    ```bash
+   pg_token
    psql -d ledger -f packages/ledger-db/sql/verify.sql
    ```
 
@@ -2533,9 +2542,13 @@ against the system's CAs (`sslrootcert=system`).
    An `inbox.filed` (or `inbox.sorted_to_review`) and, for the same `driveItemId` and
    `listItemId` `$CANARY_ROW`, an `index.written` with `created` `true` and, for an invoice,
    `invoiceFields` above `0`. No `index.write_failed`. Then the database itself, as the
-   administrator — the only place a scope is set by hand, in a transaction that is rolled back:
+   administrator — the only place a scope is set by hand, in a transaction that is rolled back.
+   Steps 6–8 usually outlast the token (about an hour), so fetch a fresh one first; if your IP
+   changed since step 3, delete the rule (step 10's `firewall-rule delete` line) and run step
+   3's `MY_IP` and `firewall-rule create` lines again:
 
    ```bash
+   pg_token
    CANARY_CLIENT=$(CLIENT_DIRECTORY_LIST_ID=$LIST_ID corepack yarn workspace @bcr/ledger-db migrate client-id "$CANARY_ROW")
    psql -d ledger <<SQL
    BEGIN;
@@ -2563,25 +2576,31 @@ against the system's CAs (`sslrootcert=system`).
 10. **Close your access.**
 
     ```bash
-    az postgres flexible-server firewall-rule delete -g $RG -n $DB_SERVER --rule-name $OP_RULE --yes
-    az postgres flexible-server firewall-rule list -g $RG -n $DB_SERVER -o table
+    az postgres flexible-server firewall-rule delete -g $RG -s $DB_SERVER -n $OP_RULE --yes
+    az postgres flexible-server firewall-rule list -g $RG -s $DB_SERVER -o table
     unset PGPASSWORD LEDGER_DB_ADMIN_USER
     ```
 
     Exactly one rule again: `AllowAllAzureServicesAndResourcesWithinAzureIps`.
 
 **Daily check** (with the [standing checks](#standing-checks)): `verify.sql` must return no rows,
-and no `index.write_failed` should repeat. The first needs your access for a minute:
+and no `index.write_failed` should repeat. The first needs your access for a minute. In a new
+shell, from the repository, after the [variables](#variables-used-below) (`RG`, `APPI`, `aiq`):
 
 ```bash
+ADMIN_UPN=$(az ad signed-in-user show --query userPrincipalName -o tsv)
+DB_SERVER=$(az postgres flexible-server list -g $RG --query "[?starts_with(name,'psql-bcr-dev-')].name | [0]" -o tsv)
+DB_HOST=$(az postgres flexible-server show -g $RG -n $DB_SERVER --query fullyQualifiedDomainName -o tsv)
+[[ $DB_HOST == psql-bcr-dev-*.postgres.database.azure.com ]] || echo "STOP: no index server in $RG"
 index_verify() {
   local rule="operator-$(date -u +%Y%m%dT%H%M)" ip
   ip=$(curl -s https://api.ipify.org)
-  az postgres flexible-server firewall-rule create -g $RG -n $DB_SERVER --rule-name $rule \
+  az postgres flexible-server firewall-rule create -g $RG -s $DB_SERVER -n $rule \
     --start-ip-address $ip --end-ip-address $ip -o none &&
   LEDGER_DB_HOST=$DB_HOST LEDGER_DB_ADMIN_USER=$ADMIN_UPN \
     corepack yarn workspace @bcr/ledger-db migrate verify
-  az postgres flexible-server firewall-rule delete -g $RG -n $DB_SERVER --rule-name $rule --yes
+  az postgres flexible-server firewall-rule delete -g $RG -s $DB_SERVER -n $rule --yes
+  az postgres flexible-server firewall-rule list -g $RG -s $DB_SERVER --query '[].name' -o tsv
 }
 index_verify
 aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
@@ -2590,7 +2609,8 @@ aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
   "$(date -u -v-1d +%Y-%m-%dT%H:%M:%SZ)"
 ```
 
-`verify.sql: no problems`, and the rule is gone afterwards. `index.write_failed` by reason:
+`verify.sql: no problems`, and the last line lists one rule only,
+`AllowAllAzureServicesAndResourcesWithinAzureIps`: yours is gone. `index.write_failed` by reason:
 `unavailable` now and then is the server restarting (maintenance is Saturday 18:00 UTC);
 `constraint` with `sqlState` `23505` is two bound Directory rows sharing a NIP (a Directory
 conflict: fix the Directory); `row_security` (`42501`) or `scope` must never happen — treat it

@@ -714,3 +714,7 @@ The tests use synthetic fixtures only:
 
 They drive the CLIs end to end, and assert that read-only commands issue only
 GET requests and that the token never reaches the output.
+
+`test/runbook-az-postgres.test.mjs` reads the docs instead: every Azure CLI command for the
+index's PostgreSQL server in them must be one the CLI has, with flags it accepts (the table there is copied from each command's `--help`; `firewall-rule` and
+`microsoft-entra-admin` take the server as `-s`, and `-n` is the rule).
