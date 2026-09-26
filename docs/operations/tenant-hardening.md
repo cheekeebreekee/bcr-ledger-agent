@@ -734,11 +734,11 @@ laptops (`.env`) are an accepted risk, recorded in
 | T-1 | Yahor (Global Admin) | 2026-09-26, sign-in blocked on the three `{NIP}@` accounts (0002, 0003, 0004); `accountEnabled=false` verified | audit output kept off-repo (holds NIPs) | Licences not removed yet: convert to shared mailboxes first (T-2) |
 | T-2 | | | | |
 | T-3 | | | | Time made Private, from Purview |
-| T-4 | | | | Folders locked, and the time; whether `98_Nieposortowane` was created first; the check after H-6b, its time, and any folder it locked |
+| T-4 | Yahor | not needed | — | IR-1 (26 Sep) found no ledger-written file left in BCR GROUP, and H-6b stops new ones |
 | T-4b | | | | Per client site: folders locked and the time of the lock; H-3's time; any re-check after H-3; the check after IR-1 of the items outside the locked folders, done or not, and how many it locked (each item and its lock time are in the evidence store). W4 ends, for items already moved, at the latest of these that applies to the item |
 | T-5 | | | | |
-| T-6 | Roman decides | | | Private / deleted |
-| T-7 | Roman decides | | | Explained / sign-in blocked (membership unchanged) |
+| T-6 | Yahor (for Roman) | 2026-09-26 | — | Private, via `tools/ops/phase0-admin.sh bricore` |
+| T-7 | Yahor (for Roman) | 2026-09-26 14:05Z | — | Sign-in blocked: purpose unknown (account created 2026-09-21); membership unchanged |
 | T-8 | | | | TEST invite checked |
 | T-9 | Roman confirms tenant level | | | TEST guest checked |
 | T-10 | | | | Everyone (Phase 0); version 0.2.0 shown; sha256 of the uploaded zip |

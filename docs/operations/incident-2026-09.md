@@ -684,8 +684,8 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 |---|---|---|---|---|
 | H-0: G0, deploy trigger removed | Yahor | done | 2026-09-25 | `f5a2bd4` |
 | Phase-0 contract committed | Yahor | done | 2026-09-25 | `21b0883` |
-| H-1: IR-3 (1), processor notice phase 1 to PESKOVOI | Roman + IOD | todo | | |
-| H-1: IR-3 (2), breach-register entry | IOD | todo | | register entry id |
+| H-1: IR-3 (1), processor notice phase 1 to PESKOVOI | Yahor (CTO) | not sent: decided no notification | 2026-09-26 | Yahor's decision: the July documents were used for testing by BCR staff (Yahor, Roman) only; IR-0/IR-1 show no client-side access path used. Recorded here as the Art. 33(5) documentation; the IOD may review |
+| H-1: IR-3 (2), breach-register entry | Yahor (CTO) | this table is the record | 2026-09-26 | assessed as not notifiable (see H-1 row); no UODO notification |
 | H-2: IR-0 A, trace export | Yahor | done (local; not yet in the store) | 2026-09-26 | 90 days, 2026-06-28 → 09-26: `ir0-appinsights-2026-09-26T13-34-08Z/SHA256SUMS` sha256 `1ac442f02f8478b3…`, 5,103 rows (72 routing). The first 30-day run (`…12-04-00Z`) held no application log and is superseded. Findings: [IR-0 A findings](#ir-0-a-findings-26-september) |
 | H-2: IR-0 B, Purview export (file operations, group events, sign-in events) and audit-log state | Global Admin | not possible: unified audit log was off; turned on 2026-09-26 | 2026-09-26 | no past records exist; recording from 26 Sep |
 | H-2: Entra sign-in log, last 7 days, for the `{NIP}@` accounts and `AuthoriseMe@` | Global Admin | todo | | `SHA256SUMS` |
@@ -706,8 +706,8 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-8b: ingestion identity `Directory.Read.All` (runtime Team check) | Yahor (Global Admin) | done | 2026-09-26 12:34:35Z | app role assignment verified on the ingestion managed identity; H-12 not before 2026-09-27 12:35Z (token cache) |
 | H-9: bot deploy, gate in `log` | Yahor | deployed 12:16:59Z; TEST guest `pomoc` pending | 2026-09-26 | pre-Phase-0 bot `b1c74ec5…29cfa`, ingestion `19e4f769…1dc14a` (saved); deployed zip `56963ff9…a5278` from `b742acc`; `bot runtime initialised` with `botGateMode=log` |
 | H-10: manifest 0.2.0 and availability (T-10) | Teams Admin | todo | | |
-| H-11: gate `enforce` after 24 h clean | Yahor | todo | | |
-| H-12: ingestion deploy, further site grants, bindings, canaries | Yahor, Roman reviews | todo | | apply log hash; sha256 of the saved pre-Phase-0 ingestion package |
+| H-11: gate `enforce` after 24 h clean | Yahor | done early, by Yahor's decision (no real clients use the agent) | 2026-09-26 13:59:20Z | 1 refusal in log mode, a channel `conversationUpdate` (correct); a real guest's personal chat passed |
+| H-12: ingestion deploy, further site grants, bindings, canaries | Yahor | deployed and PESKOVOI bound; canary pending | 2026-09-26 14:00:17Z | zip `038b69ab…` from `9951450`; health `p0/identity-only/membershipCheck=enforce`; old `/api/ingest` and `/api/user-target` 404; Directory columns added; apply log `c92c663d…` (row 0002: staff id removed, guest bound, `Dokumenty księgowe`); no TEST row exists; `ANTHROPIC_ENABLED=true` 14:06:03Z |
 | H-13: ingestion grant on BCR GROUP downgraded to `read` | Global Admin | todo | | any other application `write`/`owner` entry on BCR GROUP (application id and roles), and Roman's decision on it |
 | H-14: `FALLBACK_*` settings removed, pre-Phase-0 packages deleted | Yahor | todo | | |
 | IR-2 relocation complete, allow-lists issued | Roman + second person | todo | | |
