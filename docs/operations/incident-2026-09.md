@@ -658,6 +658,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-6b: running build's fallback re-pointed at the quarantine | Yahor | todo | | `FALLBACK_*` names; values in the evidence store (`SHA256SUMS`); which guest verified it (canary or TEST) |
 | H-7: Directory check; duplicate `0002` resolved; per-row decisions, incl. which sites get a grant in H-12 | Yahor, Roman | todo | | |
 | H-8: app settings added | Yahor | done | 2026-09-26 | shape check clean; `MICROSOFT_APP_TYPE` was already `SingleTenant` (no live change) |
+| H-8b: ingestion identity `Directory.Read.All` (runtime Team check) | Yahor (Global Admin) | done | 2026-09-26 12:34:35Z | app role assignment verified on the ingestion managed identity; H-12 not before 2026-09-27 12:35Z (token cache) |
 | H-9: bot deploy, gate in `log` | Yahor | deployed 12:16:59Z; TEST guest `pomoc` pending | 2026-09-26 | pre-Phase-0 bot `b1c74ec5…29cfa`, ingestion `19e4f769…1dc14a` (saved); deployed zip `56963ff9…a5278` from `b742acc`; `bot runtime initialised` with `botGateMode=log` |
 | H-10: manifest 0.2.0 and availability (T-10) | Teams Admin | todo | | |
 | H-11: gate `enforce` after 24 h clean | Yahor | todo | | |
