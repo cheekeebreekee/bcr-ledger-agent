@@ -17,7 +17,9 @@
 // below, so this template, with main.<env>.parameters.json, must record every
 // setting the apps run with. A setting changed by hand in Azure has to be
 // changed here in the same change, or the next deploy reverts it. What-if
-// cannot show app-setting changes: it reads no app-setting values.
+// cannot show app-setting changes: it reads no app-setting values. Compare
+// with `node tools/check-app-settings.mjs --live -g <rg> -p <params>` instead;
+// CI runs its static half on every push.
 // =============================================================================
 
 targetScope = 'resourceGroup'
@@ -182,8 +184,8 @@ module plan 'modules/appServicePlan.bicep' = {
 // ---- App settings -----------------------------------------------------------
 // Each app's whole set, with the runtime settings in modules/functionApp.bicep:
 // a deploy replaces every app setting, so a setting missing here is deleted.
-// A setting left out gets the code's default. Secrets are Key Vault
-// references, never values.
+// A setting left out gets the code's default (tools/check-app-settings.mjs
+// lists them). Secrets are Key Vault references, never values.
 
 var botAppSettings = {
   MICROSOFT_APP_ID: botAppId

@@ -13,6 +13,7 @@ without `yarn install`.
 | `ir0/export-purview.ps1` | IR-0: exports the Purview unified audit log (file reads, writes, moves, copies and deletions; group and sharing events; sign-ins of named accounts) | Never |
 | `../infrastructure/ir/evidence-store.sh` | An immutable blob container for the IR-0 and IR-1 evidence, with reader RBAC | Only with `--apply` |
 | `../infrastructure/quarantine/New-QuarantineSite.ps1` | The staff-only quarantine site (P0-2). See [its README](../infrastructure/quarantine/README.md) | Only with `-Apply` |
+| `check-app-settings.mjs` | The Function Apps' app settings: the code vs Bicep (CI), and with `--live` Bicep vs the running apps | Never (Azure reads only) |
 
 ## Safety model (every tool)
 
@@ -640,6 +641,43 @@ still holds write access.
 
 Uploads carry their sha256 as metadata. A blob that already exists with another
 hash stops the run: evidence is never overwritten.
+
+## `check-app-settings.mjs`
+
+A Bicep deploy **replaces** every app setting of a Function App, and what-if
+cannot show it: it reads no app-setting values and reports no change whatever
+they hold. That is how dev's hand-set Phase-0 settings came to be one deploy
+away from deletion (gate G1). This check has two halves.
+
+```bash
+corepack yarn check:app-settings        # static; CI runs it on every push
+node tools/check-app-settings.mjs --live -g rg-bcr-ledger-dev \
+  -p infrastructure/main.dev.parameters.json   # read-only, needs az login
+```
+
+**Static** (offline). For each Function App, every setting its code reads (its
+config `envMap`, and any direct `process.env.X` in its sources or
+`@bcr/shared`'s) must be set by Bicep for that app. Missing is an error, or a
+warning when the zod schema defaults it: the warnings list what is left to the
+code's default. Every setting Bicep sets must be read by that app's code or be
+a platform setting (`FUNCTIONS_*`, `AzureWebJobsStorage`, …); a stale one is
+an error. A secret-named setting must be a Key Vault reference, and
+`WEBSITE_RUN_FROM_PACKAGE` must not be in Bicep at all (the zip deploy owns
+it). A file or Bicep variable the check cannot find fails it.
+
+**Live** (`--live`). Compares what a deploy with that parameters file would
+write with the running apps: a setting running but not in Bicep (a deploy would
+delete it), in Bicep but not running (would add it), a value that differs (would
+change it), and Key Vault references (a reference, to the same secret). Values
+are read only for settings whose Bicep value follows from the parameters file
+or a literal, which are not secrets. The storage and App Insights connection
+strings, the package URL and the Key Vault secrets are only named, or checked
+as a boolean inside the `az` query, so they never reach the tool. Run it
+before any Bicep deploy to an existing app, and after changing a setting by
+hand (then record the change in the parameters file).
+
+Exit codes: `0` clean (warnings allowed); `1` an error or drift; `2` a usage
+error.
 
 ## Tests
 

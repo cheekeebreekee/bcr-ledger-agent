@@ -16,6 +16,7 @@
     "test": "yarn workspaces foreach -A -p run test",
     "test:coverage": "yarn workspaces foreach -A -p run test:coverage",
     "test:tools": "node --test \"tools/**/*.test.mjs\"",
+    "check:app-settings": "node tools/check-app-settings.mjs",
     "lint": "eslint \"packages/**/src/**/*.ts\"",
     "format": "prettier --write \"packages/**/src/**/*.{ts,json}\" \"infrastructure/**/*.bicep\"",
     "type-check": "yarn workspaces foreach -A -p run type-check",
