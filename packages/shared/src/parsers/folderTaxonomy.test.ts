@@ -3,6 +3,7 @@ import {
   categoryCatalog,
   FALLBACK_CATEGORY,
   getCategory,
+  hasInvoiceFields,
   invoiceCategoryForDirection,
   isDocumentCategory,
 } from './folderTaxonomy';
@@ -104,6 +105,25 @@ describe('folderTaxonomy', () => {
     });
     it('defaults non-invoice direction to purchase', () => {
       expect(invoiceCategoryForDirection('nie_dotyczy')).toBe('faktury_zakupu');
+    });
+  });
+
+  describe('hasInvoiceFields', () => {
+    it('is the 01_Faktury family: invoices, corrections, notes and receipts', () => {
+      expect(categoryCatalog.filter((c) => hasInvoiceFields(c.id)).map((c) => c.id)).toEqual([
+        'faktury_sprzedazy',
+        'faktury_zakupu',
+        'faktury_korekty',
+        'faktury_noty',
+      ]);
+      for (const c of categoryCatalog.filter((c) => hasInvoiceFields(c.id))) {
+        expect(c.segments[0]).toBe('01_Faktury');
+      }
+    });
+
+    it('is false for anything that is not a category', () => {
+      expect(hasInvoiceFields('faktura')).toBe(false);
+      expect(hasInvoiceFields(undefined)).toBe(false);
     });
   });
 

@@ -26,6 +26,7 @@ describe('root logger redaction', () => {
     'title',
     'parties',
     'nip',
+    'extraction',
   ])('censors %s at the top level and one level down', (key) => {
     const { logger, lines } = capture();
     logger.info({ [key]: 'sensitive', nested: { [key]: 'sensitive' } }, 'm');

@@ -4,6 +4,7 @@
  * duplicated config loading, Graph client construction, or Directory reader
  * setup.
  */
+import { createLedgerPool, LedgerDb } from '@bcr/ledger-db';
 import { createLogger } from '@bcr/shared';
 import { loadIngestionConfig, RETIRED_SETTINGS, retiredSettingsIn } from './config';
 import { AuthMiddleware } from './auth/authMiddleware';
@@ -19,6 +20,7 @@ import { ClaudeClassifier } from './services/claudeClassifier';
 import { BatchIngestor } from './services/batchIngestor';
 import { UserTypeReader } from './services/userDirectory';
 import { ChannelInbox, MAX_INBOX_FILE_BYTES } from './services/channelInbox';
+import { INDEX_OFF, LedgerDocumentIndex, type DocumentIndex } from './services/documentIndex';
 
 export const config = loadIngestionConfig();
 
@@ -112,11 +114,43 @@ createLogger('ingestion/runtime').info(
   'classification.config',
 );
 
+/**
+ * The document index (`LEDGER_INDEX_MODE`). `off`: no pool, no connection,
+ * nothing written. `write`: a small pool that logs in as this app's managed
+ * identity (an Entra token per connection, TLS verified), and every filed
+ * document recorded in a transaction scoped to its client. Said once per
+ * cold start: the mode, the server and the login, never a token.
+ */
+export const documentIndex: DocumentIndex =
+  config.ledgerIndexMode === 'write'
+    ? new LedgerDocumentIndex({
+        db: new LedgerDb(
+          createLedgerPool({
+            host: config.ledgerDbHost,
+            database: config.ledgerDbName,
+            user: config.ledgerDbUser,
+          }),
+        ),
+        directoryListId: config.clientDirectoryListId,
+      })
+    : INDEX_OFF;
+createLogger('ingestion/runtime').info(
+  {
+    event: 'index.config',
+    mode: config.ledgerIndexMode,
+    ...(config.ledgerIndexMode === 'write'
+      ? { host: config.ledgerDbHost, database: config.ledgerDbName, user: config.ledgerDbUser }
+      : {}),
+  },
+  'index.config',
+);
+
 export const batchIngestor = new BatchIngestor({
   resolver: clientResolver,
   classification,
   clientSharePointFactory,
   quarantineSharePointFactory,
+  index: documentIndex,
 });
 
 /**
@@ -143,6 +177,8 @@ export const channelInbox = new ChannelInbox({
   maxDownloadBytes: Math.min(config.anthropicMaxContentBytes, MAX_INBOX_FILE_BYTES),
   onlyRows: config.inboxSweepRows,
   ...(config.inboxCreatedAfter !== undefined ? { createdAfterMs: config.inboxCreatedAfter } : {}),
+  // Written only after a move, so never in shadow.
+  index: documentIndex,
 });
 if (config.inboxSweepMode !== 'off') {
   createLogger('ingestion/runtime').info(

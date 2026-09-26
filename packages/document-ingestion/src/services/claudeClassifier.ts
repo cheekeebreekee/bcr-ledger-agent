@@ -4,12 +4,22 @@ import {
   categoryCatalog,
   createLogger,
   getCategory,
+  hasInvoiceFields,
   isDocumentCategory,
+  MAX_INVOICE_NUMBER_LENGTH,
+  MAX_PARTY_NAME_LENGTH,
+  normalizeAmount,
+  normalizeCurrency,
+  normalizeIsoDate,
+  normalizeKsefNumber,
+  normalizeNip,
+  normalizeText,
   type Classification,
   type Classifier,
   type ClassifierContext,
   type ClassifierNoResult,
   type ClassifierRetryLater,
+  type DocumentExtraction,
   type DocumentParty,
   type Logger,
   type PartyRole,
@@ -71,11 +81,59 @@ const CLIENT_ROLES: readonly ClientRole[] = ['seller', 'buyer', 'none', 'unknown
 
 const nullable = (schema: Record<string, unknown>) => ({ anyOf: [schema, { type: 'null' }] });
 
+/** The categories whose documents carry invoice fields, from the taxonomy. */
+const INVOICE_FIELD_CATEGORIES = categoryCatalog.filter((c) => c.invoiceFields).map((c) => c.id);
+
+const nullableString = (description: string) => ({
+  ...nullable({ type: 'string' }),
+  description,
+});
+
+/**
+ * The searchable fields of an invoice, receipt or note, read in the same call.
+ * Every value is a nullable string: amounts too, so no float ever rounds a
+ * grosz away, and every one is validated after the call (`buildExtraction`).
+ * Seller and buyer are not repeated here: they are the `parties`.
+ */
+const INVOICE_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  description:
+    `Dane faktury, paragonu lub noty do wyszukiwania: tylko dla kategorii ` +
+    `${INVOICE_FIELD_CATEGORIES.join(', ')}. Dla innych kategorii każde pole null.`,
+  properties: {
+    number: nullableString('Numer dokumentu, dokładnie jak na dokumencie.'),
+    issue_date: nullableString('Data wystawienia, RRRR-MM-DD.'),
+    sale_date: nullableString(
+      'Data sprzedaży lub wykonania usługi, RRRR-MM-DD, tylko gdy jest podana.',
+    ),
+    currency: nullableString('Waluta dokumentu, kod ISO 4217, np. PLN, EUR.'),
+    net_amount: nullableString(
+      'Suma netto dokumentu: cyfry z kropką dziesiętną, bez spacji i waluty, np. 1234.50.',
+    ),
+    vat_amount: nullableString('Suma VAT dokumentu, w tym samym zapisie.'),
+    gross_amount: nullableString('Suma brutto dokumentu, w tym samym zapisie.'),
+    ksef_number: nullableString('Numer KSeF, tylko gdy jest na dokumencie.'),
+  },
+  required: [
+    'number',
+    'issue_date',
+    'sale_date',
+    'currency',
+    'net_amount',
+    'vat_amount',
+    'gross_amount',
+    'ksef_number',
+  ],
+  additionalProperties: false,
+};
+
 /**
  * The structured output the model must return (`output_config.format`). The
  * category enum is the taxonomy's, so the model can never name a category no
  * folder exists for. Numeric bounds are not supported by structured outputs:
- * they are checked here, after parsing.
+ * they are checked here, after parsing. Every property is required, and
+ * optional values are nullable (`anyOf` with `null`): 13 union-typed
+ * properties in all, well inside the API's limit on them.
  */
 export const CLASSIFICATION_OUTPUT_SCHEMA: Record<string, unknown> = {
   type: 'object',
@@ -111,10 +169,22 @@ export const CLASSIFICATION_OUTPUT_SCHEMA: Record<string, unknown> = {
         additionalProperties: false,
       },
     },
+    invoice: INVOICE_OUTPUT_SCHEMA,
   },
-  required: ['category', 'year', 'month', 'confidence', 'client_role', 'reasoning', 'parties'],
+  required: [
+    'category',
+    'year',
+    'month',
+    'confidence',
+    'client_role',
+    'reasoning',
+    'parties',
+    'invoice',
+  ],
   additionalProperties: false,
 };
+
+const optionalText = z.string().nullable().optional();
 
 /** Parses the answer. Lenient on what the schema already constrains; strict on what we use. */
 const modelOutput = z.object({
@@ -134,6 +204,21 @@ const modelOutput = z.object({
       }),
     )
     .optional(),
+  // Lenient: a malformed invoice block loses its fields, never the classification.
+  invoice: z
+    .object({
+      number: optionalText,
+      issue_date: optionalText,
+      sale_date: optionalText,
+      currency: optionalText,
+      net_amount: optionalText,
+      vat_amount: optionalText,
+      gross_amount: optionalText,
+      ksef_number: optionalText,
+    })
+    .nullable()
+    .optional()
+    .catch(null),
 });
 type ModelOutput = z.infer<typeof modelOutput>;
 
@@ -145,7 +230,9 @@ type ModelOutput = z.infer<typeof modelOutput>;
  *
  * Contract: this classifier NEVER throws and never rejects. It returns
  *  - a {@link Classification}: the model's suggestion, with invoice direction
- *    settled from the client's own identity (or flagged unresolved);
+ *    settled from the client's own identity (or flagged unresolved) and, for
+ *    an invoice, receipt or note, its searchable fields (`extraction`), each
+ *    validated or `null` — a bad field never costs the classification;
  *  - `retry_later` for a failure that is not about the document — 429, 529,
  *    another 5xx, a timeout, a lost connection, or an account/configuration
  *    error (401, 402, 403, 404): the caller tries again later and never files
@@ -406,6 +493,12 @@ export function systemPrompt(client: ClassifierContext['client']): string {
       'i nazwą, jeśli są na dokumencie.',
     '- nieposortowane wybierz tylko wtedy, gdy dokument jest nieczytelny albo nie pasuje ' +
       'do żadnej kategorii.',
+    `- invoice: dla kategorii ${INVOICE_FIELD_CATEGORIES.join(', ')} przepisz z dokumentu ` +
+      'numer, datę wystawienia, datę sprzedaży, walutę, sumy netto, VAT i brutto oraz numer ' +
+      'KSeF. Kwoty zapisuj cyframi z kropką dziesiętną, bez spacji i symbolu waluty (np. ' +
+      '1234.50; ujemne na korekcie in minus). Pole, którego nie ma na dokumencie albo którego ' +
+      'nie da się odczytać, ustaw na null: nie zgaduj i nie licz. Dla pozostałych kategorii ' +
+      'wszystkie pola invoice ustaw na null.',
     '',
     'Kategorie:',
     categoryCatalog.map((c) => `- ${c.id} (${c.polishLabel}): ${c.description}`).join('\n'),
@@ -466,7 +559,51 @@ function toClassification(
       ...(preview ? { pagesRead: preview.pages, pageCount: preview.pageCount } : {}),
     },
     ...(parties.length > 0 ? { parties } : {}),
+    ...(hasInvoiceFields(category)
+      ? { extraction: buildExtraction(output.invoice ?? null, parties) }
+      : {}),
   };
+}
+
+/**
+ * The index fields of an invoice, receipt or note: the model's `invoice`
+ * block and the seller and buyer from its parties, each validated on its own
+ * (`@bcr/shared` `invoiceFields`). An invalid value becomes `null`: a NIP
+ * with a wrong checksum, an amount in any other notation, a date that does
+ * not exist, a currency that is not ISO 4217. Exported for tests.
+ */
+export function buildExtraction(
+  invoice: ModelOutput['invoice'],
+  parties: readonly DocumentParty[],
+): DocumentExtraction {
+  const seller = partyOn(parties, ['seller', 'issuer']);
+  const buyer = partyOn(parties, ['buyer', 'recipient']);
+  return {
+    invoiceNumber: normalizeText(invoice?.number, MAX_INVOICE_NUMBER_LENGTH),
+    issueDate: normalizeIsoDate(invoice?.issue_date),
+    saleDate: normalizeIsoDate(invoice?.sale_date),
+    currency: normalizeCurrency(invoice?.currency),
+    netAmount: normalizeAmount(invoice?.net_amount),
+    vatAmount: normalizeAmount(invoice?.vat_amount),
+    grossAmount: normalizeAmount(invoice?.gross_amount),
+    sellerNip: normalizeNip(seller?.nip),
+    sellerName: normalizeText(seller?.companyName ?? seller?.personName, MAX_PARTY_NAME_LENGTH),
+    buyerNip: normalizeNip(buyer?.nip),
+    buyerName: normalizeText(buyer?.companyName ?? buyer?.personName, MAX_PARTY_NAME_LENGTH),
+    ksefNumber: normalizeKsefNumber(invoice?.ksef_number),
+  };
+}
+
+/** The first party in the first of `roles` that has one (seller before issuer). */
+function partyOn(
+  parties: readonly DocumentParty[],
+  roles: readonly PartyRole[],
+): DocumentParty | undefined {
+  for (const role of roles) {
+    const party = parties.find((p) => p.role === role);
+    if (party) return party;
+  }
+  return undefined;
 }
 
 /**

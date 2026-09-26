@@ -25,6 +25,8 @@ import {
   listInstalled,
   packageFunction,
   parseYarnLock,
+  workspaceDependencies,
+  workspaceDir,
 } from '../package-function.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -317,6 +319,25 @@ describe('packageFunction', () => {
     assert.equal(existsSync(join(root, 'artifacts/document-ingestion.zip')), false);
   });
 
+  test('an orphan in the dist of another workspace package the app ships fails too', () => {
+    const root = fakeRepo({
+      'packages/document-ingestion/package.json': JSON.stringify({
+        name: '@bcr/document-ingestion',
+        dependencies: { '@bcr/ledger-db': 'workspace:*', '@bcr/shared': 'workspace:*' },
+      }),
+      'packages/ledger-db/package.json': '{"name":"@bcr/ledger-db"}',
+      'packages/ledger-db/src/index.ts': '',
+      'packages/ledger-db/dist/index.js': '',
+      'packages/ledger-db/dist/deleted.js': '',
+    });
+    assert.throws(
+      () => packageFunction({ root, name: 'document-ingestion', log: quiet }),
+      (err) =>
+        err instanceof PackageError && /@bcr\/ledger-db.*\n.*dist\/deleted\.js/.test(err.message),
+    );
+    assert.equal(existsSync(join(root, 'artifacts/document-ingestion.zip')), false);
+  });
+
   test('a missing build fails and removes the old zip', () => {
     const root = fakeRepo({ 'packages/document-ingestion/src/functions/ingestDocument.ts': '' });
     assert.throws(
@@ -324,5 +345,38 @@ describe('packageFunction', () => {
       (err) => err instanceof PackageError && /ingestDocument\.ts/.test(err.message),
     );
     assert.equal(existsSync(join(root, 'artifacts/document-ingestion.zip')), false);
+  });
+});
+
+describe('workspace packages', () => {
+  test('always @bcr/shared, plus the workspace dependencies, transitively, once each', () => {
+    const manifests = {
+      '@bcr/ledger-db': { dependencies: { '@bcr/shared': 'workspace:*', pg: '^8' } },
+      '@bcr/shared': { dependencies: { zod: '^3' } },
+    };
+    assert.deepEqual(
+      workspaceDependencies(
+        { dependencies: { '@bcr/ledger-db': 'workspace:*', jose: '^5' } },
+        (dep) => manifests[dep] ?? {},
+      ),
+      ['@bcr/ledger-db', '@bcr/shared'],
+    );
+    assert.deepEqual(workspaceDependencies({}), ['@bcr/shared']);
+    // A registry package that happens to be scoped @bcr is not a workspace.
+    assert.deepEqual(workspaceDependencies({ dependencies: { '@bcr/other': '^1.0.0' } }), [
+      '@bcr/shared',
+    ]);
+    assert.equal(workspaceDir('@bcr/ledger-db'), 'ledger-db');
+  });
+
+  test('this repo: ingestion ships @bcr/ledger-db and @bcr/shared, the bot only @bcr/shared', () => {
+    const read = (dir) =>
+      JSON.parse(readFileSync(join(REPO, 'packages', dir, 'package.json'), 'utf8'));
+    const byName = (dep) => read(workspaceDir(dep));
+    assert.deepEqual(workspaceDependencies(read('document-ingestion'), byName), [
+      '@bcr/ledger-db',
+      '@bcr/shared',
+    ]);
+    assert.deepEqual(workspaceDependencies(read('teams-bot'), byName), ['@bcr/shared']);
   });
 });

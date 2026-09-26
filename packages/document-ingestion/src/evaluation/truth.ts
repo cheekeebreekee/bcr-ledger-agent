@@ -1,7 +1,17 @@
 import {
+  DOCUMENT_EXTRACTION_FIELDS,
   invoiceCategoryForDirection,
   isDocumentCategory,
+  MAX_INVOICE_NUMBER_LENGTH,
+  MAX_PARTY_NAME_LENGTH,
+  normalizeAmount,
+  normalizeCurrency,
+  normalizeIsoDate,
+  normalizeKsefNumber,
+  normalizeNip,
+  normalizeText,
   type DocumentCategory,
+  type DocumentExtractionField,
 } from '@bcr/shared';
 import { z } from 'zod';
 
@@ -15,23 +25,77 @@ export const INVOICE_FAMILY = 'faktura';
 export type TruthCategory = DocumentCategory | typeof INVOICE_FAMILY;
 export type TruthDirection = 'sprzedaz' | 'zakup';
 
+/** The invoice fields a truth entry asserts, each already in its compared form. */
+export type TruthFields = Readonly<Partial<Record<DocumentExtractionField, string>>>;
+
 /**
  * One labelled document. `truth.json` is an array of these:
  *
  *     [{ "file": "fv-01.pdf", "category": "faktury_zakupu", "month": "2026-09",
- *        "direction": "zakup" }]
+ *        "direction": "zakup",
+ *        "fields": { "invoiceNumber": "FV/12/2026", "grossAmount": "1230.00",
+ *                    "sellerNip": "526-025-02-74" } }]
  *
  * `file` is a name inside the `--dir` folder (no path). `month` is the
  * document's month, `YYYY-MM`, or `""` when it has none. `direction` is
  * optional; when given, `category` is the matching invoice folder or
- * `faktura`.
+ * `faktura`. `fields` is optional too, and so is each of its keys (those of
+ * `DocumentExtraction`): only the fields given are scored.
  */
 export interface TruthEntry {
   readonly file: string;
   readonly category: TruthCategory;
   readonly month: string;
   readonly direction?: TruthDirection;
+  readonly fields?: TruthFields;
 }
+
+/**
+ * How a field is compared, truth and extraction alike: the extraction's own
+ * validators, so `526-025-02-74` equals `5260250274` and `1 230,00` equals
+ * `1230.00`; invoice numbers ignore case and spaces, names compare as
+ * {@link normalizeName}. `null`: not a valid value.
+ */
+export const FIELD_COMPARATORS: Readonly<
+  Record<DocumentExtractionField, (value: string) => string | null>
+> = {
+  invoiceNumber: (v) =>
+    normalizeText(v, MAX_INVOICE_NUMBER_LENGTH)?.replace(/\s+/g, '').toUpperCase() ?? null,
+  issueDate: normalizeIsoDate,
+  saleDate: normalizeIsoDate,
+  currency: normalizeCurrency,
+  netAmount: normalizeAmount,
+  vatAmount: normalizeAmount,
+  grossAmount: normalizeAmount,
+  sellerNip: normalizeNip,
+  sellerName: (v) => normalizeName(normalizeText(v, MAX_PARTY_NAME_LENGTH) ?? '') || null,
+  buyerNip: normalizeNip,
+  buyerName: (v) => normalizeName(normalizeText(v, MAX_PARTY_NAME_LENGTH) ?? '') || null,
+  ksefNumber: normalizeKsefNumber,
+};
+
+const fieldsSchema = z
+  .object(
+    Object.fromEntries(DOCUMENT_EXTRACTION_FIELDS.map((f) => [f, z.string().optional()])) as Record<
+      DocumentExtractionField,
+      z.ZodOptional<z.ZodString>
+    >,
+  )
+  .strict()
+  .transform((fields, ctx) => {
+    const out: Partial<Record<DocumentExtractionField, string>> = {};
+    for (const field of DOCUMENT_EXTRACTION_FIELDS) {
+      const raw = fields[field];
+      if (raw === undefined) continue;
+      const compared = FIELD_COMPARATORS[field](raw);
+      if (compared === null) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: 'not a valid value' });
+        continue;
+      }
+      out[field] = compared;
+    }
+    return out;
+  });
 
 const MONTH = /^(\d{4}-(0[1-9]|1[0-2]))?$/;
 
@@ -52,6 +116,7 @@ const entrySchema = z
       ),
     month: z.string().regex(MONTH, 'must be YYYY-MM or ""'),
     direction: z.enum(['sprzedaz', 'zakup']).optional(),
+    fields: fieldsSchema.optional(),
   })
   .strict()
   .superRefine((e, ctx) => {
@@ -92,6 +157,7 @@ export function parseTruth(json: unknown): TruthEntry[] {
       category,
       month: e.month,
       ...(e.direction ? { direction: e.direction } : {}),
+      ...(e.fields && Object.keys(e.fields).length > 0 ? { fields: e.fields } : {}),
     });
   }
   return entries;

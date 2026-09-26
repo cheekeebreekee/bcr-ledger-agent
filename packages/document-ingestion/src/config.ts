@@ -1,4 +1,10 @@
-import { type IngestionConfig, ingestionConfigSchema, loadConfig } from '@bcr/shared';
+import {
+  type IngestionConfig,
+  ingestionConfigSchema,
+  loadConfig,
+  missingLedgerIndexSettings,
+  ValidationError,
+} from '@bcr/shared';
 
 const envMap = {
   azureTenantId: 'AZURE_TENANT_ID',
@@ -26,6 +32,10 @@ const envMap = {
   anthropicModel: 'ANTHROPIC_MODEL',
   anthropicMaxContentBytes: 'ANTHROPIC_MAX_CONTENT_BYTES',
   classificationAcceptThreshold: 'CLASSIFICATION_ACCEPT_THRESHOLD',
+  ledgerIndexMode: 'LEDGER_INDEX_MODE',
+  ledgerDbHost: 'LEDGER_DB_HOST',
+  ledgerDbName: 'LEDGER_DB_NAME',
+  ledgerDbUser: 'LEDGER_DB_USER',
   applicationInsightsConnectionString: 'APPLICATIONINSIGHTS_CONNECTION_STRING',
   logLevel: 'LOG_LEVEL',
 } as const satisfies Record<keyof IngestionConfig, string>;
@@ -50,7 +60,18 @@ let cached: IngestionConfig | undefined;
 
 export function loadIngestionConfig(env: NodeJS.ProcessEnv = process.env): IngestionConfig {
   if (!cached) {
-    cached = loadConfig(ingestionConfigSchema, envMap, env);
+    const config = loadConfig(ingestionConfigSchema, envMap, env);
+    // `write` without a server or a login would fail at the first filing,
+    // every filing: it fails here, at cold start, naming what is missing.
+    const missing = missingLedgerIndexSettings(config);
+    if (missing.length > 0) {
+      throw new ValidationError(
+        `Invalid configuration: ${missing
+          .map((name) => `${name}: required when LEDGER_INDEX_MODE=write`)
+          .join('; ')}`,
+      );
+    }
+    cached = config;
   }
   return cached;
 }

@@ -71,7 +71,8 @@ bcr-ledger-agent/
 ├── packages/
 │   ├── shared/                 # Cross-cutting types, parsers, logger, config
 │   ├── teams-bot/              # Bot Framework v4 hosted in Azure Functions
-│   └── document-ingestion/     # HTTP-triggered ingestion / SharePoint API
+│   ├── document-ingestion/     # HTTP-triggered ingestion / SharePoint API
+│   └── ledger-db/              # The document index: PostgreSQL, row-level security per client
 ├── infrastructure/             # Bicep IaC (Bot, Func, KV, AI, App Insights)
 ├── teams-app/                  # Teams app manifest + icons (sideload package)
 ├── docs/                       # Deployment, local-dev, sequence diagrams

@@ -358,11 +358,69 @@ export const ingestionConfigSchema = z.object({
     `must be a number from ${CLASSIFICATION_ACCEPT_THRESHOLD_MIN.toFixed(2)} to ` +
       `${CLASSIFICATION_ACCEPT_THRESHOLD_MAX.toFixed(2)}`,
   ),
+  // --- The document index (packages/ledger-db, Azure Database for PostgreSQL) ---
+  /**
+   * `LEDGER_INDEX_MODE`. `off` (the default, also when empty): no database is
+   * connected to and nothing is indexed. `write`: after a document is filed
+   * or sorted to review by the bot path, or moved by the channel inbox in
+   * `enforce` (never in `shadow`), its row is written to the index in a
+   * transaction scoped to its client; quarantined documents are never
+   * indexed. A failed index write is logged (`index.write_failed`) and never
+   * blocks or undoes the filing. Anything else fails at cold start.
+   */
+  ledgerIndexMode: z
+    .preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z
+        .enum(['off', 'write'], { errorMap: () => ({ message: "must be 'off' or 'write'" }) })
+        .optional(),
+    )
+    .transform((v) => v ?? 'off'),
+  /**
+   * `LEDGER_DB_HOST`: the PostgreSQL server's host name,
+   * `<server>.postgres.database.azure.com`. Required with `write`.
+   */
+  ledgerDbHost: optionalStr().refine(
+    (h) => h === '' || /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i.test(h),
+    'must be a host name like <server>.postgres.database.azure.com, not a URL',
+  ),
+  /** `LEDGER_DB_NAME`: the database. Default `ledger`. */
+  ledgerDbName: optionalStr('ledger').refine(
+    (n) => /^[a-z_][a-z0-9_]{0,62}$/.test(n),
+    'must be a database name (lower-case letters, digits, _)',
+  ),
+  /**
+   * `LEDGER_DB_USER`: the PostgreSQL login of this app's managed identity,
+   * named after the Function App (`pgaadauth_create_principal`). Its password
+   * is an Entra token fetched per connection; there is no stored password.
+   * Required with `write`.
+   */
+  ledgerDbUser: optionalStr().refine(
+    (u) => u === '' || /^[A-Za-z0-9][A-Za-z0-9._@-]{0,62}$/.test(u),
+    'must be a PostgreSQL login name (the Function App name)',
+  ),
   applicationInsightsConnectionString: optionalStr(),
   logLevel,
 });
 
 export type IngestionConfig = z.infer<typeof ingestionConfigSchema>;
+
+/** `LEDGER_INDEX_MODE`: see {@link ingestionConfigSchema}. */
+export type LedgerIndexMode = IngestionConfig['ledgerIndexMode'];
+
+/**
+ * The settings `LEDGER_INDEX_MODE=write` needs, by env var name, that are
+ * empty in `config`. Empty with `off`: nothing is needed then.
+ */
+export function missingLedgerIndexSettings(
+  config: Pick<IngestionConfig, 'ledgerIndexMode' | 'ledgerDbHost' | 'ledgerDbUser'>,
+): string[] {
+  if (config.ledgerIndexMode !== 'write') return [];
+  return [
+    ...(config.ledgerDbHost === '' ? ['LEDGER_DB_HOST'] : []),
+    ...(config.ledgerDbUser === '' ? ['LEDGER_DB_USER'] : []),
+  ];
+}
 
 /** `MEMBERSHIP_CHECK_MODE`: see {@link ingestionConfigSchema}. */
 export type MembershipCheckMode = IngestionConfig['membershipCheckMode'];

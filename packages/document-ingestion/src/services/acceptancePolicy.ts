@@ -8,6 +8,7 @@ import {
   isDocumentCategory,
   type Classification,
   type DocumentCategory,
+  type DocumentExtraction,
 } from '@bcr/shared';
 import { DIRECTION_UNRESOLVED, isDirectedInvoice } from './invoiceDirection';
 
@@ -81,6 +82,12 @@ export interface AcceptanceDecision {
    * With `RETRY_EXHAUSTED`: the last retry-later reason (`timeout`, …).
    */
   readonly unclassifiedReason?: string;
+  /**
+   * The invoice fields the classifier read, carried through unchanged (filed
+   * or for review) for the document index. The policy never looks at them.
+   * Client data: {@link decisionLogFields} leaves them out.
+   */
+  readonly extraction?: DocumentExtraction;
 }
 
 /**
@@ -140,6 +147,7 @@ export class AcceptancePolicy {
       classifier: classification.classifier,
       model: classification.model ?? '',
       month: date ? `${date.year}-${String(date.month).padStart(2, '0')}` : '',
+      ...(classification.extraction ? { extraction: classification.extraction } : {}),
     };
     if (reasons.size === 0 && category) {
       const folderPath = getCategory(category).dated
@@ -206,7 +214,8 @@ export function reviewFolderPath(now: Date): string {
 
 /**
  * The fields every filing log line carries: codes and the taxonomy path only.
- * Never a file name, the client's channel folder, a party or the model's text.
+ * Never a file name, the client's channel folder, a party, the invoice fields
+ * or the model's text.
  */
 export function decisionLogFields(decision: AcceptanceDecision): Record<string, unknown> {
   return {

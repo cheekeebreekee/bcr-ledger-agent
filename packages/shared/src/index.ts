@@ -8,6 +8,7 @@ export * from './types/clientDirectory';
 export * from './types/bot';
 export * from './types/classification';
 export * from './parsers/folderTaxonomy';
+export * from './parsers/invoiceFields';
 export * from './sitePath';
 export * from './config';
 export * from './logger';

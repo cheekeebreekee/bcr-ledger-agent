@@ -8,6 +8,7 @@ import {
   CLAUDE_MAX_TOKENS,
   CLAUDE_REQUEST_TIMEOUT_MS,
   ClaudeClassifier,
+  buildExtraction,
   classifyApiError,
   systemPrompt,
   type ClaudeUsage,
@@ -591,5 +592,189 @@ describe('classifyApiError', () => {
       outcome: 'no_result',
       reason: 'invalid_request',
     });
+  });
+});
+
+describe('ClaudeClassifier: invoice fields for the document index', () => {
+  // Synthetic NIPs with valid checksums: 1234567819 (the client), 5260250274.
+  const OWN = { nip: '1234567819', companyName: 'Klient Testowy Sp. z o.o.' };
+  const purchase = (invoice: Record<string, unknown> | null, over: Record<string, unknown> = {}) =>
+    answer({
+      category: 'faktury_zakupu',
+      year: 2026,
+      month: 9,
+      confidence: 0.93,
+      client_role: 'buyer',
+      parties: [
+        {
+          role: 'seller',
+          nip: 'PL 526-025-02-74',
+          company_name: 'Dostawca S.A.',
+          person_name: null,
+        },
+        { role: 'buyer', nip: '1234567819', company_name: OWN.companyName, person_name: null },
+      ],
+      invoice,
+      ...over,
+    });
+  const fullInvoice = {
+    number: '  FV 12/09/2026 ',
+    issue_date: '2026-09-12',
+    sale_date: '2026-09-10',
+    currency: 'pln',
+    net_amount: '1 000,00',
+    vat_amount: '230',
+    gross_amount: '1230.00',
+    ksef_number: '5260250274-20260912-0123456789ab-cd',
+  };
+
+  it('asks for the invoice block in the same call: required, closed, nullable strings only', () => {
+    const schema = CLASSIFICATION_OUTPUT_SCHEMA as {
+      required: string[];
+      properties: Record<string, Record<string, unknown>>;
+    };
+    expect(schema.required).toContain('invoice');
+    const invoice = schema.properties['invoice'] as {
+      additionalProperties: boolean;
+      required: string[];
+      properties: Record<string, { anyOf?: { type: string }[] }>;
+    };
+    expect(invoice.additionalProperties).toBe(false);
+    expect(Object.keys(invoice.properties).sort()).toEqual([...invoice.required].sort());
+    const notNullableStrings = Object.entries(invoice.properties)
+      .filter(([, p]) => JSON.stringify(p.anyOf?.map((a) => a.type)) !== '["string","null"]')
+      .map(([k]) => k);
+    expect(notNullableStrings).toEqual([]);
+  });
+
+  it('stays within the limit on union-typed properties', () => {
+    let unions = 0;
+    const walk = (node: unknown): void => {
+      if (!node || typeof node !== 'object') return;
+      if ('anyOf' in (node as object)) unions += 1;
+      for (const v of Object.values(node as object)) {
+        if (Array.isArray(v)) v.forEach(walk);
+        else walk(v);
+      }
+    };
+    walk(CLASSIFICATION_OUTPUT_SCHEMA);
+    expect(unions).toBe(13);
+  });
+
+  it('tells the model which categories carry the fields, and not to guess', () => {
+    const prompt = systemPrompt(OWN);
+    expect(prompt).toContain(
+      'invoice: dla kategorii faktury_sprzedazy, faktury_zakupu, faktury_korekty, faktury_noty',
+    );
+    expect(prompt).toContain('nie zgaduj i nie licz');
+  });
+
+  it('reads and normalises the fields of a purchase invoice, seller and buyer from the parties', async () => {
+    const { c } = classifier(jest.fn().mockResolvedValue(purchase(fullInvoice)));
+    const result = (await c.classify(ctx({ client: OWN }))) as Classification;
+    expect(result.fields['category']).toBe('faktury_zakupu');
+    expect(result.extraction).toEqual({
+      invoiceNumber: 'FV 12/09/2026',
+      issueDate: '2026-09-12',
+      saleDate: '2026-09-10',
+      currency: 'PLN',
+      netAmount: '1000.00',
+      vatAmount: '230.00',
+      grossAmount: '1230.00',
+      sellerNip: '5260250274',
+      sellerName: 'Dostawca S.A.',
+      buyerNip: '1234567819',
+      buyerName: OWN.companyName,
+      ksefNumber: '5260250274-20260912-0123456789AB-CD',
+    });
+  });
+
+  it('nulls each invalid field and keeps the rest, and the classification', async () => {
+    const { c } = classifier(
+      jest.fn().mockResolvedValue(
+        purchase(
+          {
+            ...fullInvoice,
+            issue_date: '2026-02-30',
+            currency: 'zł',
+            net_amount: '1.000,00',
+            ksef_number: '1234567810-20260912-0123456789AB-CD',
+          },
+          {
+            parties: [
+              { role: 'seller', nip: '5260250275', company_name: 'Dostawca', person_name: null },
+              { role: 'buyer', nip: '1234567819', company_name: null, person_name: null },
+            ],
+          },
+        ),
+      ),
+    );
+    const result = (await c.classify(ctx({ client: OWN }))) as Classification;
+    expect(result.confidence).toBe(0.93);
+    expect(result.extraction).toMatchObject({
+      invoiceNumber: 'FV 12/09/2026',
+      issueDate: null,
+      saleDate: '2026-09-10',
+      currency: null,
+      netAmount: null,
+      grossAmount: '1230.00',
+      sellerNip: null,
+      sellerName: 'Dostawca',
+      buyerNip: '1234567819',
+      buyerName: null,
+      ksefNumber: null,
+    });
+  });
+
+  it('keeps the classification when the invoice block is malformed', async () => {
+    const { c } = classifier(
+      jest.fn().mockResolvedValue(purchase({ number: 12, gross_amount: 1230 } as never)),
+    );
+    const result = (await c.classify(ctx({ client: OWN }))) as Classification;
+    expect(result.fields['category']).toBe('faktury_zakupu');
+    expect(result.extraction?.invoiceNumber).toBeNull();
+    expect(result.extraction?.grossAmount).toBeNull();
+    // The parties still give seller and buyer.
+    expect(result.extraction?.sellerNip).toBe('5260250274');
+  });
+
+  it('gives all-null fields for an invoice without an invoice block', async () => {
+    const { c } = classifier(jest.fn().mockResolvedValue(purchase(null, { parties: [] })));
+    const result = (await c.classify(ctx({ client: OWN }))) as Classification;
+    expect(Object.values(result.extraction ?? {}).every((v) => v === null)).toBe(true);
+  });
+
+  it.each(['umowy', 'wyciagi_bankowe', 'nieposortowane', 'kategoria_z_kosmosu'])(
+    'extracts nothing for %s, whatever the model wrote',
+    async (category) => {
+      const { c } = classifier(
+        jest.fn().mockResolvedValue(purchase(fullInvoice, { category, year: 2026, month: 9 })),
+      );
+      const result = (await c.classify(ctx({ client: OWN }))) as Classification;
+      expect(result.extraction).toBeUndefined();
+    },
+  );
+
+  it('extracts for a note or receipt, and takes the issuer when there is no seller', () => {
+    const extraction = buildExtraction({ ...fullInvoice, ksef_number: null }, [
+      { role: 'issuer', nip: '5260250274', companyName: 'Stacja Paliw' },
+      { role: 'recipient', personName: 'Jan Testowy' },
+    ]);
+    expect(extraction).toMatchObject({
+      sellerNip: '5260250274',
+      sellerName: 'Stacja Paliw',
+      buyerNip: null,
+      buyerName: 'Jan Testowy',
+      ksefNumber: null,
+    });
+  });
+
+  it('never logs the fields', async () => {
+    const { c, lines } = classifier(
+      jest.fn().mockResolvedValue(purchase(fullInvoice, { stop_reason: 'end_turn' })),
+    );
+    await c.classify(ctx({ client: OWN }));
+    const serialized = JSON.stringify(lines);
+    expect(['FV 12', '1230', '5260250274'].filter((v) => serialized.includes(v))).toEqual([]);
   });
 });

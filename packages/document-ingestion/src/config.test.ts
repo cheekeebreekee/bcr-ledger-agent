@@ -47,6 +47,25 @@ describe('loadIngestionConfig', () => {
     expect(cfg.inboxCreatedAfter).toBe(Date.UTC(2026, 9, 1));
   });
 
+  it('reads the document index settings: off by default, write with a server and a login', () => {
+    expect(loadIngestionConfig(env).ledgerIndexMode).toBe('off');
+    _resetConfigCache();
+    const cfg = loadIngestionConfig({
+      ...env,
+      LEDGER_INDEX_MODE: 'write',
+      LEDGER_DB_HOST: 'psql-bcr-test-x.postgres.database.azure.com',
+      LEDGER_DB_USER: 'func-bcr-ingest-test-x',
+    });
+    expect(cfg.ledgerIndexMode).toBe('write');
+    expect(cfg.ledgerDbName).toBe('ledger');
+  });
+
+  it('refuses to start in write mode without the server and the login, naming both', () => {
+    expect(() => loadIngestionConfig({ ...env, LEDGER_INDEX_MODE: 'write' })).toThrow(
+      /LEDGER_DB_HOST: required when LEDGER_INDEX_MODE=write; LEDGER_DB_USER: required/,
+    );
+  });
+
   it('refuses to start on an INBOX_SWEEP_MODE it does not know', () => {
     expect(() => loadIngestionConfig({ ...env, INBOX_SWEEP_MODE: 'on' })).toThrow(/INBOX_SWEEP_MODE/);
   });

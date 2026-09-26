@@ -98,6 +98,7 @@ export function renderReport(
     '|---|---|---|',
     ...summary.confidenceBuckets.map((b) => `| ${b.label} | ${b.of} | ${b.hit} |`),
     '',
+    ...extractionSection(summary, results),
     '## Documents',
     '',
     '| File | Truth | Month | Suggested | Filed as | Month read | Confidence | Reasons | Result |',
@@ -106,6 +107,42 @@ export function renderReport(
     '',
   ];
   return lines.join('\n');
+}
+
+/**
+ * Invoice-field accuracy (reported, not part of the verdict), and which field
+ * each miss was: field names only, never a value read or expected.
+ */
+function extractionSection(
+  summary: EvaluationSummary,
+  results: readonly DocumentResult[],
+): string[] {
+  if (summary.extraction.length === 0) {
+    return ['## Invoice fields', '', 'No truth entry gives invoice fields.', ''];
+  }
+  const misses = results.flatMap((r) =>
+    Object.entries(r.fields ?? {})
+      .filter(([, correct]) => !correct)
+      .map(([field]) => `| ${cell(r.truth.file)} | \`${field}\` |`),
+  );
+  return [
+    '## Invoice fields (answered documents whose truth gives the field)',
+    '',
+    '| Field | Read correctly |',
+    '|---|---|',
+    ...summary.extraction.map((f) => `| \`${f.field}\` | ${ratio(f)} |`),
+    '',
+    ...(misses.length > 0
+      ? [
+          'Misses (a wrong value, or none where the truth has one):',
+          '',
+          '| File | Field |',
+          '|---|---|',
+          ...misses,
+          '',
+        ]
+      : ['No misses.', '']),
+  ];
 }
 
 function row(r: DocumentResult): string {

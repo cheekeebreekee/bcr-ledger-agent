@@ -246,6 +246,45 @@ describe('reviewFolderPath', () => {
   });
 });
 
+describe('invoice fields', () => {
+  const extraction = {
+    invoiceNumber: 'FV 1/2026',
+    issueDate: '2026-08-12',
+    saleDate: null,
+    currency: 'PLN',
+    netAmount: '100.00',
+    vatAmount: '23.00',
+    grossAmount: '123.00',
+    sellerNip: '5260250274',
+    sellerName: 'Dostawca S.A.',
+    buyerNip: '1234567819',
+    buyerName: 'Klient Sp. z o.o.',
+    ksefNumber: null,
+  };
+
+  it('are carried through unchanged when filed and when sent to review', () => {
+    const filed = policy.decide(result(purchase, { extraction }), NOW);
+    const review = policy.decide(result(purchase, { extraction, confidence: 0.4 }), NOW);
+    expect(filed.review).toBe(false);
+    expect(filed.extraction).toBe(extraction);
+    expect(review.review).toBe(true);
+    expect(review.extraction).toBe(extraction);
+  });
+
+  it('are absent when the classifier read none', () => {
+    expect('extraction' in policy.decide(result(purchase), NOW)).toBe(false);
+  });
+
+  it('never reach a log line', () => {
+    const logged = JSON.stringify(
+      decisionLogFields(policy.decide(result(purchase, { extraction }), NOW)),
+    );
+    expect(['FV 1', '5260250274', '123.00', 'Dostawca'].filter((v) => logged.includes(v))).toEqual(
+      [],
+    );
+  });
+});
+
 describe('decisionLogFields', () => {
   it('carries codes, a two-decimal confidence and the taxonomy path only', () => {
     const decision = policy.decide(

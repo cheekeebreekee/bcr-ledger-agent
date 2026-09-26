@@ -1,5 +1,5 @@
 import { app, type HttpResponseInit } from '@azure/functions';
-import type { InboxSweepMode, MembershipCheckMode } from '@bcr/shared';
+import type { InboxSweepMode, LedgerIndexMode, MembershipCheckMode } from '@bcr/shared';
 import { loadIngestionConfig } from '../config';
 
 /**
@@ -26,6 +26,10 @@ import { loadIngestionConfig } from '../config';
  * `INBOX_SWEEP_ROWS` limits the sweep to named rows (a canary first), and
  * `all` otherwise; the ids themselves are in the cold-start `inbox.sweep_mode`
  * line, not here.
+ *
+ * `build.ledgerIndex` is `LEDGER_INDEX_MODE`: `off`, or `write` when filed
+ * documents are recorded in the document index. The server and the login are
+ * in the cold-start `index.config` line, not here.
  */
 app.http('health', {
   route: 'health',
@@ -43,6 +47,7 @@ export async function handleHealth(): Promise<HttpResponseInit> {
         membershipCheck: config.membershipCheckMode,
         inboxSweep: config.inboxSweepMode,
         inboxSweepRows: config.inboxSweepRows.length > 0 ? 'listed' : 'all',
+        ledgerIndex: config.ledgerIndexMode,
       },
       new Date(),
     ),
@@ -53,6 +58,7 @@ export interface HealthBuild {
   readonly membershipCheck: MembershipCheckMode;
   readonly inboxSweep: InboxSweepMode;
   readonly inboxSweepRows: 'all' | 'listed';
+  readonly ledgerIndex: LedgerIndexMode;
 }
 
 export function healthBody(build: HealthBuild, now: Date) {
@@ -65,6 +71,7 @@ export function healthBody(build: HealthBuild, now: Date) {
       membershipCheck: build.membershipCheck,
       inboxSweep: build.inboxSweep,
       inboxSweepRows: build.inboxSweepRows,
+      ledgerIndex: build.ledgerIndex,
     },
     timestamp: now.toISOString(),
   } as const;

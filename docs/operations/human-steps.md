@@ -14,7 +14,9 @@ of a comment: a pasted comment becomes a command, the variable set on the same l
 or an apostrophe in the comment opens a quote that swallows the lines after it. For the same
 reason every comment in the blocks below sits on its own line.
 
-Today (25 September 2026) only Phase 0 is here. Later phases add their own sections.
+Phase 0 is here, then the releases that followed it: [Lifting gate G1](#lifting-gate-g1), the
+[Classification release](#classification-release) and the
+[Document index release](#document-index-release). Later phases add their own sections.
 
 ---
 
@@ -41,7 +43,9 @@ database. The containment has three strands, and this checklist puts them in one
   `az functionapp config appsettings set … -o none`, which merges rather than replaces. **Record
   every such change in `infrastructure/main.dev.parameters.json` (and `main.bicep` for a new
   setting) in the same change**, or the first Bicep deploy reverts it; `--live` shows any
-  difference.
+  difference. The one Bicep deploy allowed is `infrastructure/db-deploy.sh` in the
+  [Document index release](#document-index-release): it deploys `infrastructure/db.bicep`, which
+  is **not** `main.bicep` — PostgreSQL resources only, incremental, no app and no app setting.
 - ⚠️ **Never roll ingestion back to a pre-Phase-0 build.** That build contains content promotion,
   the cross-client write path. A rollback reverts individual commits and is deployed as a new
   build. For an emergency there is a stop switch that files nothing anywhere
@@ -1918,6 +1922,14 @@ hash, in the incident's status table.
 and reviews the commit that lifts the gate. **When:** after the G1 branch is merged, outside the
 1st–10th freeze, and not in the same window as any other change.
 
+The gate is about `main.bicep`, whose deploy replaces every app setting.
+`infrastructure/db.bicep`, the document index database, is **not** `main.bicep` and does not
+replace app settings: it is a standalone template of PostgreSQL resources only, deployed alone
+in incremental mode by `infrastructure/db-deploy.sh`
+([Document index release](#document-index-release)), so it is neither held by this gate nor a
+way around it. The index's own app settings (`LEDGER_*`) are recorded in `main.bicep` and
+`main.dev.parameters.json` like every other.
+
 `infrastructure/deploy.sh` and the *Deploy* workflow refuse "dev" until every step below is done,
 in this order, and recorded in the incident's
 [status table](incident-2026-09.md#status). The template now records every setting dev runs
@@ -2278,3 +2290,340 @@ are, and files it left as "retry later" are taken by the old build on its next t
 record the model in the template, in a commit of its own: `"anthropicModel"` back to
 `claude-opus-4-5-20251101` in `main.dev.parameters.json`, until the next attempt. `--live` is
 then clean again; until that commit, no Bicep deploy to dev.
+
+---
+
+## Document index release
+
+**Owner:** Yahor runs it; Roman approves the cost and decides go or no-go from the evaluation.
+**When:** any working day outside the change freeze (1st–10th), after the classification
+release, not in the same window as another change. It adds a database and changes only the
+ingestion app. The index is point 2 of the v2 plan: every document filed into a client's space
+gets a row, for search (point 5) and later billing
+([`ARCHITECTURE.md` §4.5](../../ARCHITECTURE.md#45-the-document-index)).
+
+**What it changes.**
+- A new **Azure Database for PostgreSQL Flexible Server** in `$RG`, from its own template,
+  `infrastructure/db.bicep`. **It is not `main.bicep`:** it declares only
+  `Microsoft.DBforPostgreSQL` resources, is deployed alone in incremental mode by
+  `infrastructure/db-deploy.sh`, and never touches the Function Apps or their app settings, so
+  gate G1 does not hold it and it cannot undo G1.
+- The **ingestion build**: the classifier also reads the invoice fields (number, dates, currency,
+  net/VAT/gross, KSeF number; seller and buyer from the parties) in the same call, and every
+  document filed or sorted to `98_` — by the bot path and by the channel inbox in `enforce` — is
+  written to the index in a transaction scoped to its client. Quarantined documents are never
+  indexed. An index failure never blocks or undoes filing: it is logged as
+  `index.write_failed`.
+- Four ingestion settings: `LEDGER_INDEX_MODE` (`off` | `write`), `LEDGER_DB_HOST`,
+  `LEDGER_DB_NAME` (`ledger`), `LEDGER_DB_USER`. `main.bicep` and both parameter files record
+  them with the index `off` and an empty host and login, so from the merge until step 7,
+  `check-app-settings --live` against dev reports exactly these four names as settings a
+  deploy would add; no Bicep deploy to dev and no G1-b may run in between.
+
+**Cost.** About **USD 15–17 a month**, at approximate West Europe list prices (September 2026;
+check the [pricing calculator](https://azure.microsoft.com/pricing/calculator/) before step 2):
+Burstable **B1ms** compute about USD 12–13 (about USD 0.017 an hour), **32 GiB** of storage
+about USD 4 (about USD 0.13 per GiB-month), and backups nothing extra while they stay within the
+free allowance of 100% of the provisioned storage (geo-redundant copies included). No HA
+(Burstable has none), no private endpoint, no VNet. Roman approves this before step 2.
+
+**The network trade-off, in one line.** The ingestion app runs on a Y1 Consumption plan, which has
+no VNet integration and no fixed outbound IP, so the server keeps public network access with the
+one firewall rule that admits Azure services (`0.0.0.0`). That rule admits every Azure address,
+other tenants' too; what keeps them out is Microsoft Entra-only authentication (no password
+exists), TLS 1.2+, and row-level security inside
+([`security.md` T19](../security.md#t19-the-document-index-database)).
+
+**Variables** (with those of [Variables used below](#variables-used-below)):
+
+```bash
+# Your UPN: the server's Entra administrator is the signed-in account.
+ADMIN_UPN=$(az ad signed-in-user show --query userPrincipalName -o tsv)
+# The canary Team's Client Directory row (H-12, the channel-inbox step), a list item id.
+CANARY_ROW=<canary listItemId>
+# CLIENT_DIRECTORY_LIST_ID, from infrastructure/main.dev.parameters.json.
+LIST_ID=$(jq -r .parameters.clientDirectoryListId.value infrastructure/main.dev.parameters.json)
+```
+
+Tools: `az` (signed in, Owner or Contributor on `$RG`), `jq`, Node 22 with `corepack`, and
+`psql` from libpq 16 or later (`brew install libpq`), which can verify the server's certificate
+against the system's CAs (`sslrootcert=system`). Homebrew's `libpq` is keg-only: it puts no
+`psql` on your `PATH`, so step 3 adds it (`export PATH="$(brew --prefix libpq)/bin:$PATH"`)
+in every new shell.
+
+1. **Evaluate, before anything is deployed.** The classifier's prompt and output schema changed
+   (the `invoice` block), so this is a classification change too. Run the evaluation exactly as
+   in [Classification release](#classification-release) step 1, on the same documents and
+   truth file, with the same go/no-go bar. The report now also has an **Invoice fields** table:
+   it scores a field only where `truth.json` gives it (`"fields": {"grossAmount": "1230.00",
+   "sellerNip": "…", …}`, optional per entry and per field), and lists each miss by file and
+   field name, never by value. It is reported for Roman to read; it does not change the verdict.
+   **No-go:** stop here; nothing was deployed.
+
+2. **Deploy the database.** First the read-only checks and what-if:
+
+   ```bash
+   # Registered once per subscription (Roman, if it prints NotRegistered:
+   # az provider register -n Microsoft.DBforPostgreSQL).
+   az provider show -n Microsoft.DBforPostgreSQL --query registrationState -o tsv
+   infrastructure/db-deploy.sh dev
+   ```
+
+   The script refuses a template with any resource outside `Microsoft.DBforPostgreSQL`, and a
+   what-if that would delete anything or change anything else. It must end with `What-if clean`
+   after exactly six `Create` lines: the server `psql-bcr-dev-<suffix>`, its administrator (your
+   object id), the two TLS settings, the database `ledger` and the firewall rule
+   `AllowAllAzureServicesAndResourcesWithinAzureIps`. Then deploy, typing the resource group's
+   name when asked:
+
+   ```bash
+   infrastructure/db-deploy.sh dev --apply
+   DB_SERVER=$(az postgres flexible-server list -g $RG --query "[?starts_with(name,'psql-bcr-dev-')].name | [0]" -o tsv)
+   DB_HOST=$(az postgres flexible-server show -g $RG -n $DB_SERVER --query fullyQualifiedDomainName -o tsv)
+   ```
+
+   **Verify** (read-only):
+
+   ```bash
+   az postgres flexible-server show -g $RG -n $DB_SERVER --query "{state:state, version:version,
+     sku:sku.name, entra:authConfig.activeDirectoryAuth, password:authConfig.passwordAuth,
+     public:network.publicNetworkAccess, days:backup.backupRetentionDays,
+     geo:backup.geoRedundantBackup}" -o json
+   az postgres flexible-server firewall-rule list -g $RG -s $DB_SERVER -o table
+   az postgres flexible-server microsoft-entra-admin list -g $RG -s $DB_SERVER -o table
+   ```
+
+   `Ready`, `16`, `Standard_B1ms`, `Enabled`, `Disabled`, `Enabled`, `7`, `Enabled`; exactly one
+   firewall rule, `0.0.0.0`–`0.0.0.0`; one administrator, you. Geo-redundant backup is offered
+   on Burstable in PostgreSQL Flexible Server and can only be chosen at creation; if the deploy
+   refuses it in this region, set `"geoRedundantBackup": "Disabled"` in
+   `infrastructure/db.dev.parameters.json` in a reviewed commit and deploy again (backups are
+   then zone-local for the 7 days). Record the server name, the date and the `geo` value in the
+   incident's status table.
+
+   **Rollback.** Nothing uses the server yet. Roman decides whether to delete it
+   (`az postgres flexible-server delete -g $RG -n $DB_SERVER`); it holds no data at this point.
+
+3. **Open your own access, for this session only.** The server admits Azure addresses only;
+   your laptop needs a rule of its own, named with today's date, removed in step 10.
+
+   ```bash
+   MY_IP=$(curl -s https://api.ipify.org)
+   [[ $MY_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || echo "STOP: MY_IP is not an IPv4 address"
+   OP_RULE="operator-$(date -u +%Y%m%d)"
+   # -s is the server, -n the rule.
+   az postgres flexible-server firewall-rule create -g $RG -s $DB_SERVER -n $OP_RULE \
+     --start-ip-address $MY_IP --end-ip-address $MY_IP -o none
+   # Homebrew's libpq is keg-only: its psql is not on PATH until this. Must print 16 or later.
+   export PATH="$(brew --prefix libpq)/bin:$PATH"
+   psql --version
+   # psql as the Entra administrator: the password is a token (about an hour), never printed.
+   # pg_token fetches a fresh one; run it again before psql whenever time has passed.
+   export PGHOST=$DB_HOST PGUSER=$ADMIN_UPN PGSSLMODE=verify-full PGSSLROOTCERT=system
+   pg_token() { export PGPASSWORD=$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv); }
+   pg_token
+   psql -d postgres -c 'SELECT current_user'
+   ```
+
+4. **Create the ingestion identity's login.** In the `postgres` database, as the administrator,
+   with the Function App's name — the display name of its system-assigned managed identity —
+   as the role name:
+
+   ```bash
+   psql -d postgres -c "SELECT * FROM pgaadauth_create_principal('$INGEST', false, false);"
+   psql -d postgres -c "SELECT rolname, rolcanlogin, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = '$INGEST';"
+   ```
+
+   One row: `rolcanlogin` `t`, `rolsuper` `f`, `rolbypassrls` `f`. (`false, false`: not an
+   administrator, no MFA claim — a managed identity has none.) If the call cannot resolve the
+   name (two principals share it), use the managed identity's object id instead:
+   `SELECT * FROM pgaadauth_create_principal_with_oid('$INGEST', '<principal id>', 'service', false, false);`
+   with `<principal id>` from
+   `az functionapp identity show -g $RG -n $INGEST --query principalId -o tsv`.
+   The login can do nothing yet: it has no privilege on anything until step 5 grants it
+   `ledger_app`.
+
+5. **Run the migrations, then grant the app's role.** From the repository, on the commit being
+   released, as the administrator (the tool takes its token from your `az login`):
+
+   ```bash
+   corepack yarn install --immutable
+   export LEDGER_DB_HOST=$DB_HOST LEDGER_DB_ADMIN_USER=$ADMIN_UPN
+   corepack yarn workspace @bcr/ledger-db migrate status
+   corepack yarn workspace @bcr/ledger-db migrate
+   corepack yarn workspace @bcr/ledger-db migrate grant-app "$INGEST"
+   ```
+
+   `migrate` prints `applying 0001_ledger_core`, `applied 1, already applied 0` and
+   `verify.sql: no problems`; running it again applies nothing. `grant-app` prints
+   `granted ledger_app to <app> (INHERIT FALSE, SET TRUE)` and `verify.sql: no problems`. It
+   refuses a login that is a superuser, has BYPASSRLS or cannot log in. **Verify** by hand too:
+
+   ```bash
+   pg_token
+   psql -d ledger -f packages/ledger-db/sql/verify.sql
+   ```
+
+   `(0 rows)`. Any row names the broken invariant: stop, and do not go on to step 7.
+
+6. **Record the settings, then compare** (read-only), in a commit of its own:
+   `"ledgerDbHost"` = `$DB_HOST` and `"ledgerDbUser"` = `$INGEST` in
+   `infrastructure/main.dev.parameters.json` (`"ledgerIndexMode"` stays `"off"`). Then:
+
+   ```bash
+   node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json \
+     --expect LEDGER_INDEX_MODE,LEDGER_DB_HOST,LEDGER_DB_NAME,LEDGER_DB_USER
+   ```
+
+   Exactly four `note` lines, all on ingestion, each a setting added: `LEDGER_INDEX_MODE` `off`,
+   `LEDGER_DB_HOST` the server, `LEDGER_DB_NAME` `ledger`, `LEDGER_DB_USER` the app's name.
+   **Any `drift` line: stop** and record it first, as the standing rules require.
+
+7. **Deploy the ingestion build, with the index off.** As
+   [the channel-inbox step of H-12](#h-12-the-change-window-ingestion-deploy-bindings-canaries),
+   sub-step 1 (`save_running` under a new name, build, marker checks, `config-zip` or the
+   package URL with the trigger sync), with these checks added; each must print `1` or more:
+
+   ```bash
+   STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+   save_running $INGEST document-ingestion-p0-$STAMP.zip
+   corepack yarn workspace @bcr/document-ingestion package
+   unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js | grep -c ledgerIndexMode
+   unzip -l artifacts/document-ingestion.zip | grep -c 'node_modules/@bcr/ledger-db/dist/tx.js'
+   unzip -l artifacts/document-ingestion.zip | grep -c 'node_modules/pg/package.json'
+   ```
+
+   Then set the four settings with the index still off (one restart), and compare again:
+
+   ```bash
+   az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
+     LEDGER_INDEX_MODE=off LEDGER_DB_HOST=$DB_HOST LEDGER_DB_NAME=ledger LEDGER_DB_USER=$INGEST
+   node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json
+   ```
+
+   **Verify.** `✔ no errors, no drift`. `/api/health` reports `"ledgerIndex":"off"` beside the
+   unchanged `phase`, `routing`, `membershipCheck` and `inboxSweep`; the cold-start
+   `index.config` line says `mode` `off`. Files are filed as before; the filing lines are
+   unchanged, and nothing connects to the database.
+
+8. **Switch the index on.** In a commit of its own, `"ledgerIndexMode": { "value": "write" }` in
+   `main.dev.parameters.json`. Then:
+
+   ```bash
+   node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json \
+     --expect LEDGER_INDEX_MODE
+   az functionapp config appsettings set -g $RG -n $INGEST -o none --settings LEDGER_INDEX_MODE=write
+   node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json
+   ```
+
+   One `note` (`off` → `write`) before, `✔ no errors, no drift` after. **Verify.**
+   `/api/health` reports `"ledgerIndex":"write"`; the next cold start's `index.config` line
+   says `mode` `write` with the host, `ledger` and the app's name. The app refuses to start in
+   `write` without `LEDGER_DB_HOST` or `LEDGER_DB_USER`, so a started app has both.
+
+9. **Canary: the canary Team's row.** This needs what the channel-inbox step of H-12 set up for
+   its canaries: the canary row in `INBOX_SWEEP_ROWS` with the sweep in `enforce` for it
+   (sub-step 4), and the canary guest back in the canary Team, and in no other (sub-step 2;
+   sub-step 6 took it out). `shadow` writes nothing, and so indexes nothing, by design: if the
+   sweep is still in `shadow`, run this canary within sub-step 4, after step 8 here. As the
+   canary guest, post one synthetic invoice PDF (no real data; a made-up seller NIP with a
+   valid checksum) in the canary Team's „Dokumenty księgowe” channel. Within two ticks:
+
+   ```bash
+   aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
+     | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
+     | where msg in ("inbox.filed", "inbox.sorted_to_review", "index.written", "index.write_failed")
+     | project timestamp, msg, listItemId = tostring(m.listItemId), driveItemId = tostring(m.driveItemId),
+         status = tostring(m.status), created = tostring(m.created),
+         invoiceFields = toint(m.invoiceFields), reason = tostring(m.reason)' \
+     <post time, UTC>
+   ```
+
+   An `inbox.filed` (or `inbox.sorted_to_review`) and, for the same `driveItemId` and
+   `listItemId` `$CANARY_ROW`, an `index.written` with `created` `true` and, for an invoice,
+   `invoiceFields` above `0`. No `index.write_failed`. Then the database itself, as the
+   administrator — the only place a scope is set by hand, in a transaction that is rolled back.
+   Steps 6–8 usually outlast the token (about an hour), so fetch a fresh one first; if your IP
+   changed since step 3, delete the rule (step 10's `firewall-rule delete` line) and run step
+   3's `MY_IP` and `firewall-rule create` lines again:
+
+   ```bash
+   pg_token
+   CANARY_CLIENT=$(CLIENT_DIRECTORY_LIST_ID=$LIST_ID corepack yarn workspace @bcr/ledger-db migrate client-id "$CANARY_ROW")
+   psql -d ledger <<SQL
+   BEGIN;
+   SET LOCAL ROLE ledger_owner;
+   -- No scope: must be 0, even for the owner (FORCE ROW LEVEL SECURITY).
+   SELECT count(*) AS without_scope FROM ledger.documents;
+   SELECT set_config('app.client_id', '$CANARY_CLIENT', true);
+   SELECT directory_list_item_id, status FROM ledger.clients;
+   SELECT source, status, category, to_char(document_month, 'YYYY-MM') AS month,
+          invoice_number IS NOT NULL AS has_number, gross_amount IS NOT NULL AS has_gross,
+          seller_nip IS NOT NULL AS has_seller_nip
+     FROM ledger.documents ORDER BY created_at DESC LIMIT 5;
+   ROLLBACK;
+   SQL
+   ```
+
+   `without_scope` `0`; one client row, `$CANARY_ROW`, `active`; the canary's document, source
+   `inbox`, filed as the log said. A staff member's post in the same channel, which the sweep
+   leaves alone, gives no row. Record the `index.written` lines and the counts in the incident's
+   status table. Then clean up as in sub-step 6: delete the canary files, and the canary guest
+   leaves the canary Team. The canary's index rows stay (synthetic, in the canary's own scope).
+   There is no separate switch per client: from now on every document the sweep files (for the
+   rows it sweeps in `enforce`) and every bot-path filing is indexed.
+
+10. **Close your access.**
+
+    ```bash
+    az postgres flexible-server firewall-rule delete -g $RG -s $DB_SERVER -n $OP_RULE --yes
+    az postgres flexible-server firewall-rule list -g $RG -s $DB_SERVER -o table
+    unset PGPASSWORD LEDGER_DB_ADMIN_USER
+    ```
+
+    Exactly one rule again: `AllowAllAzureServicesAndResourcesWithinAzureIps`.
+
+**Daily check** (with the [standing checks](#standing-checks)): `verify.sql` must return no rows,
+and no `index.write_failed` should repeat. The first needs your access for a minute. In a new
+shell, from the repository, after the [variables](#variables-used-below) (`RG`, `APPI`, `aiq`):
+
+```bash
+ADMIN_UPN=$(az ad signed-in-user show --query userPrincipalName -o tsv)
+DB_SERVER=$(az postgres flexible-server list -g $RG --query "[?starts_with(name,'psql-bcr-dev-')].name | [0]" -o tsv)
+DB_HOST=$(az postgres flexible-server show -g $RG -n $DB_SERVER --query fullyQualifiedDomainName -o tsv)
+[[ $DB_HOST == psql-bcr-dev-*.postgres.database.azure.com ]] || echo "STOP: no index server in $RG"
+index_verify() {
+  local rule="operator-$(date -u +%Y%m%dT%H%M)" ip
+  ip=$(curl -s https://api.ipify.org)
+  az postgres flexible-server firewall-rule create -g $RG -s $DB_SERVER -n $rule \
+    --start-ip-address $ip --end-ip-address $ip -o none &&
+  LEDGER_DB_HOST=$DB_HOST LEDGER_DB_ADMIN_USER=$ADMIN_UPN \
+    corepack yarn workspace @bcr/ledger-db migrate verify
+  az postgres flexible-server firewall-rule delete -g $RG -s $DB_SERVER -n $rule --yes
+  az postgres flexible-server firewall-rule list -g $RG -s $DB_SERVER --query '[].name' -o tsv
+}
+index_verify
+aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
+  | extend m = parse_json(message) | where tostring(m.msg) == "index.write_failed"
+  | summarize n = count() by reason = tostring(m.reason), sqlState = tostring(m.err.sqlState)' \
+  "$(date -u -v-1d +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+`verify.sql: no problems`, and the last line lists one rule only,
+`AllowAllAzureServicesAndResourcesWithinAzureIps`: yours is gone. `index.write_failed` by reason:
+`unavailable` now and then is the server restarting (maintenance is Saturday 18:00 UTC);
+`constraint` with `sqlState` `23505` is two bound Directory rows sharing a NIP (a Directory
+conflict: fix the Directory); `row_security` (`42501`) or `scope` must never happen — treat it
+as an incident. A failed write never blocked a filing; the missing rows are backfilled later.
+
+**Rollback.** The index can be switched off at any time without touching filing:
+
+```bash
+az functionapp config appsettings set -g $RG -n $INGEST -o none --settings LEDGER_INDEX_MODE=off
+```
+
+Then record `"off"` in `main.dev.parameters.json` in a commit of its own, and `--live` is clean
+again. The rows already written stay; nothing is deleted. To go back to the previous build,
+deploy the `document-ingestion-p0-$STAMP.zip` saved in step 7, the same way: it ignores the
+`LEDGER_*` settings (and still files as before). The database stays until Roman decides
+otherwise; it costs the same whether or not anything writes to it.

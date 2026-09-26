@@ -19,6 +19,7 @@ function summary(over: Partial<EvaluationSummary> = {}): EvaluationSummary {
     filedCorrectly: 36,
     filedWrongly: 1,
     confidenceBuckets: [{ label: '0.90-1.00', hit: 38, of: 40 }],
+    extraction: [],
     reasons: { LOW_CONFIDENCE: 3 },
     inputTokens: 2_000_000,
     outputTokens: 40_000,
@@ -212,6 +213,44 @@ describe('renderReport', () => {
     expect(text).toContain('| unreadable |');
     expect(text).toContain('`faktury_zakupu` (zakup)');
     expect(text).toContain('- Review reasons: LOW_CONFIDENCE 3.');
+  });
+
+  it('reports invoice-field accuracy and each miss by field name, never by value', () => {
+    const text = renderReport(
+      summary({
+        extraction: [
+          { field: 'grossAmount', hit: 9, of: 10 },
+          { field: 'sellerNip', hit: 10, of: 10 },
+        ],
+      }),
+      [
+        {
+          ...base,
+          truth: {
+            file: 'fv|1.pdf',
+            category: 'faktury_zakupu',
+            month: '2026-09',
+            fields: { grossAmount: '1230.00' },
+          },
+          outcome: 'answered',
+          fields: { grossAmount: false, sellerNip: true },
+        },
+      ],
+      meta,
+    );
+    expect(text).toContain('## Invoice fields (answered documents whose truth gives the field)');
+    expect(text).toContain('| `grossAmount` | 9/10 (90%) |');
+    expect(text).toContain('| `sellerNip` | 10/10 (100%) |');
+    expect(text).toContain('| fv 1.pdf | `grossAmount` |');
+    expect(text).not.toContain('1230.00');
+    expect(text).not.toContain('| fv 1.pdf | `sellerNip` |');
+  });
+
+  it('says when no truth gives invoice fields, and when nothing was missed', () => {
+    expect(renderReport(summary(), [], meta)).toContain('No truth entry gives invoice fields.');
+    expect(
+      renderReport(summary({ extraction: [{ field: 'currency', hit: 1, of: 1 }] }), [], meta),
+    ).toContain('No misses.');
   });
 
   it('says so when direction is not measured, and prices nothing it does not know', () => {
