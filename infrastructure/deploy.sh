@@ -42,16 +42,18 @@ PARAM_ENV="$(lower "$(jq -r '.parameters.environmentName.value // empty' "$PARAM
 
 # "dev" is production (it serves a real client), and this deploy replaces
 # every app setting of both apps. main.bicep with main.dev.parameters.json now
-# records the settings dev runs with (gate G1), but lifting this refusal is a
-# person's decision, after reviewing a what-if and a clean
-# `node tools/check-app-settings.mjs --live` against rg-bcr-ledger-dev. Until
-# then, deploy dev as code-only zips (docs/operations/human-steps.md). Dev is
-# recognised by the environment name, by its resource group (an explicit
-# second argument too) and by the parameter file's environmentName, all
-# case-insensitively.
+# records the settings dev runs with (gate G1), but the WEBSITE_RUN_FROM_PACKAGE
+# carry-over in modules/functionApp.bicep has never run against a real app.
+# This refusal goes only in a reviewed commit of its own, after the "Lifting
+# gate G1" checklist in docs/operations/human-steps.md: a rehearsal on a
+# throwaway resource group, a clean `tools/check-app-settings.mjs --live`
+# against rg-bcr-ledger-dev, a reviewed what-if. Until then, deploy dev as
+# code-only zips (the same page). Dev is recognised by the environment name,
+# by its resource group (an explicit second argument too) and by the parameter
+# file's environmentName, all case-insensitively.
 if [[ "${ALLOW_DEV_BICEP:-}" != "i-have-fixed-the-drift" ]] &&
   [[ "$ENV_NAME" == "dev" || "$(lower "$RG")" == "rg-bcr-ledger-dev" || "$PARAM_ENV" == "dev" ]]; then
-  echo "Refusing: dev is production; Bicep deploys to it wait for the G1 review." >&2
+  echo "Refusing: dev is production; Bicep deploys to it wait for 'Lifting gate G1'." >&2
   echo "Deploy code-only zips as in docs/operations/human-steps.md." >&2
   exit 1
 fi

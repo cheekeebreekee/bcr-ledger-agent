@@ -10,11 +10,12 @@ subscription and Microsoft 365 tenant.
 > ⚠️ **This guide is for a brand-new environment. Never run it against "dev".** "dev" is
 > production: it serves a real client, and a Bicep deploy replaces every app setting.
 > `main.bicep` with `main.dev.parameters.json` now records the settings dev runs with (gate G1),
-> but `infrastructure/deploy.sh` still refuses `dev` in any spelling, and the
-> `rg-bcr-ledger-dev` resource group, until a person has reviewed a what-if and a clean
-> `node tools/check-app-settings.mjs --live` against it and lifted the refusal. Until then "dev"
-> gets code only, in the order given in
-> [`operations/human-steps.md`](operations/human-steps.md#phase-0).
+> but `infrastructure/deploy.sh` and the Deploy workflow still refuse `dev` in any spelling,
+> and the `rg-bcr-ledger-dev` resource group, until
+> [Lifting gate G1](operations/human-steps.md#lifting-gate-g1) is done: a rehearsal on a
+> throwaway resource group, a clean `node tools/check-app-settings.mjs --live`, a reviewed
+> what-if, then the refusal removed in a reviewed commit of its own. Until then "dev" gets code
+> only, in the order given in [`operations/human-steps.md`](operations/human-steps.md#phase-0).
 
 ---
 

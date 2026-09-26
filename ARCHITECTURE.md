@@ -793,6 +793,9 @@ against the running apps (before any deploy to an existing environment).
 
 ⚠️ **"dev" is production: it serves PESKOVOI.** Its routing settings were set by hand during
 Phase 0; the template now records them (v2 gate G1), but there is still no deploy on push, and
-Bicep deploys to dev stay refused until a person has reviewed a what-if and a clean `--live`
-comparison. Until then deploys are code-only. See
+Bicep deploys to dev stay refused until
+[Lifting gate G1](./docs/operations/human-steps.md#lifting-gate-g1) is done: a rehearsal on a
+throwaway resource group (the `WEBSITE_RUN_FROM_PACKAGE` carry-over has never run against a
+real app), a clean `--live` comparison and a reviewed what-if. Until then deploys are
+code-only. See
 [`docs/operations/human-steps.md`](./docs/operations/human-steps.md#phase-0).

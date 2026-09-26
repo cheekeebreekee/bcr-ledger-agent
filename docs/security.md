@@ -296,9 +296,13 @@ settings are added with a merge. The template and `main.dev.parameters.json` rec
 setting dev runs with (gate G1). CI fails when the code reads a setting Bicep does not set, or
 Bicep sets one no code reads (`tools/check-app-settings.mjs`); `--live` compares the template
 with the running apps, which what-if cannot (it masks app settings), and `deploy.sh` and the
-Deploy workflow run it before any Bicep deploy to existing apps. **Status: Mitigated (G0, G1
-in review).** Bicep deploys to dev stay refused until a person reviews a what-if and a clean
-`--live` run; environment approval is still open.
+Deploy workflow run it before any Bicep deploy to existing apps, stopping on any difference
+not named in `EXPECTED_SETTING_CHANGES`, and on any `az` failure. **Status: Mitigated (G0, G1
+in review).** Bicep deploys to dev stay refused until
+[Lifting gate G1](operations/human-steps.md#lifting-gate-g1) is done: the
+`WEBSITE_RUN_FROM_PACKAGE` carry-over is rehearsed on a throwaway resource group first, and the
+refusal goes in a reviewed commit of its own. Environment approval is still open; that commit
+adds it.
 
 ### T18. Channel-inbox intake
 

@@ -554,9 +554,12 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
     from the template, and one deploy would have taken ingestion down; the push-to-`main` deploy
     was removed for this reason (`f5a2bd4`). The template now records them (gate G1), CI checks
     that Bicep sets every setting the code reads (`yarn check:app-settings`), and
-    `node tools/check-app-settings.mjs --live` compares the template with the running apps.
-    Bicep deploys to "dev" stay refused until a person has reviewed a what-if and a clean
-    `--live` run. Any setting changed by hand must go into the parameters file too.
+    `node tools/check-app-settings.mjs --live` compares the template with the running apps
+    (`--expect` for the changes a deploy is meant to make). Bicep deploys to "dev" stay refused
+    until [Lifting gate G1](docs/operations/human-steps.md#lifting-gate-g1) is done: the
+    `WEBSITE_RUN_FROM_PACKAGE` carry-over has never run against a real app, so it is rehearsed
+    on a throwaway resource group first. Any setting changed by hand must go into the parameters
+    file too.
 
 21. **`az functionapp config appsettings set` prints every setting**, including the storage
     account key in `AzureWebJobsStorage` and any SAS URL. Always pass `-o none`, and list

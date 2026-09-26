@@ -313,10 +313,11 @@ only in Azure is reverted by the next deploy. Change it here.
 > ⚠️ **For a brand-new environment only. Never deploy "dev" this way.** "dev" is production: it
 > serves a real client, and a template deploy replaces every app setting with the template's.
 > The template now records dev's settings (gate G1), but `infrastructure/deploy.sh` still refuses
-> `dev` in any spelling, and the `rg-bcr-ledger-dev` resource group, until a person has reviewed
-> a what-if and a clean `node tools/check-app-settings.mjs --live` and lifted the refusal. To
-> ship code to "dev", deploy code only, in the order in
-> [`operations/human-steps.md`](operations/human-steps.md#phase-0).
+> `dev` in any spelling, and the `rg-bcr-ledger-dev` resource group, until
+> [Lifting gate G1](operations/human-steps.md#lifting-gate-g1) is done (a rehearsal on a
+> throwaway resource group, a clean `node tools/check-app-settings.mjs --live`, a reviewed
+> what-if, then a reviewed commit that lifts the refusal). To ship code to "dev", deploy code
+> only, in the order in [`operations/human-steps.md`](operations/human-steps.md#phase-0).
 
 ```bash
 az login

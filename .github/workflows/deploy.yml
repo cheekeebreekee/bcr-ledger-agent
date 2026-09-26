@@ -18,10 +18,11 @@ on:
   # No `push` trigger, and a manual run against dev is refused too (first step
   # below). "dev" serves a real client, and a Bicep deploy replaces every app
   # setting. The template and main.dev.parameters.json now record the settings
-  # dev runs with (gate G1), but lifting the refusal is a person's decision,
-  # after reviewing a what-if and a clean `tools/check-app-settings.mjs --live`
-  # against rg-bcr-ledger-dev. Until then dev is deployed as code-only zips:
-  # docs/operations/human-steps.md.
+  # dev runs with (gate G1), but the refusal goes only in a reviewed commit of
+  # its own, after the "Lifting gate G1" checklist in
+  # docs/operations/human-steps.md (a rehearsal on a throwaway resource group,
+  # a clean `tools/check-app-settings.mjs --live`, a reviewed what-if). Until
+  # then dev is deployed as code-only zips (the same page).
 
 permissions:
   id-token: write   # OIDC federation to Azure
@@ -40,7 +41,7 @@ jobs:
       - name: Refuse dev until the G1 review
         if: env.ENV_NAME == 'dev'
         run: |
-          echo "::error::dev is production (it serves a real client). Bicep deploys to it are blocked until a person has reviewed the G1 drift fix (what-if and check-app-settings --live): deploy code-only zips as in docs/operations/human-steps.md."
+          echo "::error::dev is production (it serves a real client). Bicep deploys to it are blocked until the 'Lifting gate G1' checklist in docs/operations/human-steps.md is done: deploy code-only zips as described there."
           exit 1
 
       - uses: actions/checkout@v4
