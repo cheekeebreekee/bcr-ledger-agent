@@ -150,6 +150,11 @@ export interface InboxTickSummary {
   /** Would have been moved (shadow): logged as `inbox.would_move` this tick. */
   readonly wouldMove: number;
   /**
+   * Shadow: unchanged since this worker logged its `inbox.would_move`. Not
+   * processed again, and not counted against the file budget.
+   */
+  readonly alreadyReported: number;
+  /**
    * The classifier could not answer now (429, 529, 5xx, a timeout): left in
    * the inbox for the next tick, not a failure, never sent to review.
    */
@@ -254,8 +259,9 @@ interface Tick {
  * `If-Match`. A file someone moved, renamed or replaced meanwhile is left
  * where it now is. It never recurses (subfolders are the filed area), never
  * copies, never deletes, never moves across drives and never overwrites. In
- * `shadow` it does everything but write, and logs what it would move. A
- * classifier that cannot answer now leaves the file for the next tick. Logs carry ids, codes, counts and taxonomy paths only.
+ * `shadow` it does everything but write, and logs what it would move once per
+ * version of a file. A classifier that cannot answer now leaves the file for
+ * the next tick. Logs carry ids, codes, counts and taxonomy paths only.
  */
 export class ChannelInbox {
   private readonly log: Logger;
@@ -268,6 +274,8 @@ export class ChannelInbox {
   private readonly placements = new Map<string, CachedPlacement>();
   private readonly failures = new Map<string, number>();
   private readonly reportedSkips = new Set<string>();
+  /** Shadow: the (driveItemId, eTag) pairs whose `inbox.would_move` this worker logged. */
+  private readonly reportedMoves = new Set<string>();
   /** The row to start the next tick with (its list item id). */
   private cursor: string | undefined;
   private running = false;
@@ -300,6 +308,7 @@ export class ChannelInbox {
         filed: 0,
         sortedToReview: 0,
         wouldMove: 0,
+        alreadyReported: 0,
         retryLater: 0,
         skippedNotClient: 0,
         skippedUnverified: 0,
@@ -412,10 +421,17 @@ export class ChannelInbox {
     tick.counts.skippedBeforeCutoff += selected.beforeCutoff;
     tick.counts.skippedNotClient += selected.noCreator;
 
-    for (const [index, candidate] of selected.candidates.entries()) {
+    for (const candidate of selected.candidates) {
+      // The budget is for files that need work. In shadow, a version already
+      // reported needs none: without this, the same cached files took the
+      // whole budget every tick and the rest of a channel was never reached.
+      if (this.deps.mode === 'shadow' && this.reportedMoves.has(versionKey(candidate))) {
+        tick.counts.alreadyReported += 1;
+        continue;
+      }
       if (this.outOfBudget(tick)) {
-        tick.counts.deferred += selected.candidates.length - index;
-        return;
+        tick.counts.deferred += 1;
+        continue;
       }
       const uploader = await this.uploaderVerdict(candidate, ids.teamId);
       if (uploader.verdict !== 'client') {
@@ -612,7 +628,7 @@ export class ChannelInbox {
     return false;
   }
 
-  /** Shadow: what would be moved, and where. */
+  /** Shadow: one `inbox.would_move` per version of a file while this worker runs. */
   private reportWouldMove(
     tick: Tick,
     ids: RowIds,
@@ -620,6 +636,9 @@ export class ChannelInbox {
     decision: AcceptanceDecision,
     extra: Record<string, unknown> = {},
   ): void {
+    const key = versionKey(candidate);
+    if (this.reportedMoves.has(key)) return;
+    remember(this.reportedMoves, key);
     tick.counts.wouldMove += 1;
     tick.log.info(
       {
@@ -872,6 +891,11 @@ export function selectCandidates(
 function userIdOf(identity: { readonly user?: { readonly id?: string } } | undefined): string {
   const id = identity?.user?.id?.trim().toLowerCase() ?? '';
   return GUID.test(id) ? id : '';
+}
+
+/** One version of one file: the key of what shadow has already reported. */
+function versionKey(candidate: InboxCandidate): string {
+  return `${candidate.item.id}|${candidate.eTag}`;
 }
 
 /** The tick has too little time left for the next stage: the file waits, not a failure. */

@@ -1314,6 +1314,70 @@ describe('ChannelInbox: modes', () => {
     ]);
   });
 
+  it('shadow logs would_move once per version of a file, and again when it changes', async () => {
+    const { tenant, inbox, classify, events } = setup({ mode: 'shadow' });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    const ticks = [await inbox.sweep(), await inbox.sweep(), await inbox.sweep()];
+    expect(events('inbox.would_move')).toHaveLength(1);
+    expect(ticks.map((t) => [t.wouldMove, t.alreadyReported])).toEqual([
+      [1, 0],
+      [0, 1],
+      [0, 1],
+    ]);
+    expect(classify).toHaveBeenCalledTimes(1);
+
+    tenant.item(id).eTag = '"replaced"';
+    await inbox.sweep();
+    expect(events('inbox.would_move')).toHaveLength(2);
+    expect(classify).toHaveBeenCalledTimes(2);
+  });
+
+  // The 2026-09-26 evaluation: 43 files, a budget of 20, and the same 20
+  // cached files took the budget every tick, so 23 were never classified.
+  it('shadow reaches every file of a backlog: 43 files, a budget of 20, all classified within 3 ticks', async () => {
+    const { tenant, inbox, classify, events } = setup({
+      mode: 'shadow',
+      deps: { maxFilesPerTick: 20 },
+    });
+    const ids = Array.from({ length: 43 }, (_, i) =>
+      tenant.addFile('inbox-a', { name: `doc-${String(i).padStart(2, '0')}.pdf` }),
+    );
+
+    const ticks = [await inbox.sweep(), await inbox.sweep(), await inbox.sweep()];
+
+    expect(classify).toHaveBeenCalledTimes(43);
+    expect(new Set(events('inbox.would_move').map((l) => l['driveItemId']))).toEqual(new Set(ids));
+    expect(ticks.map((t) => [t.wouldMove, t.alreadyReported, t.deferred])).toEqual([
+      [20, 0, 23],
+      [20, 20, 3],
+      [3, 40, 0],
+    ]);
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  it('shadow still spends the budget on a file whose earlier classification failed', async () => {
+    let fail = true;
+    const { tenant, inbox, classify } = setup({
+      mode: 'shadow',
+      deps: { maxFilesPerTick: 1 },
+      classify: jest.fn(async () => {
+        if (fail) throw new Error('down');
+        return invoice;
+      }),
+    });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.addFile('inbox-a', { name: 'b.pdf' });
+
+    const first = await inbox.sweep();
+    fail = false;
+    const second = await inbox.sweep();
+
+    expect(first).toMatchObject({ failed: 1, deferred: 1, wouldMove: 0 });
+    expect(second).toMatchObject({ wouldMove: 1, deferred: 1 });
+    expect(classify).toHaveBeenCalledTimes(2);
+  });
+
   it('shadow logs the move to 98_ that three failures would make, and still writes nothing', async () => {
     const { tenant, inbox, events } = setup({
       mode: 'shadow',
@@ -1864,6 +1928,7 @@ describe('ChannelInbox: logs', () => {
       filed: 1,
       sortedToReview: 0,
       wouldMove: 0,
+      alreadyReported: 0,
       retryLater: 0,
       skippedNotClient: 0,
       skippedUnverified: 0,
