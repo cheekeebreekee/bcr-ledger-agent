@@ -1,5 +1,5 @@
 import { app, type HttpResponseInit } from '@azure/functions';
-import type { MembershipCheckMode } from '@bcr/shared';
+import type { InboxSweepMode, MembershipCheckMode } from '@bcr/shared';
 import { loadIngestionConfig } from '../config';
 
 /**
@@ -18,6 +18,11 @@ import { loadIngestionConfig } from '../config';
  * uploader must be in their row's Team and no other, `off` when that check is
  * switched off (R46 open). An operator can require it with
  * `--expect-health build.membershipCheck=enforce`.
+ *
+ * `build.inboxSweep` is `INBOX_SWEEP_MODE`: `off`, `shadow` (reads, and logs
+ * what it would move) or `enforce` (moves client uploads inside their channel
+ * folder). An operator checks a mode change took effect here before reading
+ * the sweep's logs.
  */
 app.http('health', {
   route: 'health',
@@ -27,17 +32,22 @@ app.http('health', {
 });
 
 export async function handleHealth(): Promise<HttpResponseInit> {
+  const config = loadIngestionConfig();
   return {
     status: 200,
-    jsonBody: healthBody(loadIngestionConfig().membershipCheckMode, new Date()),
+    jsonBody: healthBody(config.membershipCheckMode, config.inboxSweepMode, new Date()),
   };
 }
 
-export function healthBody(membershipCheck: MembershipCheckMode, now: Date) {
+export function healthBody(
+  membershipCheck: MembershipCheckMode,
+  inboxSweep: InboxSweepMode,
+  now: Date,
+) {
   return {
     status: 'ok',
     service: 'document-ingestion',
-    build: { phase: 'p0', routing: 'identity-only', membershipCheck },
+    build: { phase: 'p0', routing: 'identity-only', membershipCheck, inboxSweep },
     timestamp: now.toISOString(),
   } as const;
 }

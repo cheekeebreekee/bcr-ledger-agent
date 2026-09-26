@@ -4,8 +4,9 @@ const mockHttp = jest.fn();
 jest.mock('@azure/functions', () => ({ app: { http: mockHttp } }));
 
 let mockMode: 'enforce' | 'off' = 'enforce';
+let mockInbox: 'off' | 'shadow' | 'enforce' = 'off';
 jest.mock('../config', () => ({
-  loadIngestionConfig: () => ({ membershipCheckMode: mockMode }),
+  loadIngestionConfig: () => ({ membershipCheckMode: mockMode, inboxSweepMode: mockInbox }),
 }));
 
 import { handleHealth, healthBody } from './health';
@@ -27,17 +28,38 @@ describe('health', () => {
     'keeps phase and routing exactly, and reports membershipCheck=%s',
     async (m) => {
       mockMode = m;
+      mockInbox = 'off';
       const res = await handleHealth();
       expect(res.status).toBe(200);
       const body = res.jsonBody as ReturnType<typeof healthBody>;
-      expect(body.build).toEqual({ phase: 'p0', routing: 'identity-only', membershipCheck: m });
+      expect(body.build).toEqual({
+        phase: 'p0',
+        routing: 'identity-only',
+        membershipCheck: m,
+        inboxSweep: 'off',
+      });
       expect(body.status).toBe('ok');
       expect(body.service).toBe('document-ingestion');
     },
   );
 
+  it.each(['off', 'shadow', 'enforce'] as const)(
+    'reports inboxSweep=%s without touching phase or routing',
+    async (m) => {
+      mockMode = 'enforce';
+      mockInbox = m;
+      const body = (await handleHealth()).jsonBody as ReturnType<typeof healthBody>;
+      expect(body.build).toEqual({
+        phase: 'p0',
+        routing: 'identity-only',
+        membershipCheck: 'enforce',
+        inboxSweep: m,
+      });
+    },
+  );
+
   it('stamps the time it was asked', () => {
     const now = new Date('2026-09-26T10:00:00.000Z');
-    expect(healthBody('enforce', now).timestamp).toBe('2026-09-26T10:00:00.000Z');
+    expect(healthBody('enforce', 'off', now).timestamp).toBe('2026-09-26T10:00:00.000Z');
   });
 });
