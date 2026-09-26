@@ -2098,3 +2098,145 @@ The first Bicep deploy to dev after that is a change window of its own: save bot
 packages first (H-9 step 1's `save_running`, under new file names), since a zip deploy of them
 is the rollback if the package setting is ever lost; deploy with `EXPECTED_SETTING_CHANGES` set
 to G1-b's names, if any; then `/api/health` as in H-12, and `--live` clean again.
+
+---
+
+## Classification release
+
+**Owner:** Yahor runs it; Roman decides go or no-go from the evaluation report. **When:** any
+working day outside the change freeze (1st–10th), after the channel-inbox step of H-12. It
+changes only the ingestion app.
+
+**What it changes** ([`ARCHITECTURE.md` §4](../../ARCHITECTURE.md#4-classification-pipeline)):
+the classifier moves to `claude-opus-5` with structured output; one acceptance threshold,
+`CLASSIFICATION_ACCEPT_THRESHOLD` (0.70–0.95), replaces `ANTHROPIC_CONFIDENCE_THRESHOLD` (0.6);
+a 429/529/5xx/timeout is "retry later" (the inbox leaves the file, the bot says send it again),
+never `98_`; a PDF over 100 pages is classified from its first 20; invoice direction comes only
+from the client's own NIP or name (without it: review, `DIRECTION_UNRESOLVED`); the category
+rules from the 26 September evaluation; shadow logs each file once and no longer starves the
+budget; filing lines carry `confidence`, `model`, `month`, `reviewReasons` and the taxonomy
+`folder`.
+
+**Why the settings change after the code, not before.** The new request is valid on both
+`claude-opus-4-5-20251101` (the running setting) and `claude-opus-5`, so the new build runs on
+either. The old build's forced tool call is only known to work on the old model. And the new
+build does not read `ANTHROPIC_CONFIDENCE_THRESHOLD` at all (it only warns that it is still set),
+so its 0.6 cannot stop the cold start.
+
+1. **Evaluate, before anything is deployed (the go/no-go).** On Yahor's machine, with the 43
+   documents of the 26 September evaluation in a git-ignored folder (for example
+   `tools/out/evaluations/2026-09-26-docs/`; they are client data: never commit, upload or paste
+   them). The key comes from the Anthropic Console into this shell only, never from Key Vault,
+   and is unset afterwards. The harness sends each document to the Anthropic API and nowhere else.
+
+   ```bash
+   corepack yarn install --immutable
+   corepack yarn build
+   # truth.json from the arbiter report (local, git-ignored).
+   corepack yarn workspace @bcr/document-ingestion eval:truth \
+     --arbiter "$PWD/tools/out/evaluations/classification-eval-2026-09-26.json" \
+     --client-name "BCR GROUP Sp. z o.o." \
+     --out "$PWD/tools/out/evaluations/truth-2026-09-26.json"
+   read -rs ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
+   corepack yarn workspace @bcr/document-ingestion eval \
+     --dir "$PWD/tools/out/evaluations/2026-09-26-docs" \
+     --truth "$PWD/tools/out/evaluations/truth-2026-09-26.json" \
+     --client-name "BCR GROUP Sp. z o.o." --client-nip "<NIP BCR GROUP>" \
+     --out "$PWD/tools/out/evaluations/eval-$(date -u +%Y%m%dT%H%M%SZ).md"
+   unset ANTHROPIC_API_KEY
+   ```
+
+   Use absolute paths: the yarn script runs in the package's folder. The run takes several
+   minutes and costs a few dollars (the report estimates it from the tokens used).
+   `--model` and `--threshold` override `ANTHROPIC_MODEL` and `CLASSIFICATION_ACCEPT_THRESHOLD`;
+   leave them at the release values (`claude-opus-5`, `0.70`).
+
+   **Go / no-go** (the report's first table, and its last line on the terminal):
+
+   | Criterion | Go when |
+   |---|---|
+   | Category accuracy | ≥ 95% of the documents the model answered |
+   | Direction | 100% of the invoices where the client is a party: no `wrong`, and no `unresolved` either |
+   | Transient errors | None filed to `98_`: the report's "retry later" count is `0` (a document still "retry later" after the retry pass is not filed, but the run is incomplete: run it again) |
+   | Review rate | Reported, and read by Roman: every `98_` row in the report has a reason |
+
+   Record the verdict, the report's totals and its file's sha256 in the incident's status table.
+   The report itself stays local. **No-go:** stop here; nothing was deployed.
+
+2. **Build and deploy the ingestion package**, exactly as the channel-inbox step of H-12,
+   sub-step 1 (`save_running` under a new name, build, the marker checks, `config-zip` or the
+   package URL with the trigger sync), with one more marker. Each count must be greater than 0:
+
+   ```bash
+   STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+   save_running $INGEST document-ingestion-p0-$STAMP.zip
+   corepack yarn workspace @bcr/document-ingestion package
+   unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js \
+     | grep -c classificationAcceptThreshold
+   unzip -l artifacts/document-ingestion.zip | grep -c 'node_modules/pdf-lib/package.json'
+   ```
+
+   plus the four counts of that sub-step. Deploy the zip as there. The app now runs the new
+   build on the old model setting, which it accepts.
+
+   **Verify.** `/api/health` answers as before (`build` unchanged). The cold-start line
+   `classification.config` shows `claude: on` and `acceptThreshold` `0.7`, and a
+   `config.retired_setting` line names `ANTHROPIC_CONFIDENCE_THRESHOLD`:
+
+   ```bash
+   aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
+     | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
+     | where msg in ("classification.config", "config.retired_setting")
+     | project timestamp, msg, model = tostring(m.model),
+         acceptThreshold = tostring(m.acceptThreshold), setting = tostring(m.setting)' \
+     <deploy time, UTC>
+   ```
+
+3. **Switch the settings.** One restart:
+
+   ```bash
+   az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
+     ANTHROPIC_MODEL=claude-opus-5 CLASSIFICATION_ACCEPT_THRESHOLD=0.70
+   az functionapp config appsettings delete -g $RG -n $INGEST -o none \
+     --setting-names ANTHROPIC_CONFIDENCE_THRESHOLD
+   ```
+
+   **Verify.** The next cold start's `classification.config` shows `model` `claude-opus-5` and
+   `acceptThreshold` `0.7`, and no `config.retired_setting` follows it. Then, once files flow,
+   the filing lines carry the new fields, and "retry later" is visible on its own:
+
+   ```bash
+   aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
+     | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
+     | where msg in ("inbox.filed", "inbox.sorted_to_review", "inbox.would_move",
+         "document.filed", "inbox.retry_later", "document.retry_later")
+     | project timestamp, msg, category = tostring(m.category),
+         suggested = tostring(m.suggestedCategory), confidence = todouble(m.confidence),
+         model = tostring(m.model), month = tostring(m.month),
+         reasons = tostring(m.reviewReasons), folder = tostring(m.folder),
+         status = tostring(m.status)' \
+     <switch time, UTC>
+   ```
+
+   `model` is `claude-opus-5` on every line a model answered; `folder` is a taxonomy path only
+   (`01_Faktury/…`, `98_Nieposortowane/…`); a `98_` line always has `reasons`. An
+   `inbox.retry_later` or `document.retry_later` now and then is the API being busy, and the
+   file is simply taken on a later tick; on every tick for an hour, check
+   [status.anthropic.com](https://status.anthropic.com), and `status` 401/403/404 means the key or
+   the model setting is wrong.
+
+4. **Bicep.** `main.bicep` still sets `ANTHROPIC_MODEL=claude-opus-4-5-20251101` and
+   `ANTHROPIC_CONFIDENCE_THRESHOLD`, and not `CLASSIFICATION_ACCEPT_THRESHOLD`. Nothing here
+   deploys Bicep ("dev" is production); the template is brought in line with the drift fix
+   (gate G1).
+
+**Rollback.** First set the model back, so the old build never runs on the new model:
+
+```bash
+az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
+  ANTHROPIC_MODEL=claude-opus-4-5-20251101 ANTHROPIC_CONFIDENCE_THRESHOLD=0.6
+```
+
+Then deploy the `document-ingestion-p0-$STAMP.zip` saved in step 2, the same way. The old build
+ignores `CLASSIFICATION_ACCEPT_THRESHOLD`; leave it. Files the new build filed stay
+where they are, and files it left as "retry later" are taken by the old build on its next tick.

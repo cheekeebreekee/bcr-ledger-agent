@@ -40,8 +40,8 @@ flowchart TB
     WHO{"Uploader AAD id on exactly<br/>one admitted client row?"}:::gate
     MEM{"Uploader's Teams, read from Entra now<br/>memberOf as the managed identity, 5 min cache,<br/>exactly the row's TeamId?"}:::gate
     BOUND["Bound client target from that row<br/>site, drive, RootFolder = channel folder<br/>RootFolder, DriveId and TeamId all set"]:::client
-    CLS["Claude classifies, primed with the<br/>bound client only. Below the threshold<br/>or on failure: 98_Nieposortowane/YYYY/MM"]:::agent
-    FLIP["After classification: invoice direction<br/>flip inside the same client only<br/>no promotion, parties never pick a client"]:::gate
+    CLS["Claude claude-opus-5 suggests, primed with the<br/>bound client only. Acceptance policy: below<br/>CLASSIFICATION_ACCEPT_THRESHOLD or no answer:<br/>98_Nieposortowane/YYYY/MM. 429, 529, 5xx:<br/>retry later, rejected RetryLater, never 98_"]:::agent
+    FLIP["Invoice direction from the bound client's<br/>own NIP or name only, else review.<br/>No promotion, parties never pick a client"]:::gate
     SITE{"Resolved site collection is<br/>BCR GROUP or the quarantine site?"}:::gate
     DRV{"Resolved drive equals the<br/>row's DriveId?"}:::gate
     UPC["PUT into the client folder<br/>conflictBehavior=fail, retry _1 to _10<br/>segments sanitised, then encoded<br/>own retry: network, 500, 502 only"]:::system

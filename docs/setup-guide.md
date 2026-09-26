@@ -289,7 +289,7 @@ change to dev's settings.
     "inboxCreatedAfter":          { "value": "" },
     "inboxMaxFilesPerTick":       { "value": "" },
     "enableAnthropic":            { "value": true },
-    "anthropicModel":             { "value": "claude-opus-4-5-20251101" },
+    "anthropicModel":             { "value": "claude-opus-5" },
     "anthropicConfidenceThreshold": { "value": "0.6" },
     "botGateMode":                { "value": "enforce" },
     "logLevel":                   { "value": "info" }
@@ -551,9 +551,9 @@ Skip (set `ANTHROPIC_ENABLED=false`) if you want fallback-only routing
 |---|---|
 | `ANTHROPIC_ENABLED` | `true` to wire the Claude classifier in; `false` to disable (fallback only). |
 | `ANTHROPIC_API_KEY` | [Anthropic Console](https://console.anthropic.com/) → **API Keys**. After deployment, store as Key Vault secret `anthropic-api-key` *(§4)*. |
-| `ANTHROPIC_MODEL` | Model id. Default `claude-opus-4-5-20251101`. |
-| `ANTHROPIC_MAX_CONTENT_BYTES` | Max document size sent to the API. Default `10485760` (10 MiB); larger files skip AI and go to manual review. |
-| `ANTHROPIC_CONFIDENCE_THRESHOLD` | Minimum model confidence (`0`–`1`) to accept a category. Default `0.6`; below this routes to manual review. |
+| `ANTHROPIC_MODEL` | Model id. Default `claude-opus-5`. |
+| `ANTHROPIC_MAX_CONTENT_BYTES` | Max document size sent to the API. Default `10485760` (10 MiB); larger files skip AI and go to manual review. A PDF over 100 pages is classified from its first 20. |
+| `CLASSIFICATION_ACCEPT_THRESHOLD` | Minimum confidence to file a document under its category. Default `0.70`; must be from `0.70` to `0.95` or ingestion does not start. Below it the document goes to manual review. Replaces `ANTHROPIC_CONFIDENCE_THRESHOLD`, which is no longer read. |
 
 > **Note:** the previous `CLIENT_COMPANY_NAME` / `CLIENT_NIP` env vars
 > have been removed. Client identity is now injected into the Claude
@@ -696,7 +696,7 @@ union requests, exceptions, traces
 | `ANTHROPIC_API_KEY` | Anthropic Console | **Key Vault** secret `anthropic-api-key` |
 | `ANTHROPIC_MODEL` | constant (model id) | Ingestion Function App setting |
 | `ANTHROPIC_MAX_CONTENT_BYTES` | constant | Ingestion Function App setting |
-| `ANTHROPIC_CONFIDENCE_THRESHOLD` | constant | Ingestion Function App setting |
+| `CLASSIFICATION_ACCEPT_THRESHOLD` | constant, `0.70`–`0.95` | Ingestion Function App setting |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | App Insights Overview | Both Function Apps |
 | `LOG_LEVEL` | constant | Both Function Apps |
 | `NODE_ENV` | `production` in Azure | Both Function Apps |
