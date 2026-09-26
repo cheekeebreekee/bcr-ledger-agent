@@ -6,18 +6,22 @@ import type {
   ClientDirectoryEntry,
   Logger,
 } from '@bcr/shared';
+import Anthropic from '@anthropic-ai/sdk';
+import { AcceptancePolicy } from './acceptancePolicy';
 import {
   ChannelInbox,
+  CLASSIFICATION_CACHE_TTL_MS,
   CLASSIFY_RESERVE_MS,
   INBOX_TICK_HARD_LIMIT_MS,
+  MAX_RETRY_LATER_ATTEMPTS,
+  RETRY_LATER_BACKOFF_MS,
   WRITE_RESERVE_MS,
-  inboxPlacement,
-  reviewFolderPath,
   selectCandidates,
   type ChannelInboxDeps,
   type InboxTickSummary,
 } from './channelInbox';
 import { ClassificationService, FallbackClassifier } from './classificationService';
+import { ClaudeClassifier } from './claudeClassifier';
 import { buildSnapshot, type ClientDirectorySnapshot } from './clientDirectoryReader';
 import type { InboxItem } from './sharePointService';
 import { createSharePointWiring } from './sharePointWiring';
@@ -419,8 +423,23 @@ const invoice: Classification = {
   folderPath: '01_Faktury/02_Faktury_zakupu/2026/09',
   confidence: 0.93,
   classifier: 'claude',
-  fields: { category: 'faktury_zakupu', year: 2026, month: 9, reasoning: 'model free text' },
+  model: 'claude-opus-5',
+  fields: {
+    category: 'faktury_zakupu',
+    year: 2026,
+    month: 9,
+    direction: 'zakup',
+    reasoning: 'model free text',
+  },
 };
+
+const policy = new AcceptancePolicy(0.7);
+const silent = { info: () => undefined, warn: () => undefined } as unknown as Logger;
+
+/** The real classification service (acceptance policy included) around one classifier. */
+function serviceOf(...classifiers: Classifier[]): ClassificationService {
+  return new ClassificationService(classifiers, { policy, log: silent });
+}
 
 /** Reads the content like the Claude classifier, and like it returns null on any failure. */
 function contentReadingClassifier(result: Classification): Classifier {
@@ -484,7 +503,7 @@ function setup(opts: SetupOptions = {}) {
     sharePointFactory: createSharePointWiring(tenant.client, wiringConfig).clientSharePointFactory,
     users: new UserTypeReader(tenant.client, noRetry),
     membership: new TeamMembershipReader(tenant.client, noRetry),
-    classification: opts.classification ?? { classify },
+    classification: opts.classification ?? serviceOf({ name: 'claude', classify }),
     minAgeMs: 120_000,
     maxFilesPerTick: 20,
     maxDownloadBytes: 10 * 1024 * 1024,
@@ -516,9 +535,16 @@ describe('ChannelInbox: filing a client upload', () => {
         teamId: TEAM_A,
         driveItemId: id,
         category: 'faktury_zakupu',
+        confidence: 0.93,
+        classifier: 'claude',
+        model: 'claude-opus-5',
+        month: '2026-09',
+        reviewReasons: [],
+        folder: '01_Faktury/02_Faktury_zakupu/2026/09',
         nameSuffix: 0,
       }),
     ]);
+    expect(events('inbox.filed')[0]).not.toHaveProperty('suggestedCategory');
   });
 
   it('creates the folder chain under the channel folder, never under the drive root', async () => {
@@ -596,16 +622,8 @@ describe('ChannelInbox: filing a client upload', () => {
     expect(events('inbox.filed')[0]).toMatchObject({ driveItemId: id, nameSuffix: 2 });
   });
 
-  it('primes the classifier with this row’s client identity only, and flips direction from its NIP', async () => {
-    const { tenant, inbox, classify } = setup({
-      classify: jest.fn(async () => ({
-        ...invoice,
-        parties: [
-          { role: 'seller', nip: NIP_A },
-          { role: 'buyer', nip: '2222222222' },
-        ],
-      })),
-    });
+  it('primes the classifier with this row’s client identity only', async () => {
+    const { tenant, inbox, classify } = setup();
     const id = tenant.addFile('inbox-a', { name: 'fv.pdf' });
 
     await inbox.sweep();
@@ -613,7 +631,77 @@ describe('ChannelInbox: filing a client upload', () => {
     const ctx = classify.mock.calls[0]?.[0] as ClassifierContext;
     expect(ctx.client).toEqual({ nip: NIP_A, companyName: 'Client 11 Sp. z o.o.' });
     expect(ctx.contentType).toBe('application/pdf');
-    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/01_Faktury/01_Faktury_sprzedaży/2026/09/fv.pdf`);
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/01_Faktury/02_Faktury_zakupu/2026/09/fv.pdf`);
+  });
+
+  it("files a sale by the row's NIP, whatever direction the model guessed (real classifier)", async () => {
+    const create = jest.fn().mockResolvedValue({
+      model: 'claude-opus-5',
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            category: 'faktury_zakupu',
+            year: 2026,
+            month: 8,
+            confidence: 0.95,
+            client_role: 'buyer',
+            reasoning: 'x',
+            parties: [
+              { role: 'seller', nip: NIP_A, company_name: null, person_name: null },
+              { role: 'buyer', nip: '2222222222', company_name: null, person_name: null },
+            ],
+          }),
+        },
+      ],
+    });
+    const claude = new ClaudeClassifier({
+      apiKey: 'k',
+      model: 'claude-opus-5',
+      maxContentBytes: 1024,
+      client: { messages: { create } } as never,
+      log: silent,
+    });
+    const { tenant, inbox } = setup({
+      classification: serviceOf(claude, new FallbackClassifier()),
+    });
+    const id = tenant.addFile('inbox-a', { name: 'fv.pdf' });
+
+    await inbox.sweep();
+
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/01_Faktury/01_Faktury_sprzedaży/2026/08/fv.pdf`);
+    expect(create.mock.calls[0][0].system).toContain(`NIP ${NIP_A}`);
+  });
+
+  it('sends an invoice of a row without NIP or name match to review, suggestion logged', async () => {
+    const { tenant, inbox, events } = setup({
+      classify: jest.fn(async () => ({
+        ...invoice,
+        confidence: 0.5,
+        reviewReasons: ['DIRECTION_UNRESOLVED'],
+        fields: { category: 'faktury_sprzedazy', year: 2026, month: 7 },
+      })),
+    });
+    const id = tenant.addFile('inbox-a', { name: 'fv.pdf' });
+
+    await inbox.sweep();
+
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/98_Nieposortowane/2026/09/fv.pdf`);
+    expect(events('inbox.sorted_to_review')[0]).toEqual(
+      expect.objectContaining({
+        driveItemId: id,
+        category: 'nieposortowane',
+        suggestedCategory: 'faktury_sprzedazy',
+        confidence: 0.5,
+        classifier: 'claude',
+        model: 'claude-opus-5',
+        month: '2026-07',
+        reviewReasons: ['DIRECTION_UNRESOLVED', 'LOW_CONFIDENCE'],
+        folder: '98_Nieposortowane/2026/09',
+      }),
+    );
   });
 
   it('builds the folder from the category alone, never from the model’s folder path', async () => {
@@ -642,7 +730,7 @@ describe('ChannelInbox: filing a client upload', () => {
 
   it('reads the file by id, only when the classifier asks for it', async () => {
     const { tenant, inbox } = setup({
-      classification: new ClassificationService([contentReadingClassifier(invoice)]),
+      classification: serviceOf(contentReadingClassifier(invoice)),
     });
     const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
     await inbox.sweep();
@@ -739,7 +827,7 @@ describe('ChannelInbox: what is never touched', () => {
   // guest's upload leaves the guest as creator and staff's content inside.
   it('leaves a guest’s file that staff replaced: not classified, not read, not moved', async () => {
     const { tenant, inbox, classify, events } = setup({
-      classification: new ClassificationService([contentReadingClassifier(invoice)]),
+      classification: serviceOf(contentReadingClassifier(invoice)),
     });
     const id = tenant.addFile('inbox-a', {
       name: 'skan.pdf',
@@ -953,7 +1041,7 @@ describe('ChannelInbox: it acts only on the version it listed', () => {
     ]);
     const { inbox, classify } = setup({
       tenant,
-      classification: new ClassificationService([contentReadingClassifier(invoice)]),
+      classification: serviceOf(contentReadingClassifier(invoice)),
     });
     const spy = jest.spyOn(ClassificationService.prototype, 'classify');
 
@@ -1219,8 +1307,78 @@ describe('ChannelInbox: modes', () => {
         driveItemId: id,
         category: 'faktury_zakupu',
         review: false,
+        confidence: 0.93,
+        classifier: 'claude',
+        model: 'claude-opus-5',
+        month: '2026-09',
+        reviewReasons: [],
+        folder: '01_Faktury/02_Faktury_zakupu/2026/09',
       }),
     ]);
+  });
+
+  it('shadow logs would_move once per version of a file, and again when it changes', async () => {
+    const { tenant, inbox, classify, events } = setup({ mode: 'shadow' });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    const ticks = [await inbox.sweep(), await inbox.sweep(), await inbox.sweep()];
+    expect(events('inbox.would_move')).toHaveLength(1);
+    expect(ticks.map((t) => [t.wouldMove, t.alreadyReported])).toEqual([
+      [1, 0],
+      [0, 1],
+      [0, 1],
+    ]);
+    expect(classify).toHaveBeenCalledTimes(1);
+
+    tenant.item(id).eTag = '"replaced"';
+    await inbox.sweep();
+    expect(events('inbox.would_move')).toHaveLength(2);
+    expect(classify).toHaveBeenCalledTimes(2);
+  });
+
+  // The 2026-09-26 evaluation: 43 files, a budget of 20, and the same 20
+  // cached files took the budget every tick, so 23 were never classified.
+  it('shadow reaches every file of a backlog: 43 files, a budget of 20, all classified within 3 ticks', async () => {
+    const { tenant, inbox, classify, events } = setup({
+      mode: 'shadow',
+      deps: { maxFilesPerTick: 20 },
+    });
+    const ids = Array.from({ length: 43 }, (_, i) =>
+      tenant.addFile('inbox-a', { name: `doc-${String(i).padStart(2, '0')}.pdf` }),
+    );
+
+    const ticks = [await inbox.sweep(), await inbox.sweep(), await inbox.sweep()];
+
+    expect(classify).toHaveBeenCalledTimes(43);
+    expect(new Set(events('inbox.would_move').map((l) => l['driveItemId']))).toEqual(new Set(ids));
+    expect(ticks.map((t) => [t.wouldMove, t.alreadyReported, t.deferred])).toEqual([
+      [20, 0, 23],
+      [20, 20, 3],
+      [3, 40, 0],
+    ]);
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  it('shadow still spends the budget on a file whose earlier classification failed', async () => {
+    let fail = true;
+    const { tenant, inbox, classify } = setup({
+      mode: 'shadow',
+      deps: { maxFilesPerTick: 1 },
+      classify: jest.fn(async () => {
+        if (fail) throw new Error('down');
+        return invoice;
+      }),
+    });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.addFile('inbox-a', { name: 'b.pdf' });
+
+    const first = await inbox.sweep();
+    fail = false;
+    const second = await inbox.sweep();
+
+    expect(first).toMatchObject({ failed: 1, deferred: 1, wouldMove: 0 });
+    expect(second).toMatchObject({ wouldMove: 1, deferred: 1 });
+    expect(classify).toHaveBeenCalledTimes(2);
   });
 
   it('shadow logs the move to 98_ that three failures would make, and still writes nothing', async () => {
@@ -1259,7 +1417,7 @@ describe('ChannelInbox: modes', () => {
         .clientSharePointFactory,
       users: new UserTypeReader(tenant.client, noRetry),
       membership: new TeamMembershipReader(tenant.client, noRetry),
-      classification: { classify: async () => invoice },
+      classification: serviceOf({ name: 'claude', classify: async () => invoice }),
       minAgeMs: 0,
       maxFilesPerTick: 20,
       maxDownloadBytes: 1024,
@@ -1318,7 +1476,7 @@ describe('ChannelInbox: manual review and failures', () => {
       },
     };
     const { tenant, inbox, events } = setup({
-      classification: new ClassificationService([failing, new FallbackClassifier()]),
+      classification: serviceOf(failing, new FallbackClassifier()),
     });
     const id = tenant.addFile('inbox-a', { name: 'skan.pdf' });
 
@@ -1335,10 +1493,7 @@ describe('ChannelInbox: manual review and failures', () => {
 
   it('sends a file too big for the classifier to manual review without reading it whole', async () => {
     const { tenant, inbox } = setup({
-      classification: new ClassificationService([
-        contentReadingClassifier(invoice),
-        new FallbackClassifier(),
-      ]),
+      classification: serviceOf(contentReadingClassifier(invoice), new FallbackClassifier()),
       deps: { maxDownloadBytes: 8 },
     });
     const id = tenant.addFile('inbox-a', { name: 'duzy.pdf', content: Buffer.alloc(64, 1) });
@@ -1351,10 +1506,7 @@ describe('ChannelInbox: manual review and failures', () => {
 
   it('counts a failed download as a failed attempt and leaves the file for the next tick', async () => {
     const { tenant, inbox, events } = setup({
-      classification: new ClassificationService([
-        contentReadingClassifier(invoice),
-        new FallbackClassifier(),
-      ]),
+      classification: serviceOf(contentReadingClassifier(invoice), new FallbackClassifier()),
     });
     const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
     let failing = true;
@@ -1464,14 +1616,307 @@ describe('ChannelInbox: manual review and failures', () => {
 
   it('classifies again once the cached classification is an hour old', async () => {
     let now = NOW;
-    const { tenant, inbox, classify } = setup({ mode: 'shadow', deps: { now: () => now } });
+    const { tenant, inbox, classify } = setup({ deps: { now: () => now } });
     tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    tenant.overrides.push([
+      /^PATCH /,
+      () => {
+        throw graphError(400);
+      },
+    ]);
 
     await inbox.sweep();
     now = new Date(NOW.getTime() + 60 * 60 * 1000);
     await inbox.sweep();
 
     expect(classify).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('ChannelInbox: retry later', () => {
+  const overloaded = {
+    outcome: 'retry_later' as const,
+    reason: 'overloaded',
+    status: 529,
+  };
+
+  // 529 "Overloaded" in the evaluation parked classifiable documents in 98_.
+  it('leaves a file the model could not answer for in the inbox: no 98_, no failure, a retry_later line', async () => {
+    let answer: typeof overloaded | Classification = overloaded;
+    const classify = jest.fn(async () => answer);
+    const { tenant, inbox, events } = setup({
+      classification: serviceOf({ name: 'claude', classify }, new FallbackClassifier()),
+    });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    // More ticks than the three failures that would send a file to 98_.
+    const ticks = [];
+    for (let i = 0; i < 4; i += 1) ticks.push(await inbox.sweep());
+
+    expect(ticks.map((t) => [t.retryLater, t.failed, t.sortedToReview, t.filed])).toEqual([
+      [1, 0, 0, 0],
+      [1, 0, 0, 0],
+      [1, 0, 0, 0],
+      [1, 0, 0, 0],
+    ]);
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/faktura.pdf`);
+    expect(tenant.writes()).toEqual([]);
+    expect(events('inbox.failed')).toEqual([]);
+    expect(events('inbox.retry_later')[0]).toEqual(
+      expect.objectContaining({
+        clientId: '0011',
+        listItemId: '11',
+        driveItemId: id,
+        classifier: 'claude',
+        reason: 'overloaded',
+        status: 529,
+      }),
+    );
+
+    answer = invoice;
+    const recovered = await inbox.sweep();
+    expect(recovered).toMatchObject({ filed: 1, retryLater: 0 });
+    expect(tenant.pathOf(id)).toContain('/01_Faktury/02_Faktury_zakupu/2026/09/');
+  });
+
+  it('does not log would_move for a retry in shadow, and tries again after the backoff', async () => {
+    const classify = jest
+      .fn()
+      .mockResolvedValueOnce({ outcome: 'retry_later', reason: 'timeout' })
+      .mockResolvedValue(invoice);
+    let now = NOW;
+    const { tenant, inbox, events } = setup({
+      mode: 'shadow',
+      classification: serviceOf({ name: 'claude', classify }),
+      deps: { now: () => now },
+    });
+    tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, wouldMove: 0 });
+    expect(events('inbox.retry_later')[0]).not.toHaveProperty('status');
+    expect(events('inbox.retry_later')[0]).toMatchObject({
+      counted: true,
+      retryLaterAttempt: 1,
+      maxRetryLaterAttempts: MAX_RETRY_LATER_ATTEMPTS,
+      retryAfterMs: RETRY_LATER_BACKOFF_MS,
+    });
+    now = new Date(NOW.getTime() + 2 * 60_000);
+    expect(await inbox.sweep()).toMatchObject({ retryLaterWaiting: 1, wouldMove: 0 });
+    now = new Date(NOW.getTime() + RETRY_LATER_BACKOFF_MS);
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 0, wouldMove: 1 });
+    expect(classify).toHaveBeenCalledTimes(2);
+  });
+
+  it('with the real classifier: a 529 after the SDK retry leaves the file in the inbox', async () => {
+    const create = jest
+      .fn()
+      .mockRejectedValue(
+        Anthropic.APIError.generate(529, { type: 'error' }, 'Overloaded', new Headers()),
+      );
+    const claude = new ClaudeClassifier({
+      apiKey: 'k',
+      model: 'claude-opus-5',
+      maxContentBytes: 1024,
+      client: { messages: { create } } as never,
+      log: silent,
+    });
+    const { tenant, inbox } = setup({
+      classification: serviceOf(claude, new FallbackClassifier()),
+    });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    for (let i = 0; i < 4; i += 1) await inbox.sweep();
+
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/faktura.pdf`);
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  // Review finding: a document that always times out (a long scan) was
+  // retried every tick forever, never reaching a person, and took about 90 s
+  // and a budget slot of every tick.
+  it('sorts a file that times out on every attempt to 98_ (RETRY_EXHAUSTED) after the bound, with a backoff', async () => {
+    const create = jest.fn().mockRejectedValue(new Anthropic.APIConnectionTimeoutError());
+    const claude = new ClaudeClassifier({
+      apiKey: 'k',
+      model: 'claude-opus-5',
+      maxContentBytes: 1024,
+      client: { messages: { create } } as never,
+      log: silent,
+    });
+    let now = NOW.getTime();
+    const { tenant, inbox, events } = setup({
+      classification: serviceOf(claude, new FallbackClassifier()),
+      deps: { now: () => new Date(now) },
+    });
+    const id = tenant.addFile('inbox-a', { name: 'skan.pdf' });
+
+    // A tick every 2 minutes for 3 hours.
+    const ticks: (InboxTickSummary & { minute: number })[] = [];
+    for (let minute = 0; minute <= 180; minute += 2) {
+      now = NOW.getTime() + minute * 60_000;
+      ticks.push({ ...(await inbox.sweep()), minute });
+    }
+
+    // Five attempts, 10, 20, 40 and 80 minutes apart; none in between.
+    expect(create).toHaveBeenCalledTimes(MAX_RETRY_LATER_ATTEMPTS);
+    expect(ticks.filter((t) => t.retryLater > 0).map((t) => t.minute)).toEqual([
+      0, 10, 30, 70, 150,
+    ]);
+    // Every other tick up to minute 150 waits: 76 ticks, 5 of them attempts.
+    expect(ticks.filter((t) => t.retryLaterWaiting > 0)).toHaveLength(76 - 5);
+    expect(ticks.every((t) => t.failed === 0 && t.filed === 0)).toBe(true);
+    expect(ticks.filter((t) => t.sortedToReview > 0).map((t) => t.minute)).toEqual([150]);
+    expect(
+      events('inbox.retry_later').map((l) => [l['reason'], l['counted'], l['retryLaterAttempt']]),
+    ).toEqual([1, 2, 3, 4, 5].map((n) => ['timeout', true, n]));
+    expect(events('inbox.failed')).toEqual([]);
+
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/98_Nieposortowane/2026/09/skan.pdf`);
+    expect(events('inbox.sorted_to_review')).toEqual([
+      expect.objectContaining({
+        driveItemId: id,
+        category: 'nieposortowane',
+        reviewReasons: ['RETRY_EXHAUSTED'],
+        unclassifiedReason: 'timeout',
+        retryLaterAttempts: MAX_RETRY_LATER_ATTEMPTS,
+        unclassified: true,
+        folder: '98_Nieposortowane/2026/09',
+      }),
+    ]);
+  });
+
+  it.each([
+    ['rate_limited', 429],
+    ['overloaded', 529],
+    ['unavailable', 401],
+  ])('never counts a %s (%i) against the file: no backoff, never 98_', async (reason, status) => {
+    const classify = jest.fn(async () => ({ outcome: 'retry_later' as const, reason, status }));
+    let now = NOW.getTime();
+    const { tenant, inbox, events } = setup({
+      classification: serviceOf({ name: 'claude', classify }, new FallbackClassifier()),
+      deps: { now: () => new Date(now) },
+    });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    const ticks = [];
+    for (let i = 0; i < MAX_RETRY_LATER_ATTEMPTS * 2; i += 1) {
+      now = NOW.getTime() + i * 2 * 60_000;
+      ticks.push(await inbox.sweep());
+    }
+
+    expect(classify).toHaveBeenCalledTimes(MAX_RETRY_LATER_ATTEMPTS * 2);
+    expect(ticks.every((t) => t.retryLater === 1 && t.retryLaterWaiting === 0)).toBe(true);
+    expect(ticks.every((t) => t.sortedToReview === 0 && t.failed === 0)).toBe(true);
+    expect(events('inbox.retry_later').every((l) => l['counted'] === false)).toBe(true);
+    expect(events('inbox.retry_later')[0]).toMatchObject({ retryLaterAttempt: 0 });
+    expect(events('inbox.retry_later')[0]).not.toHaveProperty('retryAfterMs');
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/faktura.pdf`);
+  });
+
+  it('spends no file budget on a file waiting out its backoff', async () => {
+    const classify = jest.fn(async (ctx: ClassifierContext) =>
+      ctx.filename === 'a.pdf' ? { outcome: 'retry_later' as const, reason: 'timeout' } : invoice,
+    );
+    let now = NOW.getTime();
+    const { tenant, inbox } = setup({
+      classification: serviceOf({ name: 'claude', classify }),
+      deps: { now: () => new Date(now), maxFilesPerTick: 1 },
+    });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+    const b = tenant.addFile('inbox-a', { name: 'b.pdf' });
+
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, deferred: 1, filed: 0 });
+    now += 2 * 60_000;
+    expect(await inbox.sweep()).toMatchObject({ retryLaterWaiting: 1, filed: 1, deferred: 0 });
+    expect(tenant.pathOf(b)).toContain('/01_Faktury/02_Faktury_zakupu/2026/09/');
+  });
+
+  it('forgets earlier timeouts once the file is classified', async () => {
+    const timeout = { outcome: 'retry_later', reason: 'timeout' };
+    const classify = jest
+      .fn()
+      .mockResolvedValueOnce(timeout)
+      .mockResolvedValueOnce(timeout)
+      .mockResolvedValueOnce(invoice)
+      .mockResolvedValueOnce(timeout)
+      .mockResolvedValue(invoice);
+    let now = NOW.getTime();
+    let failMove = true;
+    const { tenant, inbox, events } = setup({
+      classification: serviceOf({ name: 'claude', classify }),
+      deps: { now: () => new Date(now), maxRetryLaterAttempts: 3, retryLaterBackoffMs: 0 },
+    });
+    const id = tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.overrides.push([
+      new RegExp(`^PATCH .*/${id}$`),
+      (_c, next) => {
+        if (!failMove) return next();
+        failMove = false;
+        throw graphError(400);
+      },
+    ]);
+
+    await inbox.sweep();
+    await inbox.sweep();
+    // Classified on the third attempt, and the move fails: a failure.
+    expect(await inbox.sweep()).toMatchObject({ failed: 1, sortedToReview: 0 });
+    // The cached placement expires; the next timeout is the first again, not
+    // the third that would reach the bound.
+    now += CLASSIFICATION_CACHE_TTL_MS;
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, sortedToReview: 0 });
+    expect(events('inbox.retry_later').at(-1)).toMatchObject({ retryLaterAttempt: 1 });
+    expect(await inbox.sweep()).toMatchObject({ filed: 1, sortedToReview: 0 });
+    expect(events('inbox.sorted_to_review')).toEqual([]);
+  });
+
+  it('at the bound without time to move, moves it on the next tick without classifying again', async () => {
+    let now = NOW.getTime();
+    const classify = jest.fn(async () => {
+      now += INBOX_TICK_HARD_LIMIT_MS - WRITE_RESERVE_MS + 1;
+      return { outcome: 'retry_later' as const, reason: 'server_error', status: 500 };
+    });
+    const { tenant, inbox, events } = setup({
+      classification: serviceOf({ name: 'claude', classify }),
+      deps: { now: () => new Date(now), maxRetryLaterAttempts: 1 },
+    });
+    const id = tenant.addFile('inbox-a', { name: 'a.pdf' });
+
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, deferred: 1, sortedToReview: 0 });
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/a.pdf`);
+
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 0, sortedToReview: 1 });
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(tenant.pathOf(id)).toContain('/98_Nieposortowane/');
+    expect(events('inbox.sorted_to_review')[0]).toMatchObject({
+      reviewReasons: ['RETRY_EXHAUSTED'],
+      unclassifiedReason: 'server_error',
+      status: 500,
+      retryLaterAttempts: 1,
+    });
+  });
+
+  it('in shadow, reports a file at the bound once as would_move RETRY_EXHAUSTED, and writes nothing', async () => {
+    const classify = jest.fn(async () => ({ outcome: 'retry_later' as const, reason: 'timeout' }));
+    const { tenant, inbox, events } = setup({
+      mode: 'shadow',
+      classification: serviceOf({ name: 'claude', classify }),
+      deps: { maxRetryLaterAttempts: 2, retryLaterBackoffMs: 0 },
+    });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, wouldMove: 0 });
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, wouldMove: 1 });
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 0, alreadyReported: 1 });
+    expect(classify).toHaveBeenCalledTimes(2);
+    expect(events('inbox.would_move')).toEqual([
+      expect.objectContaining({
+        review: true,
+        reviewReasons: ['RETRY_EXHAUSTED'],
+        unclassified: true,
+        retryLaterAttempts: 2,
+      }),
+    ]);
+    expect(tenant.writes()).toEqual([]);
   });
 });
 
@@ -1635,10 +2080,10 @@ describe('ChannelInbox: logs', () => {
     const secretName = 'FV_SECRET-PARTNER_1234567890.pdf';
     const { tenant, inbox, lines } = setup({
       rows: [rowA, rowB],
-      classification: new ClassificationService([
+      classification: serviceOf(
         contentReadingClassifier({ ...invoice, parties: [{ role: 'buyer', nip: NIP_A }] }),
         new FallbackClassifier(),
-      ]),
+      ),
     });
     const id = tenant.addFile('inbox-a', { name: secretName });
     tenant.addFile('inbox-a', { name: `staff-${secretName}`, createdBy: STAFF });
@@ -1662,16 +2107,13 @@ describe('ChannelInbox: logs', () => {
     }
 
     const text = JSON.stringify(lines);
-    const leaks = [
-      'SECRET',
-      '1234567890',
-      NIP_A,
-      CHANNEL,
-      'Faktury',
-      'Client 11',
-      'model free text',
-    ].filter((s) => text.includes(s));
+    const leaks = ['SECRET', '1234567890', NIP_A, CHANNEL, 'Client 11', 'model free text'].filter(
+      (s) => text.includes(s),
+    );
     expect(leaks).toEqual([]);
+    // The one path logged is the taxonomy's, relative to the channel folder.
+    const folders = lines.filter((l) => 'folder' in l).map((l) => l['folder']);
+    expect(folders).toEqual(['01_Faktury/02_Faktury_zakupu/2026/09']);
     expect(lines.filter((l) => l['event'] === 'inbox.tick')).toHaveLength(2);
   });
 
@@ -1688,6 +2130,9 @@ describe('ChannelInbox: logs', () => {
       filed: 1,
       sortedToReview: 0,
       wouldMove: 0,
+      alreadyReported: 0,
+      retryLater: 0,
+      retryLaterWaiting: 0,
       skippedNotClient: 0,
       skippedUnverified: 0,
       skippedYoung: 0,
@@ -1786,35 +2231,5 @@ describe('selectCandidates', () => {
       beforeCutoff: 0,
       noCreator: 0,
     });
-  });
-});
-
-describe('inboxPlacement', () => {
-  const base = { ...invoice, fields: {} };
-
-  it('builds a dated category with its year and month', () => {
-    expect(inboxPlacement(invoice, NOW)).toEqual({
-      category: 'faktury_zakupu',
-      folderPath: '01_Faktury/02_Faktury_zakupu/2026/09',
-      review: false,
-    });
-  });
-
-  it.each([
-    ['an unknown category', { category: 'evil' }],
-    ['no category (the fallback classifier)', {}],
-    ['a dated category without a date', { category: 'wyciagi_bankowe' }],
-    [
-      'a dated category with an impossible month',
-      { category: 'wyciagi_bankowe', year: 2026, month: 13 },
-    ],
-    ['nieposortowane itself', { category: 'nieposortowane', year: 2020, month: 1 }],
-  ])('sends %s to review for this month', (_label, fields) => {
-    expect(inboxPlacement({ ...base, fields }, NOW)).toEqual({
-      category: 'nieposortowane',
-      folderPath: reviewFolderPath(NOW),
-      review: true,
-    });
-    expect(reviewFolderPath(NOW)).toBe('98_Nieposortowane/2026/09');
   });
 });

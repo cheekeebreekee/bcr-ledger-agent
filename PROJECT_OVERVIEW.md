@@ -187,7 +187,8 @@ difference, and CI checks that Bicep sets every setting the code needs.
 | `QUARANTINE_DRIVE_NAME` | **New.** Default `Documents`; on this tenant, `Dokumenty` |
 | `QUARANTINE_ROOT_FOLDER` | **New.** Default `Kwarantanna` |
 | `FORBIDDEN_TARGET_SITE_PATHS` | **New, required.** Sites no row may route to: at least `/sites/BCRGROUPSp.zo.o`. Each entry exactly `/sites/<name>` or `/teams/<name>`. The quarantine path is added automatically. |
-| `ANTHROPIC_ENABLED`, `ANTHROPIC_API_KEY` (Key Vault), `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_CONTENT_BYTES`, `ANTHROPIC_CONFIDENCE_THRESHOLD` | Classification. The threshold defaults to 0.6. |
+| `ANTHROPIC_ENABLED`, `ANTHROPIC_API_KEY` (Key Vault), `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_CONTENT_BYTES` | Classification. The model defaults to `claude-opus-5`, in the code and in `main.bicep` and both parameter files; the running app was set to `claude-opus-4-5-20251101` and is switched at the classification release. |
+| `CLASSIFICATION_ACCEPT_THRESHOLD` | **New.** The one acceptance threshold: default `0.70`, and anything outside 0.70–0.95 stops ingestion at cold start. Bicep sets it from `classificationAcceptThreshold` (`0.70`). It replaces `ANTHROPIC_CONFIDENCE_THRESHOLD`, which is no longer read (a set value only logs `config.retired_setting`; the classification release deletes it, and the template no longer sets it). |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING`, `LOG_LEVEL` | |
 
 **Removed in Phase 0:** `FALLBACK_CLIENT_ID`, `FALLBACK_SITE_HOSTNAME`, `FALLBACK_SITE_PATH`,
@@ -253,16 +254,20 @@ generated from the folder taxonomy. The model returns:
 
 The category id maps to a literal SharePoint path through
 [`buildFolderPath`](packages/shared/src/parsers/folderTaxonomy.ts); `dated` categories get a
-`YYYY/MM` leaf. If confidence is below `ANTHROPIC_CONFIDENCE_THRESHOLD` (default `0.6`), or no
-AI is configured, the deterministic fallback files the document in `98_Nieposortowane/RRRR/MM/`.
+`YYYY/MM` leaf. The model only suggests: the
+[acceptance policy](packages/document-ingestion/src/services/acceptancePolicy.ts) files the
+suggestion under its category only at or above `CLASSIFICATION_ACCEPT_THRESHOLD` (default
+`0.70`), with a usable date for a dated category and a settled direction for an invoice;
+anything else, and a document no model answered for, goes to `98_Nieposortowane/RRRR/MM/` with
+the reasons logged. A 429, 529, 5xx or timeout from the API is "retry later", never review;
+only a document that keeps timing out or getting a 5xx is, at a bound, filed for review with
+`RETRY_EXHAUSTED` ([`ARCHITECTURE.md` §4](ARCHITECTURE.md#4-classification-pipeline)).
 
 **Client identity is injected per request** through `ClassifierContext.client`, but only when
-the uploader is bound to a client. Claude then knows the client's NIP and name, and can decide
-invoice direction directly.
-[`ClientResolver.resolvePostClassification`](packages/document-ingestion/src/services/clientResolver.ts)
-checks the direction against the parties' roles, and flips `faktury_sprzedazy`, `faktury_zakupu`
-or `nieposortowane` when the bound client's NIP is on the invoice. **It never changes the
-client.**
+the uploader is bound to a client. The invoice direction is then settled from that identity only
+([`invoiceDirection.ts`](packages/document-ingestion/src/services/invoiceDirection.ts)): the
+client's NIP on one side of the parties, or the model's match of the primed NIP or name. Without
+it, the invoice goes to review (`DIRECTION_UNRESOLVED`). **It never changes the client.**
 
 | Kategoria (id) | Folder docelowy | Datowany |
 |---|---|---|

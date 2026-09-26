@@ -5,7 +5,7 @@
  * setup.
  */
 import { createLogger } from '@bcr/shared';
-import { loadIngestionConfig } from './config';
+import { loadIngestionConfig, RETIRED_SETTINGS, retiredSettingsIn } from './config';
 import { AuthMiddleware } from './auth/authMiddleware';
 import { createGraphClient } from './services/graphClient';
 import { forbiddenSiteKeys } from './services/sharePointService';
@@ -13,6 +13,7 @@ import { createSharePointWiring } from './services/sharePointWiring';
 import { ClientDirectoryReader } from './services/clientDirectoryReader';
 import { ClientResolver } from './services/clientResolver';
 import { membershipCheckFor, TeamMembershipReader } from './services/teamMembership';
+import { AcceptancePolicy } from './services/acceptancePolicy';
 import { ClassificationService, FallbackClassifier } from './services/classificationService';
 import { ClaudeClassifier } from './services/claudeClassifier';
 import { BatchIngestor } from './services/batchIngestor';
@@ -20,6 +21,15 @@ import { UserTypeReader } from './services/userDirectory';
 import { ChannelInbox, MAX_INBOX_FILE_BYTES } from './services/channelInbox';
 
 export const config = loadIngestionConfig();
+
+// A retired setting is never read. Named once per cold start so the operator
+// removes it (its value is not logged).
+for (const name of retiredSettingsIn()) {
+  createLogger('ingestion/runtime').warn(
+    { event: 'config.retired_setting', setting: name, replacedBy: RETIRED_SETTINGS[name] },
+    'config.retired_setting',
+  );
+}
 
 export const auth = new AuthMiddleware({
   tenantId: config.azureTenantId,
@@ -70,19 +80,37 @@ export const clientResolver = new ClientResolver(clientDirectory, {
   membership: membershipCheckFor(config.membershipCheckMode, teamMembership),
 });
 
-export const classification = new ClassificationService([
-  ...(config.anthropicEnabled && config.anthropicApiKey
-    ? [
-        new ClaudeClassifier({
-          apiKey: config.anthropicApiKey,
-          model: config.anthropicModel,
-          maxContentBytes: config.anthropicMaxContentBytes,
-          confidenceThreshold: config.anthropicConfidenceThreshold,
-        }),
-      ]
-    : []),
-  new FallbackClassifier(),
-]);
+/**
+ * Claude (when enabled and keyed), then the fallback; every result then goes
+ * through the acceptance policy, the one place `CLASSIFICATION_ACCEPT_THRESHOLD`
+ * and the review reasons are applied. Said once per cold start: the model and
+ * the threshold, never the key.
+ */
+const claudeOn = config.anthropicEnabled && config.anthropicApiKey !== '';
+export const classification = new ClassificationService(
+  [
+    ...(claudeOn
+      ? [
+          new ClaudeClassifier({
+            apiKey: config.anthropicApiKey,
+            model: config.anthropicModel,
+            maxContentBytes: config.anthropicMaxContentBytes,
+          }),
+        ]
+      : []),
+    new FallbackClassifier(),
+  ],
+  { policy: new AcceptancePolicy(config.classificationAcceptThreshold) },
+);
+createLogger('ingestion/runtime').info(
+  {
+    event: 'classification.config',
+    claude: claudeOn ? 'on' : 'off',
+    model: claudeOn ? config.anthropicModel : '',
+    acceptThreshold: config.classificationAcceptThreshold,
+  },
+  'classification.config',
+);
 
 export const batchIngestor = new BatchIngestor({
   resolver: clientResolver,

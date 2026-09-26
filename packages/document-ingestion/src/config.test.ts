@@ -1,4 +1,4 @@
-import { _resetConfigCache, loadIngestionConfig } from './config';
+import { _resetConfigCache, loadIngestionConfig, RETIRED_SETTINGS, retiredSettingsIn } from './config';
 
 const env: NodeJS.ProcessEnv = {
   AZURE_TENANT_ID: '00000000-0000-0000-0000-000000000000',
@@ -55,6 +55,35 @@ describe('loadIngestionConfig', () => {
     expect(() => loadIngestionConfig({ ...env, MEMBERSHIP_CHECK_MODE: 'disabled' })).toThrow(
       /MEMBERSHIP_CHECK_MODE/,
     );
+  });
+
+  it('reads the classification settings, with claude-opus-5 and 0.70 by default', () => {
+    const defaults = loadIngestionConfig(env);
+    expect(defaults.anthropicModel).toBe('claude-opus-5');
+    expect(defaults.classificationAcceptThreshold).toBe(0.7);
+    _resetConfigCache();
+    const set = loadIngestionConfig({
+      ...env,
+      ANTHROPIC_MODEL: 'claude-opus-4-5-20251101',
+      CLASSIFICATION_ACCEPT_THRESHOLD: '0.8',
+    });
+    expect(set.anthropicModel).toBe('claude-opus-4-5-20251101');
+    expect(set.classificationAcceptThreshold).toBe(0.8);
+  });
+
+  it('refuses to start on a threshold of 0.69', () => {
+    expect(() => loadIngestionConfig({ ...env, CLASSIFICATION_ACCEPT_THRESHOLD: '0.69' })).toThrow(
+      /CLASSIFICATION_ACCEPT_THRESHOLD/,
+    );
+  });
+
+  it('starts with the retired ANTHROPIC_CONFIDENCE_THRESHOLD still set, and names it', () => {
+    const withOld = { ...env, ANTHROPIC_CONFIDENCE_THRESHOLD: '0.6' };
+    expect(loadIngestionConfig(withOld).classificationAcceptThreshold).toBe(0.7);
+    expect(retiredSettingsIn(withOld)).toEqual(['ANTHROPIC_CONFIDENCE_THRESHOLD']);
+    expect(retiredSettingsIn({ ...env, ANTHROPIC_CONFIDENCE_THRESHOLD: ' ' })).toEqual([]);
+    expect(retiredSettingsIn(env)).toEqual([]);
+    expect(RETIRED_SETTINGS['ANTHROPIC_CONFIDENCE_THRESHOLD']).toMatch(/CLASSIFICATION_ACCEPT_THRESHOLD/);
   });
 
   it('fails fast, naming the variable, when a required setting is missing', () => {

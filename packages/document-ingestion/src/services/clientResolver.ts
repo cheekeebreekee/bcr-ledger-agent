@@ -1,10 +1,5 @@
 import {
-  buildFolderPath,
   createLogger,
-  getCategory,
-  invoiceCategoryForDirection,
-  isDocumentCategory,
-  type Classification,
   type IngestionSource,
   type Logger,
   type QuarantineReason,
@@ -32,18 +27,6 @@ export interface ClientResolverOptions {
 }
 
 /**
- * Result of `resolvePostClassification`: the unchanged client plus a
- * possibly-corrected classification (invoice direction flipped after
- * matching the bound client's own NIP against the parties).
- */
-export interface PostClassificationResolution {
-  readonly client: ResolvedClient;
-  readonly classification: Classification;
-  /** Set when the invoice direction was corrected. Useful for tracing. */
-  readonly directionCorrection?: 'sprzedaz' | 'zakup';
-}
-
-/**
  * Decides **which client** an upload belongs to — from the authenticated
  * uploader's identity and nothing else.
  *
@@ -53,13 +36,16 @@ export interface PostClassificationResolution {
  * Team, and a crafted or prompt-injected document could plant files in any
  * client's space. It is gone, and a source test keeps it gone.
  *
- *  - {@link resolve} runs before classification and returns either the one
- *    client the uploader is bound to, or the quarantine with a reason. A
- *    bound uploader routes only while their Teams, read from Entra at upload
- *    time, are exactly their row's TeamId: a guest added to a second client's
- *    Team after binding would otherwise file that client's documents here.
- *  - {@link resolvePostClassification} only corrects invoice direction inside
- *    the bound client (sales ⇄ purchase, from the client's own NIP).
+ * {@link resolve} runs before classification and returns either the one
+ * client the uploader is bound to, or the quarantine with a reason. A bound
+ * uploader routes only while their Teams, read from Entra at upload time, are
+ * exactly their row's TeamId: a guest added to a second client's Team after
+ * binding would otherwise file that client's documents here.
+ *
+ * Nothing after classification comes back here: invoice direction (sales ⇄
+ * purchase, from the bound client's own identity) is settled inside
+ * classification (`invoiceDirection.ts`), and it only ever picks a folder of
+ * the client resolved here.
  */
 export class ClientResolver {
   private readonly log: Logger;
@@ -153,97 +139,4 @@ export class ClientResolver {
   quarantine(reason: QuarantineReason): ResolvedClient {
     return { source: 'quarantine', reason, target: this.opts.quarantineTarget };
   }
-
-  /**
-   * Correct invoice direction inside the bound client. Never changes the
-   * client: the returned `client` is always the one passed in.
-   */
-  resolvePostClassification(
-    preResolved: ResolvedClient,
-    classification: Classification,
-  ): PostClassificationResolution {
-    if (preResolved.source !== 'directory' || !preResolved.nip) {
-      return { client: preResolved, classification };
-    }
-    const applied = applyInvoiceDirection(classification, preResolved.nip);
-    if (!applied) {
-      return { client: preResolved, classification };
-    }
-    this.log.info(
-      { clientId: preResolved.clientId, direction: applied.direction },
-      'invoice direction derived from the bound client NIP',
-    );
-    return {
-      client: preResolved,
-      classification: applied.classification,
-      directionCorrection: applied.direction,
-    };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Direction override (exported for unit tests).
-// ---------------------------------------------------------------------------
-
-/**
- * If the classification is an invoice and the bound client appears as a
- * seller or buyer in `parties`, ensure the category matches that direction.
- * Returns `null` when no correction is warranted (already correct, not an
- * invoice, no matching party, missing year/month for the rebuild, etc.).
- */
-export function applyInvoiceDirection(
-  classification: Classification,
-  clientNip: string,
-): { classification: Classification; direction: 'sprzedaz' | 'zakup' } | null {
-  const parties = classification.parties;
-  if (!parties || parties.length === 0) return null;
-
-  const currentCategory = classification.fields.category;
-  // Only touch invoice-ish categories and the manual-review bucket —
-  // don't retro-flip contracts, statements, reports, etc.
-  if (
-    currentCategory !== 'faktury_sprzedazy' &&
-    currentCategory !== 'faktury_zakupu' &&
-    currentCategory !== 'nieposortowane'
-  ) {
-    return null;
-  }
-
-  const clientParty = parties.find(
-    (p) => p.nip === clientNip && (p.role === 'seller' || p.role === 'buyer'),
-  );
-  if (!clientParty) return null;
-
-  const direction: 'sprzedaz' | 'zakup' =
-    clientParty.role === 'seller' ? 'sprzedaz' : 'zakup';
-  const targetCategory = invoiceCategoryForDirection(direction);
-
-  if (currentCategory === targetCategory) return null; // already correct
-
-  const year = numOrUndef(classification.fields.year);
-  const month = numOrUndef(classification.fields.month);
-  if (year === undefined || month === undefined) return null;
-  if (!isDocumentCategory(targetCategory)) return null;
-
-  const def = getCategory(targetCategory);
-  const newFolder = buildFolderPath(targetCategory, { year, month });
-
-  return {
-    direction,
-    classification: {
-      ...classification,
-      documentType: def.polishLabel,
-      folderPath: newFolder,
-      fields: {
-        ...classification.fields,
-        category: targetCategory,
-        directionCorrection: direction,
-      },
-    },
-  };
-}
-
-function numOrUndef(v: string | number | undefined): number | undefined {
-  if (typeof v === 'number' && Number.isFinite(v)) return v;
-  return undefined;
 }

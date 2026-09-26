@@ -133,5 +133,47 @@ describe('folderTaxonomy', () => {
         expect(buildFolderPath(c.id, { year: 2026, month: 5 })).toMatch(/\/2026\/05$/);
       }
     });
+
+    // Ids are folder keys, log values and eval truth labels: descriptions may
+    // change, ids may not.
+    it('keeps the category ids and their order', () => {
+      expect(categoryCatalog.map((c) => c.id)).toEqual([
+        'faktury_sprzedazy',
+        'faktury_zakupu',
+        'faktury_korekty',
+        'faktury_noty',
+        'wyciagi_bankowe',
+        'raporty_marketplace',
+        'umowy',
+        'dokumenty_firmowe',
+        'kadry_place',
+        'deklaracje_jpk',
+        'korespondencja',
+        'raporty',
+        'srodki_trwale',
+        'ewidencja_vat',
+        'onboarding_reguly',
+        'inne',
+        'nieposortowane',
+      ]);
+    });
+  });
+
+  // The rules the 2026-09-26 evaluation found missing. The descriptions are
+  // the model's rules, so each must stay in the catalog.
+  describe('classification rules in the descriptions', () => {
+    const description = (id: Parameters<typeof getCategory>[0]) => getCategory(id).description;
+
+    it.each([
+      ['faktury_noty', /paragon.*BEZ danych nabywcy/s],
+      ['faktury_noty', /klantenbon/],
+      ['faktury_zakupu', /paragon fiskalny z NIP-em nabywcy/],
+      ['faktury_sprzedazy', /paragon fiskalny z NIP-em nabywcy/],
+      ['faktury_zakupu', /zagraniczna.*rachunek hotelowy/s],
+      ['inne', /pro forma/],
+      ['umowy', /OWU/],
+    ] as const)('%s says %s', (id, rule) => {
+      expect(description(id)).toMatch(rule);
+    });
   });
 });

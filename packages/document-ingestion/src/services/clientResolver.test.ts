@@ -2,9 +2,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Client } from '@microsoft/microsoft-graph-client';
 import type {
-  Classification,
   ClientDirectoryEntry,
-  DocumentParty,
   IngestionSource,
   Logger,
   SharePointTarget,
@@ -14,7 +12,7 @@ import {
   type ClientDirectoryReader,
   type ClientDirectorySnapshot,
 } from './clientDirectoryReader';
-import { applyInvoiceDirection, ClientResolver } from './clientResolver';
+import { ClientResolver } from './clientResolver';
 import {
   TeamMembershipReadError,
   TeamMembershipReader,
@@ -511,108 +509,6 @@ describe('ClientResolver.resolve — Team membership', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Post-classification: direction only, never the client
-// ---------------------------------------------------------------------------
-
-function makeClassification(overrides: Partial<Classification> = {}): Classification {
-  return {
-    documentType: 'Nieposortowane',
-    folderPath: '98_Nieposortowane/2026/02',
-    confidence: 0.75,
-    classifier: 'claude',
-    fields: { category: 'nieposortowane', year: 2026, month: 2 },
-    ...overrides,
-  };
-}
-
-describe('ClientResolver.resolvePostClassification', () => {
-  const resolver = new ClientResolver(makeReader([clientA, clientB, staffRow]), {
-    quarantineTarget,
-    membership: enforce,
-  });
-
-  it('flips a nieposortowane invoice to faktury_zakupu when the bound client is the buyer', async () => {
-    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: OID_A });
-    const post = resolver.resolvePostClassification(
-      pre,
-      makeClassification({ parties: [{ role: 'buyer', nip: '1111111111' }] }),
-    );
-    expect(post.client).toBe(pre);
-    expect(post.directionCorrection).toBe('zakup');
-    expect(post.classification.folderPath).toBe('01_Faktury/02_Faktury_zakupu/2026/02');
-  });
-
-  it('flips to faktury_sprzedazy when the bound client is the seller', async () => {
-    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: OID_A });
-    const post = resolver.resolvePostClassification(
-      pre,
-      makeClassification({ parties: [{ role: 'seller', nip: '1111111111' }] }),
-    );
-    expect(post.directionCorrection).toBe('sprzedaz');
-    expect(post.classification.fields.category).toBe('faktury_sprzedazy');
-  });
-
-  // Regressions for the verified findings nip-promotion-misfile and
-  // prompt-injection-steers-routing: a document naming another client's NIP
-  // stays exactly where identity put it.
-  it("keeps a quarantined receipt in quarantine even though client B's NIP is on it", async () => {
-    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: undefined });
-    const post = resolver.resolvePostClassification(
-      pre,
-      makeClassification({ parties: [{ role: 'seller', nip: '2222222222' }] }),
-    );
-    expect(post.client).toEqual({ source: 'quarantine', reason: 'unmapped', target: quarantineTarget });
-  });
-
-  it("keeps a staff upload in quarantine even when exactly one client's NIP matches", async () => {
-    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: OID_STAFF });
-    const post = resolver.resolvePostClassification(
-      pre,
-      makeClassification({ parties: [{ role: 'buyer', nip: '1111111111' }] }),
-    );
-    expect(post.client.source).toBe('quarantine');
-  });
-
-  it("keeps client A's upload in A when the document names only client B", async () => {
-    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: OID_A });
-    const post = resolver.resolvePostClassification(
-      pre,
-      makeClassification({ parties: [{ role: 'seller', nip: '2222222222' }] }),
-    );
-    expect(post.client).toBe(pre);
-    expect(post.directionCorrection).toBeUndefined();
-  });
-
-  it('never changes the client for any combination of parties (property)', async () => {
-    const roles: DocumentParty['role'][] = ['seller', 'buyer', 'issuer', 'recipient', 'unknown'];
-    const nips = ['1111111111', '2222222222', '3333333333', ''];
-    const uploaders = [OID_A, OID_B, OID_STAFF, undefined];
-    for (const oid of uploaders) {
-      const pre = await resolver.resolve({ ...baseSource, userAadObjectId: oid });
-      for (const role of roles) {
-        for (const nip of nips) {
-          for (const other of nips) {
-            const parties: DocumentParty[] = [
-              { role, nip },
-              { role: 'seller', nip: other },
-            ];
-            const post = resolver.resolvePostClassification(pre, makeClassification({ parties }));
-            expect(post.client).toBe(pre);
-          }
-        }
-      }
-    }
-  });
-
-  it('does nothing when no parties are extracted', async () => {
-    const pre = await resolver.resolve({ ...baseSource, userAadObjectId: OID_A });
-    const classification = makeClassification();
-    const post = resolver.resolvePostClassification(pre, classification);
-    expect(post.classification).toBe(classification);
-  });
-});
-
 describe('content-based routing stays deleted', () => {
   // The control for the cross-client write path is that the code does not
   // exist. If someone re-adds a NIP lookup or a promotion step to the
@@ -624,67 +520,23 @@ describe('content-based routing stays deleted', () => {
     );
     expect(offenders).toEqual([]);
   });
-});
 
-describe('applyInvoiceDirection', () => {
-  it('returns null when parties is empty', () => {
-    expect(applyInvoiceDirection(makeClassification({ parties: [] }), '9571185285')).toBeNull();
-  });
-
-  it('returns null when the current category is neither invoice nor nieposortowane', () => {
-    expect(
-      applyInvoiceDirection(
-        makeClassification({
-          fields: { category: 'umowy', year: 2026, month: 2 },
-          parties: [{ role: 'seller', nip: '9571185285' }],
-        }),
-        '9571185285',
-      ),
-    ).toBeNull();
-  });
-
-  it('returns null when the current category already matches the party role', () => {
-    expect(
-      applyInvoiceDirection(
-        makeClassification({
-          documentType: 'Faktura sprzedaży',
-          folderPath: '01_Faktury/01_Faktury_sprzedaży/2026/02',
-          fields: { category: 'faktury_sprzedazy', year: 2026, month: 2 },
-          parties: [{ role: 'seller', nip: '9571185285' }],
-        }),
-        '9571185285',
-      ),
-    ).toBeNull();
-  });
-
-  it('returns null when year/month are missing (cannot rebuild path)', () => {
-    expect(
-      applyInvoiceDirection(
-        makeClassification({
-          fields: { category: 'nieposortowane' },
-          parties: [{ role: 'buyer', nip: '9571185285' }],
-        }),
-        '9571185285',
-      ),
-    ).toBeNull();
-  });
-
-  it('flips nieposortowane → faktury_zakupu for a buyer client', () => {
-    const applied = applyInvoiceDirection(
-      makeClassification({ parties: [{ role: 'buyer', nip: '9571185285' }] }),
-      '9571185285',
-    );
-    expect(applied?.direction).toBe('zakup');
-    expect(applied?.classification.fields.category).toBe('faktury_zakupu');
-    expect(applied?.classification.folderPath).toBe('01_Faktury/02_Faktury_zakupu/2026/02');
-  });
-
-  it('ignores party roles other than seller/buyer', () => {
-    expect(
-      applyInvoiceDirection(
-        makeClassification({ parties: [{ role: 'unknown', nip: '9571185285' }] }),
-        '9571185285',
-      ),
-    ).toBeNull();
+  // Direction is settled inside classification, from the bound client's own
+  // identity. Nothing there may reach the Directory, where another client's
+  // NIP could be found.
+  it('the classification modules never read the Directory', () => {
+    const offenders: string[] = [];
+    for (const file of [
+      'invoiceDirection.ts',
+      'acceptancePolicy.ts',
+      'claudeClassifier.ts',
+      'classificationService.ts',
+    ]) {
+      const source = readFileSync(join(__dirname, file), 'utf8');
+      for (const needle of ['getSnapshot', 'byUserAadObjectId', 'byNip', 'clientDirectory']) {
+        if (source.includes(needle)) offenders.push(`${file}: ${needle}`);
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 });

@@ -169,33 +169,103 @@ A single-document route, `POST /api/ingest`, also existed. Phase 0 deleted it.
 
 ## 4. Classification pipeline
 
-Ingestion passes every file through an ordered list of `Classifier` strategies. The first one
-that returns a match wins, and the fallback always succeeds last.
+Both intakes classify through one
+[`ClassificationService`](./packages/document-ingestion/src/services/classificationService.ts):
+it takes the first classifier in `ClaudeClassifier → FallbackClassifier` that answers, and the
+[acceptance policy](./packages/document-ingestion/src/services/acceptancePolicy.ts) then decides
+the folder. Classifiers only suggest; the policy files.
 
 1. **`ClaudeClassifier`** ([`claudeClassifier.ts`](./packages/document-ingestion/src/services/claudeClassifier.ts)).
-   It sends the document **content** to the Anthropic Messages API: PDF as a `document` block,
-   images as `image`, text as `text`. It comes with a tool whose `input_schema` is generated from
-   the folder taxonomy ([`folderTaxonomy.ts`](./packages/shared/src/parsers/folderTaxonomy.ts)).
-   The model returns a `category`, optional `year`/`month`, a `confidence`, and optional
-   `parties[]` (seller, buyer, issuer, recipient, each with NIP and name). The category maps to a
-   literal path through `buildFolderPath`; `dated` categories get a `YYYY/MM` leaf.
+   It sends the document **content** to the Messages API (`ANTHROPIC_MODEL`, default
+   `claude-opus-5`): PDF as a `document` block, images as `image`, text as `text`. The answer is
+   **structured output** (`output_config.format`, `json_schema`) at `output_config.effort: low`:
+   `category` (an enum generated from the folder taxonomy,
+   [`folderTaxonomy.ts`](./packages/shared/src/parsers/folderTaxonomy.ts)), `year`/`month`,
+   `confidence`, `client_role` (seller, buyer, none, unknown), a one-line `reasoning`, and
+   `parties[]` (role, NIP, name). The request has no `thinking`, sampling or tool fields: on
+   `claude-opus-5` it thinks adaptively (so `max_tokens` is 8192, which caps thinking and answer
+   together), and the same request is valid on `claude-opus-4-5-20251101`. Each call has a 45 s
+   timeout and one SDK retry.
 
-   When the uploader is bound to a client, that client's NIP and name are passed per call through
-   `ClassifierContext.client`. The model can then decide invoice direction (sales or purchase)
-   directly. When the upload is going to quarantine, no client identity is passed, and nothing is
-   flipped.
+   - **Long PDFs.** A PDF over 100 pages is classified from an in-memory copy of its first 20
+     ([`pdfPreview.ts`](./packages/document-ingestion/src/services/pdfPreview.ts), pdf-lib), and
+     the model is told so. The original is what gets filed. If no copy can be made (encrypted, or
+     the copy fails), there is no result, reason `pdf_trim_failed`.
+   - **Direction.** [`invoiceDirection.ts`](./packages/document-ingestion/src/services/invoiceDirection.ts)
+     settles sales (`faktury_sprzedazy`) vs purchase (`faktury_zakupu`) from the bound client's
+     **own** identity, passed per call in `ClassifierContext.client`: its NIP on exactly one side
+     of the parties, or else the model's `client_role`, which the prompt lets it answer only by
+     matching that NIP or name. The model's role counts only when the extracted parties do not
+     contradict it: when the client has a NIP, the side the model names (seller or issuer for
+     `seller`, buyer or recipient for `buyer`) must carry no NIP but the client's. A purchase
+     between two other companies, answered `seller` from a name guess or from text in the
+     document, is therefore not filed as the client's sale. Without an identity, with the client
+     on neither side, or with a role the NIPs contradict, it does not guess: the invoice is
+     flagged `DIRECTION_UNRESOLVED` with its confidence capped at 0.5, and goes to review. It
+     picks between two folders of the client it was given; it never looks anything up in the
+     Directory.
+   - **Contract.** The classifier **never throws**, and returns one of three things: the
+     suggestion; `retry_later` for a failure that is not about the document (429, 529 and other
+     5xx, a timeout, a lost connection, and 401/402/403/404, an account or configuration fault);
+     or `no_result` with a reason for one that is (an unsupported type, a file over
+     `ANTHROPIC_MAX_CONTENT_BYTES`, `pdf_trim_failed`, a 400/413/422, a refusal, truncated or
+     malformed output). The classifier is off when `ANTHROPIC_ENABLED=false` or there is no key.
+2. **`FallbackClassifier`**: always answers "not classified", so a document with no model answer
+   is filed for review **inside the client's own space**, never lost.
 
-   The classifier **never throws**. An unsupported type, an oversized file
-   (`ANTHROPIC_MAX_CONTENT_BYTES`), confidence below `ANTHROPIC_CONFIDENCE_THRESHOLD`, an unknown
-   category or an API error all return `null`, and the fallback runs. The classifier is off when
-   `ANTHROPIC_ENABLED=false` or when there is no key.
-2. **`FallbackClassifier`**: `98_Nieposortowane/<YYYY>/<MM>/`. It always succeeds, so the user
-   never gets a *"nowhere to put this"* error, and the file goes to manual review **inside the
-   client's own space**.
+**Retry later is not a result.** `ClassificationService` stops at a `retry_later` instead of
+falling through to the fallback. On the bot path the document comes back `rejected` with
+`RetryLater`, and the card asks the user to send it again; in the channel inbox the file stays
+where it is for the next tick (`inbox.retry_later` with the API's status), counts no failure, and
+is never moved to `98_` for it. The 26 September evaluation found 529 "Overloaded" answers
+parking classifiable documents in review; that is what this prevents.
 
-To add or change a category, edit the single `categoryCatalog` in
-[`folderTaxonomy.ts`](./packages/shared/src/parsers/folderTaxonomy.ts) and add a unit test. The
-Claude prompt, the tool schema and the fallback all derive from it.
+**But it is bounded** ([`retryLaterBound.ts`](./packages/document-ingestion/src/services/retryLaterBound.ts)).
+A document the model cannot read inside the 45 s timeout (a long scan under the 100-page
+limit), or one the API answers with a 500 every time, would otherwise be retried forever and
+never reach a person. So a retry-later reason the document may cause itself — `timeout`,
+`server_error` (a 5xx other than 529), `connection` — counts against that document; `rate_limited`
+(429), `overloaded` (529), `unavailable` (401–404) and `conflict` (409) are about the service or
+the account and never count. In the channel inbox the count is per (`driveItemId`, `eTag`): after
+each counted answer the file waits 10, 20, 40, then 80 minutes (skipped without using the file
+budget, `retryLaterWaiting`), and the fifth counted answer, about 2.5 hours after the first,
+sorts it to `98_` unclassified with `RETRY_EXHAUSTED`. On the bot path it is per client row and
+SHA-256 of the bytes, for 24 hours: the third counted answer files the document into `98_` with
+`RETRY_EXHAUSTED` instead of a third "send it again". Both are in memory per worker, like the
+inbox's failure count; a worker restart only means a few more attempts.
+
+**The acceptance policy is the only place a threshold or review reason is applied.** A
+suggestion is filed under its category only when the category exists and is not the review
+bucket, a dated category has a usable year and month, an invoice's direction is settled, and the
+confidence is at least `CLASSIFICATION_ACCEPT_THRESHOLD` (default 0.70; the configuration refuses
+anything outside 0.70–0.95 at cold start, so a 0.69 result can never be filed under its category).
+Otherwise it goes to `98_Nieposortowane/<YYYY>/<MM>/` of the current month, with one or more
+reasons — `NOT_CLASSIFIED` (with the model's `unclassifiedReason`), `UNKNOWN_CATEGORY`,
+`MODEL_UNSORTED`, `DIRECTION_UNRESOLVED`, `DATE_MISSING`, `LOW_CONFIDENCE`, `RETRY_EXHAUSTED`,
+and the inbox's `PROCESSING_FAILED` — and with the suggestion kept (category, month, confidence) for the logs and
+the reviewer. The folder is always built with `buildFolderPath` from the category; a classifier's
+own folder path is never used. `ANTHROPIC_CONFIDENCE_THRESHOLD`, the setting this replaced, is
+no longer read.
+
+**Logs.** `document.filed` and `inbox.filed`, `inbox.sorted_to_review`, `inbox.would_move` carry
+codes only: `category`, `suggestedCategory` (on review), `confidence` (two decimals),
+`classifier`, `model`, `month` (`YYYY-MM` or empty), `reviewReasons`, and `folder`, the taxonomy
+path (e.g. `01_Faktury/02_Faktury_zakupu/2026/09`) — never the client's channel folder, a file
+name, a party or the model's reasoning.
+
+**The category rules.** The catalog's descriptions are the model's rules, and carry what the
+evaluation found missing: a receipt, card slip or foreign "klantenbon"/"receipt" **without** buyer
+data is `faktury_noty` (a "dowód księgowy niebędący fakturą VAT"); a Polish fiscal receipt with
+the buyer's NIP (a "faktura uproszczona", up to 450 PLN) and a foreign invoice, ticket or hotel bill
+that names a buyer are invoices; a pro forma is `inne`; insurance terms (OWU) and policies are
+`umowy`. To add or change a category, edit the single `categoryCatalog` and add a unit test; the
+prompt, the output schema and the folders all derive from it. Never change an id.
+
+**Measuring it.** `corepack yarn workspace @bcr/document-ingestion eval` runs the real classifier
+and policy over a local folder against a `truth.json`, and reports category accuracy, direction,
+month, review rate, confidence and cost with the release's go/no-go verdict
+([`src/evaluation/`](./packages/document-ingestion/src/evaluation/); the release runbook is in
+[`human-steps.md`](./docs/operations/human-steps.md#classification-release)).
 
 ### 4.1 Batch ingestion
 
@@ -379,11 +449,11 @@ Team, and logs the routing with ids only (`clientId`, `listItemId`, `teamId`, an
 `membership_unverified`. The upload step can add `target_unwritable`, and `forbidden_target` when
 the row's site resolves to BCR GROUP or the quarantine site.
 
-After classification, `resolvePostClassification` does exactly one thing, and only for a
-`directory` client. If that client's NIP is on the invoice as seller or buyer, it sets the
-direction (`faktury_sprzedazy` ⇄ `faktury_zakupu`) and rebuilds the folder path. It never
-changes the client. A source-scan test fails the build if a path from a NIP to a client comes
-back.
+Nothing after classification comes back to the resolver. Invoice direction
+(`faktury_sprzedazy` ⇄ `faktury_zakupu`) is settled inside classification from the bound client's
+own identity (§4), and only ever picks a folder of that client. Source-scan tests fail the build
+if a path from a NIP to a client comes back to the resolver, or if a classification module reads
+the Directory.
 
 #### Quarantine
 
@@ -539,11 +609,12 @@ inbox**, and ingestion sweeps it.
   had been moved, undo a rename, or file new content by the old content's classification.
 - **Processing, per file, isolated.** The file is read by id, size-capped, and only if the
   classifier asks for it (so never when Claude is off). It is classified by the same
-  `ClassificationService`, primed with this row's client identity only; the direction-only
-  `applyInvoiceDirection` may flip sprzedaż ⇄ zakup from the row's NIP; the folder is built by
-  `buildFolderPath` from the category alone (the model's folder path is never used), and an
-  unknown category, the fallback's result or a dated category without a date goes to
-  `98_Nieposortowane/YYYY/MM`. In `enforce` the folder chain is created **under the channel
+  `ClassificationService`, primed with this row's client identity only (which settles invoice
+  direction, §4); the acceptance policy's folder is built by `buildFolderPath` from the category
+  alone (the model's folder path is never used), and review goes to
+  `98_Nieposortowane/YYYY/MM` of the tick's month. A "retry later" leaves the file where it is
+  for a later tick: not a failure. A timeout, 5xx or lost connection counts against the version
+  and starts a backoff; the fifth sorts it to `98_` with `RETRY_EXHAUSTED` (§4). In `enforce` the folder chain is created **under the channel
   folder**, and the file is moved by id:
   `PATCH /drives/{d}/items/{id}?@microsoft.graph.conflictBehavior=fail` with
   `If-Match: <listed eTag>` and `parentReference.id` = the target folder, and on a 409
@@ -554,7 +625,10 @@ inbox**, and ingestion sweeps it.
   ([move a driveItem](https://learn.microsoft.com/en-us/graph/api/driveitem-move?view=graph-rest-1.0)).
 - **Classification cache and repeated failures.** A placement is reused per
   (`driveItemId`, `eTag`) for an hour, so a file whose move keeps failing is not sent to Claude
-  every tick. A file whose processing fails three times (counted per worker) is moved to
+  every tick. In `shadow`, where nothing moves and every file is listed again each tick,
+  `inbox.would_move` is logged once per (`driveItemId`, `eTag`) per worker, and a version already
+  reported is skipped before the budget (`alreadyReported`): otherwise the same cached files took
+  the whole budget every tick and the rest of a channel was never classified. A file whose processing fails three times (counted per worker) is moved to
   `98_Nieposortowane/YYYY/MM` unclassified, so the inbox drains; if even that fails, it stays and
   is logged each tick.
 - **Budget and time limit.** At most `INBOX_MAX_FILES_PER_TICK` files (default 20) per tick
@@ -573,16 +647,18 @@ inbox**, and ingestion sweeps it.
   upload path keep them too: the Directory refresh and a target's first site and drive lookup
   (both cached, and both before any file starts). Rows are swept in list-item order from a
   cursor that moves past the last row served, so a row with a backlog cannot starve the others.
-- **Logs.** Ids and counts only: `inbox.filed` and `inbox.sorted_to_review`
-  (`clientId`, `listItemId`, `teamId`, `driveItemId`, `category`, `nameSuffix`),
-  `inbox.would_move` (shadow), `inbox.failed` (`clientId`, `listItemId`, `driveItemId`, `stage`
+- **Logs.** Ids, codes, counts and taxonomy paths only: `inbox.filed` and
+  `inbox.sorted_to_review` (`clientId`, `listItemId`, `teamId`, `driveItemId`, the decision's
+  fields of §4, `nameSuffix`), `inbox.would_move` (shadow, the same fields and `review`),
+  `inbox.retry_later` (`clientId`, `listItemId`, `driveItemId`, `classifier`, `reason`, the API's
+  `status`, `counted`, `retryLaterAttempt`, `maxRetryLaterAttempts`, `retryAfterMs`), `inbox.failed` (`clientId`, `listItemId`, `driveItemId`, `stage`
   — `check`, `download`, `classify`, `folder`, `move` or `review_fallback` — `attempt`, and under
   `err` the error's `code`, `httpStatus`, Graph's `status` and any `targetErrorKind`),
   `inbox.skipped` (once per file and reason per worker, with a `reason`: `not_guest`,
   `not_in_team`, `unknown_user`, `modified_by_other`, `unverified` with Graph's `status`, or
   `changed`), `inbox.row_failed` (`stage` `resolve` or `list`, and `err` as above), and one
   `inbox.tick` per tick: `mode`, `rows`, `candidates`, `filed`, `sortedToReview`, `wouldMove`,
-  `skippedNotClient`, `skippedUnverified`, `skippedYoung`, `skippedIneligible`,
+  `alreadyReported`, `retryLater`, `retryLaterWaiting`, `skippedNotClient`, `skippedUnverified`, `skippedYoung`, `skippedIneligible`,
   `skippedBeforeCutoff`, `skippedChanged`, `deferred`, `failed`, `rowsFailed`, `durationMs`.
   Never a file name, title, path or NIP.
 
@@ -727,7 +803,9 @@ and site grants through the onboarding repo's `Grant-TeamSiteAccess.ps1` runbook
 
 | Failure | Behaviour |
 |---|---|
-| Claude is off, low confidence, or an API error | Filed in `98_Nieposortowane/<YYYY>/<MM>/` in the client's own space, for manual review. |
+| Claude is off, gives no answer (unsupported or oversize file, a PDF that cannot be shortened, 400/413/422, refusal, malformed output), or an answer the acceptance policy does not accept (below `CLASSIFICATION_ACCEPT_THRESHOLD`, unsettled invoice direction, no date) | Filed in `98_Nieposortowane/<YYYY>/<MM>/` in the client's own space, for manual review, with the reasons and the suggestion in the log line. |
+| Claude answers 429, 529, another 5xx, times out, loses the connection, or 401–404 (after the SDK's one retry) | Not a classification. Bot path: the document is `rejected` with `RetryLater` (`document.retry_later`). Channel inbox: the file stays for a later tick (`inbox.retry_later`), no failure counted. A 429, 529 or 401–404 never files it to `98_`. |
+| The same document times out, gets a 5xx other than 529, or loses the connection again and again | Bounded: the inbox's fifth such answer for a file version (after a 10/20/40/80 min backoff), or the bot path's third for the same bytes and client, files it into `98_` with `RETRY_EXHAUSTED` and the last status, for a person to look at. |
 | Uploader not bound to exactly one client | Quarantine, with the reason. |
 | Directory cannot be refreshed for over 15 min | Everything goes to quarantine (`stale_directory`). |
 | Uploader's only row is not bound (`RootFolder`, `DriveId` or `TeamId` missing) | Quarantine (`unbound_target`). |

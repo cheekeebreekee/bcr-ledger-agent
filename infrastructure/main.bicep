@@ -96,11 +96,11 @@ param inboxMaxFilesPerTick string = ''
 @description('Enable Claude (Anthropic) content classification?')
 param enableAnthropic bool = true
 
-@description('Anthropic model id used for document classification.')
-param anthropicModel string = 'claude-opus-4-5-20251101'
+@description('ANTHROPIC_MODEL: Anthropic model id used for document classification.')
+param anthropicModel string = 'claude-opus-5'
 
-@description('Minimum classification confidence; below this → manual review.')
-param anthropicConfidenceThreshold string = '0.6'
+@description('CLASSIFICATION_ACCEPT_THRESHOLD: the one acceptance threshold, 0.70-0.95; below it a document goes to 98_Nieposortowane for review. Ingestion refuses to start outside that range.')
+param classificationAcceptThreshold string = '0.70'
 
 // ---- Bot --------------------------------------------------------------------
 
@@ -217,6 +217,8 @@ var ingestionAppSettings = union(
     INBOX_SWEEP_ROWS: inboxSweepRows
     INBOX_CREATED_AFTER: inboxCreatedAfter
     INBOX_MAX_FILES_PER_TICK: inboxMaxFilesPerTick
+    // The acceptance policy applies it with Claude on or off.
+    CLASSIFICATION_ACCEPT_THRESHOLD: classificationAcceptThreshold
     // Not string(enableAnthropic): ARM spells that 'True'. The code reads either,
     // but the running value is 'true', and this template records it.
     ANTHROPIC_ENABLED: enableAnthropic ? 'true' : 'false'
@@ -225,7 +227,6 @@ var ingestionAppSettings = union(
   enableAnthropic
     ? {
         ANTHROPIC_MODEL: anthropicModel
-        ANTHROPIC_CONFIDENCE_THRESHOLD: anthropicConfidenceThreshold
         ANTHROPIC_API_KEY: '@Microsoft.KeyVault(SecretUri=${keyVault.outputs.uri}secrets/anthropic-api-key/)'
       }
     : {}

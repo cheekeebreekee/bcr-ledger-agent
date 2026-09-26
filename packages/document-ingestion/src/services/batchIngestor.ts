@@ -1,8 +1,7 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   LedgerAgentError,
   ValidationError,
-  type Classification,
   type ClassifierContext,
   type DirectoryClientResolution,
   type IngestionBatchItemResult,
@@ -13,7 +12,14 @@ import {
   type ResolvedClient,
   type SharePointTarget,
 } from '@bcr/shared';
+import {
+  decisionLogFields,
+  retryExhaustedDecision,
+  type AcceptanceDecision,
+} from './acceptancePolicy';
+import type { ClassificationOutcome } from './classificationService';
 import type { ClientResolver } from './clientResolver';
+import { RetryLaterBound, type RetryLaterLast } from './retryLaterBound';
 import { SharePointTargetError, type SharePointService } from './sharePointService';
 
 /**
@@ -24,8 +30,24 @@ import { SharePointTargetError, type SharePointService } from './sharePointServi
  */
 export const BATCH_DEADLINE_MS = 150_000;
 
-/** The code of a document returned unprocessed because the batch ran out of time. */
+/**
+ * The code of a document returned unprocessed: the batch ran out of time
+ * before it started, or the classifier could not answer now (429, 529, 5xx,
+ * a timeout). Such a document is never filed, not even for review.
+ */
 export const RETRY_LATER = 'RetryLater';
+
+/**
+ * "Retry later" answers the same document (same client, same bytes) may get
+ * for a reason it may cause itself (a timeout, a 5xx, a lost connection)
+ * before it is filed for review with `RETRY_EXHAUSTED` instead: the third
+ * send of a document the model cannot read in time is filed, not refused
+ * again. 429, 529 and 401–404 never count (`retryLaterBound.ts`).
+ */
+export const MAX_RETRY_LATER_ATTEMPTS = 3;
+
+/** How long those answers are remembered, from the first. */
+export const RETRY_LATER_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** Where documents are written, as a narrow interface so tests can supply fakes. */
 export interface SharePointFactoryLike {
@@ -36,8 +58,11 @@ export interface SharePointFactoryLike {
 
 /** The collaborators, as narrow interfaces so tests can supply fakes. */
 export interface BatchIngestorDeps {
-  readonly resolver: Pick<ClientResolver, 'resolve' | 'resolvePostClassification' | 'quarantine'>;
-  readonly classification: { classify(ctx: ClassifierContext): Promise<Classification> };
+  readonly resolver: Pick<ClientResolver, 'resolve' | 'quarantine'>;
+  /** Classification, the acceptance policy included: where to file, or retry later. */
+  readonly classification: {
+    classify(ctx: ClassifierContext, now?: Date): Promise<ClassificationOutcome>;
+  };
   /**
    * For client targets. Refuses a target that resolves to BCR GROUP or to
    * the quarantine site (`forbidden_site`).
@@ -52,6 +77,8 @@ export interface BatchIngestorDeps {
   readonly newId?: () => string;
   /** Defaults to {@link BATCH_DEADLINE_MS}. */
   readonly batchDeadlineMs?: number;
+  /** Defaults to {@link MAX_RETRY_LATER_ATTEMPTS}. */
+  readonly maxRetryLaterAttempts?: number;
 }
 
 /**
@@ -66,18 +93,31 @@ export interface BatchIngestorDeps {
  *    response for them carries no link, folder or name.
  *
  * A failure on one document is captured as that document's row, so a bad file
- * never blocks the rest. A document not started within the batch deadline is
- * returned `rejected` with {@link RETRY_LATER}, never filed late.
+ * never blocks the rest. A document not started within the batch deadline, or
+ * one the classifier could not answer for now, is returned `rejected` with
+ * {@link RETRY_LATER}: never filed late, and never filed for review because
+ * the model was overloaded. Only a document that keeps getting a "retry
+ * later" it may cause itself is, at the {@link MAX_RETRY_LATER_ATTEMPTS}-th
+ * send, filed for review (`RETRY_EXHAUSTED`) rather than refused forever.
  */
 export class BatchIngestor {
   private readonly now: () => Date;
   private readonly newId: () => string;
   private readonly deadlineMs: number;
+  /**
+   * Counted "retry later" answers per client row and content hash. In memory
+   * on this worker: a resend that reaches another worker starts again there.
+   */
+  private readonly retryLaters: RetryLaterBound;
 
   constructor(private readonly deps: BatchIngestorDeps) {
     this.now = deps.now ?? (() => new Date());
     this.newId = deps.newId ?? randomUUID;
     this.deadlineMs = deps.batchDeadlineMs ?? BATCH_DEADLINE_MS;
+    this.retryLaters = new RetryLaterBound({
+      maxAttempts: deps.maxRetryLaterAttempts ?? MAX_RETRY_LATER_ATTEMPTS,
+      windowMs: RETRY_LATER_WINDOW_MS,
+    });
   }
 
   async ingestBatch(
@@ -106,7 +146,8 @@ export class BatchIngestor {
     const results: IngestionBatchItemResult[] = [];
     let notStarted = 0;
     for (const document of payload.documents) {
-      if (this.now().getTime() - startedAt >= this.deadlineMs) {
+      const at = this.now();
+      if (at.getTime() - startedAt >= this.deadlineMs) {
         notStarted += 1;
         results.push({
           filename: document.filename,
@@ -115,7 +156,7 @@ export class BatchIngestor {
         });
         continue;
       }
-      results.push(await this.ingestOne(document, resolved, batch));
+      results.push(await this.ingestOne(document, resolved, batch, at));
     }
     if (notStarted > 0) {
       log.warn(
@@ -134,6 +175,7 @@ export class BatchIngestor {
     document: IngestionDocument,
     resolved: ResolvedClient,
     batch: BatchContext,
+    at: Date,
   ): Promise<IngestionBatchItemResult> {
     const documentId = this.newId();
     const docLog = batch.log.child({ documentId });
@@ -152,7 +194,7 @@ export class BatchIngestor {
         );
       }
       try {
-        return await this.fileForClient(document, content, resolved, documentId, docLog);
+        return await this.fileForClient(document, content, resolved, documentId, docLog, at);
       } catch (err) {
         // A client whose space can't be written must not lose the document,
         // and must not have it written anywhere else. Hold it for staff.
@@ -190,36 +232,90 @@ export class BatchIngestor {
     client: DirectoryClientResolution,
     documentId: string,
     docLog: Logger,
+    at: Date,
   ): Promise<IngestionBatchItemResult> {
     // Prime the classifier with the bound client's own identity so it can
     // tell sales from purchases. Only this client's identity is ever sent.
-    const classified = await this.deps.classification.classify({
-      filename: document.filename,
-      contentType: document.contentType,
-      readContent: async () => content,
-      ...(client.nip || client.companyName
-        ? { client: { nip: client.nip, companyName: client.companyName } }
-        : {}),
-    });
-    const post = this.deps.resolver.resolvePostClassification(client, classified);
-    const category = String(post.classification.fields.category ?? '');
+    // The classifier reads a copy of the bytes if it must shorten a PDF; the
+    // original `content` is what gets filed.
+    const ids = { clientId: client.clientId, listItemId: client.listItemId, teamId: client.teamId };
+    const outcome = await this.deps.classification.classify(
+      {
+        filename: document.filename,
+        contentType: document.contentType,
+        readContent: async () => content,
+        ...(client.nip || client.companyName
+          ? { client: { nip: client.nip, companyName: client.companyName } }
+          : {}),
+      },
+      at,
+    );
+    // Hashed only when a "retry later" is, or was, in play.
+    let key: string | undefined;
+    const keyOf = () => (key ??= retryKey(client, content));
+    let decision: AcceptanceDecision;
+    let exhausted: RetryLaterLast | undefined;
+    if (outcome.kind === 'retry_later') {
+      const verdict = this.retryLaters.record(
+        keyOf(),
+        outcome.reason,
+        outcome.status,
+        at.getTime(),
+      );
+      docLog.warn(
+        {
+          event: 'document.retry_later',
+          documentId,
+          ...ids,
+          classifier: outcome.classifier,
+          reason: outcome.reason,
+          ...(outcome.status !== undefined ? { status: outcome.status } : {}),
+          counted: verdict.counted,
+          retryLaterAttempt: verdict.attempts,
+          maxRetryLaterAttempts: this.retryLaters.maxAttempts,
+        },
+        'document.retry_later',
+      );
+      if (!verdict.exhausted) {
+        return {
+          filename: document.filename,
+          status: 'rejected',
+          error: { code: RETRY_LATER, message: rejectionMessage(RETRY_LATER) },
+        };
+      }
+      exhausted = {
+        attempts: verdict.attempts,
+        reason: outcome.reason,
+        ...(outcome.status !== undefined ? { status: outcome.status } : {}),
+      };
+      decision = retryExhaustedDecision(at, outcome.reason);
+    } else {
+      decision = outcome.decision;
+    }
 
     const item = await this.deps.clientSharePointFactory.forTarget(client.target).uploadDocument({
-      folderPath: post.classification.folderPath,
+      folderPath: decision.folderPath,
       filename: document.filename,
       contentType: document.contentType,
       content,
     });
+    // Filed, for review or not: its earlier "retry later" answers are spent.
+    if (this.retryLaters.size > 0) this.retryLaters.forget(keyOf());
     docLog.info(
       {
         event: 'document.filed',
         documentId,
-        clientId: client.clientId,
-        listItemId: client.listItemId,
-        teamId: client.teamId,
-        category,
+        ...ids,
         driveItemId: item.id,
-        ...(post.directionCorrection ? { directionCorrection: post.directionCorrection } : {}),
+        review: decision.review,
+        ...decisionLogFields(decision),
+        ...(exhausted
+          ? {
+              unclassified: true,
+              retryLaterAttempts: exhausted.attempts,
+              ...(exhausted.status !== undefined ? { status: exhausted.status } : {}),
+            }
+          : {}),
       },
       'document.filed',
     );
@@ -230,13 +326,13 @@ export class BatchIngestor {
       result: {
         driveItemId: item.id,
         webUrl: item.webUrl,
-        folderPath: post.classification.folderPath,
+        folderPath: decision.folderPath,
         finalFilename: item.name,
         classification: {
-          documentType: post.classification.documentType,
-          categoryId: category,
-          confidence: post.classification.confidence,
-          classifier: post.classification.classifier,
+          documentType: decision.documentType,
+          categoryId: decision.category,
+          confidence: decision.confidence,
+          classifier: decision.classifier,
         },
       },
     };
@@ -304,6 +400,11 @@ interface BatchContext {
   readonly log: Logger;
 }
 
+/** One document of one client: the row and a hash of the bytes, never a name. */
+function retryKey(client: DirectoryClientResolution, content: Buffer): string {
+  return `${client.listItemId}|${createHash('sha256').update(content).digest('hex')}`;
+}
+
 /**
  * Why a client document is held when its target fails. A resolved site that
  * is BCR GROUP or the quarantine is an incident indicator, kept apart from a
@@ -338,7 +439,7 @@ function rejectionMessage(code: string): string {
     case 'SharePointError':
       return 'The document could not be stored; try again later';
     case RETRY_LATER:
-      return 'The document was not processed in time; send it again';
+      return 'The document was not processed now; send it again later';
     default:
       return 'The document could not be processed';
   }

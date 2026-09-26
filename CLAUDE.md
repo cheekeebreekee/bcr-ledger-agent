@@ -52,7 +52,7 @@ Single workspace / single test / single case:
 
 ```bash
 yarn workspace @bcr/document-ingestion test src/services/clientResolver.test.ts
-yarn workspace @bcr/document-ingestion test -t 'never changes the client'
+yarn workspace @bcr/document-ingestion test -t 'never guesses'
 yarn workspace @bcr/shared test:coverage        # enforces per-package thresholds
 ```
 
@@ -61,6 +61,19 @@ Coverage thresholds are **per package and they fail the run**: `shared` 85/85/80
 `src/functions/**`, `src/index.ts` and `src/runtime.ts` are excluded from coverage in the two
 Function App packages — they are HTTP registration and cold-start wiring. The logic lives in services
 with injected collaborators (e.g. `services/batchIngestor.ts`) and is tested there.
+
+Classifier evaluation (local; calls the Anthropic API with `ANTHROPIC_API_KEY` from your shell,
+never from Key Vault; uploads nothing else anywhere):
+
+```bash
+corepack yarn workspace @bcr/document-ingestion eval:truth --arbiter <arbiter.json> --out <truth.json>
+corepack yarn workspace @bcr/document-ingestion eval --dir <folder> --truth <truth.json> \
+  [--client-name <name>] [--client-nip <nip>] [--out <report.md>]
+```
+
+`truth.json` is `[{file, category, month, direction?}]` (`category` may be `faktura`: an invoice,
+either direction). Keep documents, truth and reports under the git-ignored `tools/out/`: they are
+client data. Test fixtures are synthetic only. The code is `src/evaluation/`.
 
 Local run (two processes; `prestart` builds, and `@bcr/shared` must be built first):
 
@@ -112,7 +125,7 @@ versions with install scripts disabled (checking each top-level version against 
 output: never commit one, and deploy only a zip built for that deploy. Before deploying, still
 check the vendored copy: `unzip -p artifacts/<pkg>.zip node_modules/@bcr/shared/dist/config.js |
 grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths`, `membershipCheckMode`,
-`inboxSweepMode` and `inboxSweepRows`) must be greater than 0.
+`inboxSweepMode`, `inboxSweepRows` and `classificationAcceptThreshold`) must be greater than 0.
 
 CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test (and `test:tools`), plus
 `bicep build`, `bicep lint` and the static `check-app-settings`.
@@ -157,12 +170,24 @@ Two intakes share the classifier, the taxonomy, the client SharePoint factory an
    row lacks `RootFolder`, `DriveId` or `TeamId`), `membership_mismatch` (the Teams read differ
    from the row's) or `membership_unverified` (they could not be read). The upload step adds
    `target_unwritable`. Quarantined documents are never classified.
-4. **Classify** — `services/classificationService.ts` runs classifiers in order and returns the
-   first result at/above 0.8 confidence, else the best one. Chain is
-   `ClaudeClassifier → FallbackClassifier` (Claude only if `ANTHROPIC_ENABLED` + key). Only the
-   bound client's own identity is primed into the prompt.
-5. **Direction** — `resolvePostClassification()` flips sprzedaż ⇄ zakup from the bound client's own
-   NIP. It never changes the client.
+4. **Classify** — `services/classificationService.ts` takes the first classifier with an answer
+   from `ClaudeClassifier → FallbackClassifier` (Claude only if `ANTHROPIC_ENABLED` + key) and
+   passes it through `services/acceptancePolicy.ts`, which decides the folder. `ClaudeClassifier`
+   sends the content to `ANTHROPIC_MODEL` (default `claude-opus-5`) with structured output
+   (`output_config.format`, the category enum from the taxonomy) at effort `low`; a PDF over 100
+   pages is sent as a copy of its first 20 (`services/pdfPreview.ts`; the original is filed).
+   Only the bound client's own identity is primed into the prompt. A classifier's
+   **retry later** (429, 529, 5xx, timeout, connection, 401–404) stops the chain: the document is
+   `rejected` with `RetryLater` (the card's Polish text says to send it again), never filed —
+   until its bound: the 3rd timeout, 5xx or lost connection for the same bytes and client row
+   (24 h, per worker) files it into `98_` with `RETRY_EXHAUSTED` instead of refusing it again.
+5. **Direction** — `services/invoiceDirection.ts`, inside classification: sales ⇄ purchase only
+   from the bound client's own NIP on one side of the parties, else the model's `client_role`
+   (it can only match the primed NIP or name), and only when the parties do not contradict it:
+   with a client NIP, the side the model names (seller/issuer, or buyer/recipient) must carry
+   no NIP but the client's. No identity, the client on neither side, or a `client_role` the
+   extracted NIPs contradict → `DIRECTION_UNRESOLVED`, confidence ≤ 0.5, review. It never
+   changes the client.
 6. **Upload** — `sharePointServiceFactory.ts` returns a per-target cached `SharePointService`, which
    resolves site+drive ids (refusing a drive that differs from the row's `DriveId`, and a site
    whose site-collection id is BCR GROUP's or the quarantine site's: `SharePointTargetError`
@@ -199,10 +224,17 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
    `not_in_team`, `modified_by_other`, …); an unreadable user is `unverified` and waits.
 5. **Classify** — only with 120 s left before the tick's 270 s limit, and only after
    `checkInboxItem()` re-reads the item: still a direct child at the **listed `eTag`**. Same
-   `ClassificationService`, primed with this row only; `applyInvoiceDirection` from the row's NIP;
-   `inboxPlacement()` builds the folder with `buildFolderPath` from the category alone (fallback /
-   no date → `98_Nieposortowane/YYYY/MM`). Cached per (`driveItemId`, `eTag`) for 1 h; the file is
-   read by id, size-capped, only if Claude reads it.
+   `ClassificationService` (direction from this row's identity, then the acceptance policy),
+   primed with this row only; the policy's folder is built with `buildFolderPath` from the
+   category alone (review → `98_Nieposortowane/YYYY/MM` of the tick). Cached per (`driveItemId`,
+   `eTag`) for 1 h; the file is read by id, size-capped, only if Claude reads it. A **retry
+   later** leaves the file where it is for a later tick: `inbox.retry_later` with the status,
+   `retryLater` in `inbox.tick`, no failure counted. A timeout, 5xx or lost connection counts
+   against that (`driveItemId`, `eTag`): the file waits 10, 20, 40, 80 min (`retryLaterWaiting`,
+   outside the budget), and the 5th such answer (about 2.5 h) sorts it to `98_` with
+   `RETRY_EXHAUSTED`; a 429/529/401–404 never counts and never reaches `98_`. In `shadow`, `inbox.would_move`
+   is logged once per (`driveItemId`, `eTag`) per worker, and a version already reported is
+   skipped before the budget (`alreadyReported`): the budget is for files that need work.
 6. **Move** — only with 60 s left: `ensureInboxFolder()` under the channel folder, then
    `moveWithinInbox()`: re-check, PATCH by id with `If-Match: <listed eTag>` and
    `conflictBehavior=fail`, `_1`…`_10` on 409, then assert same item, same drive, new parent. A
@@ -212,7 +244,8 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
    file out of time is `deferred`. Every sweep Graph call runs `withoutSdkRetries` + our bounded
    retry (the SDK would sleep through `Retry-After` past the 5-minute `functionTimeout`, which
    restarts the worker and every bot upload on it). Logs `inbox.filed|sorted_to_review|
-   would_move|failed|skipped|row_failed|tick`, ids and counts only.
+   would_move|retry_later|failed|skipped|row_failed|tick`, ids, codes, counts and taxonomy paths
+   only.
 
 ### Invariants — break these and documents mis-file
 
@@ -247,9 +280,29 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
   documents `conflictBehavior` for creating items and `if-match` for move/update, not
   `conflictBehavior` for a move. The H-12 canary's same-name move (`_1`) is the proof in this
   tenant; keep it in any rollout of a changed move.
-- **`ClaudeClassifier.classify()` never throws and never rejects.** Unsupported type, oversize, API
-  error, malformed output, low confidence → return `null` so `FallbackClassifier` files the document
-  into `98_Nieposortowane/YYYY/MM/` for manual review. Preserve this contract.
+- **`ClaudeClassifier.classify()` never throws and never rejects**, and it tells three answers
+  apart. A `Classification` is only a *suggestion* (category, month, confidence, parties,
+  direction settled or flagged). `{ outcome: 'retry_later' }` — 429, 529, other 5xx, timeouts,
+  lost connections, 401/402/403/404 — is **not a result**: `ClassificationService` stops there
+  (never the fallback), the bot path answers `RetryLater`, the inbox leaves the file for the next
+  tick; a transient failure must never park a classifiable document in `98_`. It is bounded,
+  though (`services/retryLaterBound.ts`): only a reason the document may cause itself — a
+  timeout, a 5xx other than 529, a lost connection — counts per document (inbox: per
+  `driveItemId`+`eTag`, 5 with a doubling backoff; bot: per client row + content hash, 3), and
+  at the bound the document goes to `98_` with `RETRY_EXHAUSTED`, never retried forever. 429,
+  529 and 401–404 never count.
+  `{ outcome: 'no_result', reason }` — unsupported type, oversize, `pdf_trim_failed`, 400/413/422,
+  refusal, truncated or malformed output — lets `FallbackClassifier` file it into
+  `98_Nieposortowane/YYYY/MM/` for manual review (`NOT_CLASSIFIED`, with `unclassifiedReason`).
+  Preserve this contract.
+- **`services/acceptancePolicy.ts` is the only place a threshold or review reason is applied.**
+  `CLASSIFICATION_ACCEPT_THRESHOLD` (default 0.70; zod refuses anything outside 0.70–0.95 at cold
+  start, so a 0.69 result is never filed under its category) and the reasons `NOT_CLASSIFIED`,
+  `UNKNOWN_CATEGORY`, `MODEL_UNSORTED`, `DIRECTION_UNRESOLVED`, `DATE_MISSING`, `LOW_CONFIDENCE`
+  (and `RETRY_EXHAUSTED`, and the inbox's `PROCESSING_FAILED`) send a document to `98_` of *this* month with the
+  suggestion kept for the logs. Don't add a second threshold in a classifier, the service or a
+  caller. The old `ANTHROPIC_CONFIDENCE_THRESHOLD` is not read (it would stop cold start at the
+  live 0.6); a set value only logs `config.retired_setting`.
 - **Directory lookups are fail-closed and order-independent.** `buildSnapshot` in
   `clientDirectoryReader.ts` works in two passes: collect every key's rows, then admit a user id only
   when exactly one trusted row holds it. A user id on two rows (or on a client and an admin row) routes
@@ -289,9 +342,13 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
   site-collection id with BCR GROUP's (from `CLIENT_DIRECTORY_SITE_ID`) and the quarantine site's
   (resolved lazily and cached — failing to resolve it refuses the write). Keep both layers.
 - **`parsers/folderTaxonomy.ts` is the single source of truth for folder layout.** `categoryCatalog`
-  drives the Claude system prompt *and* the tool-call enum *and* `buildFolderPath()`, so the model
-  can never name a category the uploader can't build a path for. Add or rename a category there and
-  nowhere else; `dated: true` categories require `year`/`month` and get a `YYYY/MM` leaf.
+  drives the Claude system prompt (its descriptions are the model's category rules: receipts
+  without a buyer are `faktury_noty`, a receipt with the buyer's NIP and a foreign invoice naming
+  a buyer are invoices, pro forma is `inne`, OWU are `umowy`) *and* the output schema's category
+  enum *and* `buildFolderPath()`, so the model can never name a category the uploader can't build
+  a path for. Add or rename a category there and nowhere else; never change an id (ids are folder
+  keys, log values and evaluation labels); `dated: true` categories require `year`/`month` and
+  get a `YYYY/MM` leaf.
 - **Never build a SharePoint path by string concatenation.** Go through
   `utils/pathBuilder.ts` (`sanitizeFolderPath` / `sanitizeFilename` / `joinFolderPath`, then
   `encodeGraphPath` for the URL) — it rejects traversal and reserved names, strips SharePoint's
@@ -301,7 +358,11 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
 - **Responses and logs carry ids, not client data.** A quarantined row has no link, folder or name;
   the result card shows the taxonomy label, never the model's reasoning; logs carry `documentId`,
   `clientId`, `listItemId`, `teamId`, `driveItemId` — file names, titles, NIPs and SharePoint
-  locations are redacted by the root logger (`shared/src/logger.ts`).
+  locations are redacted by the root logger (`shared/src/logger.ts`). Filing lines
+  (`document.filed`, `inbox.filed|sorted_to_review|would_move`) add codes from
+  `decisionLogFields()`: `category`, `suggestedCategory` (review), `confidence` (2 decimals),
+  `classifier`, `model`, `month`, `reviewReasons`, and `folder` — the **taxonomy** path only,
+  never the channel folder or a file name.
 - **The bot processes only 1:1 chats.** Teams *channel* uploads never reach a bot (drag-drop
   bypasses Bot Framework; `@mention` activities carry only mention HTML) — they reach ingestion
   through the channel inbox instead — and group chats are refused. Every activity passes the bot
@@ -403,8 +464,17 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
   so grant a day before the deploy; until then bound uploads are `membership_unverified`.
 - `MICROSOFT_APP_TYPE` must be `SingleTenant` (the app registration is `AzureADMyOrg`); the wrong
   value is a 401 at Bot Framework auth.
-- `@anthropic-ai/sdk` must stay ≥ 0.40 for typed PDF `document` content blocks
-  (`Anthropic.Messages.ContentBlockParam`).
+- `@anthropic-ai/sdk` 0.104.2 (the locked version) has what the classifier sends: typed PDF
+  `document` blocks, `output_config.format` (`json_schema`) and `output_config.effort`. Keep the
+  request free of `temperature`/`top_p`/`top_k`, `thinking.budget_tokens` and forced
+  `tool_choice`: `claude-opus-5` rejects the first two, and successors reject the third. Without a
+  `thinking` field `claude-opus-5` thinks adaptively, and `max_tokens` covers thinking **and**
+  the answer. The same request works on `claude-opus-4-5-20251101`, the model the running app
+  was set to before the classification release; the operator switches `ANTHROPIC_MODEL` at that
+  deploy (`docs/operations/human-steps.md`, *Classification release*). `main.bicep` and both
+  parameter files already record the release (`claude-opus-5`, `CLASSIFICATION_ACCEPT_THRESHOLD`,
+  no `ANTHROPIC_CONFIDENCE_THRESHOLD`), so until that switch `--live` against dev reports exactly
+  those three names, and no Bicep deploy to dev may run in between.
 - If `tsc -b` keeps seeing stale `@bcr/shared` types, delete the physical copy Yarn sometimes leaves
   at `packages/<pkg>/node_modules/@bcr/shared` so resolution falls back to the root symlink.
 
@@ -419,7 +489,7 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
 | `docs/client-directory-admin-guide.md` | The Client Directory list — columns and admin workflow |
 | `docs/admin-sharepoint-grant.md` | `Sites.Selected` via Graph Explorer |
 | `docs/security.md` | Threat model + secrets inventory |
-| `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback; "Lifting gate G1" |
+| `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback; "Lifting gate G1"; the *Classification release* runbook (evaluate, deploy, switch the model, go/no-go) |
 | `docs/operations/incident-2026-09.md` | The cross-client routing incident: causes, IR-0..IR-3, status |
 | `docs/operations/tenant-hardening.md` | Tenant settings that keep clients apart (BCR GROUP stays Private, read-only check) |
 | `docs/diagrams/` | Mermaid: as-is, Phase-0 routing, target business logic/architecture/data flow, sequences, data model |

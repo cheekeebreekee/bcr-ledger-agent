@@ -1,26 +1,37 @@
 /**
  * Output of a single classifier strategy.
  *
- * `confidence` is on `[0, 1]`. A classifier should return `null` if it
- * has nothing useful to say (i.e. the file does not match its pattern).
+ * `confidence` is on `[0, 1]`. It is the classifier's suggestion only: the
+ * ingestion acceptance policy decides whether it is filed under its category
+ * or sent to manual review.
  */
 export interface Classification {
   readonly documentType: string;
   readonly confidence: number;
   /** Identifier of the classifier that produced this result. */
   readonly classifier: string;
-  /** Computed SharePoint folder path, relative to the drive root. */
+  /**
+   * Folder path the classifier computed, relative to the drive root; `''` when
+   * it could not build one (a dated category without a date). Never used to
+   * file a document: the acceptance policy rebuilds the path from the category.
+   */
   readonly folderPath: string;
   /** Optional structured fields extracted from the filename/content. */
   readonly fields: Readonly<Record<string, string | number | undefined>>;
   /**
    * Parties identified in the document content (relevant for invoices and
    * contracts). Populated by content-based classifiers such as Claude;
-   * `undefined` when no extraction was performed. Consumers use this to
-   * cross-reference against the Client Directory and to determine invoice
-   * direction (sales vs purchase) post-classification.
+   * `undefined` when no extraction was performed. Used to settle invoice
+   * direction (sales vs purchase) from the bound client's own NIP.
    */
   readonly parties?: readonly DocumentParty[];
+  /** The model that answered (`message.model`), for model-backed classifiers. */
+  readonly model?: string;
+  /**
+   * Review flags raised while classifying, e.g. `DIRECTION_UNRESOLVED`. They
+   * are only flags: the acceptance policy is what sends a document to review.
+   */
+  readonly reviewReasons?: readonly string[];
 }
 
 /** The role a party plays in a document. */
@@ -43,12 +54,10 @@ export interface ClassifierContext {
   readonly readContent: () => Promise<Buffer>;
   readonly contentType: string;
   /**
-   * Optional client identity hint injected by the caller AFTER routing has
-   * pre-resolved a client. When present, content-based classifiers can use
-   * it to determine invoice direction (sales/purchase) during classification
-   * instead of leaving direction ambiguous. Absent when the request routes
-   * to the fallback bucket \u2014 direction is derived post-classification
-   * from extracted parties in that case.
+   * The bound client's own identity, injected by the caller AFTER routing has
+   * resolved the client. Content-based classifiers use it to tell sales from
+   * purchase invoices; without it, invoice direction stays unresolved and the
+   * document goes to manual review. It never selects or changes the client.
    */
   readonly client?: {
     readonly nip: string;
@@ -56,7 +65,47 @@ export interface ClassifierContext {
   };
 }
 
+/**
+ * A classifier that could not classify the document for a reason that is
+ * about the document or the request (unsupported type, too large, a 400,
+ * malformed output, a refusal). The next classifier runs; the document ends
+ * up in manual review.
+ */
+export interface ClassifierNoResult {
+  readonly outcome: 'no_result';
+  /** A code, never free text: `unsupported_type`, `too_large`, `pdf_trim_failed`, … */
+  readonly reason: string;
+  /** The model API's HTTP status, when there was one. */
+  readonly status?: number;
+}
+
+/**
+ * A classifier that could not classify the document NOW (rate limit, overload,
+ * a 5xx, a timeout, a lost connection). Not a classification result: the
+ * document must be tried again later, never filed for review because of it.
+ */
+export interface ClassifierRetryLater {
+  readonly outcome: 'retry_later';
+  /** A code: `rate_limited`, `overloaded`, `server_error`, `timeout`, `connection`, … */
+  readonly reason: string;
+  /** The model API's HTTP status, when there was one (429, 529, 5xx). */
+  readonly status?: number;
+}
+
+/** What a classifier returns. `null` is a no-result without a reason. */
+export type ClassifierResult = Classification | ClassifierNoResult | ClassifierRetryLater | null;
+
 export interface Classifier {
   readonly name: string;
-  classify(ctx: ClassifierContext): Promise<Classification | null>;
+  classify(ctx: ClassifierContext): Promise<ClassifierResult>;
+}
+
+/** Whether a classifier said "try again later" rather than giving a result. */
+export function isRetryLater(result: ClassifierResult): result is ClassifierRetryLater {
+  return result !== null && 'outcome' in result && result.outcome === 'retry_later';
+}
+
+/** Whether a classifier gave up on the document, with a reason. */
+export function isNoResult(result: ClassifierResult): result is ClassifierNoResult {
+  return result !== null && 'outcome' in result && result.outcome === 'no_result';
 }

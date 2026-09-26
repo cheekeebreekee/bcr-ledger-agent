@@ -241,8 +241,12 @@ register of which client sent what.
 - events `document.filed`, `document.quarantined`, `directory.conflict`,
   `ingestion.caller.rejected`, `sharepoint.forbidden_site` and `sharepoint.possible_duplicate`;
 - for the channel inbox (T18), `inbox.filed`, `inbox.sorted_to_review`, `inbox.would_move`,
-  `inbox.failed`, `inbox.skipped`, `inbox.row_failed` and one `inbox.tick` of counts per tick,
-  with the row's ids and the `driveItemId`, never a file name, folder path, title or NIP;
+  `inbox.retry_later`, `inbox.failed`, `inbox.skipped`, `inbox.row_failed` and one `inbox.tick`
+  of counts per tick, with the row's ids and the `driveItemId`, never a file name, title or NIP;
+- on the filing lines (`document.filed`, `inbox.filed`, `inbox.sorted_to_review`,
+  `inbox.would_move`) the classification's codes: category, suggested category, confidence,
+  classifier, model, month, review reasons and the **taxonomy** folder (e.g.
+  `01_Faktury/02_Faktury_zakupu/2026/09`), never the client's channel folder;
 - one redaction list covering file names, titles, URLs, paths, parties and NIPs.
 
 **Status: P0**, deployed only after IR-0 copied the old lines into the evidence store. Old lines

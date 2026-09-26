@@ -12,6 +12,8 @@ module.exports = {
     '!src/functions/**',
     '!src/index.ts',
     '!src/runtime.ts',
+    // The evaluation harness's process entry point: argv, files and streams.
+    '!src/evaluation/main.ts',
   ],
   coverageThreshold: {
     global: { branches: 75, functions: 80, lines: 85, statements: 85 },

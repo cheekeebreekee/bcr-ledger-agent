@@ -21,8 +21,8 @@
     "inboxCreatedAfter": { "value": "" },
     "inboxMaxFilesPerTick": { "value": "" },
     "enableAnthropic": { "value": true },
-    "anthropicModel": { "value": "claude-opus-4-5-20251101" },
-    "anthropicConfidenceThreshold": { "value": "0.6" },
+    "anthropicModel": { "value": "claude-opus-5" },
+    "classificationAcceptThreshold": { "value": "0.70" },
     "botGateMode": { "value": "enforce" },
     "logLevel": { "value": "info" }
   }

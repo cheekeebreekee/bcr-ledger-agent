@@ -8,67 +8,161 @@ import {
   type Classification,
   type Classifier,
   type ClassifierContext,
-  type DocumentCategory,
+  type ClassifierNoResult,
+  type ClassifierRetryLater,
   type DocumentParty,
+  type Logger,
   type PartyRole,
 } from '@bcr/shared';
+import { z } from 'zod';
+import { settleInvoiceDirection, type ClientRole } from './invoiceDirection';
+import { pdfForModel, type PdfForModel } from './pdfPreview';
+
+/** The effort levels this classifier may run at (`output_config.effort`). */
+export type ClaudeEffort = 'low' | 'medium' | 'high';
+
+/** Token usage of one API response, for cost reporting. */
+export interface ClaudeUsage {
+  readonly model: string;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+}
 
 export interface ClaudeClassifierOptions {
   readonly apiKey: string;
-  /** Model id, e.g. `claude-opus-4-5-20251101`. */
+  /** Model id, e.g. `claude-opus-5`. */
   readonly model: string;
   /** Reject documents larger than this many bytes (don't send to the model). */
   readonly maxContentBytes: number;
-  /** Below this confidence the result is discarded → manual review. */
-  readonly confidenceThreshold: number;
+  /** Defaults to {@link CLAUDE_EFFORT}. */
+  readonly effort?: ClaudeEffort;
+  /** Called with every response's token usage (the evaluation harness sums them). */
+  readonly onUsage?: (usage: ClaudeUsage) => void;
   /** Injectable for tests. */
   readonly client?: Pick<Anthropic, 'messages'>;
+  /** Injected in tests; defaults to the `ingestion/claude` logger. */
+  readonly log?: Logger;
 }
 
-/** Shape the model must return via the forced `classify_document` tool. */
-interface ClassifyToolInput {
-  readonly category: string;
-  readonly year?: number | null;
-  readonly month?: number | null;
-  readonly confidence: number;
-  readonly reasoning?: string;
-  readonly parties?: readonly {
-    readonly role: string;
-    readonly nip?: string | null;
-    readonly company_name?: string | null;
-    readonly person_name?: string | null;
-  }[];
-}
-
-const TOOL_NAME = 'classify_document';
-const MAX_TOKENS = 1024;
 /**
  * The SDK default is 10 minutes with 2 retries, far past the batch's 150 s
  * deadline and the Functions front end's ~230 s: one slow call would fail the
- * whole card while the invocation went on filing. A timeout is an API error
- * like any other, so the document falls through to manual review.
+ * whole card while the invocation went on filing. A timeout is "retry later",
+ * never a classification.
  */
 export const CLAUDE_REQUEST_TIMEOUT_MS = 45_000;
 export const CLAUDE_MAX_RETRIES = 1;
 
 /**
+ * Thinking plus the JSON answer. On `claude-opus-5` a request without a
+ * `thinking` field thinks (adaptively), and `max_tokens` caps thinking and
+ * answer together, so this is far above the ~300 tokens the answer takes.
+ */
+export const CLAUDE_MAX_TOKENS = 8192;
+
+/**
+ * A short classification call: `low` effort keeps the adaptive thinking
+ * brief. `effort` is valid on `claude-opus-5` and on `claude-opus-4-5`.
+ */
+export const CLAUDE_EFFORT: ClaudeEffort = 'low';
+
+const PARTY_ROLES: readonly PartyRole[] = ['seller', 'buyer', 'issuer', 'recipient', 'unknown'];
+const CLIENT_ROLES: readonly ClientRole[] = ['seller', 'buyer', 'none', 'unknown'];
+
+const nullable = (schema: Record<string, unknown>) => ({ anyOf: [schema, { type: 'null' }] });
+
+/**
+ * The structured output the model must return (`output_config.format`). The
+ * category enum is the taxonomy's, so the model can never name a category no
+ * folder exists for. Numeric bounds are not supported by structured outputs:
+ * they are checked here, after parsing.
+ */
+export const CLASSIFICATION_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    category: {
+      type: 'string',
+      enum: categoryCatalog.map((c) => c.id),
+      description: 'Identyfikator kategorii docelowej.',
+    },
+    year: { ...nullable({ type: 'integer' }), description: 'Rok daty dokumentu (RRRR).' },
+    month: { ...nullable({ type: 'integer' }), description: 'Miesiąc daty dokumentu (1-12).' },
+    confidence: { type: 'number', description: 'Pewność klasyfikacji, od 0 do 1.' },
+    client_role: {
+      type: 'string',
+      enum: [...CLIENT_ROLES],
+      description:
+        'Rola klienta na fakturze: seller (sprzedawca/wystawca), buyer (nabywca), ' +
+        'none (klient nie jest stroną), unknown (nie da się ustalić lub brak tożsamości klienta).',
+    },
+    reasoning: { type: 'string', description: 'Jedno krótkie zdanie uzasadnienia po polsku.' },
+    parties: {
+      type: 'array',
+      description: 'Strony dokumentu: sprzedawca i nabywca faktury, strony umowy, wystawca.',
+      items: {
+        type: 'object',
+        properties: {
+          role: { type: 'string', enum: [...PARTY_ROLES] },
+          nip: nullable({ type: 'string' }),
+          company_name: nullable({ type: 'string' }),
+          person_name: nullable({ type: 'string' }),
+        },
+        required: ['role', 'nip', 'company_name', 'person_name'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['category', 'year', 'month', 'confidence', 'client_role', 'reasoning', 'parties'],
+  additionalProperties: false,
+};
+
+/** Parses the answer. Lenient on what the schema already constrains; strict on what we use. */
+const modelOutput = z.object({
+  category: z.string(),
+  year: z.number().int().nullable().optional(),
+  month: z.number().int().nullable().optional(),
+  confidence: z.number(),
+  client_role: z.enum(['seller', 'buyer', 'none', 'unknown']).optional(),
+  reasoning: z.string().optional(),
+  parties: z
+    .array(
+      z.object({
+        role: z.string(),
+        nip: z.string().nullable().optional(),
+        company_name: z.string().nullable().optional(),
+        person_name: z.string().nullable().optional(),
+      }),
+    )
+    .optional(),
+});
+type ModelOutput = z.infer<typeof modelOutput>;
+
+/**
  * Content-based classifier backed by Anthropic Claude. Reads the actual
- * document (PDF / image / text), then routes it into the BCR SharePoint
- * taxonomy. Unlike filename rules, it can tell a sales invoice from a
- * purchase invoice by comparing parties against the client's own identity.
+ * document (PDF / image / text) and suggests a category of the BCR SharePoint
+ * taxonomy, with the document's month, a confidence and the parties. Whether
+ * that suggestion is filed or sent to review is the acceptance policy's call.
  *
- * Contract: this classifier NEVER throws. Any failure (unsupported type,
- * oversize, API error, malformed output, low confidence) returns `null` so
- * the {@link ClassificationService} falls through to the fallback, which
- * routes the file to `98_Nieposortowane` for manual review.
+ * Contract: this classifier NEVER throws and never rejects. It returns
+ *  - a {@link Classification}: the model's suggestion, with invoice direction
+ *    settled from the client's own identity (or flagged unresolved);
+ *  - `retry_later` for a failure that is not about the document — 429, 529,
+ *    another 5xx, a timeout, a lost connection, or an account/configuration
+ *    error (401, 402, 403, 404): the caller tries again later and never files
+ *    the document for review because of it;
+ *  - `no_result` for a failure about the document or the request — an
+ *    unsupported type, oversize, a PDF that could not be shortened, a 400,
+ *    413 or 422, a refusal, malformed or truncated output — so the fallback
+ *    files it in `98_Nieposortowane` for manual review.
  */
 export class ClaudeClassifier implements Classifier {
   readonly name = 'claude';
-  private readonly log = createLogger('ingestion/claude');
+  private readonly log: Logger;
   private readonly client: Pick<Anthropic, 'messages'>;
   private readonly model: string;
   private readonly maxContentBytes: number;
-  private readonly confidenceThreshold: number;
+  private readonly effort: ClaudeEffort;
+  private readonly onUsage: ((usage: ClaudeUsage) => void) | undefined;
 
   constructor(opts: ClaudeClassifierOptions) {
     this.client =
@@ -80,311 +174,310 @@ export class ClaudeClassifier implements Classifier {
       });
     this.model = opts.model;
     this.maxContentBytes = opts.maxContentBytes;
-    this.confidenceThreshold = opts.confidenceThreshold;
+    this.effort = opts.effort ?? CLAUDE_EFFORT;
+    this.onUsage = opts.onUsage;
+    this.log = opts.log ?? createLogger('ingestion/claude');
   }
 
-  async classify(ctx: ClassifierContext): Promise<Classification | null> {
+  async classify(
+    ctx: ClassifierContext,
+  ): Promise<Classification | ClassifierNoResult | ClassifierRetryLater> {
     try {
-      const content = await ctx.readContent();
-      if (content.length > this.maxContentBytes) {
-        this.log.warn(
-          { filename: ctx.filename, sizeBytes: content.length, limit: this.maxContentBytes },
-          'document exceeds size limit for AI classification, skipping',
-        );
-        return null;
+      let content: Buffer;
+      try {
+        content = await ctx.readContent();
+      } catch {
+        return this.noResult('read_failed');
       }
+      if (content.length > this.maxContentBytes) return this.noResult('too_large');
 
-      const block = buildDocumentBlock(content, ctx.contentType);
-      if (!block) {
-        this.log.warn(
-          { filename: ctx.filename, contentType: ctx.contentType },
-          'unsupported content type for AI classification, skipping',
-        );
-        return null;
-      }
+      const input = await this.modelInput(content, ctx.contentType);
+      if ('outcome' in input) return input;
 
-      const message = await this.client.messages.create({
-        model: this.model,
-        max_tokens: MAX_TOKENS,
-        system: this.systemPrompt(ctx.client),
-        tools: [this.toolDefinition()],
-        tool_choice: { type: 'tool', name: TOOL_NAME },
-        messages: [
-          {
-            role: 'user',
-            content: [block, { type: 'text', text: this.userInstruction(ctx.filename) }],
+      let message: Anthropic.Message;
+      try {
+        message = await this.client.messages.create({
+          model: this.model,
+          max_tokens: CLAUDE_MAX_TOKENS,
+          system: systemPrompt(ctx.client),
+          output_config: {
+            effort: this.effort,
+            format: { type: 'json_schema', schema: CLASSIFICATION_OUTPUT_SCHEMA },
           },
-        ],
-      });
-
-      const input = extractToolInput(message);
-      if (!input) {
-        this.log.warn({ filename: ctx.filename }, 'model returned no tool output');
-        return null;
+          messages: [
+            {
+              role: 'user',
+              content: [
+                input.block,
+                { type: 'text', text: userInstruction(ctx.filename, input.preview) },
+              ],
+            },
+          ],
+        });
+      } catch (err) {
+        return this.apiFailure(err);
       }
+      this.reportUsage(message);
 
-      return this.toClassification(input, ctx.filename);
+      if (message.stop_reason === 'refusal') return this.noResult('refusal');
+      if (message.stop_reason === 'max_tokens') return this.noResult('max_tokens');
+      const output = parseOutput(message);
+      if (!output) return this.noResult('malformed_output');
+
+      return settleInvoiceDirection(
+        toClassification(output, message.model || this.model, input.preview),
+        ctx.client,
+      );
     } catch (err) {
-      this.log.warn({ err, filename: ctx.filename }, 'AI classification failed, skipping');
-      return null;
+      this.log.warn(
+        { event: 'claude.no_result', reason: 'internal_error', err: describeError(err) },
+        'claude.no_result',
+      );
+      return { outcome: 'no_result', reason: 'internal_error' };
     }
   }
 
   // -------------------------------------------------------------------------
 
-  private toClassification(
-    input: ClassifyToolInput,
-    filename: string,
-  ): Classification | null {
-    if (!isDocumentCategory(input.category)) {
-      this.log.warn({ filename, category: input.category }, 'model returned unknown category');
-      return null;
-    }
-
-    const confidence = clamp(input.confidence);
-    if (confidence < this.confidenceThreshold) {
-      this.log.info(
-        { filename, category: input.category, confidence },
-        'classification below threshold, routing to manual review',
-      );
-      return null;
-    }
-
-    const category = input.category;
-    const def = getCategory(category);
-    const date = resolveDate(category, input.year, input.month);
-
-    if (def.dated && !date) {
-      this.log.warn(
-        { filename, category },
-        'dated category without a usable date, routing to manual review',
-      );
-      return null;
-    }
-
-    let folderPath: string;
-    try {
-      folderPath = buildFolderPath(category, date);
-    } catch (err) {
-      this.log.warn({ err, filename, category }, 'failed to build folder path');
-      return null;
-    }
-
-    return {
-      documentType: def.polishLabel,
-      folderPath,
-      confidence,
-      classifier: this.name,
-      fields: {
-        category,
-        ...(date ? { year: date.year, month: date.month } : {}),
-        ...(input.reasoning ? { reasoning: input.reasoning } : {}),
-      },
-      ...(input.parties && input.parties.length > 0
-        ? { parties: normalizeParties(input.parties) }
-        : {}),
-    };
-  }
-
-  private systemPrompt(client: ClassifierContext['client']): string {
-    // When the caller has pre-resolved a client (via channel, user identity,
-    // or a prior turn), we prime Claude with that identity so it can decide
-    // invoice direction (sales vs purchase) confidently. When absent, Claude
-    // is instructed to extract parties without deciding direction — the
-    // resolver then infers direction post-classification.
-    const identity = client && (client.nip || client.companyName)
-      ? `Dokumenty należą do klienta: ${client.companyName || '(nazwa nieznana)'}` +
-        `${client.nip ? `, NIP: ${client.nip}` : ''}. ` +
-        'Gdy na fakturze klient występuje jako SPRZEDAWCA/WYSTAWCA, jest to faktura ' +
-        'sprzedaży. Gdy klient jest NABYWCĄ/KUPUJĄCYM, jest to faktura zakupu. ' +
-        'Porównuj nazwę firmy oraz NIP, aby ustalić kierunek faktury.'
-      : 'Tożsamość klienta nie jest podana. Wyodrębnij WSZYSTKIE strony (parties) ' +
-        'występujące w dokumencie z ich rolami i numerami NIP — kierunek faktury ' +
-        '(sprzedaż/zakup) zostanie ustalony później na podstawie tych danych. ' +
-        'Jeśli nie potrafisz jednoznacznie określić kategorii bez tożsamości klienta, ' +
-        'wybierz kategorię "nieposortowane" — nadal jednak WYPEŁNIJ pole parties.';
-
-    return [
-      'Jesteś asystentem księgowym polskiego biura rachunkowego. Twoim zadaniem jest ' +
-        'sklasyfikowanie załączonego dokumentu i przypisanie go do właściwej kategorii ' +
-        'w strukturze folderów SharePoint klienta.',
-      identity,
-      'Zawsze wywołuj narzędzie "classify_document". Dla kategorii datowanych podaj rok ' +
-        '(RRRR) i miesiąc (1-12) na podstawie daty dokumentu (np. daty wystawienia faktury ' +
-        'lub okresu wyciągu). Ustaw "confidence" rzetelnie: niska wartość, gdy nie masz ' +
-        'pewności. Krótko uzasadnij wybór w polu "reasoning" (po polsku). ' +
-        'Wypełniaj pole "parties" dla faktur, umow i innych dokumentów, na których ' +
-        'występują zidentyfikowane strony (firmy z NIP-em lub osoby fizyczne).',
-      '',
-      'Dostępne kategorie:',
-      categoryCatalog
-        .map((c) => `- ${c.id} (${c.polishLabel}): ${c.description}`)
-        .join('\n'),
-    ].join('\n');
-  }
-
-  private userInstruction(filename: string): string {
-    return (
-      `Nazwa pliku (jedynie wskazówka, może być myląca): "${filename}". ` +
-      'Sklasyfikuj dokument na podstawie jego TREŚCI, nie nazwy pliku.'
-    );
-  }
-
-  private toolDefinition(): Anthropic.Tool {
-    return {
-      name: TOOL_NAME,
-      description:
-        'Zwraca kategorię dokumentu w taksonomii folderów klienta oraz datę dokumentu.',
-      input_schema: {
-        type: 'object',
-        properties: {
-          category: {
-            type: 'string',
-            enum: categoryCatalog.map((c) => c.id),
-            description: 'Identyfikator kategorii docelowej.',
-          },
-          year: {
-            type: ['integer', 'null'],
-            description: 'Rok dokumentu (RRRR). Wymagany dla kategorii datowanych.',
-          },
-          month: {
-            type: ['integer', 'null'],
-            minimum: 1,
-            maximum: 12,
-            description: 'Miesiąc dokumentu (1-12). Wymagany dla kategorii datowanych.',
-          },
-          confidence: {
-            type: 'number',
-            minimum: 0,
-            maximum: 1,
-            description: 'Pewność klasyfikacji w zakresie 0-1.',
-          },
-          reasoning: {
-            type: 'string',
-            description: 'Krótkie uzasadnienie wyboru kategorii (po polsku).',
-          },
-          parties: {
-            type: 'array',
-            description:
-              'Strony zidentyfikowane w dokumencie. Wypełniaj dla faktur ' +
-              '(sprzedawca + nabywca), umów (strony umowy) i innych dokumentów, ' +
-              'na których występują zidentyfikowane podmioty.',
-            items: {
-              type: 'object',
-              properties: {
-                role: {
-                  type: 'string',
-                  enum: ['seller', 'buyer', 'issuer', 'recipient', 'unknown'],
-                  description:
-                    'Rola strony: seller=sprzedawca/wystawca faktury, ' +
-                    'buyer=nabywca/kupujący, issuer=wystawca dokumentu (nie faktury), ' +
-                    'recipient=adresat/odbiorca, unknown=nieokreślona.',
-                },
-                nip: {
-                  type: ['string', 'null'],
-                  description: 'NIP strony (tylko cyfry, można zwrócić z formatowaniem).',
-                },
-                company_name: {
-                  type: ['string', 'null'],
-                  description: 'Pełna nazwa firmy, jeśli strona jest osobą prawną.',
-                },
-                person_name: {
-                  type: ['string', 'null'],
-                  description: 'Imię i nazwisko, jeśli strona jest osobą fizyczną.',
-                },
-              },
-              required: ['role'],
-            },
-          },
+  /** The content block for the model, or why there is none. */
+  private async modelInput(
+    content: Buffer,
+    contentType: string,
+  ): Promise<
+    | { readonly block: Anthropic.Messages.ContentBlockParam; readonly preview?: PdfPreview }
+    | ClassifierNoResult
+  > {
+    const type = contentType.split(';')[0]?.trim().toLowerCase() ?? '';
+    if (type === 'application/pdf') {
+      const pdf: PdfForModel = await pdfForModel(content);
+      if (pdf.kind === 'trim_failed') {
+        return this.noResult('pdf_trim_failed', undefined, { pageCount: pdf.pageCount });
+      }
+      const bytes = pdf.kind === 'first_pages' ? pdf.content : content;
+      return {
+        block: {
+          type: 'document',
+          source: { type: 'base64', media_type: 'application/pdf', data: bytes.toString('base64') },
         },
-        required: ['category', 'confidence'],
+        ...(pdf.kind === 'first_pages'
+          ? { preview: { pages: pdf.pages, pageCount: pdf.pageCount } }
+          : {}),
+      };
+    }
+    if (isImageType(type)) {
+      return {
+        block: {
+          type: 'image',
+          source: { type: 'base64', media_type: type, data: content.toString('base64') },
+        },
+      };
+    }
+    if (type.startsWith('text/')) {
+      return { block: { type: 'text', text: content.toString('utf-8') } };
+    }
+    return this.noResult('unsupported_type');
+  }
+
+  /** Transient or account failures are "retry later"; request failures are "no result". */
+  private apiFailure(err: unknown): ClassifierNoResult | ClassifierRetryLater {
+    const failure = classifyApiError(err);
+    if (failure.outcome === 'retry_later') {
+      this.log.warn(
+        {
+          event: 'claude.retry_later',
+          reason: failure.reason,
+          model: this.model,
+          ...(failure.status !== undefined ? { status: failure.status } : {}),
+        },
+        'claude.retry_later',
+      );
+      return failure;
+    }
+    return this.noResult(failure.reason, failure.status);
+  }
+
+  private noResult(
+    reason: string,
+    status?: number,
+    extra: Record<string, unknown> = {},
+  ): ClassifierNoResult {
+    this.log.info(
+      {
+        event: 'claude.no_result',
+        reason,
+        model: this.model,
+        ...(status !== undefined ? { status } : {}),
+        ...extra,
       },
-    };
+      'claude.no_result',
+    );
+    return { outcome: 'no_result', reason, ...(status !== undefined ? { status } : {}) };
+  }
+
+  private reportUsage(message: Anthropic.Message): void {
+    if (!this.onUsage || !message.usage) return;
+    this.onUsage({
+      model: message.model || this.model,
+      inputTokens: message.usage.input_tokens ?? 0,
+      outputTokens: message.usage.output_tokens ?? 0,
+    });
   }
 }
 
 // ---------------------------------------------------------------------------
 
-const IMAGE_MEDIA_TYPES = new Set([
-  'image/jpeg',
-  'image/png',
-  'image/gif',
-  'image/webp',
-]);
-
-function buildDocumentBlock(
-  content: Buffer,
-  contentType: string,
-): Anthropic.Messages.ContentBlockParam | null {
-  const type = contentType.split(';')[0]?.trim().toLowerCase() ?? '';
-
-  if (type === 'application/pdf') {
-    return {
-      type: 'document',
-      source: { type: 'base64', media_type: 'application/pdf', data: content.toString('base64') },
-    };
-  }
-
-  if (IMAGE_MEDIA_TYPES.has(type)) {
-    return {
-      type: 'image',
-      source: {
-        type: 'base64',
-        media_type: type as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
-        data: content.toString('base64'),
-      },
-    };
-  }
-
-  if (type.startsWith('text/')) {
-    return { type: 'text', text: content.toString('utf-8') };
-  }
-
-  return null;
+interface PdfPreview {
+  readonly pages: number;
+  readonly pageCount: number;
 }
-
-function extractToolInput(message: Anthropic.Message): ClassifyToolInput | null {
-  for (const block of message.content) {
-    if (block.type === 'tool_use' && block.name === TOOL_NAME) {
-      const input = block.input as Partial<ClassifyToolInput> | undefined;
-      if (
-        input &&
-        typeof input.category === 'string' &&
-        typeof input.confidence === 'number'
-      ) {
-        return {
-          category: input.category,
-          year: input.year ?? null,
-          month: input.month ?? null,
-          confidence: input.confidence,
-          ...(typeof input.reasoning === 'string' ? { reasoning: input.reasoning } : {}),
-          ...(Array.isArray(input.parties) ? { parties: input.parties } : {}),
-        };
-      }
-    }
-  }
-  return null;
-}
-
-const PARTY_ROLES = new Set<PartyRole>([
-  'seller',
-  'buyer',
-  'issuer',
-  'recipient',
-  'unknown',
-]);
 
 /**
- * Turn the raw tool output into the immutable `DocumentParty` shape. Drops
- * entries that carry no useful signal (no NIP, no name, no person name) and
- * normalizes NIPs to digits-only so downstream lookups don't have to.
+ * The SDK's typed errors, most specific first. Everything that says nothing
+ * about the document is `retry_later`: the SDK has already retried it once.
  */
-function normalizeParties(
-  raw: NonNullable<ClassifyToolInput['parties']>,
-): readonly DocumentParty[] {
+export function classifyApiError(err: unknown): ClassifierNoResult | ClassifierRetryLater {
+  const retryLater = (reason: string, status?: number): ClassifierRetryLater => ({
+    outcome: 'retry_later',
+    reason,
+    ...(status !== undefined ? { status } : {}),
+  });
+  if (err instanceof Anthropic.APIConnectionTimeoutError) return retryLater('timeout');
+  if (err instanceof Anthropic.APIConnectionError) return retryLater('connection');
+  if (err instanceof Anthropic.RateLimitError) return retryLater('rate_limited', 429);
+  if (err instanceof Anthropic.APIError) {
+    const status = err.status;
+    if (status === 529) return retryLater('overloaded', status);
+    if (status !== undefined && status >= 500) return retryLater('server_error', status);
+    if (status === 408) return retryLater('timeout', status);
+    if (status === 409) return retryLater('conflict', status);
+    if (status === 401 || status === 402 || status === 403 || status === 404) {
+      return retryLater('unavailable', status);
+    }
+    return {
+      outcome: 'no_result',
+      reason: 'invalid_request',
+      ...(status !== undefined ? { status } : {}),
+    };
+  }
+  return { outcome: 'no_result', reason: 'internal_error' };
+}
+
+/**
+ * The rules, in Polish like the documents. The client's identity is the only
+ * client data in it, and only the bound client's own.
+ */
+export function systemPrompt(client: ClassifierContext['client']): string {
+  const nip = client?.nip.replace(/\D+/g, '') ?? '';
+  const name = client?.companyName.trim() ?? '';
+  const identity =
+    nip || name
+      ? `Dokument należy do klienta: ${name || '(nazwa nieznana)'}${nip ? `, NIP ${nip}` : ''}. ` +
+        'W polu client_role wskaż rolę klienta na fakturze, porównując jego NIP (same cyfry) ' +
+        'i nazwę z danymi sprzedawcy i nabywcy: seller, gdy klient jest sprzedawcą lub ' +
+        'wystawcą; buyer, gdy jest nabywcą; none, gdy nie jest żadną ze stron; unknown, gdy ' +
+        'nie da się tego ustalić. Nie zgaduj: rola musi wynikać z danych na dokumencie.'
+      : 'Tożsamość klienta nie jest podana. Nie ustalaj, czy faktura jest sprzedażowa, czy ' +
+        'zakupowa: ustaw client_role na unknown. Kierunek faktury ustali księgowy.';
+
+  return [
+    'Jesteś asystentem księgowym polskiego biura rachunkowego. Klasyfikujesz jeden dokument ' +
+      'klienta do kategorii w strukturze folderów SharePoint tego klienta.',
+    identity,
+    '',
+    'Zasady:',
+    '- Kategorię wybierasz na podstawie TREŚCI dokumentu, nie nazwy pliku.',
+    '- Faktura to także faktura uproszczona, zaliczkowa, rozliczeniowa, faktura KSeF oraz ' +
+      'faktura zagraniczna (invoice, factuur, Rechnung). Faktura trafia do faktury_sprzedazy ' +
+      'albo faktury_zakupu, zależnie od roli klienta.',
+    '- Paragon fiskalny z NIP-em nabywcy (do 450 zł brutto) to faktura uproszczona, czyli faktura.',
+    '- Paragon, potwierdzenie płatności kartą, wydruk z terminala i zagraniczny paragon ' +
+      '(klantenbon, receipt, Kassenbon) BEZ danych nabywcy to faktury_noty: dowód księgowy ' +
+      'niebędący fakturą VAT.',
+    '- Zagraniczna faktura, bilet lub rachunek hotelowy, który wskazuje nabywcę (firmę lub ' +
+      'osobę), to faktura.',
+    '- Faktura pro forma to inne. Polisa, ogólne warunki ubezpieczenia (OWU) i warunki ' +
+      'polisy to umowy.',
+    '- Faktura korygująca i anulowanie faktury to faktury_korekty; nota księgowa, ' +
+      'obciążeniowa lub uznaniowa to faktury_noty.',
+    '- year i month to data dokumentu: data wystawienia faktury, data transakcji paragonu, ' +
+      'okres wyciągu. Podaj je zawsze, gdy da się je odczytać; w przeciwnym razie null.',
+    '- confidence (0-1) ustaw rzetelnie: niska, gdy nie masz pewności kategorii.',
+    '- parties: sprzedawca i nabywca faktury (lub strony umowy, wystawca pisma) z NIP-em ' +
+      'i nazwą, jeśli są na dokumencie.',
+    '- nieposortowane wybierz tylko wtedy, gdy dokument jest nieczytelny albo nie pasuje ' +
+      'do żadnej kategorii.',
+    '',
+    'Kategorie:',
+    categoryCatalog.map((c) => `- ${c.id} (${c.polishLabel}): ${c.description}`).join('\n'),
+  ].join('\n');
+}
+
+function userInstruction(filename: string, preview: PdfPreview | undefined): string {
+  return [
+    `Nazwa pliku (jedynie wskazówka, może być myląca): "${filename}".`,
+    ...(preview
+      ? [
+          `Dokument ma ${preview.pageCount} stron; załączono tylko pierwsze ${preview.pages}. ` +
+            'Sklasyfikuj cały dokument na ich podstawie.',
+        ]
+      : []),
+    'Sklasyfikuj dokument na podstawie jego TREŚCI, nie nazwy pliku.',
+  ].join(' ');
+}
+
+function parseOutput(message: Anthropic.Message): ModelOutput | null {
+  const text = message.content
+    .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+    .map((b) => b.text)
+    .join('');
+  if (!text.trim()) return null;
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const parsed = modelOutput.safeParse(json);
+  return parsed.success ? parsed.data : null;
+}
+
+function toClassification(
+  output: ModelOutput,
+  model: string,
+  preview: PdfPreview | undefined,
+): Classification {
+  const category = output.category;
+  const def = isDocumentCategory(category) ? getCategory(category) : undefined;
+  const date = validDate(output.year, output.month);
+  let folderPath = '';
+  if (def && (!def.dated || date)) folderPath = buildFolderPath(def.id, date);
+  const parties = normalizeParties(output.parties ?? []);
+  return {
+    documentType: def?.polishLabel ?? '',
+    folderPath,
+    confidence: clamp(output.confidence),
+    classifier: 'claude',
+    model,
+    fields: {
+      category,
+      ...(date ? { year: date.year, month: date.month } : {}),
+      clientRole: output.client_role ?? 'unknown',
+      ...(output.reasoning ? { reasoning: output.reasoning } : {}),
+      ...(preview ? { pagesRead: preview.pages, pageCount: preview.pageCount } : {}),
+    },
+    ...(parties.length > 0 ? { parties } : {}),
+  };
+}
+
+/**
+ * Turn the raw output into the immutable `DocumentParty` shape. Drops entries
+ * that carry no useful signal (no NIP, no name, no person name) and
+ * normalizes NIPs to digits-only so downstream comparisons don't have to.
+ */
+function normalizeParties(raw: NonNullable<ModelOutput['parties']>): readonly DocumentParty[] {
   const out: DocumentParty[] = [];
   for (const p of raw) {
-    const role: PartyRole = PARTY_ROLES.has(p.role as PartyRole)
+    const role = (PARTY_ROLES as readonly string[]).includes(p.role)
       ? (p.role as PartyRole)
       : 'unknown';
     const nip = typeof p.nip === 'string' ? p.nip.replace(/\D+/g, '') : '';
@@ -401,32 +494,37 @@ function normalizeParties(
   return out;
 }
 
-function resolveDate(
-  category: DocumentCategory,
+const IMAGE_MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'] as const;
+
+function isImageType(type: string): type is (typeof IMAGE_MEDIA_TYPES)[number] {
+  return (IMAGE_MEDIA_TYPES as readonly string[]).includes(type);
+}
+
+function validDate(
   year: number | null | undefined,
   month: number | null | undefined,
 ): { year: number; month: number } | undefined {
-  if (isValidYear(year) && isValidMonth(month)) {
+  if (
+    typeof year === 'number' &&
+    Number.isInteger(year) &&
+    year >= 1000 &&
+    year <= 9999 &&
+    typeof month === 'number' &&
+    Number.isInteger(month) &&
+    month >= 1 &&
+    month <= 12
+  ) {
     return { year, month };
   }
-  // The manual-review bucket is always dated; fall back to "now" when the
-  // model couldn't read a date off the document.
-  if (category === 'nieposortowane') {
-    const now = new Date();
-    return { year: now.getUTCFullYear(), month: now.getUTCMonth() + 1 };
-  }
   return undefined;
-}
-
-function isValidYear(year: number | null | undefined): year is number {
-  return typeof year === 'number' && Number.isInteger(year) && year >= 1000 && year <= 9999;
-}
-
-function isValidMonth(month: number | null | undefined): month is number {
-  return typeof month === 'number' && Number.isInteger(month) && month >= 1 && month <= 12;
 }
 
 function clamp(n: number): number {
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(1, n));
+}
+
+/** The error's class name only: an SDK message can quote the request. */
+function describeError(err: unknown): Record<string, unknown> {
+  return err instanceof Error ? { name: err.name } : { type: typeof err };
 }
