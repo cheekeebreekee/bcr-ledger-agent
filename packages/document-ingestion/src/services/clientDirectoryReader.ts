@@ -349,6 +349,30 @@ export function isBoundRow(e: ClientDirectoryEntry): boolean {
   return Boolean(e.target.rootFolder && e.target.expectedDriveId && e.teamId);
 }
 
+/**
+ * The client rows the snapshot routes to, whatever user ids they hold: active,
+ * not admin, bound, and not excluded (`forbidden_target`, `target_conflict`,
+ * `unbound_target`). An unavailable snapshot has none. Ordered by list item id
+ * (numerically where it is a number), so callers see a stable order.
+ *
+ * The channel inbox sweeps exactly these rows' channel folders.
+ */
+export function boundClientRows(snapshot: ClientDirectorySnapshot): ClientDirectoryEntry[] {
+  if (snapshot.health !== 'fresh') return [];
+  return snapshot.entries
+    .filter(
+      (e) => e.active && !e.isAdmin && isBoundRow(e) && !snapshot.excludedRows.has(e.listItemId),
+    )
+    .sort(compareListItemIds);
+}
+
+function compareListItemIds(a: ClientDirectoryEntry, b: ClientDirectoryEntry): number {
+  const x = a.listItemId;
+  const y = b.listItemId;
+  if (/^\d+$/.test(x) && /^\d+$/.test(y) && x.length !== y.length) return x.length - y.length;
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
 export interface BuildSnapshotOptions {
   readonly forbiddenSitePaths: readonly string[];
   readonly allowedSiteHostname: string;
