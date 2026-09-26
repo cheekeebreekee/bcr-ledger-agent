@@ -9,7 +9,7 @@ without `yarn install`.
 |---|---|---|
 | `directory-bindings.mjs` | Binds each Client Directory row to its Team's "Dokumenty księgowe" folder and its guests (`RootFolder`, `UserAadObjectIds`, `DriveId`, `TeamId`) | Only with `--apply`, and only those four columns (plus two new columns with `--add-columns --apply`) |
 | `inventory-misfiled.mjs` | IR-1: a register of every file the ingestion wrote, joined with the IR-0 log evidence | Never |
-| `ir0/export-appinsights.sh` | IR-0: exports the routing and upload traces, and the Personal Tab lookup requests (W5), before the 30-day retention deletes them | Never |
+| `ir0/export-appinsights.sh` | IR-0: exports the routing and upload traces, and the Personal Tab lookup requests (W5), before the component's retention (90 days here) deletes them | Never |
 | `ir0/export-purview.ps1` | IR-0: exports the Purview unified audit log (file reads, writes, moves, copies and deletions; group and sharing events; sign-ins of named accounts) | Never |
 | `../infrastructure/ir/evidence-store.sh` | An immutable blob container for the IR-0 and IR-1 evidence, with reader RBAC | Only with `--apply` |
 | `../infrastructure/quarantine/New-QuarantineSite.ps1` | The staff-only quarantine site (P0-2). See [its README](../infrastructure/quarantine/README.md) | Only with `-Apply` |
@@ -551,7 +551,7 @@ tools/ir0/export-appinsights.sh --app <component name> --resource-group rg-bcr-l
 - Runs `ir0/routing-traces.kql`, which parses the pino JSON in `traces.message`. It selects the pre-Phase-0 routing and upload messages, and the Personal Tab lookup lines (W5): `personal tab resolved`, `user-target lookup failed` and `user target resolved`.
 - Always also runs `ir0/personal-tab-requests.kql` into `requests-<chunk>.json`: the `requests` rows for `/api/mydocs` and `/api/user-target`, with `url` (the user id looked up), `resultCode`, `client_IP` and the geo columns. Requests are not sampled, so this is the full record of calls to the anonymous lookup, which Purview cannot see. App Insights masks `client_IP` by default; the geo columns survive.
 - Keeps `itemCount` on every row. Traces are sampled; an `itemCount` above 1 means the row stands for that many, so the export is not complete.
-- Uses 24-hour chunks over the last 30 days, or `--start`/`--end` in UTC.
+- Uses 24-hour chunks over the last `--days` (default 90; match the component's `retentionInDays`), or `--start`/`--end` in UTC.
 - Always passes **both** `--start-time` and `--end-time`: with only a start, the CLI's window is one hour.
 - Stops if a chunk reaches the API row limit, because a truncated export looks complete.
 - `--all-traces` also exports every trace, unfiltered.

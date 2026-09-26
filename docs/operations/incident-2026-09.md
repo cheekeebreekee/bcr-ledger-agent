@@ -154,7 +154,9 @@ Two things are **not** done in Phase 0, deliberately:
 
 ## IR-0: preserve the evidence first
 
-App Insights keeps **30 days**, and the window moves every day. Each day's delay deletes a day
+App Insights keeps **90 days** on this component (`retentionInDays`), and the window moves every
+day. The uploads of this incident reached ingestion on 7–16 July, so they age out from about
+5 October. Each day's delay deletes a day
 of evidence. The export also has to happen **before** the Phase-0 deploy, because P0-9 changes
 what the logs contain, and before any change to logging configuration.
 
@@ -214,8 +216,8 @@ az monitor app-insights query -g rg-bcr-ledger-dev --app <app-insights-name> \
 ```
 
 ⚠️ **Always pass both `--start-time` and `--end-time`.** With only a start, the CLI queries a
-one-hour window and returns a result that looks complete. Pass a start older than 30 days;
-the service simply returns what it still holds.
+one-hour window and returns a result that looks complete. Pass a start older than the retention
+(90 days here); the service simply returns what it still holds.
 
 `tools/ir0/` holds the scripted version of these exports; the query above is the reference for
 what it must return. Run it with `--all-traces`
@@ -254,7 +256,7 @@ country and city columns say where a call came from **[verify]**.
    `itemCount` greater than 1 stands for lines that were dropped, so the export can be incomplete
    by construction. An item with no log line is treated as *uploader unknown*, not as *no upload
    happened*.
-4. **Uploads older than 30 days have no trace at all.** The same rule applies to them.
+4. **Uploads older than the retention (90 days) have no trace at all.** The same rule applies to them.
 
 `operation_Id` may also group the lines of one invocation **[verify]**. The JSON fields above do
 not depend on it, so prefer them.
@@ -487,7 +489,7 @@ produced.
    - **Staff** (a `Member` of the tenant): membership does not narrow it, because staff belong
      to many Teams. The staff member who uploaded states in writing which client the document
      was for; that client is the candidate.
-   - **Unknown uploader** (no log line, older than 30 days, or sampled away): there is no
+   - **Unknown uploader** (no log line, older than the 90-day retention, or sampled away): there is no
      candidate. The item goes to quarantine.
 3. **Use the content only as a tie-breaker, and as a check.**
    - Several candidates: if the content points to exactly one of them, that one is the owner;

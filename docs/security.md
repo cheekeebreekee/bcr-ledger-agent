@@ -231,7 +231,7 @@ VNet integration and private endpoints.
 
 **Before:** every upload logged its file name, the client's title, the site path, the SharePoint
 URL and the uploader's id. The duplicate warning logged the duplicated NIP or user id itself.
-App Insights keeps 30 days and is readable by anyone with read on the resource. That made it a
+App Insights keeps 90 days on this component and is readable by anyone with read on the resource. That made it a
 register of which client sent what.
 **Now:** ids only:
 
@@ -242,7 +242,7 @@ register of which client sent what.
 - one redaction list covering file names, titles, URLs, paths, parties and NIPs.
 
 **Status: P0**, deployed only after IR-0 copied the old lines into the evidence store. Old lines
-age out within 30 days of the deploy.
+age out within 90 days of the deploy.
 
 ### T14. No Entra ID P1
 
@@ -317,7 +317,8 @@ check that every setting the code reads exists in Bicep, `what-if`, and environm
 
 ## 4. Data residency and retention
 
-- **Application Insights** keeps telemetry for 30 days (`logAnalytics.bicep`). From Phase 0 it
+- **Application Insights** keeps telemetry for 90 days on the running component (`retentionInDays`,
+  checked 26 September; `logAnalytics.bicep` says 30, one more drift item for G1). From Phase 0 it
   holds ids and codes, not names, file names or URLs.
 - **IR evidence store:** the pre-Phase-0 logs, the Purview export, the sign-in exports and the
   Directory export for the incident. It is immutable, readable by Roman, the IOD and

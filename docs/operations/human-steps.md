@@ -160,7 +160,9 @@ never withdraws one.
 
 **Owner:** Roman (creates the store, as subscription Owner), Yahor (trace and Directory
 exports), Global Admin (Purview export and the Entra sign-in log). **When:** today. App Insights
-keeps 30 days, and each day of delay deletes a day of evidence. This must also happen **before
+keeps **90 days** on this component (`retentionInDays`; checked 26 September, not the 30 the
+design assumed), and each day of delay deletes a day of evidence. Every upload of the incident
+reached ingestion between 7 and 16 July, so that evidence starts ageing out around 5 October. This must also happen **before
 H-9 and H-12**, because the Phase-0 code changes what is logged. H-3 does not wait for it: it
 deletes no past data, so it runs at once, and step 1 starts in parallel.
 
@@ -168,14 +170,16 @@ What to export, and why each join works, is in
 [incident → IR-0](incident-2026-09.md#ir-0-preserve-the-evidence-first). Every script is
 described, with all its flags, in [`tools/README.md`](../../tools/README.md).
 
-**1. The trace export (Yahor).** 24-hour chunks over the last 30 days. It writes the files, the
+**1. The trace export (Yahor).** 24-hour chunks over the component's whole retention: pass
+`--days 90` (a 30-day run on 26 September found no application log at all, because every upload
+was in July). It writes the files, the
 query, `export-meta.txt` and `SHA256SUMS` under `tools/out/` (git-ignored). `--all-traces` also
 keeps every trace unfiltered, from both apps (they share the component). The script always
 exports the `requests` rows for `/api/mydocs` and `/api/user-target`: the only record of who
 used the Personal Tab lookup (W5), which Purview cannot see.
 
 ```bash
-tools/ir0/export-appinsights.sh --app <App Insights component> --resource-group rg-bcr-ledger-dev --all-traces
+tools/ir0/export-appinsights.sh --app <App Insights component> --resource-group rg-bcr-ledger-dev --days 90 --all-traces
 ```
 
 **2. The Purview export (Global Admin, PowerShell 7, "View-Only Audit Logs" role).** Sites: BCR
