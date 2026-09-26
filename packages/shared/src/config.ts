@@ -122,6 +122,13 @@ const logLevel = z
   .optional()
   .transform((v) => v ?? 'info');
 
+/** `CLASSIFICATION_ACCEPT_THRESHOLD` when unset. */
+export const CLASSIFICATION_ACCEPT_THRESHOLD_DEFAULT = 0.7;
+/** The lowest accepted threshold: a 0.69 result is never filed under its category. */
+export const CLASSIFICATION_ACCEPT_THRESHOLD_MIN = 0.7;
+/** The highest accepted threshold. */
+export const CLASSIFICATION_ACCEPT_THRESHOLD_MAX = 0.95;
+
 // ---------------------------------------------------------------------------
 // Bot configuration
 //
@@ -329,11 +336,28 @@ export const ingestionConfigSchema = z.object({
   // --- Claude (Anthropic) content classification ---
   anthropicEnabled: boolish(false),
   anthropicApiKey: optionalStr(),
-  anthropicModel: optionalStr('claude-opus-4-5-20251101'),
+  /**
+   * The model id. The request (structured output, `effort`, no sampling
+   * parameters, no `thinking` field) is valid on `claude-opus-5` and on the
+   * `claude-opus-4-5-20251101` it replaces, so the setting can change at the
+   * deploy without an outage in between.
+   */
+  anthropicModel: optionalStr('claude-opus-5'),
   /** Hard cap on document bytes sent to the model. Default 10 MiB. */
   anthropicMaxContentBytes: numeric(10 * 1024 * 1024),
-  /** Minimum confidence to accept a classification; below this → manual review. */
-  anthropicConfidenceThreshold: numeric(0.6),
+  /**
+   * The one confidence threshold (`CLASSIFICATION_ACCEPT_THRESHOLD`): below it
+   * a document is filed in `98_Nieposortowane` for review, with the model's
+   * suggestion kept. Only the acceptance policy applies it. It replaces
+   * `ANTHROPIC_CONFIDENCE_THRESHOLD`, which is no longer read. Outside
+   * 0.70–0.95 it fails at cold start: 0.69 would file guesses, and above 0.95
+   * almost everything would wait for review.
+   */
+  classificationAcceptThreshold: numeric(CLASSIFICATION_ACCEPT_THRESHOLD_DEFAULT).refine(
+    (n) => n >= CLASSIFICATION_ACCEPT_THRESHOLD_MIN && n <= CLASSIFICATION_ACCEPT_THRESHOLD_MAX,
+    `must be a number from ${CLASSIFICATION_ACCEPT_THRESHOLD_MIN.toFixed(2)} to ` +
+      `${CLASSIFICATION_ACCEPT_THRESHOLD_MAX.toFixed(2)}`,
+  ),
   applicationInsightsConnectionString: optionalStr(),
   logLevel,
 });

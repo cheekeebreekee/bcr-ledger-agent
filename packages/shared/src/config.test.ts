@@ -1,4 +1,10 @@
-import { botConfigSchema, ingestionConfigSchema, loadConfig } from './config';
+import {
+  botConfigSchema,
+  CLASSIFICATION_ACCEPT_THRESHOLD_MAX,
+  CLASSIFICATION_ACCEPT_THRESHOLD_MIN,
+  ingestionConfigSchema,
+  loadConfig,
+} from './config';
 
 const botEnvMap = {
   microsoftAppId: 'MICROSOFT_APP_ID',
@@ -37,7 +43,7 @@ const ingestionEnvMap = {
   anthropicApiKey: 'ANTHROPIC_API_KEY',
   anthropicModel: 'ANTHROPIC_MODEL',
   anthropicMaxContentBytes: 'ANTHROPIC_MAX_CONTENT_BYTES',
-  anthropicConfidenceThreshold: 'ANTHROPIC_CONFIDENCE_THRESHOLD',
+  classificationAcceptThreshold: 'CLASSIFICATION_ACCEPT_THRESHOLD',
   applicationInsightsConnectionString: 'APPLICATIONINSIGHTS_CONNECTION_STRING',
   logLevel: 'LOG_LEVEL',
 } as const;
@@ -126,9 +132,9 @@ describe('ingestionConfigSchema', () => {
     expect(cfg.clientDirectoryMaxStaleMs).toBe(15 * 60 * 1000);
     expect(cfg.expectedRoles).toEqual(['Documents.Ingest']);
     expect(cfg.anthropicEnabled).toBe(false);
-    expect(cfg.anthropicModel).toBe('claude-opus-4-5-20251101');
+    expect(cfg.anthropicModel).toBe('claude-opus-5');
     expect(cfg.anthropicMaxContentBytes).toBe(10 * 1024 * 1024);
-    expect(cfg.anthropicConfidenceThreshold).toBe(0.6);
+    expect(cfg.classificationAcceptThreshold).toBe(0.7);
     expect(cfg.membershipCheckMode).toBe('enforce');
     expect(cfg.inboxSweepMode).toBe('off');
     expect(cfg.inboxMinAgeMs).toBe(2 * 60 * 1000);
@@ -275,21 +281,50 @@ describe('ingestionConfigSchema', () => {
     const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
       ...baseEnv,
       ANTHROPIC_MAX_CONTENT_BYTES: '2048',
-      ANTHROPIC_CONFIDENCE_THRESHOLD: '0.8',
+      CLASSIFICATION_ACCEPT_THRESHOLD: '0.8',
       CLIENT_DIRECTORY_CACHE_TTL_MS: '60000',
     });
     expect(cfg.anthropicMaxContentBytes).toBe(2048);
-    expect(cfg.anthropicConfidenceThreshold).toBe(0.8);
+    expect(cfg.classificationAcceptThreshold).toBe(0.8);
     expect(cfg.clientDirectoryCacheTtlMs).toBe(60000);
   });
 
-  it('rejects a non-numeric threshold', () => {
-    expect(() =>
-      loadConfig(ingestionConfigSchema, ingestionEnvMap, {
-        ...baseEnv,
-        ANTHROPIC_CONFIDENCE_THRESHOLD: 'abc',
-      }),
-    ).toThrow(/ANTHROPIC_CONFIDENCE_THRESHOLD/);
+  it.each(['0.70', '0.7', '0.85', '0.95'])('accepts CLASSIFICATION_ACCEPT_THRESHOLD=%s', (v) => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      CLASSIFICATION_ACCEPT_THRESHOLD: v,
+    });
+    expect(cfg.classificationAcceptThreshold).toBe(Number(v));
+  });
+
+  // A threshold of 0.69 would file a 0.69 guess under its category. Outside
+  // the range the app refuses to start, naming the variable.
+  it.each(['0.69', '0.6', '0', '0.96', '1', 'abc'])(
+    'refuses to start on CLASSIFICATION_ACCEPT_THRESHOLD=%s',
+    (v) => {
+      expect(() =>
+        loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+          ...baseEnv,
+          CLASSIFICATION_ACCEPT_THRESHOLD: v,
+        }),
+      ).toThrow(/CLASSIFICATION_ACCEPT_THRESHOLD/);
+    },
+  );
+
+  it('keeps the range at 0.70–0.95', () => {
+    expect([CLASSIFICATION_ACCEPT_THRESHOLD_MIN, CLASSIFICATION_ACCEPT_THRESHOLD_MAX]).toEqual([
+      0.7, 0.95,
+    ]);
+  });
+
+  // The old name is not read: the running app still carries 0.6 there, and
+  // reading it would now stop ingestion at cold start.
+  it('ignores the retired ANTHROPIC_CONFIDENCE_THRESHOLD', () => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      ANTHROPIC_CONFIDENCE_THRESHOLD: '0.6',
+    });
+    expect(cfg.classificationAcceptThreshold).toBe(0.7);
   });
 
   it.each([

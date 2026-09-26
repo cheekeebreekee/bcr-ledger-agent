@@ -25,10 +25,26 @@ const envMap = {
   anthropicApiKey: 'ANTHROPIC_API_KEY',
   anthropicModel: 'ANTHROPIC_MODEL',
   anthropicMaxContentBytes: 'ANTHROPIC_MAX_CONTENT_BYTES',
-  anthropicConfidenceThreshold: 'ANTHROPIC_CONFIDENCE_THRESHOLD',
+  classificationAcceptThreshold: 'CLASSIFICATION_ACCEPT_THRESHOLD',
   applicationInsightsConnectionString: 'APPLICATIONINSIGHTS_CONNECTION_STRING',
   logLevel: 'LOG_LEVEL',
 } as const satisfies Record<keyof IngestionConfig, string>;
+
+/**
+ * Settings this build no longer reads, with what replaced them. Still set on
+ * a running app, each is named in a warning at cold start so the operator
+ * removes it; none is ever read, so none can change behaviour.
+ */
+export const RETIRED_SETTINGS: Readonly<Record<string, string>> = {
+  // Not an alias: the live app carries 0.6 there, below the new minimum of
+  // 0.70, and reading it would stop ingestion at cold start.
+  ANTHROPIC_CONFIDENCE_THRESHOLD: 'CLASSIFICATION_ACCEPT_THRESHOLD (0.70-0.95, default 0.70)',
+};
+
+/** The retired settings that are still set (non-empty) in `env`, by name only. */
+export function retiredSettingsIn(env: NodeJS.ProcessEnv = process.env): string[] {
+  return Object.keys(RETIRED_SETTINGS).filter((name) => (env[name] ?? '').trim() !== '');
+}
 
 let cached: IngestionConfig | undefined;
 

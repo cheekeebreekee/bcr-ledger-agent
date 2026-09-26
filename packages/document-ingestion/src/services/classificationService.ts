@@ -4,12 +4,20 @@ import {
   createLogger,
   FALLBACK_CATEGORY,
   getCategory,
+  isNoResult,
+  isRetryLater,
   type Classification,
   type Classifier,
   type ClassifierContext,
+  type ClassifierResult,
+  type Logger,
 } from '@bcr/shared';
+import type { AcceptanceDecision, AcceptancePolicy } from './acceptancePolicy';
 
-/** Always succeeds — routes uncategorised files into the manual-review folder. */
+/**
+ * Always succeeds, and always for review: the document goes to
+ * `98_Nieposortowane` because nothing could classify it.
+ */
 export class FallbackClassifier implements Classifier {
   readonly name = 'fallback-unsorted';
   async classify(ctx: ClassifierContext): Promise<Classification> {
@@ -23,7 +31,9 @@ export class FallbackClassifier implements Classifier {
       }),
       confidence: 0.1,
       classifier: this.name,
+      reviewReasons: ['NOT_CLASSIFIED'],
       fields: {
+        category: FALLBACK_CATEGORY,
         filename: ctx.filename,
         reasoning:
           'Nie udało się pewnie rozpoznać typu dokumentu, więc trafił do folderu ' +
@@ -33,47 +43,88 @@ export class FallbackClassifier implements Classifier {
   }
 }
 
+/**
+ * What classification decided for one document:
+ *  - `decided`: file it where {@link AcceptanceDecision} says (its category,
+ *    or `98_Nieposortowane` for review);
+ *  - `retry_later`: a classifier could not answer now (429, 529, 5xx, a
+ *    timeout, …). Nothing may be filed: the bot path hands the document back
+ *    with `RetryLater`, the channel inbox leaves it for the next tick.
+ */
+export type ClassificationOutcome =
+  | { readonly kind: 'decided'; readonly decision: AcceptanceDecision }
+  | {
+      readonly kind: 'retry_later';
+      readonly classifier: string;
+      readonly reason: string;
+      readonly status?: number;
+    };
+
 export interface ClassificationServiceOptions {
-  /** Confidence at/above which we accept a result and stop trying others. */
-  readonly acceptanceThreshold?: number;
+  /** The one place a threshold or review reason is applied. */
+  readonly policy: AcceptancePolicy;
+  /** Defaults to the wall clock; the review folder is this month's. */
+  readonly now?: () => Date;
+  /** Injected in tests; defaults to the `ingestion/classificationService` logger. */
+  readonly log?: Logger;
 }
 
 /**
- * Runs a sequence of classifiers and returns the first high-confidence
- * result. Lower-confidence results are kept and the best one is returned
- * if nothing meets the threshold.
+ * Runs the classifiers in order and takes the first one with an answer; the
+ * acceptance policy then decides where it is filed. A classifier with no
+ * answer (`null`, `no_result`) hands over to the next — ending with the
+ * fallback, which files for review. A classifier that says `retry_later`
+ * stops the chain: a transient failure is never a reason to file a
+ * classifiable document for review.
  */
 export class ClassificationService {
-  private readonly log = createLogger('ingestion/classificationService');
-  private readonly threshold: number;
+  private readonly log: Logger;
+  private readonly now: () => Date;
 
   constructor(
     private readonly classifiers: readonly Classifier[],
-    opts: ClassificationServiceOptions = {},
+    private readonly opts: ClassificationServiceOptions,
   ) {
     if (classifiers.length === 0) {
       throw new ClassificationError('ClassificationService needs at least one classifier');
     }
-    this.threshold = opts.acceptanceThreshold ?? 0.8;
+    this.log = opts.log ?? createLogger('ingestion/classificationService');
+    this.now = opts.now ?? (() => new Date());
   }
 
-  async classify(ctx: ClassifierContext): Promise<Classification> {
-    let best: Classification | null = null;
+  /** `now` sets the review folder's month; callers with their own clock pass it. */
+  async classify(ctx: ClassifierContext, now: Date = this.now()): Promise<ClassificationOutcome> {
+    let unclassifiedReason: string | undefined;
     for (const c of this.classifiers) {
+      let result: ClassifierResult;
       try {
-        const result = await c.classify(ctx);
-        if (!result) continue;
-        this.log.debug(
-          { classifier: c.name, confidence: result.confidence, folderPath: result.folderPath },
-          'classifier result',
-        );
-        if (result.confidence >= this.threshold) return result;
-        if (!best || result.confidence > best.confidence) best = result;
+        result = await c.classify(ctx);
       } catch (err) {
-        this.log.warn({ err, classifier: c.name }, 'classifier failed, continuing');
+        this.log.warn(
+          { classifier: c.name, err: err instanceof Error ? { name: err.name } : {} },
+          'classifier failed, continuing',
+        );
+        continue;
       }
+      if (isRetryLater(result)) {
+        return {
+          kind: 'retry_later',
+          classifier: c.name,
+          reason: result.reason,
+          ...(result.status !== undefined ? { status: result.status } : {}),
+        };
+      }
+      if (result === null) continue;
+      if (isNoResult(result)) {
+        unclassifiedReason ??= result.reason;
+        continue;
+      }
+      const withReason =
+        unclassifiedReason && result.reviewReasons?.includes('NOT_CLASSIFIED')
+          ? { ...result, fields: { ...result.fields, unclassifiedReason } }
+          : result;
+      return { kind: 'decided', decision: this.opts.policy.decide(withReason, now) };
     }
-    if (best) return best;
     throw new ClassificationError(`No classifier produced a result for ${ctx.filename}`);
   }
 }

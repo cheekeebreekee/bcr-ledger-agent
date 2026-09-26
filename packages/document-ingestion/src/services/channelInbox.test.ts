@@ -6,18 +6,19 @@ import type {
   ClientDirectoryEntry,
   Logger,
 } from '@bcr/shared';
+import Anthropic from '@anthropic-ai/sdk';
+import { AcceptancePolicy } from './acceptancePolicy';
 import {
   ChannelInbox,
   CLASSIFY_RESERVE_MS,
   INBOX_TICK_HARD_LIMIT_MS,
   WRITE_RESERVE_MS,
-  inboxPlacement,
-  reviewFolderPath,
   selectCandidates,
   type ChannelInboxDeps,
   type InboxTickSummary,
 } from './channelInbox';
 import { ClassificationService, FallbackClassifier } from './classificationService';
+import { ClaudeClassifier } from './claudeClassifier';
 import { buildSnapshot, type ClientDirectorySnapshot } from './clientDirectoryReader';
 import type { InboxItem } from './sharePointService';
 import { createSharePointWiring } from './sharePointWiring';
@@ -419,8 +420,23 @@ const invoice: Classification = {
   folderPath: '01_Faktury/02_Faktury_zakupu/2026/09',
   confidence: 0.93,
   classifier: 'claude',
-  fields: { category: 'faktury_zakupu', year: 2026, month: 9, reasoning: 'model free text' },
+  model: 'claude-opus-5',
+  fields: {
+    category: 'faktury_zakupu',
+    year: 2026,
+    month: 9,
+    direction: 'zakup',
+    reasoning: 'model free text',
+  },
 };
+
+const policy = new AcceptancePolicy(0.7);
+const silent = { info: () => undefined, warn: () => undefined } as unknown as Logger;
+
+/** The real classification service (acceptance policy included) around one classifier. */
+function serviceOf(...classifiers: Classifier[]): ClassificationService {
+  return new ClassificationService(classifiers, { policy, log: silent });
+}
 
 /** Reads the content like the Claude classifier, and like it returns null on any failure. */
 function contentReadingClassifier(result: Classification): Classifier {
@@ -484,7 +500,7 @@ function setup(opts: SetupOptions = {}) {
     sharePointFactory: createSharePointWiring(tenant.client, wiringConfig).clientSharePointFactory,
     users: new UserTypeReader(tenant.client, noRetry),
     membership: new TeamMembershipReader(tenant.client, noRetry),
-    classification: opts.classification ?? { classify },
+    classification: opts.classification ?? serviceOf({ name: 'claude', classify }),
     minAgeMs: 120_000,
     maxFilesPerTick: 20,
     maxDownloadBytes: 10 * 1024 * 1024,
@@ -516,9 +532,16 @@ describe('ChannelInbox: filing a client upload', () => {
         teamId: TEAM_A,
         driveItemId: id,
         category: 'faktury_zakupu',
+        confidence: 0.93,
+        classifier: 'claude',
+        model: 'claude-opus-5',
+        month: '2026-09',
+        reviewReasons: [],
+        folder: '01_Faktury/02_Faktury_zakupu/2026/09',
         nameSuffix: 0,
       }),
     ]);
+    expect(events('inbox.filed')[0]).not.toHaveProperty('suggestedCategory');
   });
 
   it('creates the folder chain under the channel folder, never under the drive root', async () => {
@@ -596,16 +619,8 @@ describe('ChannelInbox: filing a client upload', () => {
     expect(events('inbox.filed')[0]).toMatchObject({ driveItemId: id, nameSuffix: 2 });
   });
 
-  it('primes the classifier with this row’s client identity only, and flips direction from its NIP', async () => {
-    const { tenant, inbox, classify } = setup({
-      classify: jest.fn(async () => ({
-        ...invoice,
-        parties: [
-          { role: 'seller', nip: NIP_A },
-          { role: 'buyer', nip: '2222222222' },
-        ],
-      })),
-    });
+  it('primes the classifier with this row’s client identity only', async () => {
+    const { tenant, inbox, classify } = setup();
     const id = tenant.addFile('inbox-a', { name: 'fv.pdf' });
 
     await inbox.sweep();
@@ -613,7 +628,77 @@ describe('ChannelInbox: filing a client upload', () => {
     const ctx = classify.mock.calls[0]?.[0] as ClassifierContext;
     expect(ctx.client).toEqual({ nip: NIP_A, companyName: 'Client 11 Sp. z o.o.' });
     expect(ctx.contentType).toBe('application/pdf');
-    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/01_Faktury/01_Faktury_sprzedaży/2026/09/fv.pdf`);
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/01_Faktury/02_Faktury_zakupu/2026/09/fv.pdf`);
+  });
+
+  it("files a sale by the row's NIP, whatever direction the model guessed (real classifier)", async () => {
+    const create = jest.fn().mockResolvedValue({
+      model: 'claude-opus-5',
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            category: 'faktury_zakupu',
+            year: 2026,
+            month: 8,
+            confidence: 0.95,
+            client_role: 'buyer',
+            reasoning: 'x',
+            parties: [
+              { role: 'seller', nip: NIP_A, company_name: null, person_name: null },
+              { role: 'buyer', nip: '2222222222', company_name: null, person_name: null },
+            ],
+          }),
+        },
+      ],
+    });
+    const claude = new ClaudeClassifier({
+      apiKey: 'k',
+      model: 'claude-opus-5',
+      maxContentBytes: 1024,
+      client: { messages: { create } } as never,
+      log: silent,
+    });
+    const { tenant, inbox } = setup({
+      classification: serviceOf(claude, new FallbackClassifier()),
+    });
+    const id = tenant.addFile('inbox-a', { name: 'fv.pdf' });
+
+    await inbox.sweep();
+
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/01_Faktury/01_Faktury_sprzedaży/2026/08/fv.pdf`);
+    expect(create.mock.calls[0][0].system).toContain(`NIP ${NIP_A}`);
+  });
+
+  it('sends an invoice of a row without NIP or name match to review, suggestion logged', async () => {
+    const { tenant, inbox, events } = setup({
+      classify: jest.fn(async () => ({
+        ...invoice,
+        confidence: 0.5,
+        reviewReasons: ['DIRECTION_UNRESOLVED'],
+        fields: { category: 'faktury_sprzedazy', year: 2026, month: 7 },
+      })),
+    });
+    const id = tenant.addFile('inbox-a', { name: 'fv.pdf' });
+
+    await inbox.sweep();
+
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/98_Nieposortowane/2026/09/fv.pdf`);
+    expect(events('inbox.sorted_to_review')[0]).toEqual(
+      expect.objectContaining({
+        driveItemId: id,
+        category: 'nieposortowane',
+        suggestedCategory: 'faktury_sprzedazy',
+        confidence: 0.5,
+        classifier: 'claude',
+        model: 'claude-opus-5',
+        month: '2026-07',
+        reviewReasons: ['DIRECTION_UNRESOLVED', 'LOW_CONFIDENCE'],
+        folder: '98_Nieposortowane/2026/09',
+      }),
+    );
   });
 
   it('builds the folder from the category alone, never from the model’s folder path', async () => {
@@ -642,7 +727,7 @@ describe('ChannelInbox: filing a client upload', () => {
 
   it('reads the file by id, only when the classifier asks for it', async () => {
     const { tenant, inbox } = setup({
-      classification: new ClassificationService([contentReadingClassifier(invoice)]),
+      classification: serviceOf(contentReadingClassifier(invoice)),
     });
     const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
     await inbox.sweep();
@@ -739,7 +824,7 @@ describe('ChannelInbox: what is never touched', () => {
   // guest's upload leaves the guest as creator and staff's content inside.
   it('leaves a guest’s file that staff replaced: not classified, not read, not moved', async () => {
     const { tenant, inbox, classify, events } = setup({
-      classification: new ClassificationService([contentReadingClassifier(invoice)]),
+      classification: serviceOf(contentReadingClassifier(invoice)),
     });
     const id = tenant.addFile('inbox-a', {
       name: 'skan.pdf',
@@ -953,7 +1038,7 @@ describe('ChannelInbox: it acts only on the version it listed', () => {
     ]);
     const { inbox, classify } = setup({
       tenant,
-      classification: new ClassificationService([contentReadingClassifier(invoice)]),
+      classification: serviceOf(contentReadingClassifier(invoice)),
     });
     const spy = jest.spyOn(ClassificationService.prototype, 'classify');
 
@@ -1219,6 +1304,12 @@ describe('ChannelInbox: modes', () => {
         driveItemId: id,
         category: 'faktury_zakupu',
         review: false,
+        confidence: 0.93,
+        classifier: 'claude',
+        model: 'claude-opus-5',
+        month: '2026-09',
+        reviewReasons: [],
+        folder: '01_Faktury/02_Faktury_zakupu/2026/09',
       }),
     ]);
   });
@@ -1259,7 +1350,7 @@ describe('ChannelInbox: modes', () => {
         .clientSharePointFactory,
       users: new UserTypeReader(tenant.client, noRetry),
       membership: new TeamMembershipReader(tenant.client, noRetry),
-      classification: { classify: async () => invoice },
+      classification: serviceOf({ name: 'claude', classify: async () => invoice }),
       minAgeMs: 0,
       maxFilesPerTick: 20,
       maxDownloadBytes: 1024,
@@ -1318,7 +1409,7 @@ describe('ChannelInbox: manual review and failures', () => {
       },
     };
     const { tenant, inbox, events } = setup({
-      classification: new ClassificationService([failing, new FallbackClassifier()]),
+      classification: serviceOf(failing, new FallbackClassifier()),
     });
     const id = tenant.addFile('inbox-a', { name: 'skan.pdf' });
 
@@ -1335,10 +1426,7 @@ describe('ChannelInbox: manual review and failures', () => {
 
   it('sends a file too big for the classifier to manual review without reading it whole', async () => {
     const { tenant, inbox } = setup({
-      classification: new ClassificationService([
-        contentReadingClassifier(invoice),
-        new FallbackClassifier(),
-      ]),
+      classification: serviceOf(contentReadingClassifier(invoice), new FallbackClassifier()),
       deps: { maxDownloadBytes: 8 },
     });
     const id = tenant.addFile('inbox-a', { name: 'duzy.pdf', content: Buffer.alloc(64, 1) });
@@ -1351,10 +1439,7 @@ describe('ChannelInbox: manual review and failures', () => {
 
   it('counts a failed download as a failed attempt and leaves the file for the next tick', async () => {
     const { tenant, inbox, events } = setup({
-      classification: new ClassificationService([
-        contentReadingClassifier(invoice),
-        new FallbackClassifier(),
-      ]),
+      classification: serviceOf(contentReadingClassifier(invoice), new FallbackClassifier()),
     });
     const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
     let failing = true;
@@ -1464,14 +1549,108 @@ describe('ChannelInbox: manual review and failures', () => {
 
   it('classifies again once the cached classification is an hour old', async () => {
     let now = NOW;
-    const { tenant, inbox, classify } = setup({ mode: 'shadow', deps: { now: () => now } });
+    const { tenant, inbox, classify } = setup({ deps: { now: () => now } });
     tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    tenant.overrides.push([
+      /^PATCH /,
+      () => {
+        throw graphError(400);
+      },
+    ]);
 
     await inbox.sweep();
     now = new Date(NOW.getTime() + 60 * 60 * 1000);
     await inbox.sweep();
 
     expect(classify).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('ChannelInbox: retry later', () => {
+  const overloaded = {
+    outcome: 'retry_later' as const,
+    reason: 'overloaded',
+    status: 529,
+  };
+
+  // 529 "Overloaded" in the evaluation parked classifiable documents in 98_.
+  it('leaves a file the model could not answer for in the inbox: no 98_, no failure, a retry_later line', async () => {
+    let answer: typeof overloaded | Classification = overloaded;
+    const classify = jest.fn(async () => answer);
+    const { tenant, inbox, events } = setup({
+      classification: serviceOf({ name: 'claude', classify }, new FallbackClassifier()),
+    });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    // More ticks than the three failures that would send a file to 98_.
+    const ticks = [];
+    for (let i = 0; i < 4; i += 1) ticks.push(await inbox.sweep());
+
+    expect(ticks.map((t) => [t.retryLater, t.failed, t.sortedToReview, t.filed])).toEqual([
+      [1, 0, 0, 0],
+      [1, 0, 0, 0],
+      [1, 0, 0, 0],
+      [1, 0, 0, 0],
+    ]);
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/faktura.pdf`);
+    expect(tenant.writes()).toEqual([]);
+    expect(events('inbox.failed')).toEqual([]);
+    expect(events('inbox.retry_later')[0]).toEqual(
+      expect.objectContaining({
+        clientId: '0011',
+        listItemId: '11',
+        driveItemId: id,
+        classifier: 'claude',
+        reason: 'overloaded',
+        status: 529,
+      }),
+    );
+
+    answer = invoice;
+    const recovered = await inbox.sweep();
+    expect(recovered).toMatchObject({ filed: 1, retryLater: 0 });
+    expect(tenant.pathOf(id)).toContain('/01_Faktury/02_Faktury_zakupu/2026/09/');
+  });
+
+  it('does not log would_move for a retry in shadow, and tries again next tick', async () => {
+    const classify = jest
+      .fn()
+      .mockResolvedValueOnce({ outcome: 'retry_later', reason: 'timeout' })
+      .mockResolvedValue(invoice);
+    const { tenant, inbox, events } = setup({
+      mode: 'shadow',
+      classification: serviceOf({ name: 'claude', classify }),
+    });
+    tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, wouldMove: 0 });
+    expect(events('inbox.retry_later')[0]).not.toHaveProperty('status');
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 0, wouldMove: 1 });
+    expect(classify).toHaveBeenCalledTimes(2);
+  });
+
+  it('with the real classifier: a 529 after the SDK retry leaves the file in the inbox', async () => {
+    const create = jest
+      .fn()
+      .mockRejectedValue(
+        Anthropic.APIError.generate(529, { type: 'error' }, 'Overloaded', new Headers()),
+      );
+    const claude = new ClaudeClassifier({
+      apiKey: 'k',
+      model: 'claude-opus-5',
+      maxContentBytes: 1024,
+      client: { messages: { create } } as never,
+      log: silent,
+    });
+    const { tenant, inbox } = setup({
+      classification: serviceOf(claude, new FallbackClassifier()),
+    });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    for (let i = 0; i < 4; i += 1) await inbox.sweep();
+
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/faktura.pdf`);
+    expect(tenant.writes()).toEqual([]);
   });
 });
 
@@ -1635,10 +1814,10 @@ describe('ChannelInbox: logs', () => {
     const secretName = 'FV_SECRET-PARTNER_1234567890.pdf';
     const { tenant, inbox, lines } = setup({
       rows: [rowA, rowB],
-      classification: new ClassificationService([
+      classification: serviceOf(
         contentReadingClassifier({ ...invoice, parties: [{ role: 'buyer', nip: NIP_A }] }),
         new FallbackClassifier(),
-      ]),
+      ),
     });
     const id = tenant.addFile('inbox-a', { name: secretName });
     tenant.addFile('inbox-a', { name: `staff-${secretName}`, createdBy: STAFF });
@@ -1662,16 +1841,13 @@ describe('ChannelInbox: logs', () => {
     }
 
     const text = JSON.stringify(lines);
-    const leaks = [
-      'SECRET',
-      '1234567890',
-      NIP_A,
-      CHANNEL,
-      'Faktury',
-      'Client 11',
-      'model free text',
-    ].filter((s) => text.includes(s));
+    const leaks = ['SECRET', '1234567890', NIP_A, CHANNEL, 'Client 11', 'model free text'].filter(
+      (s) => text.includes(s),
+    );
     expect(leaks).toEqual([]);
+    // The one path logged is the taxonomy's, relative to the channel folder.
+    const folders = lines.filter((l) => 'folder' in l).map((l) => l['folder']);
+    expect(folders).toEqual(['01_Faktury/02_Faktury_zakupu/2026/09']);
     expect(lines.filter((l) => l['event'] === 'inbox.tick')).toHaveLength(2);
   });
 
@@ -1688,6 +1864,7 @@ describe('ChannelInbox: logs', () => {
       filed: 1,
       sortedToReview: 0,
       wouldMove: 0,
+      retryLater: 0,
       skippedNotClient: 0,
       skippedUnverified: 0,
       skippedYoung: 0,
@@ -1786,35 +1963,5 @@ describe('selectCandidates', () => {
       beforeCutoff: 0,
       noCreator: 0,
     });
-  });
-});
-
-describe('inboxPlacement', () => {
-  const base = { ...invoice, fields: {} };
-
-  it('builds a dated category with its year and month', () => {
-    expect(inboxPlacement(invoice, NOW)).toEqual({
-      category: 'faktury_zakupu',
-      folderPath: '01_Faktury/02_Faktury_zakupu/2026/09',
-      review: false,
-    });
-  });
-
-  it.each([
-    ['an unknown category', { category: 'evil' }],
-    ['no category (the fallback classifier)', {}],
-    ['a dated category without a date', { category: 'wyciagi_bankowe' }],
-    [
-      'a dated category with an impossible month',
-      { category: 'wyciagi_bankowe', year: 2026, month: 13 },
-    ],
-    ['nieposortowane itself', { category: 'nieposortowane', year: 2020, month: 1 }],
-  ])('sends %s to review for this month', (_label, fields) => {
-    expect(inboxPlacement({ ...base, fields }, NOW)).toEqual({
-      category: 'nieposortowane',
-      folderPath: reviewFolderPath(NOW),
-      review: true,
-    });
-    expect(reviewFolderPath(NOW)).toBe('98_Nieposortowane/2026/09');
   });
 });

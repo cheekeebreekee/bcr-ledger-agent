@@ -1,20 +1,19 @@
 import {
-  buildFolderPath,
   createLogger,
-  FALLBACK_CATEGORY,
-  getCategory,
-  isDocumentCategory,
   LedgerAgentError,
-  type Classification,
   type ClassifierContext,
   type ClientDirectoryEntry,
-  type DocumentCategory,
   type InboxSweepMode,
   type Logger,
   type SharePointTarget,
 } from '@bcr/shared';
+import {
+  decisionLogFields,
+  processingFailedDecision,
+  type AcceptanceDecision,
+} from './acceptancePolicy';
+import type { ClassificationOutcome } from './classificationService';
 import { boundClientRows, type ClientDirectorySnapshot } from './clientDirectoryReader';
-import { applyInvoiceDirection } from './clientResolver';
 import {
   ContentTooLargeError,
   graphStatus,
@@ -65,7 +64,7 @@ export const CLASSIFICATION_CACHE_TTL_MS = 60 * 60 * 1000;
 /** Processing failures after which a file is sorted to review unclassified. */
 export const MAX_PROCESSING_ATTEMPTS = 3;
 
-/** Files whose classification, failure count or skip log line are remembered at once. */
+/** Files whose classification, failure count or log line are remembered at once. */
 const MAX_TRACKED_FILES = 1000;
 
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -100,7 +99,13 @@ export interface ChannelInboxDeps {
   readonly users: UserTypeSource;
   /** Which Teams an uploader is in (the cached Entra read the resolver uses). */
   readonly membership: TeamMembershipSource;
-  readonly classification: { classify(ctx: ClassifierContext): Promise<Classification> };
+  /**
+   * Classification, the acceptance policy included: where to file, or retry
+   * later. Given the tick's clock, for the review folder's month.
+   */
+  readonly classification: {
+    classify(ctx: ClassifierContext, now?: Date): Promise<ClassificationOutcome>;
+  };
   /** `INBOX_MIN_AGE_MS`: younger files may still be uploading. */
   readonly minAgeMs: number;
   /** `INBOX_MAX_FILES_PER_TICK`, across all rows. */
@@ -142,8 +147,13 @@ export interface InboxTickSummary {
   readonly filed: number;
   /** Moved into `98_Nieposortowane/YYYY/MM` (enforce). */
   readonly sortedToReview: number;
-  /** Would have been moved (shadow). */
+  /** Would have been moved (shadow): logged as `inbox.would_move` this tick. */
   readonly wouldMove: number;
+  /**
+   * The classifier could not answer now (429, 529, 5xx, a timeout): left in
+   * the inbox for the next tick, not a failure, never sent to review.
+   */
+  readonly retryLater: number;
   /**
    * Created, or last changed, by someone who is not a guest of this row's
    * Team; no creator id; or no such user: left untouched.
@@ -173,14 +183,6 @@ export interface InboxTickSummary {
 
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 
-/** Where a file goes: a taxonomy folder, relative to the channel folder. */
-export interface InboxPlacement {
-  readonly category: DocumentCategory;
-  readonly folderPath: string;
-  /** `98_Nieposortowane`: for manual review. */
-  readonly review: boolean;
-}
-
 /** A direct child the sweep may process, once its uploader is checked. */
 export interface InboxCandidate {
   readonly item: InboxItem;
@@ -204,9 +206,13 @@ type UploaderVerdict =
 
 type SkipReason = Exclude<UploaderVerdict, 'client'> | 'changed';
 
+/**
+ * Where a file goes (its `folderPath` is relative to the channel folder,
+ * taxonomy only), as the acceptance policy decided for the listed version.
+ */
 interface CachedPlacement {
   readonly eTag: string;
-  readonly placement: InboxPlacement;
+  readonly decision: AcceptanceDecision;
   readonly at: number;
 }
 
@@ -248,8 +254,8 @@ interface Tick {
  * `If-Match`. A file someone moved, renamed or replaced meanwhile is left
  * where it now is. It never recurses (subfolders are the filed area), never
  * copies, never deletes, never moves across drives and never overwrites. In
- * `shadow` it does everything but write, and logs what it would move. Logs
- * carry ids and counts only.
+ * `shadow` it does everything but write, and logs what it would move. A
+ * classifier that cannot answer now leaves the file for the next tick. Logs carry ids, codes, counts and taxonomy paths only.
  */
 export class ChannelInbox {
   private readonly log: Logger;
@@ -294,6 +300,7 @@ export class ChannelInbox {
         filed: 0,
         sortedToReview: 0,
         wouldMove: 0,
+        retryLater: 0,
         skippedNotClient: 0,
         skippedUnverified: 0,
         skippedYoung: 0,
@@ -508,24 +515,14 @@ export class ChannelInbox {
 
     let stage: Stage = 'check';
     try {
-      const placement = await this.placementFor(row, sharePoint, inbox, candidate, tick);
+      const decision = await this.placementFor(row, sharePoint, inbox, candidate, tick);
       if (this.deps.mode === 'shadow') {
-        tick.counts.wouldMove += 1;
-        tick.log.info(
-          {
-            event: 'inbox.would_move',
-            ...ids,
-            driveItemId,
-            category: placement.category,
-            review: placement.review,
-          },
-          'inbox.would_move',
-        );
+        this.reportWouldMove(tick, ids, candidate, decision);
         return;
       }
       if (!this.hasTimeFor(tick, WRITE_RESERVE_MS)) throw new OutOfTime();
       stage = 'folder';
-      const folderId = await sharePoint.ensureInboxFolder(inbox, placement.folderPath);
+      const folderId = await sharePoint.ensureInboxFolder(inbox, decision.folderPath);
       stage = 'move';
       const moved = await sharePoint.moveWithinInbox(
         inbox,
@@ -534,15 +531,15 @@ export class ChannelInbox {
         folderId,
       );
       this.forget(driveItemId);
-      const event = placement.review ? 'inbox.sorted_to_review' : 'inbox.filed';
-      if (placement.review) tick.counts.sortedToReview += 1;
+      const event = decision.review ? 'inbox.sorted_to_review' : 'inbox.filed';
+      if (decision.review) tick.counts.sortedToReview += 1;
       else tick.counts.filed += 1;
       tick.log.info(
         {
           event,
           ...ids,
           driveItemId,
-          category: placement.category,
+          ...decisionLogFields(decision),
           nameSuffix: moved.nameSuffix,
         },
         event,
@@ -575,8 +572,10 @@ export class ChannelInbox {
   /**
    * Not failures, and never counted towards the review fallback: a file that
    * changed since it was listed (`skippedChanged`, logged once as
-   * `inbox.skipped` `changed`), and one the tick has no time left for
-   * (`deferred`). Both are left where they are for the next tick.
+   * `inbox.skipped` `changed`), one the tick has no time left for
+   * (`deferred`), and one the classifier could not answer for now
+   * (`retryLater`, logged as `inbox.retry_later` with the API's status). All
+   * are left where they are for the next tick.
    */
   private leftForLater(
     err: unknown,
@@ -594,14 +593,54 @@ export class ChannelInbox {
       this.reportSkipOnce(tick, ids, candidate, 'changed');
       return true;
     }
+    if (err instanceof ClassificationDeferred) {
+      tick.counts.retryLater += 1;
+      tick.log.warn(
+        {
+          event: 'inbox.retry_later',
+          clientId: ids.clientId,
+          listItemId: ids.listItemId,
+          driveItemId: candidate.item.id,
+          classifier: err.classifier,
+          reason: err.reason,
+          ...(err.status !== undefined ? { status: err.status } : {}),
+        },
+        'inbox.retry_later',
+      );
+      return true;
+    }
     return false;
+  }
+
+  /** Shadow: what would be moved, and where. */
+  private reportWouldMove(
+    tick: Tick,
+    ids: RowIds,
+    candidate: InboxCandidate,
+    decision: AcceptanceDecision,
+    extra: Record<string, unknown> = {},
+  ): void {
+    tick.counts.wouldMove += 1;
+    tick.log.info(
+      {
+        event: 'inbox.would_move',
+        ...ids,
+        driveItemId: candidate.item.id,
+        review: decision.review,
+        ...decisionLogFields(decision),
+        ...extra,
+      },
+      'inbox.would_move',
+    );
   }
 
   /**
    * Classify once per (driveItemId, eTag) an hour, so a file whose move keeps
    * failing is not sent to the model every tick. The classifier is primed
-   * with THIS row's client identity only, as on the bot path, and the result
-   * may only flip invoice direction; it never chooses the client.
+   * with THIS row's client identity only, as on the bot path; that identity
+   * settles invoice direction and nothing else, and it never chooses the
+   * client. The acceptance policy's decision is what is cached. A "retry
+   * later" is not cached and throws {@link ClassificationDeferred}.
    *
    * Before anything is read, the tick must have {@link CLASSIFY_RESERVE_MS}
    * left, and the item must still be the listed version at the top of the
@@ -613,11 +652,11 @@ export class ChannelInbox {
     inbox: InboxFolder,
     candidate: InboxCandidate,
     tick: Tick,
-  ): Promise<InboxPlacement> {
+  ): Promise<AcceptanceDecision> {
     const now = this.now();
     const cached = this.placements.get(candidate.item.id);
     if (cached && cached.eTag === candidate.eTag && now.getTime() - cached.at < this.cacheTtlMs) {
-      return cached.placement;
+      return cached.decision;
     }
 
     if (!this.hasTimeFor(tick, CLASSIFY_RESERVE_MS)) throw new OutOfTime();
@@ -638,29 +677,29 @@ export class ChannelInbox {
       return content;
     };
     const companyName = row.companyNameAliases[0] ?? row.title;
-    let classified: Classification;
+    let outcome: ClassificationOutcome;
     try {
-      classified = await this.deps.classification.classify({
-        filename: candidate.name,
-        contentType: candidate.item.file?.mimeType || 'application/octet-stream',
-        readContent,
-        ...(row.nip || companyName ? { client: { nip: row.nip, companyName } } : {}),
-      });
+      outcome = await this.deps.classification.classify(
+        {
+          filename: candidate.name,
+          contentType: candidate.item.file?.mimeType || 'application/octet-stream',
+          readContent,
+          ...(row.nip || companyName ? { client: { nip: row.nip, companyName } } : {}),
+        },
+        now,
+      );
     } catch (err) {
       throw new StageFailure('classify', err);
     }
     if (downloadFailure !== undefined) throw new StageFailure('download', downloadFailure);
+    if (outcome.kind === 'retry_later') throw new ClassificationDeferred(outcome);
 
-    const directed = row.nip
-      ? (applyInvoiceDirection(classified, row.nip)?.classification ?? classified)
-      : classified;
-    const placement = inboxPlacement(directed, now);
     remember(this.placements, candidate.item.id, {
       eTag: candidate.eTag,
-      placement,
+      decision: outcome.decision,
       at: now.getTime(),
     });
-    return placement;
+    return outcome.decision;
   }
 
   /**
@@ -678,25 +717,14 @@ export class ChannelInbox {
     opts: { readonly counted: boolean },
   ): Promise<void> {
     const driveItemId = candidate.item.id;
-    const folderPath = reviewFolderPath(this.now());
+    const decision = processingFailedDecision(this.now());
     if (this.deps.mode === 'shadow') {
-      tick.counts.wouldMove += 1;
-      tick.log.info(
-        {
-          event: 'inbox.would_move',
-          ...ids,
-          driveItemId,
-          category: FALLBACK_CATEGORY,
-          review: true,
-          unclassified: true,
-        },
-        'inbox.would_move',
-      );
+      this.reportWouldMove(tick, ids, candidate, decision, { unclassified: true });
       return;
     }
     try {
       if (!this.hasTimeFor(tick, WRITE_RESERVE_MS)) throw new OutOfTime();
-      const folderId = await sharePoint.ensureInboxFolder(inbox, folderPath);
+      const folderId = await sharePoint.ensureInboxFolder(inbox, decision.folderPath);
       const moved = await sharePoint.moveWithinInbox(
         inbox,
         { id: driveItemId, eTag: candidate.eTag },
@@ -710,7 +738,7 @@ export class ChannelInbox {
           event: 'inbox.sorted_to_review',
           ...ids,
           driveItemId,
-          category: FALLBACK_CATEGORY,
+          ...decisionLogFields(decision),
           nameSuffix: moved.nameSuffix,
           unclassified: true,
         },
@@ -846,47 +874,24 @@ function userIdOf(identity: { readonly user?: { readonly id?: string } } | undef
   return GUID.test(id) ? id : '';
 }
 
-/**
- * Where a classified file goes, built with the taxonomy (`buildFolderPath`)
- * from the category id alone, so the model's own folder path is never used.
- * An unknown category, the fallback's result, or a dated category without a
- * usable date goes to `98_Nieposortowane/YYYY/MM` for this month.
- */
-export function inboxPlacement(classification: Classification, now: Date): InboxPlacement {
-  const category = classification.fields.category;
-  if (isDocumentCategory(category) && category !== FALLBACK_CATEGORY) {
-    try {
-      const folderPath = getCategory(category).dated
-        ? buildFolderPath(category, datePartsOf(classification))
-        : buildFolderPath(category);
-      return { category, folderPath, review: false };
-    } catch {
-      // A dated category without a usable date: manual review.
-    }
-  }
-  return { category: FALLBACK_CATEGORY, folderPath: reviewFolderPath(now), review: true };
-}
-
-/** `98_Nieposortowane/YYYY/MM` for the month of `now` (UTC), like the fallback classifier. */
-export function reviewFolderPath(now: Date): string {
-  return buildFolderPath(FALLBACK_CATEGORY, {
-    year: now.getUTCFullYear(),
-    month: now.getUTCMonth() + 1,
-  });
-}
-
-function datePartsOf(c: Classification): { year: number; month: number } {
-  const { year, month } = c.fields;
-  if (typeof year !== 'number' || typeof month !== 'number') {
-    throw new Error('A dated category needs a numeric year and month');
-  }
-  return { year, month };
-}
-
 /** The tick has too little time left for the next stage: the file waits, not a failure. */
 class OutOfTime extends Error {
   constructor() {
     super('Not enough time left in this tick');
+  }
+}
+
+/** The classifier could not answer now: the file waits for the next tick, not a failure. */
+class ClassificationDeferred extends Error {
+  readonly classifier: string;
+  readonly reason: string;
+  readonly status: number | undefined;
+
+  constructor(outcome: Extract<ClassificationOutcome, { kind: 'retry_later' }>) {
+    super('Classification deferred');
+    this.classifier = outcome.classifier;
+    this.reason = outcome.reason;
+    this.status = outcome.status;
   }
 }
 

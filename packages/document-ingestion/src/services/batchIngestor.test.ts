@@ -1,4 +1,6 @@
+import Anthropic from '@anthropic-ai/sdk';
 import type { Client } from '@microsoft/microsoft-graph-client';
+import { PDFDocument } from 'pdf-lib';
 import {
   SharePointError,
   ValidationError,
@@ -12,7 +14,14 @@ import {
   type ResolvedClient,
   type SharePointTarget,
 } from '@bcr/shared';
+import { AcceptancePolicy } from './acceptancePolicy';
 import { BatchIngestor, RETRY_LATER, type BatchIngestorDeps } from './batchIngestor';
+import {
+  ClassificationService,
+  FallbackClassifier,
+  type ClassificationOutcome,
+} from './classificationService';
+import { ClaudeClassifier } from './claudeClassifier';
 import {
   cachedSiteIdLookup,
   SharePointTargetError,
@@ -53,8 +62,22 @@ const invoice: Classification = {
   folderPath: '01_Faktury/02_Faktury_zakupu/2026/09',
   confidence: 0.93,
   classifier: 'claude',
-  fields: { category: 'faktury_zakupu', year: 2026, month: 9, reasoning: 'model free text' },
+  model: 'claude-opus-5',
+  fields: {
+    category: 'faktury_zakupu',
+    year: 2026,
+    month: 9,
+    direction: 'zakup',
+    reasoning: 'model free text',
+  },
 };
+
+const policy = new AcceptancePolicy(0.7);
+
+/** What the classification service returns for a classifier result: the policy's decision. */
+function decided(c: Classification): ClassificationOutcome {
+  return { kind: 'decided', decision: policy.decide(c, new Date('2026-09-25T10:00:00Z')) };
+}
 
 function payload(filenames: string[] = ['faktura.pdf']): IngestionBatchRequestPayload {
   return {
@@ -108,7 +131,8 @@ function setup(
   const sp: FakeSharePoint = { uploads: [], fields: [], failFor: new Map() };
   let n = 0;
   const classify =
-    opts.classify ?? jest.fn(async (_ctx: ClassifierContext): Promise<Classification> => invoice);
+    opts.classify ??
+    jest.fn(async (_ctx: ClassifierContext): Promise<ClassificationOutcome> => decided(invoice));
   const factory = (name: FactoryName) => ({
     forTarget: (target: SharePointTarget) => ({
       uploadDocument: jest.fn(async (args: UploadDocumentArgs): Promise<DriveItemRef> => {
@@ -130,7 +154,6 @@ function setup(
   const deps: BatchIngestorDeps = {
     resolver: {
       resolve: jest.fn().mockResolvedValue(resolved),
-      resolvePostClassification: jest.fn((client, classification) => ({ client, classification })),
       quarantine: jest.fn((reason: QuarantineReason) => ({
         source: 'quarantine' as const,
         reason,
@@ -155,6 +178,7 @@ describe('BatchIngestor — bound client', () => {
 
     expect(classify).toHaveBeenCalledWith(
       expect.objectContaining({ client: { nip: '1111111111', companyName: 'Client A Sp. z o.o.' } }),
+      new Date('2026-09-25T10:00:00Z'),
     );
     expect(sp.uploads).toHaveLength(1);
     expect(sp.uploads[0]!.target).toBe(clientTarget);
@@ -190,9 +214,17 @@ describe('BatchIngestor — bound client', () => {
       clientId: '0002',
       listItemId: '11',
       teamId: 'team-0002',
-      category: 'faktury_zakupu',
       driveItemId: 'item-1',
+      review: false,
+      category: 'faktury_zakupu',
+      confidence: 0.93,
+      classifier: 'claude',
+      model: 'claude-opus-5',
+      month: '2026-09',
+      reviewReasons: [],
+      folder: '01_Faktury/02_Faktury_zakupu/2026/09',
     });
+    expect(filed).not.toHaveProperty('suggestedCategory');
     expect(lines.find((l) => l['msg'] === 'client resolved')).toMatchObject({ teamId: 'team-0002' });
     const serialized = JSON.stringify(lines);
     const leaks = ['8652567240', 'Client A', '1111111111', '/sites/ClientA', 'faktura'].filter((s) =>
@@ -242,11 +274,153 @@ describe('BatchIngestor — bound client', () => {
     const classify = jest
       .fn()
       .mockRejectedValueOnce(new Error('unexpected'))
-      .mockResolvedValue(invoice);
+      .mockResolvedValue(decided(invoice));
     const { ingestor } = setup(clientA, { classify });
     const results = await ingestor.ingestBatch(payload(['a.pdf', 'b.pdf']), recordingLogger().log);
     expect(results.map((r) => r.status)).toEqual(['rejected', 'uploaded']);
     expect(results[0]!.error).toEqual({ code: 'InternalError', message: 'The document could not be processed' });
+  });
+});
+
+describe('BatchIngestor — classification outcomes', () => {
+  it('hands a document back with RetryLater when the model cannot answer now, filing nothing', async () => {
+    const classify = jest.fn(
+      async (): Promise<ClassificationOutcome> => ({
+        kind: 'retry_later',
+        classifier: 'claude',
+        reason: 'overloaded',
+        status: 529,
+      }),
+    );
+    const { ingestor, sp } = setup(clientA, { classify });
+    const { log, lines } = recordingLogger();
+    const [result] = await ingestor.ingestBatch(payload(), log);
+
+    expect(result).toEqual({
+      filename: 'faktura.pdf',
+      status: 'rejected',
+      error: { code: RETRY_LATER, message: 'The document was not processed now; send it again later' },
+    });
+    expect(sp.uploads).toEqual([]);
+    expect(lines.find((l) => l['event'] === 'document.retry_later')).toMatchObject({
+      documentId: 'id-2',
+      clientId: '0002',
+      listItemId: '11',
+      teamId: 'team-0002',
+      classifier: 'claude',
+      reason: 'overloaded',
+      status: 529,
+    });
+    expect(lines.some((l) => l['event'] === 'document.filed')).toBe(false);
+  });
+
+  it('files a document the policy sends to review into 98_ of the client’s own space, suggestion logged', async () => {
+    const unresolved: Classification = {
+      ...invoice,
+      confidence: 0.5,
+      reviewReasons: ['DIRECTION_UNRESOLVED'],
+      fields: { category: 'faktury_sprzedazy', year: 2026, month: 7 },
+    };
+    const { ingestor, sp } = setup(clientA, { classify: jest.fn(async () => decided(unresolved)) });
+    const { log, lines } = recordingLogger();
+    const [result] = await ingestor.ingestBatch(payload(), log);
+
+    expect(sp.uploads.map((u) => [u.factory, u.args.folderPath])).toEqual([
+      ['client', '98_Nieposortowane/2026/09'],
+    ]);
+    expect(result?.result?.classification).toEqual({
+      documentType: 'Nieposortowane',
+      categoryId: 'nieposortowane',
+      confidence: 0.5,
+      classifier: 'claude',
+    });
+    expect(lines.find((l) => l['event'] === 'document.filed')).toMatchObject({
+      review: true,
+      category: 'nieposortowane',
+      suggestedCategory: 'faktury_sprzedazy',
+      month: '2026-07',
+      confidence: 0.5,
+      reviewReasons: ['DIRECTION_UNRESOLVED', 'LOW_CONFIDENCE'],
+      folder: '98_Nieposortowane/2026/09',
+    });
+  });
+
+  describe('with the real classifier behind a fake Claude API', () => {
+    const silent = { info: () => undefined, warn: () => undefined } as unknown as Logger;
+
+    function realClassification(create: jest.Mock) {
+      const claude = new ClaudeClassifier({
+        apiKey: 'k',
+        model: 'claude-opus-5',
+        maxContentBytes: 10 * 1024 * 1024,
+        client: { messages: { create } } as never,
+        log: silent,
+      });
+      return new ClassificationService([claude, new FallbackClassifier()], {
+        policy,
+        log: silent,
+      });
+    }
+
+    async function longPdf(pages: number): Promise<Buffer> {
+      const doc = await PDFDocument.create();
+      for (let i = 0; i < pages; i += 1) doc.addPage([100, 100]);
+      return Buffer.from(await doc.save());
+    }
+
+    it('files the original of a 101-page PDF, although the model read only its first 20 pages', async () => {
+      const original = await longPdf(101);
+      const create = jest.fn().mockResolvedValue({
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 1, output_tokens: 1 },
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              category: 'umowy',
+              year: null,
+              month: null,
+              confidence: 0.9,
+              client_role: 'none',
+              reasoning: 'OWU',
+              parties: [],
+            }),
+          },
+        ],
+      });
+      const { deps, sp } = setup(clientA);
+      const real = new BatchIngestor({ ...deps, classification: realClassification(create) });
+
+      const [result] = await real.ingestBatch(
+        {
+          ...payload(),
+          documents: [
+            { filename: 'owu.pdf', contentType: 'application/pdf', contentBase64: original.toString('base64') },
+          ],
+        },
+        recordingLogger().log,
+      );
+
+      expect(result?.status).toBe('uploaded');
+      expect(sp.uploads[0]?.args.folderPath).toBe('04_Umowy');
+      expect(sp.uploads[0]?.args.content.equals(original)).toBe(true);
+      const sent = create.mock.calls[0][0].messages[0].content[0].source.data as string;
+      expect((await PDFDocument.load(Buffer.from(sent, 'base64'))).getPageCount()).toBe(20);
+    });
+
+    it('never files a document to 98_ because Claude was overloaded', async () => {
+      const create = jest
+        .fn()
+        .mockRejectedValue(Anthropic.APIError.generate(529, { type: 'error' }, 'Overloaded', new Headers()));
+      const { deps, sp } = setup(clientA);
+      const real = new BatchIngestor({ ...deps, classification: realClassification(create) });
+
+      const results = await real.ingestBatch(payload(['a.pdf', 'b.pdf']), recordingLogger().log);
+
+      expect(results.map((r) => r.error?.code)).toEqual([RETRY_LATER, RETRY_LATER]);
+      expect(sp.uploads).toEqual([]);
+    });
   });
 });
 
@@ -360,7 +534,7 @@ describe('BatchIngestor — batch deadline', () => {
     expect(results[2]).toEqual({
       filename: 'c.pdf',
       status: 'rejected',
-      error: { code: RETRY_LATER, message: 'The document was not processed in time; send it again' },
+      error: { code: RETRY_LATER, message: 'The document was not processed now; send it again later' },
     });
     expect(sp.uploads.map((u) => u.args.filename)).toEqual(['a.pdf', 'b.pdf']);
     expect(classify).toHaveBeenCalledTimes(2);
@@ -372,9 +546,9 @@ describe('BatchIngestor — batch deadline', () => {
 
   it('finishes a document it started before the deadline, even past it', async () => {
     let t = Date.parse('2026-09-25T10:00:00Z');
-    const classify = jest.fn(async (): Promise<Classification> => {
+    const classify = jest.fn(async (): Promise<ClassificationOutcome> => {
       t += 200_000; // a slow model call
-      return invoice;
+      return decided(invoice);
     });
     const { ingestor, sp } = setup(clientA, { classify, now: () => new Date(t) });
     const results = await ingestor.ingestBatch(payload(['a.pdf', 'b.pdf']), recordingLogger().log);
@@ -471,14 +645,13 @@ describe('BatchIngestor — real SharePoint services and forbidden sites', () =>
     const deps: BatchIngestorDeps = {
       resolver: {
         resolve: jest.fn().mockResolvedValue(clientA),
-        resolvePostClassification: jest.fn((client, classification) => ({ client, classification })),
         quarantine: jest.fn((reason: QuarantineReason) => ({
           source: 'quarantine' as const,
           reason,
           target: quarantineTarget,
         })),
       },
-      classification: { classify: jest.fn(async () => invoice) },
+      classification: { classify: jest.fn(async () => decided(invoice)) },
       clientSharePointFactory: new SharePointServiceFactory(client, {
         retry,
         log,
