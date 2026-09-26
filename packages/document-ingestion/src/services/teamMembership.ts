@@ -18,6 +18,13 @@ const GRAPH_ORIGIN = 'https://graph.microsoft.com/';
 
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+/**
+ * The description onboarding gives a client Team's group. Must match
+ * `BCR_TEAM_DESCRIPTION` in `tools/lib/bindings.mjs`, so the runtime counts
+ * every group the binding tool counts as a Team.
+ */
+export const CLIENT_TEAM_MARKER = /^\s*BCR\s+Group\s*[—–-]/i;
+
 /** What the resolver needs: the Teams a user is in. Fakes implement it in tests. */
 export interface TeamMembershipSource {
   /** Lower-cased Team (group) ids. Rejects when they cannot be read. */
@@ -54,6 +61,7 @@ export interface TeamMembershipReaderOptions {
 export interface MemberOfEntry {
   readonly '@odata.type'?: unknown;
   readonly id?: unknown;
+  readonly description?: unknown;
   readonly resourceProvisioningOptions?: unknown;
 }
 
@@ -69,10 +77,11 @@ interface CachedTeams {
 
 /**
  * Reads which Teams a user is a direct member of, from Entra ID:
- * `GET /users/{id}/memberOf?$select=id,resourceProvisioningOptions`, every
- * page. A Team is a group whose `resourceProvisioningOptions` contains
- * `Team` — the same rule `tools/directory-bindings.mjs` applies when it binds
- * a guest, so the tool and the runtime agree on who is in which Team.
+ * `GET /users/{id}/memberOf?$select=id,description,resourceProvisioningOptions`,
+ * every page. Which groups are Teams follows the rule
+ * `tools/directory-bindings.mjs` applies when it binds a guest (see
+ * {@link teamIdsIn}), so the tool and the runtime agree on who is in which
+ * Team. The description is read only for that rule; it is never logged.
  *
  * Why Entra and not `/users/{id}/joinedTeams` (which would need only
  * `Team.ReadBasic.All`): onboarding adds a guest to a client's Team through
@@ -138,7 +147,7 @@ export class TeamMembershipReader implements TeamMembershipSource {
   private async read(oid: string): Promise<ReadonlySet<string>> {
     const teams = new Set<string>();
     let path: string | undefined =
-      `/users/${oid}/memberOf?$select=id,resourceProvisioningOptions&$top=999`;
+      `/users/${oid}/memberOf?$select=id,description,resourceProvisioningOptions&$top=999`;
     let pages = 0;
     while (path !== undefined) {
       pages += 1;
@@ -188,7 +197,9 @@ export class TeamMembershipReader implements TeamMembershipSource {
  * The lower-cased ids of the Teams among one page of `memberOf`.
  *
  *  - Directory roles and administrative units are not Teams, and skipped.
- *  - A group is a Team when its `resourceProvisioningOptions` contains `Team`.
+ *  - A group is a Team when its `resourceProvisioningOptions` contains `Team`,
+ *    or when its description carries onboarding's client-Team marker
+ *    (`BCR Group —`), as the binding tool also counts it.
  *  - A group whose options were not returned at all cannot be told apart from
  *    a Team, so it counts as one: an unknown may quarantine, never route. (An
  *    entry without `@odata.type` is treated as a group for the same reason.)
@@ -202,7 +213,9 @@ export function teamIdsIn(entries: readonly MemberOfEntry[]): string[] {
     if (typeof type === 'string' && type.toLowerCase() !== '#microsoft.graph.group') continue;
     const options = entry.resourceProvisioningOptions;
     const isTeam =
-      !Array.isArray(options) || options.some((o) => String(o).toLowerCase() === 'team');
+      !Array.isArray(options) ||
+      options.some((o) => String(o).toLowerCase() === 'team') ||
+      (typeof entry.description === 'string' && CLIENT_TEAM_MARKER.test(entry.description));
     if (!isTeam) continue;
     const id = typeof entry.id === 'string' ? entry.id.trim().toLowerCase() : '';
     if (!GUID.test(id)) {

@@ -1,6 +1,9 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Client } from '@microsoft/microsoft-graph-client';
 import type { Logger } from '@bcr/shared';
 import {
+  CLIENT_TEAM_MARKER,
   MEMBERSHIP_CACHE_TTL_MS,
   membershipCheckFor,
   TeamMembershipReadError,
@@ -61,7 +64,7 @@ describe('TeamMembershipReader.teamsOf', () => {
     const teams = await new TeamMembershipReader(client, noRetry).teamsOf(OID);
     expect([...teams]).toEqual([TEAM_A]);
     expect(paths).toEqual([
-      `/users/${OID}/memberOf?$select=id,resourceProvisioningOptions&$top=999`,
+      `/users/${OID}/memberOf?$select=id,description,resourceProvisioningOptions&$top=999`,
     ]);
   });
 
@@ -290,6 +293,28 @@ describe('teamIdsIn', () => {
         plainGroup(GROUP),
       ]),
     ).toEqual([TEAM_A, TEAM_B]);
+  });
+
+  // The runtime and the binding tool must count the same groups as Teams, or
+  // a guest the tool binds could be held at upload, or the other way round.
+  it("uses the binding tool's client-Team marker, character for character", () => {
+    const tool = readFileSync(join(__dirname, '../../../../tools/lib/bindings.mjs'), 'utf8');
+    const match = /export const BCR_TEAM_DESCRIPTION = \/(.+)\/([a-z]*);/.exec(tool);
+    expect(match?.slice(1)).toEqual([CLIENT_TEAM_MARKER.source, CLIENT_TEAM_MARKER.flags]);
+  });
+
+  // The binding tool counts these too (BCR_TEAM_DESCRIPTION in tools/lib/bindings.mjs).
+  it.each(['BCR Group — 0002 Client', '  bcr group - 0002', 'BCR Group – 0002'])(
+    'counts a group carrying the client-Team marker %j as a Team, whatever its options',
+    (description) => {
+      expect(teamIdsIn([{ ...plainGroup(GROUP), description }])).toEqual([GROUP]);
+    },
+  );
+
+  it('does not count a group that only mentions BCR Group later in its description', () => {
+    expect(
+      teamIdsIn([{ ...plainGroup(GROUP), description: 'Mailing list for BCR Group — all' }]),
+    ).toEqual([]);
   });
 
   it('skips directory roles and administrative units', () => {
