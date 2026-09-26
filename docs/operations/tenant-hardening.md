@@ -732,7 +732,7 @@ laptops (`.env`) are an accepted risk, recorded in
 | Step | Owner | Done | Before-state saved as | Notes |
 |---|---|---|---|---|
 | T-1 | Yahor (Global Admin) | 2026-09-26, sign-in blocked on the three `{NIP}@` accounts (0002, 0003, 0004); `accountEnabled=false` verified | audit output kept off-repo (holds NIPs) | Licences not removed yet: convert to shared mailboxes first (T-2) |
-| T-2 | | | | |
+| T-2 | Yahor | deferred by Yahor's decision (2026-09-26) | — | Not converted: the three `{NIP}@` accounts stay licensed user mailboxes with sign-in blocked (T-1). Cost: three licences; residual risk: an admin re-enabling sign-in reopens W2/W3. Revisit to save the licences or before the next security review |
 | T-3 | | | | Time made Private, from Purview |
 | T-4 | Yahor | not needed | — | IR-1 (26 Sep) found no ledger-written file left in BCR GROUP, and H-6b stops new ones |
 | T-4b | | | | Per client site: folders locked and the time of the lock; H-3's time; any re-check after H-3; the check after IR-1 of the items outside the locked folders, done or not, and how many it locked (each item and its lock time are in the evidence store). W4 ends, for items already moved, at the latest of these that applies to the item |
