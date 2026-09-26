@@ -10,6 +10,8 @@ What changes compared with [D1](01-as-is.md):
   to the BCR GROUP library.
 - Every write goes into the client's channel folder, because the Directory row's `RootFolder` is
   set to it. A row without `RootFolder`, `DriveId` or `TeamId` routes nobody.
+- A bound uploader routes only while their Teams, read from Entra at upload time, are exactly
+  the row's `TeamId` (R46). A guest later added to another client's Team is quarantined.
 
 Colours and conventions are in the [README](README.md).
 
@@ -36,6 +38,7 @@ flowchart TB
     PASS["Two-pass snapshot<br/>pass 1 collects every key per row,<br/>pass 2 admits clean keys and rows only"]:::system
     RULES["Pass 2 rules<br/>user-id conflict: drop only that key<br/>same site host + canonical path, same DriveId<br/>or same TeamId: exclude every row sharing it<br/>SitePath not exactly /sites or /teams + name,<br/>host not QUARANTINE_SITE_HOSTNAME,<br/>forbidden or quarantine site: exclude the row<br/>NIP or ClientId duplicate: alert only<br/>no alias or person-name maps"]:::system
     WHO{"Uploader AAD id on exactly<br/>one admitted client row?"}:::gate
+    MEM{"Uploader's Teams, read from Entra now<br/>memberOf as the managed identity, 5 min cache,<br/>exactly the row's TeamId?"}:::gate
     BOUND["Bound client target from that row<br/>site, drive, RootFolder = channel folder<br/>RootFolder, DriveId and TeamId all set"]:::client
     CLS["Claude classifies, primed with the<br/>bound client only. Below the threshold<br/>or on failure: 98_Nieposortowane/YYYY/MM"]:::agent
     FLIP["After classification: invoice direction<br/>flip inside the same client only<br/>no promotion, parties never pick a client"]:::gate
@@ -46,7 +49,7 @@ flowchart TB
     QR["Quarantine, with one reason<br/>the folder never depends on content"]:::gate
     UPQ["PUT Kwarantanna/YYYY/MM/{batchId}/<br/>sanitised original filename, conflictBehavior=fail<br/>then PATCH UploaderOid, QuarantineReason,<br/>OriginalFilename, DocumentId"]:::system
     QFAIL["Quarantine write failed<br/>rejected row, spróbuj ponownie<br/>error log document.quarantine_failed<br/>never written anywhere else"]:::gate
-    LOG["Logs, ids only: document.filed with teamId,<br/>document.quarantined, directory.conflict,<br/>document.quarantine_failed,<br/>sharepoint.forbidden_site,<br/>sharepoint.possible_duplicate"]:::system
+    LOG["Logs, ids only: document.filed with teamId,<br/>document.quarantined, directory.conflict,<br/>membership.mismatch, membership.unverified,<br/>document.quarantine_failed,<br/>sharepoint.forbidden_site,<br/>sharepoint.possible_duplicate"]:::system
   end
   ANT["Anthropic API"]:::external
   subgraph M365["Microsoft 365 tenant BCR"]
@@ -82,7 +85,10 @@ flowchart TB
   PASS -.- RULES
   PASS -.-|"a row pointing here is excluded"| FORB
   PASS --> WHO
-  WHO -->|"yes"| BOUND
+  WHO -->|"yes"| MEM
+  MEM -->|"yes"| BOUND
+  MEM -->|"no: membership_mismatch"| QR
+  MEM -->|"read failed: membership_unverified"| QR
   WHO -->|"no row: unmapped"| QR
   WHO -->|"IsAdmin row: staff"| QR
   WHO -->|"key dropped: conflict"| QR
@@ -126,6 +132,8 @@ quarantine library and in the `document.quarantined` log event.
 | `stale_directory` | The snapshot is older than `CLIENT_DIRECTORY_MAX_STALE_MS`, so it counts as empty. Or the resolved drive is not the row's `DriveId`. |
 | `forbidden_target` | The row's `SitePath` is in `FORBIDDEN_TARGET_SITE_PATHS` (BCR GROUP is always on the list, and the quarantine site is added automatically), is not exactly `/sites/<name>` or `/teams/<name>`, or its host is not `QUARANTINE_SITE_HOSTNAME`. Or, at upload time, the site Graph resolved is BCR GROUP or the quarantine site (`sharepoint.forbidden_site`). |
 | `unbound_target` | The uploader's only row lacks `RootFolder`, `DriveId` or `TeamId`. Only `directory-bindings.mjs apply` binds a row, and it writes all three together. |
+| `membership_mismatch` | The uploader's row is bound, but their Teams, read from Entra (`memberOf`) at upload time, are not exactly its `TeamId`: they are also in another Team, or no longer in this one. |
+| `membership_unverified` | The uploader's Teams could not be read after retries (no `Directory.Read.All` in the ingestion identity's token, the user gone, Graph down). Never cached. |
 | `target_unwritable` | The client target could not be written after retries. |
 
 If the quarantine write itself fails, the user gets a rejected row asking them to try again, a
@@ -147,8 +155,9 @@ the watch query and "After the window").
   values.
 - The alias and person-name maps are deleted. Content never feeds routing.
 - `RootFolder`, `DriveId` and `TeamId` are required for a row to route. `TeamId` is a conflict key
-  and is logged; `DriveId` is a conflict key and is checked at upload time. Neither checks the
-  uploader's Team membership: the binding tool does that when it runs.
+  and is logged; `DriveId` is a conflict key and is checked at upload time. The uploader's Team
+  membership is checked twice: by the binding tool when it runs, and by ingestion at upload time
+  against `TeamId` (the `MEM` node).
 
 ## Deploy order
 

@@ -203,7 +203,10 @@ flowchart TD
   D -- yes --> Q4[quarantine: forbidden_target]
   D -- no --> U{row bound: RootFolder,<br/>DriveId and TeamId all set?}
   U -- no --> Q6[quarantine: unbound_target]
-  U -- yes --> G{resolved site is BCR GROUP<br/>or the quarantine site?}
+  U -- yes --> M{uploader's Teams, read from Entra now,<br/>exactly the row's TeamId?}
+  M -- read failed --> Q7[quarantine: membership_unverified]
+  M -- no --> Q8[quarantine: membership_mismatch]
+  M -- yes --> G{resolved site is BCR GROUP<br/>or the quarantine site?}
   G -- yes --> Q4
   G -- no --> E{path resolves to the<br/>row's DriveId, write succeeds?}
   E -- drive differs --> Q1
@@ -224,7 +227,8 @@ columns and the rules for maintaining them. What matters for routing:
   `SitePath` must be canonical (below).
 - **`DriveId`**: the resolved drive must have this id.
 - **`TeamId`**: the client's Team. Two rows may not share it, and it is logged (`teamId`) on the
-  routing line and on `document.filed`.
+  routing line and on `document.filed`. An upload routes only while it is the uploader's one and
+  only Team (below).
 - **A row routes only once it is bound**: `RootFolder`, `DriveId` and `TeamId` all set. A user
   whose only row lacks any of them is quarantined as `unbound_target`. Only
   `tools/directory-bindings.mjs apply` binds a row, and it always writes the three together, so a
@@ -236,13 +240,48 @@ columns and the rules for maintaining them. What matters for routing:
 The routing fields are written by `tools/directory-bindings.mjs` from Graph, not typed by hand.
 `NIP` is used only to decide invoice direction inside the bound client.
 
-The tool binds a guest only if the row's Team is the only Team they belong to, but it checks that
-when it runs. Ingestion does not re-check Team membership at upload time, so a binding is only as
-current as the last applied plan: a guest later added to a second client's Team keeps routing to
-the first until the whole plan is applied again. The operating rule (apply the whole plan after
-every onboarding, `check` at least weekly) is in the admin guide's
+The tool binds a guest only if the row's Team is the only Team they belong to, and ingestion
+checks the same thing again **at upload time** (R46). After the uploader resolves to a bound row,
+[`TeamMembershipReader`](./packages/document-ingestion/src/services/teamMembership.ts) reads
+their direct memberships from Entra
+(`GET /users/{id}/memberOf?$select=id,description,resourceProvisioningOptions`, every page) and
+keeps the groups that are Teams, by the tool's rule: `resourceProvisioningOptions` contains
+`Team`, or the description carries onboarding's `BCR Group —` marker, or the options come back
+missing (an unknown counts as a Team). Directory roles and administrative units are skipped. The
+upload routes only if that set is exactly `{TeamId}`, compared case-insensitively. Otherwise it
+goes to quarantine:
+
+- `membership_mismatch`: the set was read and differs. The uploader is not in the row's Team, or
+  is also in another Team, such as a guest bound to client A who was later added to client B's
+  Team. Before this check that guest's uploads, B's documents included, kept filing into A until
+  the plan was applied again.
+- `membership_unverified`: the set could not be read after retries (no grant, the grant not yet
+  in the identity's token, the user gone, Graph down). A failure is never cached.
+
+A successful read is cached per user for 5 minutes, so a Team joined since shows up on the next
+upload after that. Staff and uploads that are already quarantined are not read. The log events
+are `membership.mismatch` and `membership.unverified`, with `clientId`, `listItemId`, `teamId` and
+counts only (`teamCount`, `inRowTeam`, `otherTeamCount`, or Graph's `status`): never another
+Team's id or name.
+
+Why `memberOf` and not `/users/{id}/joinedTeams`, which needs only `Team.ReadBasic.All`:
+onboarding adds a guest to a Team through its group (`POST /groups/{id}/members/$ref`), and
+Microsoft documents that a member added outside Teams "can take up to 24 hours" to be reflected
+in Teams ([Microsoft 365 Groups and Teams](https://learn.microsoft.com/en-us/microsoftteams/office-365-groups#group-membership)).
+`joinedTeams` reads Teams, so it could miss the second Team for a day, the very window the check
+closes. Entra has the membership as soon as it is written, and the binding tool already reads it
+the same way, so the two agree. The OData cast `memberOf/microsoft.graph.group` is not used: it
+requires `ConsistencyLevel: eventual`, an index that can lag recent changes. The cost is the
+permission (§5.3).
+
+`MEMBERSHIP_CHECK_MODE=off` switches the check off. It is an emergency escape only: it reopens
+R46, logs `membership.check_off` at every cold start, and shows as `build.membershipCheck: "off"`
+in `/api/health`. The binding tool's weekly `check` stays as defence in depth: it reports the
+same drift for every bound row, including guests who have not uploaded since. One gap is shared
+by both: Microsoft notes that "certain unused old teams will not have resourceProvisioningOptions
+set", and such a Team without the onboarding marker is not counted by either. The operating rule
+is in the admin guide's
 [Keeping the bindings current](./docs/client-directory-admin-guide.md#keeping-the-bindings-current).
-A membership check at upload time is Phase 2.
 
 **Canonical site path.** A `SitePath`, `QUARANTINE_SITE_PATH` and every
 `FORBIDDEN_TARGET_SITE_PATHS` entry are read the same way: trim the string, split it on `/`, and
@@ -286,11 +325,13 @@ matching, and are deleted.
 #### Resolution
 
 [`ClientResolver.resolve(source)`](./packages/document-ingestion/src/services/clientResolver.ts)
-returns `source: 'directory'` for exactly one bound client row, and logs the routing with ids
-only (`clientId`, `listItemId`, `teamId`). Otherwise it returns `source: 'quarantine'` with a
-`quarantineReason`: `unmapped`, `staff`, `conflict`, `stale_directory`, `forbidden_target` or
-`unbound_target`. The upload step can add `target_unwritable`, and `forbidden_target` when the
-row's site resolves to BCR GROUP or the quarantine site.
+returns `source: 'directory'` for exactly one bound client row whose Team is the uploader's only
+Team, and logs the routing with ids only (`clientId`, `listItemId`, `teamId`, and
+`membership: verified`, or `unchecked` when `MEMBERSHIP_CHECK_MODE=off`). Otherwise it returns
+`source: 'quarantine'` with a `quarantineReason`: `unmapped`, `staff`, `conflict`,
+`stale_directory`, `forbidden_target`, `unbound_target`, `membership_mismatch` or
+`membership_unverified`. The upload step can add `target_unwritable`, and `forbidden_target` when
+the row's site resolves to BCR GROUP or the quarantine site.
 
 After classification, `resolvePostClassification` does exactly one thing, and only for a
 `directory` client. If that client's NIP is on the invoice as seller or buyer, it sets the
@@ -463,6 +504,18 @@ So the identity can write to every client site: that is by design, not a single-
 T3 in [`docs/security.md`](./docs/security.md)). Never grant `Files.ReadWrite.All` or
 `Sites.ReadWrite.All` instead.
 
+The Team-membership check (§4.2) needs one more application permission, **`Directory.Read.All`**,
+to read another user's `memberOf`. Microsoft Learn lists it as the least privileged application
+permission for that call
+([List a user's direct memberships](https://learn.microsoft.com/en-us/graph/api/user-list-memberof?view=graph-rest-1.0#permissions)).
+It is read-only, but it reads the whole directory, not only memberships (see T3 in
+[`docs/security.md`](./docs/security.md)).
+`infrastructure/identity/grant-ingestion-membership-read.sh` grants it, dry run by default. A
+managed identity's token carries its roles, and Microsoft documents that the platform caches that
+token for around 24 hours with no way to force a refresh, so grant it well before the deploy that
+turns the check on. Until the token carries it, every bound upload is quarantined as
+`membership_unverified`.
+
 Every grant names the **managed identity's app id** (`INGEST_MI_APPID`), never the Ingestion
 API app registration's. The registration is only the token audience of §5.2; ingestion never
 authenticates to Graph as it, so a site grant to it does nothing. The procedure is in
@@ -481,6 +534,8 @@ and site grants through the onboarding repo's `Grant-TeamSiteAccess.ps1` runbook
 | Uploader not bound to exactly one client | Quarantine, with the reason. |
 | Directory cannot be refreshed for over 15 min | Everything goes to quarantine (`stale_directory`). |
 | Uploader's only row is not bound (`RootFolder`, `DriveId` or `TeamId` missing) | Quarantine (`unbound_target`). |
+| Uploader's Teams are not exactly the row's `TeamId` (not in it, or also in another Team) | Quarantine (`membership_mismatch`), logged as `membership.mismatch` with ids and counts. |
+| Uploader's Teams cannot be read (no `Directory.Read.All` in the token, user gone, Graph down after retries) | Quarantine (`membership_unverified`), logged as `membership.unverified` with Graph's status. Never cached. |
 | The row's site resolves to BCR GROUP or the quarantine site | Refused before writing (`sharepoint.forbidden_site`); quarantine (`forbidden_target`). |
 | Name already taken (Graph 409 with `conflictBehavior=fail`) | Retry as `name_1` … `name_10`. A suffixed name taken after a retried network failure is logged as `sharepoint.possible_duplicate`. |
 | The client's site refuses the write after retries | Quarantine (`target_unwritable`). |

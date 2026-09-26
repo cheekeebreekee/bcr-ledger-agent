@@ -385,11 +385,12 @@ different internal name, because ingestion reads internal names.
 ### After every onboarding, and weekly
 
 A guest's binding is checked when it is proposed and again when it is
-applied, and never at upload time. Onboarding a second company whose
-contact person is already a guest reuses that guest and adds them to the
-new Team; their row stays bound to the first client, so the second
-company's documents would be filed into the first client's channel. This
-holds until someone applies a new plan. So, as a standing rule:
+applied. Onboarding a second company whose contact person is already a
+guest reuses that guest and adds them to the new Team; their row stays
+bound to the first client until someone applies a new plan. Ingestion's
+upload-time check (below) now quarantines their uploads meanwhile, instead
+of filing the second company's documents into the first client's channel,
+but the Directory still says otherwise. So, as a standing rule:
 
 - **After any onboarding**, run `propose` and apply the **whole** plan, never
   `--only <new row>`. The PATCH that matters may be on another row: the one
@@ -404,8 +405,15 @@ holds until someone applies a new plan. So, as a standing rule:
 - **Do not undo an onboarding with `rollback`.** Re-run `propose` and apply
   the whole plan instead (see [rollback](#rollback)).
 
-The robust fix, a membership check at upload time, is Phase 2. Onboarding
-writing the guest's id to the new row waits on Roman's re-ruling of Q21.
+Ingestion now also checks membership at upload time (R46): a bound uploader
+whose Teams are not exactly the row's `TeamId` is quarantined as
+`membership_mismatch`. It counts Teams by the same rule as this tool
+(`isTeamGroup`, minus the tenant Team listing; the `BCR Group —` marker is
+kept identical by a test in the ingestion package), so change both or
+neither. The rules above stay as defence in depth: they keep the Directory
+true, and catch drift on rows whose guests have not uploaded since.
+Onboarding writing the guest's id to the new row waits on Roman's re-ruling
+of Q21.
 
 ## `inventory-misfiled.mjs` (IR-1)
 
