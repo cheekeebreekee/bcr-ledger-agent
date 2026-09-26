@@ -21,7 +21,8 @@ one SharePoint site. Each threat now has a status:
 |---|---|---|---|
 | Teams client → bot | Bot Framework | JWT signed by `login.botframework.com` | `CloudAdapter`, then the bot's gate on **every** activity type: a 1:1 chat, from the BCR tenant, with a GUID user object id (P0) |
 | Bot → ingestion | The bot's app registration | Client secret (Key Vault, and laptop copies: see T15) → token for `api://<ingestion-app-id>` | `AuthMiddleware`: issuer, audience, the `Documents.Ingest` role, and **the caller's app id** (`appid`, else `azp`) in `BOT_CALLER_APP_IDS` (P0). Then the request body: `conversationType` must be `personal`, the user id must be a UUID, and the tenant must be BCR's (P0). |
-| Ingestion → Microsoft Graph | The ingestion Function App's system-assigned managed identity | Managed identity token | Graph. `Sites.Selected`, plus a per-site grant on every site it files into (see T3). `Directory.Read.All` (read-only), to read the uploader's Team memberships at upload time (see T10). |
+| Ingestion → Microsoft Graph | The ingestion Function App's system-assigned managed identity | Managed identity token | Graph. `Sites.Selected`, plus a per-site grant on every site it files into (see T3). `Directory.Read.All` (read-only), to read the uploader's Team memberships at upload time (see T10), and, for the channel inbox, a file creator's `userType` and Teams (see T18). |
+| Channel inbox timer → ingestion logic | None: a timer trigger | None | Not a route. It takes no input, so nothing outside can name a user, a row or a target to it (T18). |
 | Bot, ingestion → Key Vault | Each app's managed identity | *Key Vault Secrets User*, assigned at **resource-group** scope | Key Vault (see T11) |
 | Ingestion → Claude | Anthropic API key (Key Vault) | TLS and bearer key | `api.anthropic.com` (see T16) |
 
@@ -239,6 +240,9 @@ register of which client sent what.
   (`clientId`, `listItemId`, `teamId`);
 - events `document.filed`, `document.quarantined`, `directory.conflict`,
   `ingestion.caller.rejected`, `sharepoint.forbidden_site` and `sharepoint.possible_duplicate`;
+- for the channel inbox (T18), `inbox.filed`, `inbox.sorted_to_review`, `inbox.would_move`,
+  `inbox.failed`, `inbox.skipped`, `inbox.row_failed` and one `inbox.tick` of counts per tick,
+  with the row's ids and the `driveItemId`, never a file name, folder path, title or NIP;
 - one redaction list covering file names, titles, URLs, paths, parties and NIPs.
 
 **Status: P0**, deployed only after IR-0 copied the old lines into the evidence store. Old lines
@@ -291,6 +295,54 @@ would have taken ingestion down.
 settings are added with a merge. **Status: Mitigated (G0); Phase 1** adds the drift fix, a CI
 check that every setting the code reads exists in Bicep, `what-if`, and environment approval.
 
+### T18. Channel-inbox intake
+
+Clients are Teams guests, and Teams lets a guest attach files only to channel posts, never in a
+chat with the bot. So each client's "Dokumenty księgowe" channel folder is their inbox: a timer
+lists it and moves each client upload into its taxonomy folder inside the same channel folder
+([`ARCHITECTURE.md` §4.4](../ARCHITECTURE.md#44-channel-inbox-intake-clients)). It does this with
+the identity that can write every client site (T3), so what decides where a file goes is the
+whole defence:
+
+- **The client is where the file is.** The sweep lists one bound row's channel folder at a time
+  (a routed row: bound, not excluded; T10) and moves a file only within that folder. Nothing in
+  the file, its name or the model's output can name another row. Content chooses only the
+  taxonomy folder, built with `buildFolderPath` from the category enum; the model's own path is
+  never used (T8).
+- **A staff file placed in a client inbox is left alone.** A file is processed only if its
+  creator is a `Guest` and a member of that row's Team. A document a staff member or a member
+  drops into a client's channel by mistake is not filed, not classified and not sent to
+  Anthropic; it stays where they put it, for them to remove. (The client can already see it
+  there: that exposure is the mistake, not the sweep's.) A copy a staff member makes into the
+  channel is created by them, and is left alone the same way.
+- **A guest in two Teams uploading into A's inbox is filed within A.** Unlike the bot path, the
+  inbox does not refuse a guest who is also in B's Team: the file is already in A's space, and
+  the sweep can only move it inside A's channel folder, never to B. If the guest meant B, staff
+  move it by hand; the sweep has not made it worse.
+- **A guest of another Team** who reaches A's channel folder, for example through a sharing link
+  with edit rights, is not a member of A's Team, and their file is left alone.
+- **A file can never leave its drive.** Only the channel folder's direct children are candidates,
+  and a listed child whose parent or drive is not that folder is dropped. The target folder chain
+  is created under the channel folder, never at the drive root. The move is a `PATCH` by id with
+  `conflictBehavior=fail` and the `_n` rule (T2), which Graph does not perform across drives;
+  afterwards the item must be the same item, in the row's drive, under the target folder, or it
+  is refused and logged (`sharepoint.drive_mismatch`). Nothing is copied or deleted.
+- **BCR GROUP and the quarantine are never swept.** The sweep uses the client SharePoint factory,
+  so a row whose site resolves to either is refused before anything is listed
+  (`sharepoint.forbidden_site`, T3); a channel folder in another drive than the row's `DriveId`
+  is refused too.
+- **Fail closed.** An uploader who cannot be read is left for the next tick; an unavailable
+  Directory sweeps nothing; `shadow` writes nothing; `off`, the default, does nothing.
+
+**Residual risk.** A guest of the Team can already rename, move or delete files in their
+channel; the sweep adds no capability to anyone. The sweep reads the metadata of every file at
+the top of each client's channel folder, staff files included, but reads the content only of
+files it processes. That `createdBy.user.id` is the guest's Entra object id for a file attached
+to a channel post is verified by the H-12 shadow canary, not by documentation; if it were not,
+the sweep would leave the canary untouched (`skippedNotClient`), not misfile it.
+
+**Status: Mitigated by design; off until H-12** sets `INBOX_SWEEP_MODE=shadow`, then `enforce`.
+
 ### Also fixed in Phase 0
 
 - **Model text on cards.** The classifier's free-text reasoning was rendered as Markdown on the
@@ -312,7 +364,7 @@ check that every setting the code reads exists in Bicep, `what-if`, and environm
 |---|---|---|---|---|
 | **Secret rotation deferred** (T15, and the Anthropic key). Plaintext copies of both secrets are on developer laptops. | New credentials come from Roman, who will provide them soon. Rotating twice gains nothing. | Roman | New credentials arrive. Then rotate and delete the laptop copies the same day. | Caller pinning: only the bot's app id is accepted. A forged upload needs a real guest's id, lands only in that guest's own client, and is logged under that id. The secret cannot read documents, because the bot holds no SharePoint permission. |
 | **Yahor's dual role.** He is the developer, the operator who deploys, and a Global Administrator. One person can change the code, ship it and change tenant permissions. That is also a bus factor of one. | BCR has one technical person today. | Roman | A second admin or a formal approval path exists. | Roman reviews every binding plan before it is applied. IR-2 moves need two people. Every tenant and Azure change is a recorded command with its before and after state. The IR evidence is immutable and readable by Roman and the IOD. Yahor does not upload through the bot. Planned: Roman approves production deploys through GitHub environment protection, and a `HANDOVER.md`. |
-| **One identity writes every client site** (T3). | Inherent to the current design. | Yahor | Phase 2 (upload by id, attestation, nightly audit). | Identity-only routing, only bound rows route, the uploader's Teams checked at upload time against the row's Team, one client per site, drive and Team, canonical site paths, forbidden targets checked by path and by resolved site id, `DriveId` check, `conflictBehavior=fail`. |
+| **One identity writes every client site** (T3). | Inherent to the current design. | Yahor | Phase 2 (upload by id, attestation, nightly audit). | Identity-only routing, only bound rows route, the uploader's Teams checked at upload time against the row's Team, one client per site, drive and Team, canonical site paths, forbidden targets checked by path and by resolved site id, `DriveId` check, `conflictBehavior=fail`. The channel inbox moves only within the channel folder it is sweeping, by id, and checks where each move ended (T18). |
 | **No P1: 7-day Entra sign-in log, no Conditional Access** (T14). | Needs a licence purchase. | Roman | Decision 5. | Purview audit log: file operations and sign-in events, about 180 days. `{NIP}@` accounts blocked (T-1). |
 
 ## 4. Data residency and retention
@@ -343,6 +395,9 @@ check that every setting the code reads exists in Bicep, `what-if`, and environm
 - [x] Caller app id pinned to the bot (P0)
 - [x] Uploads never overwrite (`conflictBehavior=fail`, P0)
 - [x] Routing by uploader identity only; content never picks the client (P0)
+- [x] Channel inbox: the file's location picks the client; only this Team's guests' uploads are
+      processed; moves by id inside the channel folder, never across drives, never overwriting
+      (T18)
 - [x] Structured logging with secrets redacted, and from Phase 0 also file names, titles, URLs,
       paths, parties and NIPs
 - [x] No secrets in source: `.env` and `local.settings.json` are git-ignored, and the `*.example`

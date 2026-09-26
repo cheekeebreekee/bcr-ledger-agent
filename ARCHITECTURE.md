@@ -1,8 +1,10 @@
 # Architecture
 
 > **Phase 0 of v2 (September 2026).** This page describes the routing after the Phase-0
-> containment: the client comes from the uploader's identity only, and anything that cannot be
-> tied to exactly one client goes to a staff-only quarantine. Sections that describe behaviour
+> containment: on the bot path the client comes from the uploader's identity only, and anything
+> that cannot be tied to exactly one client goes to a staff-only quarantine. The channel inbox
+> (§4.4) takes the client from where the file is, the bound row's channel folder, and only files
+> uploaded there by a guest of that row's Team. Sections that describe behaviour
 > Phase 0 removed are kept, collapsed and marked **as-is before v2 (Sep 2026)**, because
 > incident [`IR-2026-09`](docs/operations/incident-2026-09.md) needs a record of how the system
 > used to behave. Do not build on them.
@@ -11,11 +13,19 @@
 
 **Goals**
 
-- Conversational document intake in Microsoft Teams, in a 1:1 chat with the bot.
-- **The document's content chooses the folder; the uploader's identity chooses the client.**
-  Each document is classified by **Claude** (Anthropic API), with a deterministic fallback to a
-  manual-review folder when confidence is low. Content never chooses whose space a document goes
-  to.
+- Document intake in Microsoft Teams through two doors:
+  - **the channel inbox, for clients.** Clients are Teams guests, and Teams lets a guest attach a
+    file only to a channel post, never in a chat
+    ([guest capabilities](https://learn.microsoft.com/en-us/microsoftteams/guest-experience):
+    *Attach files — Channel posts only*). A client posts the file in their Team's
+    "Dokumenty księgowe" channel, or uploads it on the channel's „Udostępnione” tab, and a timer
+    files it inside that same channel folder (§4.4);
+  - **a 1:1 chat with the bot, for whoever can attach there** (§3, §4.1).
+- **The document's content chooses the folder; never the client.** On the bot path the client is
+  the uploader's bound row; in the channel inbox it is the row whose channel folder holds the
+  file. Each document is classified by **Claude** (Anthropic API), with a deterministic fallback
+  to a manual-review folder when confidence is low. Content never chooses whose space a document
+  goes to.
 - A client never reaches another client's documents. Anything ambiguous goes to quarantine,
   never to a guess.
 - Fully managed, serverless Azure footprint: no VMs, no Kubernetes.
@@ -35,7 +45,7 @@
 | Component | Tech | Hosting |
 |---|---|---|
 | Teams Bot | Bot Framework SDK v4 (JS) | Azure Functions (Node 22, HTTP trigger) |
-| Document Ingestion API | TypeScript + Azure Functions v4 programming model | Azure Functions (Node 22, HTTP trigger) |
+| Document Ingestion API | TypeScript + Azure Functions v4 programming model | Azure Functions (Node 22, HTTP trigger; timer trigger for the channel inbox) |
 | Shared library | TypeScript | Yarn workspace |
 | Channel registration | Azure Bot Service | Microsoft.BotService |
 | Secrets | Azure Key Vault | Microsoft.KeyVault |
@@ -88,7 +98,41 @@ sequenceDiagram
 **Bot delivery model.** Only 1:1 chats deliver file attachments to a bot. Files posted in a
 channel bypass the bot (drag-drop), or arrive as mention HTML with no file. Manifest 0.2.0 has
 `"scopes": ["personal"]` only, and the gate refuses any other conversation type from older
-installs.
+installs. A guest cannot attach a file in this chat at all, so clients use the channel inbox
+instead (§3.1); the chat serves whoever can attach.
+
+### 3.1 Sequence: the channel inbox (clients)
+
+```mermaid
+sequenceDiagram
+  actor U as Client guest (Teams)
+  participant CH as Team channel "Dokumenty księgowe"
+  participant T as Ingestion timer (every 2 min)
+  participant CD as Client Directory
+  participant EN as Entra ID (Graph)
+  participant CL as Claude
+  participant SP as SharePoint (via Graph, ingestion MI)
+
+  U->>CH: post with an attachment, or upload on „Udostępnione”
+  CH->>SP: file stored in the channel folder (the row's RootFolder)
+  T->>CD: snapshot → bound, routed client rows only
+  loop each row, in turn (budget and deadline)
+    T->>SP: resolve the site (BCR GROUP / quarantine refused), drive = row's DriveId
+    T->>SP: GET root:/<RootFolder> → the channel folder, a folder in that drive
+    T->>SP: GET <channel folder>/children (direct children only, every page)
+    loop each file, old enough, with a creator id
+      T->>EN: creator's userType = Guest? member of THIS row's Team?
+      Note over T: otherwise: left untouched, counted as skipped
+      T->>SP: GET items/{id}/content (only if Claude reads it; size-capped)
+      T->>CL: classify, primed with THIS row's client only
+      T->>T: direction from the row's NIP; folder = buildFolderPath(category)
+      T->>SP: create <channel folder>/<taxonomy path> (under the channel folder)
+      T->>SP: PATCH items/{id} parentReference.id = folder (conflictBehavior=fail, then _1.._10)
+      T->>T: assert: same item, same drive, parent = that folder
+    end
+  end
+  T->>T: log inbox.tick (counts only)
+```
 
 <details>
 <summary>As-is before v2 (Sep 2026): the pre-Phase-0 sequence</summary>
@@ -430,6 +474,98 @@ T7 in [`docs/security.md`](./docs/security.md).
 
 </details>
 
+### 4.4 Channel-inbox intake (clients)
+
+Every client is a Teams guest, and a guest can attach files to channel posts only, never in a
+chat, and has no OneDrive in BCR's tenant
+([guest capabilities](https://learn.microsoft.com/en-us/microsoftteams/guest-experience)). What
+a guest *can* do is post a file in a channel, or upload it on the channel's files tab
+(„Udostępnione”). Both store it in the channel's folder of the Team site's library
+([Teams and SharePoint](https://learn.microsoft.com/en-us/sharepoint/teams-connected-sites):
+"the Files tab on each standard channel is connected to a folder in the parent site's default
+document library"). So each client's **"Dokumenty księgowe" channel folder is that client's
+inbox**, and ingestion sweeps it.
+
+- **Trigger.** [`functions/inboxSweep.ts`](./packages/document-ingestion/src/functions/inboxSweep.ts)
+  is a timer, `0 */2 * * * *` (every 2 minutes), and only wiring; the logic is
+  [`services/channelInbox.ts`](./packages/document-ingestion/src/services/channelInbox.ts). A
+  timer function runs on one instance at a time across a scaled-out app, and does not fire again
+  while an invocation is still running
+  ([timer trigger, scale-out](https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-timer#scale-out));
+  the service also refuses to start a tick while one is running on the same worker.
+- **Mode.** `INBOX_SWEEP_MODE`: `off` (the default) returns at once; `shadow` does everything up
+  to the first write (lists, checks uploaders, classifies) and logs `inbox.would_move`; `enforce`
+  moves. `/api/health` reports it as `build.inboxSweep`.
+- **Rows.** Exactly the rows the snapshot routes to (`boundClientRows`): active, not `IsAdmin`,
+  bound (`RootFolder`, `DriveId`, `TeamId`), not excluded (`forbidden_target`,
+  `target_conflict`, `unbound_target`). An unavailable or stale snapshot sweeps nothing. A row
+  needs no user ids to be swept: the client is where the file is.
+- **The inbox.** Through the **client** SharePoint factory, so the resolved-site guard applies
+  (BCR GROUP and the quarantine refused as `forbidden_site`, a different drive as
+  `drive_mismatch`). The channel folder is `RootFolder`, one folder at the root of the row's
+  drive, read by path (`GET /drives/{DriveId}/root:/{RootFolder}`); it must be a folder, and in
+  `DriveId`.
+- **Candidates.** The channel folder's **direct children** only, every page
+  (`@odata.nextLink`, [list children](https://learn.microsoft.com/en-us/graph/api/driveitem-list-children?view=graph-rest-1.0)),
+  never recursing: the subfolders are the filed area. A child whose `parentReference` is not
+  this folder in this drive is dropped (`inbox.unexpected_child`). A candidate has a `file`
+  facet, `0 < size ≤ 100 MiB`, a name that does not start with `~$` or `.`,
+  `lastModifiedDateTime` older than `INBOX_MIN_AGE_MS` (default 2 minutes, so an upload or edit in
+  progress is left alone), and a `createdBy.user.id`.
+- **Uploader rule: the inbox is for the client's uploads.** A file is processed only if its
+  creator's `userType` is `Guest` (`GET /users/{id}?$select=userType`) **and** they are a member
+  of **this row's** Team (the cached `TeamMembershipReader` read). Staff, members, and a guest of
+  another Team are left untouched (`skippedNotClient`); an uploader who cannot be read is left
+  for the next tick (`skippedUnverified`). A guest who is also in other Teams is *not* refused
+  here, unlike on the bot path: the file is already in this client's space, and nothing crosses.
+- **Processing, per file, isolated.** The file is read by id, size-capped, and only if the
+  classifier asks for it (so never when Claude is off). It is classified by the same
+  `ClassificationService`, primed with this row's client identity only; the direction-only
+  `applyInvoiceDirection` may flip sprzedaż ⇄ zakup from the row's NIP; the folder is built by
+  `buildFolderPath` from the category alone (the model's folder path is never used), and an
+  unknown category, the fallback's result or a dated category without a date goes to
+  `98_Nieposortowane/YYYY/MM`. In `enforce` the folder chain is created **under the channel
+  folder**, and the file is moved by id:
+  `PATCH /drives/{d}/items/{id}?@microsoft.graph.conflictBehavior=fail` with
+  `parentReference.id` = the target folder, and on a 409 `name_1` … `name_10`. Afterwards the
+  item must be the same item, in the row's drive, under that folder, or the move is refused
+  (`drive_mismatch`). Nothing is copied or deleted, and nothing moves across drives: Graph cannot
+  move an item between drives with this request
+  ([move a driveItem](https://learn.microsoft.com/en-us/graph/api/driveitem-move?view=graph-rest-1.0)).
+- **Classification cache and repeated failures.** A placement is reused per
+  (`driveItemId`, `eTag`) for an hour, so a file whose move keeps failing is not sent to Claude
+  every tick. A file whose processing fails three times (counted per worker) is moved to
+  `98_Nieposortowane/YYYY/MM` unclassified, so the inbox drains; if even that fails, it stays and
+  is logged each tick.
+- **Budget.** At most `INBOX_MAX_FILES_PER_TICK` files (default 20) per tick across all rows, and
+  nothing new is started 150 s into a tick (the host's `functionTimeout` is 5 minutes). Rows are
+  swept in list-item order from a cursor that moves past the last row served, so a row with a
+  backlog cannot starve the others.
+- **Logs.** Ids and counts only: `inbox.filed` and `inbox.sorted_to_review`
+  (`clientId`, `listItemId`, `teamId`, `driveItemId`, `category`, `nameSuffix`),
+  `inbox.would_move` (shadow), `inbox.failed` (`clientId`, `listItemId`, `driveItemId`, `stage`,
+  `attempt`, error code and status), `inbox.skipped` (once per file and reason per worker, with
+  a `reason`), `inbox.row_failed`, and one `inbox.tick` per tick: `mode`, `rows`, `candidates`,
+  `filed`, `sortedToReview`, `wouldMove`, `skippedNotClient`, `skippedUnverified`,
+  `skippedYoung`, `skippedIneligible`, `deferred`, `failed`, `rowsFailed`, `durationMs`. Never a
+  file name, title, path or NIP.
+
+Graph semantics this relies on, and their limits:
+
+- The move is an update of `parentReference`
+  ([move](https://learn.microsoft.com/en-us/graph/api/driveitem-move?view=graph-rest-1.0)).
+  `@microsoft.graph.conflictBehavior` is documented as an instance annotation "for actions that
+  create a new item", to be passed in the URL
+  ([driveItem instance attributes](https://learn.microsoft.com/en-us/graph/api/resources/driveitem?view=graph-rest-1.0#instance-attributes));
+  the move page itself does not list it. The sweep passes `fail` anyway and treats a 409 as "the
+  name is taken". A second canary with the same name in H-12 shows the `_1` in practice.
+- `createdBy` is the identity that created the item
+  ([driveItem](https://learn.microsoft.com/en-us/graph/api/resources/driveitem?view=graph-rest-1.0),
+  [identity](https://learn.microsoft.com/en-us/graph/api/resources/identity?view=graph-rest-1.0)).
+  That its `user.id` is the guest's Entra object id for a file attached to a channel post is
+  what the H-12 shadow canary verifies: if it were not, the canary would show as
+  `skippedNotClient`, and nothing would be moved.
+
 ---
 
 ## 5. Auth model
@@ -478,7 +614,10 @@ tenant's JWKS, and checks:
   not enough, because any app granted `Documents.Ingest` could have called with any user id.
   Refusals are logged as `ingestion.caller.rejected {appId}`.
 
-Ingestion's only routes are `POST /api/ingest/batch` and `GET /api/health`.
+Ingestion's only routes are `POST /api/ingest/batch` and `GET /api/health`. The channel-inbox
+timer (§4.4) is not a route and takes no input: a manual run through the host's admin endpoint
+needs the master key, and even then carries no identity or target, so it sweeps exactly what a
+scheduled tick would.
 
 **What pinning does not cover.** The user id still travels in the request body. Anyone holding
 the bot's secret *is* the bot, and can name any guest. That is threat T15 in
@@ -509,7 +648,12 @@ to read another user's `memberOf`. Microsoft Learn lists it as the least privile
 permission for that call
 ([List a user's direct memberships](https://learn.microsoft.com/en-us/graph/api/user-list-memberof?view=graph-rest-1.0#permissions)).
 It is read-only, but it reads the whole directory, not only memberships (see T3 in
-[`docs/security.md`](./docs/security.md)).
+[`docs/security.md`](./docs/security.md)). The channel inbox (§4.4) uses the same grant for an
+uploader's `userType` (`GET /users/{id}?$select=userType`,
+[get user](https://learn.microsoft.com/en-us/graph/api/user-get?view=graph-rest-1.0): its least
+privileged application permission is `User.Read.All`, which `Directory.Read.All` includes), and
+the per-site `write` grants for everything else it does in a client's channel folder: list,
+read, create folders and move. It needs no new permission.
 `infrastructure/identity/grant-ingestion-membership-read.sh` grants it, dry run by default. A
 managed identity's token carries its roles, and Microsoft documents that the platform caches that
 token for around 24 hours with no way to force a refresh, so grant it well before the deploy that
@@ -547,12 +691,19 @@ and site grants through the onboarding repo's `Grant-TeamSiteAccess.ps1` runbook
 | File > 4 MB | Graph upload session (`createUploadSession`), 320 KiB chunks, also with `conflictBehavior=fail`. |
 | Antivirus block (Graph 423) | Generic Polish message; no retry. |
 | Activity fails the bot gate | In `enforce` mode: no download and no ingestion call; one fixed line in a 1:1 chat, silence elsewhere. |
+| Channel inbox: a file by staff, a member, or a guest of another Team | Left untouched and unclassified (`skippedNotClient`, one `inbox.skipped` line per file). |
+| Channel inbox: the uploader cannot be read | Left for the next tick (`skippedUnverified`); never counted as a failure, never moved. |
+| Channel inbox: the row's site resolves to BCR GROUP or the quarantine, or its channel folder is missing or in another drive | Row skipped before any listing (`inbox.row_failed`); `sharepoint.forbidden_site` for a guarded site. Nothing is moved. |
+| Channel inbox: a download, folder or move fails | `inbox.failed` with the `stage`; the file stays and is tried again next tick, with its classification reused. After three failures it is moved to `98_Nieposortowane/YYYY/MM` unclassified. |
+| Channel inbox: a move comes back in another drive or folder | Refused (`sharepoint.drive_mismatch`, `inbox.failed` stage `move`). |
+| Channel inbox: more files than the budget, or the 150 s deadline | The rest wait for the next tick (`deferred`); rows take turns. |
 
 Every request is logged with the Teams `activityId` and `conversationId`, and from Phase 0 with a
 server-minted `documentId` per document. Routing outcomes are the events `document.filed` and
 `document.quarantined`, which carry ids and codes only (`document.filed` also carries the row's
-`teamId`). `sharepoint.forbidden_site` and `sharepoint.possible_duplicate` carry ids only too. So
-triage is one query:
+`teamId`). `sharepoint.forbidden_site` and `sharepoint.possible_duplicate` carry ids only too.
+The channel inbox's events (`inbox.*`, §4.4) carry `driveItemId`, `clientId` and `listItemId`
+rather than a `documentId`. So triage is one query:
 
 ```kusto
 traces

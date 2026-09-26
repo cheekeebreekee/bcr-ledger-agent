@@ -114,7 +114,7 @@ Graph and SharePoint tokens are set up as described in
 | H-9 | Bot deploy, gate in `log` | Yahor | day 1 | H-2, H-8 |
 | H-10 | Manifest 0.2.0, availability *Everyone* | Teams Admin | day 1 | H-9, T-1 |
 | H-11 | Gate to `enforce` | Yahor | day 2 | 24 h of clean logs |
-| H-12 | Change window: ingestion, further site grants, bindings, canaries | Yahor, Roman reviews | day 2–3 | H-5b, H-6, H-6b, H-7, H-8b, H-11, T-4, T-4b, T-5 |
+| H-12 | Change window: ingestion, further site grants, bindings, canaries, channel inbox (`shadow`, then `enforce`) | Yahor, Roman reviews | day 2–3 | H-5b, H-6, H-6b, H-7, H-8b, H-11, T-4, T-4b, T-5 |
 | H-13 | Ingestion grant on BCR GROUP to `read` | Global Admin | after H-12 | H-12 verified |
 | H-14 | `FALLBACK_*` settings and saved pre-Phase-0 packages removed | Yahor | ≥ 24 h after H-12 | H-12 verified |
 | H-15 | Exit criteria checked | Yahor, Roman | end of phase | all |
@@ -1138,6 +1138,10 @@ These steps go in **one** window because each fixes a failure the others would c
 - The gate is in `enforce` (H-11).
 - T-4 (and its check after H-6b), T-4b and T-5 are done.
 - Every H-7 finding has a decision.
+- `INBOX_SWEEP_MODE` is not set, or is `off`, so the new build starts with the channel-inbox
+  sweep off; the channel-inbox step (after step 8) turns it on:
+  `az functionapp config appsettings list -g $RG -n $INGEST --query "[?name=='INBOX_SWEEP_MODE'].value | [0]" -o tsv`
+  prints nothing or `off`.
 
 **Emergency stop,** at any point: `az functionapp stop -g $RG -n $INGEST`. Nothing is filed
 anywhere; users get the bot's generic error. `az functionapp start` resumes.
@@ -1155,18 +1159,23 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    # Must print a count greater than 0 too: the shared config with the membership check.
    unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js \
      | grep -c membershipCheckMode
+   # And this one: the shared config with the channel-inbox settings.
+   unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js \
+     | grep -c inboxSweepMode
    ```
 
    A count of `0` from the first means a pre-Phase-0 `@bcr/shared`: that build fails at cold
    start, because the old schema requires `FALLBACK_SITE_*`. A `0` from the second means a
-   Phase-0 `@bcr/shared` from before the membership check. Do not deploy either. The `package` script cleans `dist`,
+   Phase-0 `@bcr/shared` from before the membership check, and from the third one from before the
+   channel inbox. Do not deploy any of them. The `package` script cleans `dist`,
    deletes the old zip first and builds a new one (H-9 step 2), so after a failed run there is
    no zip at all: build again, and never take a zip from git. The package saved first is the
    pre-Phase-0 build: it is a record of what ran, and **never** a rollback (standing rules).
 2. **Check that it is the Phase-0 build.**
    `curl -s https://$INGEST.azurewebsites.net/api/health` reports the Phase-0 build with the
-   membership check on:
-   `"build":{"phase":"p0","routing":"identity-only","membershipCheck":"enforce"}`.
+   membership check on and the channel-inbox sweep off:
+   `"build":{"phase":"p0","routing":"identity-only","membershipCheck":"enforce","inboxSweep":"off"}`.
+   A build without `inboxSweep` is from before the channel inbox: the channel-inbox step cannot run on it.
    `directory-bindings.mjs apply` checks the routing itself: it refuses to write unless the
    `--health-url` it is given reports `build.routing=identity-only`. `--expect-health` only adds
    further checks; `--expect-health build.membershipCheck=enforce` makes an apply refuse while
@@ -1273,6 +1282,14 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
    the token yet (step 13's table). If it is quarantined as `membership_mismatch`, the TEST guest
    is in another Team as well, or not in TEST's: `check` shows which, and the row must not route
    until that is resolved.
+
+   **A guest may not be able to attach here at all.** Teams lets a guest attach files to channel
+   posts only, never in a chat
+   ([guest capabilities](https://learn.microsoft.com/en-us/microsoftteams/guest-experience)). If
+   the TEST guest's 1:1 chat with the bot offers no way to attach, this canary cannot be sent by
+   them: record that in the status table, and prove TEST's binding with the channel-inbox step's
+   canary instead. The same holds for PESKOVOI's canary in step 8. The bot path then serves only
+   whoever can attach in the chat.
 8. **Apply PESKOVOI, then canary.** The same `apply` with `--only <PESKOVOI listItemId>`. It
    takes Yahor's id off the row because step 5 ran `propose` with `--confirm-remove-staff` for
    that row; check that the printed after-state no longer holds it. For a real client, the
@@ -1320,6 +1337,105 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
 
    Never use a real client document, and never a staff account, because staff go to quarantine
    by design.
+
+   **The channel-inbox step: turn on the channel inbox, `shadow`, a canary, then `enforce`.** Clients are guests, and a
+   guest can attach files only to channel posts, so each bound client's "Dokumenty księgowe"
+   channel folder is their inbox: a timer files what the Team's guests put there into the
+   taxonomy folders inside the same channel folder
+   ([`ARCHITECTURE.md` §4.4](../../ARCHITECTURE.md#44-channel-inbox-intake-clients)). **Until the
+   sweep is on, files posted in "Dokumenty księgowe" simply wait there.** That is safe: nothing
+   moves them, and nothing is lost. So this step can also run on a later day. It needs TEST bound
+   (step 6); PESKOVOI's row is swept too once it is bound (step 8).
+
+   The canary is the synthetic canary PDF used above, never a real client document, posted by
+   the **TEST guest** into **TEST's** Team, channel "Dokumenty księgowe" (a post with the PDF
+   attached, or an upload on the „Udostępnione” tab), at the top of the channel's files, not in a
+   subfolder. Nothing in this step is posted in a real client's channel.
+
+   1. **Shadow.** It reads the channel folders, checks each file's uploader and classifies, then
+      only logs what it would move. It creates no folder and moves nothing.
+
+      ```bash
+      az functionapp config appsettings set -g $RG -n $INGEST -o none --settings "INBOX_SWEEP_MODE=shadow"
+      ```
+
+      The app restarts. `curl -s https://$INGEST.azurewebsites.net/api/health` must then report
+      `"inboxSweep":"shadow"`, with `phase`, `routing` and `membershipCheck` unchanged.
+   2. **The shadow canary.** The TEST guest posts the canary PDF in TEST's channel. A file is
+      taken once it is 2 minutes old (`INBOX_MIN_AGE_MS`) and the timer runs every 2 minutes, so
+      allow about 6 minutes, then read the sweep's lines:
+
+      ```bash
+      aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
+        | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
+        | where msg startswith "inbox."
+        | project timestamp, msg, mode = tostring(m.mode), listItemId = tostring(m.listItemId),
+            driveItemId = tostring(m.driveItemId), category = tostring(m.category),
+            review = tostring(m.review), reason = tostring(m.reason), stage = tostring(m.stage),
+            rows = tostring(m.rows), candidates = tostring(m.candidates),
+            wouldMove = tostring(m.wouldMove), skippedNotClient = tostring(m.skippedNotClient),
+            skippedUnverified = tostring(m.skippedUnverified), rowsFailed = tostring(m.rowsFailed)
+        | order by timestamp asc' \
+        <time you set shadow>
+      ```
+
+      Expect:
+      - an `inbox.tick` about every 2 minutes, `mode` `shadow`, `rows` equal to the number of
+        bound rows (TEST and PESKOVOI: `2`), `rowsFailed` `0`;
+      - one `inbox.would_move` with **TEST's** `listItemId` and the canary's `driveItemId`. Its
+        `category` is `nieposortowane` with `review` `true` while `ANTHROPIC_ENABLED=false` (H-3,
+        undone in step 11), and the model's category once the classifier runs;
+      - no `inbox.skipped` for the canary's `driveItemId`, and no `inbox.row_failed`;
+      - the canary still at the top of TEST's channel files: shadow moved nothing.
+
+      Any other outcome: stay in `shadow` (or set `off`) and use the table below. Do not go on to
+      `enforce` until the shadow canary shows exactly this.
+   3. **Enforce.**
+
+      ```bash
+      az functionapp config appsettings set -g $RG -n $INGEST -o none --settings "INBOX_SWEEP_MODE=enforce"
+      ```
+
+      `/api/health` must report `"inboxSweep":"enforce"`. Within about 4 minutes the shadow
+      canary is filed: an `inbox.filed` (or `inbox.sorted_to_review` while the classifier is off)
+      with TEST's `listItemId` and the canary's `driveItemId`, and the PDF is now inside TEST's
+      channel folder, in its taxonomy folder (for example `98_Nieposortowane/YYYY/MM`), visible on
+      the „Udostępnione” tab. It is still in TEST's channel: nothing leaves the channel folder.
+   4. **The same name again.** The TEST guest posts the same canary PDF, with the same file name,
+      once more. Expect it filed into the same folder under `<name>_1`, with `nameSuffix` `1` on
+      its line: moves never overwrite. This is the check for Graph's move with
+      `conflictBehavior=fail` in this tenant.
+   5. **A staff file is left alone (optional).** A staff member of TEST's Team posts a second
+      synthetic PDF in the same channel. Expect one `inbox.skipped` with its `driveItemId` and
+      `reason` `not_guest`, and the file still at the top of the channel files.
+   6. Delete every canary file from TEST's channel.
+
+   **Rollback.** `az functionapp config appsettings set -g $RG -n $INGEST -o none --settings "INBOX_SWEEP_MODE=off"`.
+   The sweep stops at the next start; files it already moved stay where they are, inside their
+   own channel folder, and files posted since simply wait. The emergency stop above stops it too.
+
+   The bot's help card tells clients to post in the channel. If the bot build that carries it goes
+   out before this step, clients who follow it put files in the channel, where they wait until the
+   sweep is on: safe, just not filed yet.
+
+   What the sweep's lines mean when something is off:
+
+   | What you see | Why | Action |
+   |---|---|---|
+   | No `inbox.tick` at all | The mode is `off`, or the app has not restarted with the setting | Check `/api/health` → `inboxSweep`. Set the mode again with the command above |
+   | `inbox.tick` with `rows` `0`, and `inbox.directory_unavailable` | The Client Directory could not be read recently enough, so nothing is swept (fail closed) | T-5's `directory refresh failed` query |
+   | `inbox.tick` with `rows` lower than the bound rows | A row is not bound, or excluded (conflict, forbidden target) | `node tools/directory-bindings.mjs check` |
+   | `inbox.row_failed` with `targetErrorKind` `forbidden` | The ingestion identity has no `write` grant on that client's site | Step 3's grant for `$INGEST_MI_APPID` |
+   | `inbox.row_failed` with `targetErrorKind` `inbox_unusable` | The row's `RootFolder` is not a folder at the root of its drive: the channel was renamed, or its folder is missing | `check`, then `propose` and apply the whole plan |
+   | `inbox.row_failed` with `targetErrorKind` `drive_mismatch` | The site's drive is no longer the row's `DriveId` (a recreated Team) | A rebind (admin guide → Changing a client). Nothing is swept there meanwhile |
+   | `inbox.row_failed` with `targetErrorKind` `forbidden_site` | The row's site resolved to BCR GROUP or the quarantine | Incident indicator, as `sharepoint.forbidden_site` in step 13: tell Roman |
+   | The canary never counts in `candidates` | It is in a subfolder, not at the top of the channel's files; or it is still changing (`skippedYoung`); or `inbox.unexpected_child` was logged (Graph listed it with another parent) | Post it at the top of the channel files and wait 6 minutes. An `inbox.unexpected_child` line: stop, stay in `shadow`, and raise it |
+   | `inbox.skipped` for the canary, `reason` `not_guest` or `unknown_user` | Graph's `createdBy` for the file is not the TEST guest's own guest account: it was posted by someone else, or `createdBy.user.id` is not the guest's object id for channel posts | Check who posted it. If the TEST guest did, stay in `shadow` and raise it: the sweep cannot tell this client's uploads apart |
+   | `inbox.skipped` for the canary, `reason` `not_in_team` | The TEST guest is not a member of TEST's Team (the group), as Entra reads it | `check`; fix the Team membership |
+   | `inbox.skipped`, `reason` `unverified`, `status` `403`; `skippedUnverified` on every tick | The identity's token does not carry `Directory.Read.All` | H-8b, as for `membership_unverified` in step 13. Nothing moves meanwhile |
+   | `inbox.failed`, `stage` `folder` or `move`, with `httpStatus` `403` | No `write` on that site | Step 3's grant. The file is tried again each tick, and after three failures the sweep tries `98_Nieposortowane` |
+   | `inbox.failed`, `stage` `review_fallback` on every tick | Even the move to `98_Nieposortowane` fails | The file stays where it is. Read its earlier `inbox.failed` lines for the cause, and file it by hand |
+   | `inbox.failed`, `stage` `move`, `targetErrorKind` `drive_mismatch` | Graph reported the moved file somewhere other than the target folder in the row's drive | Set `INBOX_SWEEP_MODE=off`, find the item by its `driveItemId`, and tell Roman |
 9. **Each further client** granted in step 3: apply, then canary, one at a time.
 10. **Staff.** If you want staff uploads recorded as `staff` rather than `unmapped`, add one
     `IsAdmin = Yes` row with the staff ids and no target, a `ClientId` such as `staff` and
@@ -1341,12 +1457,16 @@ aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
   | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
   | where msg in ("document.filed", "document.quarantined", "document.quarantine_failed",
       "directory.conflict", "ingestion.caller.rejected",
-      "sharepoint.forbidden_site", "sharepoint.possible_duplicate",
-      "membership.mismatch", "membership.unverified", "membership.check_off")
+      "sharepoint.forbidden_site", "sharepoint.possible_duplicate", "sharepoint.drive_mismatch",
+      "membership.mismatch", "membership.unverified", "membership.check_off",
+      "inbox.filed", "inbox.sorted_to_review", "inbox.failed", "inbox.row_failed")
   | summarize count() by msg, reason = tostring(m.quarantineReason), kind = tostring(m.kind),
-      status = tostring(m.status)' \
+      status = tostring(m.status), stage = tostring(m.stage)' \
   <start of the window>
 ```
+
+`inbox.row_failed` and `inbox.failed` should be empty, or explained by the channel-inbox step's table.
+`sharepoint.drive_mismatch` must be empty.
 
 `membership.check_off` must be empty: it means `MEMBERSHIP_CHECK_MODE=off` at a cold start.
 `membership.mismatch` and `membership.unverified` carry `clientId`, `listItemId` and `teamId`,
@@ -1493,6 +1613,7 @@ Bicep drift fix (gate G1), not here.
 | App-id pinning is live | `BOT_CALLER_APP_IDS` set (H-8 verify); the `authMiddleware` unit test "rejects the right role held by an app that is not on the allow-list" passes in CI; a live token from another app registration is refused with 403. Such a token lacks `Documents.Ingest`, so the role check refuses it first and logs no `ingestion.caller.rejected`. Do not grant `Documents.Ingest` to a test app to produce one. |
 | Every onboarded client's guest is bound, or quarantined with a known reason | H-7 and H-12 records in the incident's status table |
 | The runtime membership check is on (R46 closed) | `/api/health` reports `"membershipCheck":"enforce"`; H-8b's dry run prints `already assigned`; the H-12 TEST canary filed with `membership: verified`; the resolver's membership tests pass in CI |
+| Clients can send documents through their channel | `/api/health` reports `"inboxSweep":"enforce"`; the canary of H-12's channel-inbox step was filed inside TEST's channel (`inbox.filed` or `inbox.sorted_to_review`), and its same-name second came back with `nameSuffix` `1`; the channel-inbox tests pass in CI |
 | The IR-0 export is stored | H-2 verification |
 | The taxonomy folders at the library root of every client site the ingestion identity could write to are Owners-only | T-4b's status row lists every such site (PESKOVOI, TEST and each site IR-1 added); **Check permissions** for each client's guest returns *None*; T-4b's check of the items outside those folders, after IR-1, is recorded for each site |
 | The BCR GROUP root folders are Owners-only, including any created after the first lock | T-4's status row records the lock and the check after H-6b |
@@ -1536,11 +1657,17 @@ guest's id into the new row itself (R1) waits on Roman's re-ruling of Q21.
 aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
   | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
   | where msg in ("document.quarantine_failed", "sharepoint.forbidden_site",
-      "membership.mismatch", "membership.unverified", "membership.check_off")
+      "membership.mismatch", "membership.unverified", "membership.check_off",
+      "inbox.row_failed", "inbox.failed", "sharepoint.drive_mismatch")
   | project timestamp, itemCount, msg, quarantineReason = tostring(m.quarantineReason),
-      listItemId = tostring(m.listItemId), status = tostring(m.status)' \
+      listItemId = tostring(m.listItemId), status = tostring(m.status),
+      stage = tostring(m.stage), driveItemId = tostring(m.driveItemId)' \
   <24 hours ago, UTC>
 ```
+
+Once the channel inbox is on (H-12's channel-inbox step), an `inbox.row_failed` row means one client's
+channel is not being swept, and an `inbox.failed` row with `stage` `review_fallback` a file that
+stays at the top of a client's channel: both are read with that step's table.
 
 Record the date of each weekly `check` and each post-onboarding apply, with the apply log's
 hash, in the incident's status table.

@@ -10,13 +10,23 @@ applies to all of them; everything else is specific to this repo.
 
 ## What this repo is
 
-A Microsoft Teams bot that receives document attachments in a **1:1 DM**, classifies each file by
-reading its **content** with Claude, and uploads it into the right folder of the right client's
-SharePoint Online site — all via Azure Functions + Microsoft Graph. UI strings are **Polish**;
-code, comments and logs are English.
+A document intake for BCR's clients in Microsoft Teams. Each file is classified by reading its
+**content** with Claude and filed into the right folder of the right client's SharePoint Online
+site — all via Azure Functions + Microsoft Graph. There are **two intakes**:
 
-One deployment serves many clients. Which SharePoint site a document lands in is decided per-upload
-by a **Client Directory** SharePoint list, not by configuration or per-client deployment.
+- **The channel inbox (clients).** Clients are Teams guests, and Teams lets a guest attach files
+  only to channel posts, never in a chat with the bot. So a client posts the file in their Team's
+  **"Dokumenty księgowe"** channel (a post with an attachment, or the „Udostępnione” tab), which
+  stores it in the channel folder, and a timer in ingestion files it into the taxonomy folder
+  **inside that same channel folder**.
+- **The bot's 1:1 DM (whoever can attach there).** The bot receives attachments, and ingestion
+  files them the same way.
+
+UI strings are **Polish**; code, comments and logs are English.
+
+One deployment serves many clients. Which client a document belongs to is decided by a **Client
+Directory** SharePoint list, not by configuration or per-client deployment: on the bot path by the
+uploader's bound row, in the channel inbox by the bound row whose channel folder holds the file.
 
 ---
 
@@ -87,8 +97,8 @@ versions with install scripts disabled (checking each top-level version against 
 `node_modules`), and vendors the just-built `@bcr/shared`. `artifacts/*.zip` are git-ignored build
 output: never commit one, and deploy only a zip built for that deploy. Before deploying, still
 check the vendored copy: `unzip -p artifacts/<pkg>.zip node_modules/@bcr/shared/dist/config.js |
-grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths` and `membershipCheckMode`) must be
-greater than 0.
+grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths`, `membershipCheckMode` and
+`inboxSweepMode`) must be greater than 0.
 
 CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test, plus `bicep build` and
 `bicep lint`.
@@ -104,12 +114,16 @@ depend on it and neither depends on the other**; they talk over HTTP.
 Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
                                       │ POST /api/ingest/batch  (AAD client-credentials JWT)
                                       ▼
-                                @bcr/document-ingestion (Func App)
+Teams channel post / „Udostępnione”   @bcr/document-ingestion (Func App)
+  └─▶ channel folder ◀── timer: inboxSweep (every 2 min)
                                       ├─▶ Claude (classify content)
                                       └─▶ Microsoft Graph (managed identity) ──▶ SharePoint
 ```
 
 ### The ingestion pipeline (the part that needs several files to understand)
+
+Two intakes share the classifier, the taxonomy, the client SharePoint factory and its guards: the
+**bot DM** (below) and the **channel inbox** (after it).
 
 `functions/ingestDocument.ts` is thin wiring (the only route is `POST /api/ingest/batch`);
 `services/batchIngestor.ts` runs the pipeline; every collaborator is a cold-start singleton from
@@ -147,14 +161,56 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
    code), and a suffixed name taken after a retried network failure logs
    `sharepoint.possible_duplicate`.
 
+### The channel inbox (clients' intake)
+
+`functions/inboxSweep.ts` is a timer (`0 */2 * * * *`), thin wiring; `services/channelInbox.ts`
+runs it with injected collaborators (`runtime.ts#channelInbox`). `INBOX_SWEEP_MODE` is
+`off` (default: returns at once) | `shadow` (lists, checks, classifies, logs `inbox.would_move`,
+writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep`.
+
+1. **Rows** — `boundClientRows(snapshot)` in `clientDirectoryReader.ts`: exactly the rows the
+   snapshot routes to (active, not admin, bound, not excluded). Unavailable snapshot → nothing.
+2. **Inbox** — the **client** factory's `SharePointService.resolveInbox()`: the row's `RootFolder`,
+   one folder at the root of its `DriveId`, behind the same site guard and drive check as uploads.
+3. **Candidates** — `listInboxChildren()`: direct children only, every page, anything whose
+   `parentReference` is not this folder in this drive dropped. `selectCandidates()`: a file,
+   `0 < size ≤ 100 MiB`, not `~$`/`.`, older than `INBOX_MIN_AGE_MS`, with `createdBy.user.id`.
+4. **Uploader** — `userType` `Guest` (`services/userDirectory.ts`) **and** a member of this row's
+   Team (`TeamMembershipReader.teamsOf`, cached). Anything else is left untouched.
+5. **Classify** — same `ClassificationService`, primed with this row only; `applyInvoiceDirection`
+   from the row's NIP; `inboxPlacement()` builds the folder with `buildFolderPath` from the
+   category alone (fallback / no date → `98_Nieposortowane/YYYY/MM`). Cached per
+   (`driveItemId`, `eTag`) for 1 h; the file is read by id, size-capped, only if Claude reads it.
+6. **Move** — `ensureInboxFolder()` under the channel folder, then `moveWithinInbox()`: PATCH by id,
+   `conflictBehavior=fail`, `_1`…`_10` on 409, then assert same item, same drive, new parent.
+   Three failures (per worker) → moved to `98_` unclassified. Budget `INBOX_MAX_FILES_PER_TICK`,
+   150 s deadline, rows round-robin. Logs `inbox.filed|sorted_to_review|would_move|failed|
+   skipped|row_failed|tick`, ids and counts only.
+
 ### Invariants — break these and documents mis-file
 
-- **Routing is decided ONLY from the authenticated uploader identity.** Document content — parties,
-  NIPs, model output, the filename — can never select or change the client. The old phase 2 that
-  "promoted" unrouted uploads to whichever client's NIP was in the document filed one client's papers
-  into another client's Team and was steerable by prompt injection; it is deleted, and
-  `clientResolver.test.ts` fails if a NIP lookup or promotion comes back. Anything that can't be tied
-  to exactly one client goes to the staff-only quarantine — never BCR GROUP, never a guess.
+- **On the bot path, routing is decided ONLY from the authenticated uploader identity.** Document
+  content — parties, NIPs, model output, the filename — can never select or change the client. The
+  old phase 2 that "promoted" unrouted uploads to whichever client's NIP was in the document filed
+  one client's papers into another client's Team and was steerable by prompt injection; it is
+  deleted, and `clientResolver.test.ts` fails if a NIP lookup or promotion comes back. Anything
+  that can't be tied to exactly one client goes to the staff-only quarantine — never BCR GROUP,
+  never a guess.
+- **In the channel inbox, the client is the file's location, never its uploader or content.** The
+  client is the one bound row whose `DriveId` + `RootFolder` (the channel folder) hold the file.
+  Nothing in the file, its name or the model's output picks another row, and the sweep never
+  reads a row other than the one it is sweeping.
+- **The channel inbox processes only this Team's guests' uploads.** A file is touched only when its
+  creator is `userType` `Guest` **and** a member of the row's Team. Staff, members, guests of
+  other Teams, files with no user creator, and uploaders that cannot be read are left exactly
+  where they are (fail closed). A guest who is also in other Teams is fine here: the file is
+  already in this client's space.
+- **Inbox moves stay inside the channel folder, by id, and never overwrite.** Only the channel
+  folder's direct children are candidates (never recurse — subfolders are the filed area); the
+  target chain is created under the channel folder, never the drive root; the move is a PATCH by
+  id with `conflictBehavior=fail` and the `_n` rule, and afterwards the item must be the same
+  item, in the row's drive, under the target folder. Never copy, never delete, never move across
+  drives, never touch an item outside the inbox's direct children. `shadow` writes nothing.
 - **`ClaudeClassifier.classify()` never throws and never rejects.** Unsupported type, oversize, API
   error, malformed output, low confidence → return `null` so `FallbackClassifier` files the document
   into `98_Nieposortowane/YYYY/MM/` for manual review. Preserve this contract.
@@ -210,11 +266,12 @@ Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
   the result card shows the taxonomy label, never the model's reasoning; logs carry `documentId`,
   `clientId`, `listItemId`, `teamId`, `driveItemId` — file names, titles, NIPs and SharePoint
   locations are redacted by the root logger (`shared/src/logger.ts`).
-- **Only 1:1 chats are processed.** Teams *channel* uploads never reach a bot (drag-drop bypasses
-  Bot Framework; `@mention` activities carry only mention HTML), and group chats are refused. Every
-  activity passes the bot gate (personal conversation, BCR tenant, GUID `aadObjectId`) before any
-  logic runs, and the ingestion API re-checks it. `teamsChannelId` is telemetry only. The anonymous
-  Personal Tab lookup (`/api/user-target`) is deleted: it mapped any user id to their client.
+- **The bot processes only 1:1 chats.** Teams *channel* uploads never reach a bot (drag-drop
+  bypasses Bot Framework; `@mention` activities carry only mention HTML) — they reach ingestion
+  through the channel inbox instead — and group chats are refused. Every activity passes the bot
+  gate (personal conversation, BCR tenant, GUID `aadObjectId`) before any logic runs, and the
+  ingestion API re-checks it. `teamsChannelId` is telemetry only. The anonymous Personal Tab
+  lookup (`/api/user-target`) is deleted: it mapped any user id to their client.
 
 ### Bot side
 
@@ -224,7 +281,8 @@ All attachments from one activity are downloaded in parallel and sent as **one b
 gets a single consolidated result card. A per-file download or ingest failure becomes a `rejected`
 row in that card rather than an aborted turn. The gate (`BOT_GATE_MODE=log|enforce`) runs for every
 activity type before the turn logic; the card escapes every inserted value and renders Polish text by
-error code, never raw error messages.
+error code, never raw error messages. The help card (`buildHelpCard`) sends clients to their Team's
+„Dokumenty księgowe” channel, because guests cannot attach files in the chat.
 
 ---
 

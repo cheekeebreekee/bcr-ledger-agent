@@ -3,18 +3,25 @@
 Written for whoever maintains the list, and for the next person who changes how documents are
 routed.
 
-> **Status: Phase 0 routing, September 2026.** Routing uses the uploader's identity only. The
-> document's content never chooses the client. This guide replaces the earlier one, which
+> **Status: Phase 0 routing, September 2026.** On the bot path, routing uses the uploader's
+> identity only. In the channel inbox, the client is the bound row whose channel folder holds the
+> file. The document's content never chooses the client. This guide replaces the earlier one, which
 > described content-based promotion; that path was the cross-client write in incident
 > [`IR-2026-09`](operations/incident-2026-09.md) and has been deleted. The list is an interim
 > routing source. The database-backed registry replaces it in Phase 2 of the v2 plan.
 
 ## What it's for
 
-The ingestion function uses the list to answer one question: **which one client is this
-uploader bound to?** If the answer is exactly one client, the document is filed in that
-client's space. In every other case it goes to the staff-only quarantine, and an accountant
-decides.
+The ingestion function uses the list to answer two questions, one per intake:
+
+- **Bot chat: which one client is this uploader bound to?** If the answer is exactly one client,
+  the document is filed in that client's space. In every other case it goes to the staff-only
+  quarantine, and an accountant decides.
+- **Channel inbox: which bound client's channel folder is this file in?** Clients are Teams
+  guests, who cannot attach files in a chat with the bot, so they post them in their Team's
+  "Dokumenty księgowe" channel instead. Each bound row's channel folder (its `RootFolder`, in its
+  `DriveId`) is that client's inbox, and ingestion files what the client's guests put there into
+  the taxonomy folders inside it ([below](#how-a-channel-inbox-file-is-filed)).
 
 Two rules follow from that, and they are the ones that were broken:
 
@@ -28,6 +35,8 @@ Two rules follow from that, and they are the ones that were broken:
   the wrong client.
 
 ## How an upload is routed (Phase 0)
+
+This section is the bot chat. The channel inbox is [the next section](#how-a-channel-inbox-file-is-filed).
 
 1. **The bot's gate.** Only a 1:1 chat, from the BCR tenant, with a valid user object id,
    reaches ingestion at all. Ingestion checks the same three things again.
@@ -58,6 +67,37 @@ Two rules follow from that, and they are the ones that were broken:
 6. **Content never changes the client.** After classification, the only thing content can change
    is the direction of an invoice (sales ⇄ purchase), and only inside the client the uploader is
    bound to. It is decided by comparing the parties on the invoice with that client's `NIP`.
+
+## How a channel-inbox file is filed
+
+A timer in the ingestion app sweeps every 2 minutes, when `INBOX_SWEEP_MODE` is `shadow` or
+`enforce` (it is `off` until [human-steps H-12](operations/human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries)
+turns it on). Until then, files in a client's "Dokumenty księgowe" channel simply wait there;
+nothing is lost.
+
+1. **Which rows.** Only the rows the list routes to: `Active`, not `IsAdmin`, bound (`RootFolder`,
+   `DriveId`, `TeamId`), and not excluded as a conflict or a forbidden target. A row needs no
+   user ids for this: the client is where the file is. If the list cannot be read recently
+   enough, nothing is swept.
+2. **Which folder.** The row's `RootFolder` at the root of the drive `DriveId`, through the same
+   checks as an upload: never BCR GROUP or the quarantine site, never another drive.
+3. **Which files.** Only files directly in that folder, not in its subfolders (the subfolders are
+   where filed documents live). A file must be unchanged for `INBOX_MIN_AGE_MS` (2 minutes by
+   default), between 1 byte and 100 MiB, and not an Office lock file (`~$…`) or a hidden one.
+4. **Whose files.** Only files **created by a guest who is a member of this row's Team**. A file
+   put there by staff, by a member, or by a guest of another Team is left exactly where it is.
+   A guest who is also in another client's Team is fine here: the file is already in this
+   client's space, and it is filed inside it.
+5. **Where it goes.** The file is classified like a bot upload, as this row's client, and moved,
+   by id and under its own name, into the taxonomy folder **inside the same channel folder**, for
+   example `Dokumenty księgowe/01_Faktury/02_Faktury_zakupu/2026/09/`. A name already taken gets
+   `_1`, `_2` and so on; nothing is overwritten, copied or deleted. What cannot be classified, and
+   a file whose processing failed three times, goes to `98_Nieposortowane/YYYY/MM` inside the
+   same channel folder, for an accountant.
+
+So, for a row to be swept, it must be bound by the tool exactly as for bot routing, and the
+client's contact must be a guest of the client's Team. The `UserAadObjectIds` column plays no part
+in the channel inbox; it still decides the bot chat.
 
 ## What quarantine means
 
@@ -112,12 +152,12 @@ grant is read-only, and ingestion can never write to BCR GROUP again.
 | `SiteHostname` | Single line | Onboarding | The tenant's SharePoint host. It must equal the ingestion setting `QUARANTINE_SITE_HOSTNAME`, the only host a row may name; a row on any other host routes nobody (`forbidden_target`). |
 | `SitePath` | Single line | Onboarding | Exactly `/sites/<name>` or `/teams/<name>`, e.g. `/sites/0002PESKOVOISp.zo.o.-Ksigowo`. The Team's root site, never a sub-site. A leading or trailing `/`, doubled `/` and case do not matter; a third segment, a `.` or `..` segment, `%`, `\` or a space inside the name make the row `forbidden_target`. Must not be BCR GROUP or the quarantine site. |
 | `DriveName` | Single line | Onboarding | The library name. `Dokumenty` on this Polish tenant. |
-| `RootFolder` | Single line | **The tool** | The channel folder's name, exactly as Graph returns it for the "Dokumenty księgowe" channel (`GET /teams/{id}/channels/{id}/filesFolder`). Documents then appear in the channel's files tab. **Required:** an empty `RootFolder` means the row is not bound, and it routes nobody (`unbound_target`). Before Phase 0, empty meant the library root, which is where the incident's documents went and where clients never look. |
+| `RootFolder` | Single line | **The tool** | The channel folder's name, exactly as Graph returns it for the "Dokumenty księgowe" channel (`GET /teams/{id}/channels/{id}/filesFolder`). Documents then appear in the channel's files tab. It is also the client's **inbox**: the folder the channel-inbox sweep reads, and the only one it files inside. **Required:** an empty `RootFolder` means the row is not bound, and it routes nobody (`unbound_target`) and is never swept. Before Phase 0, empty meant the library root, which is where the incident's documents went and where clients never look. |
 | `DriveId` | Single line | **The tool** | New, **required** (`unbound_target` without it). The id of the drive holding the channel folder. Ingestion checks that the path still resolves to this drive; if not, the upload goes to quarantine as `stale_directory`. This protects against a deleted Team whose site URL is later reused by a new Team. No two `Active` client rows may share it. |
 | `TeamId` | Single line | **The tool** | New, **required** (`unbound_target` without it). The client's Team id. No two `Active` client rows may share it. Logged as `teamId` when an upload is routed and filed, and used by the tools and audits. An upload routes only while this is the uploader's one and only Team, read at upload time (`membership_mismatch` otherwise); see [Keeping the bindings current](#keeping-the-bindings-current). |
 | `IsAdmin` | Yes/No | By hand | `Yes` only on the staff row. See [Staff](#staff). |
 | `Status` | `Active` / `Inactive` | By hand | Only `Active` rows route. |
-| `TeamsChannelId` | Single line | Onboarding | Written by onboarding, read by nothing. Channel uploads never reach a bot, so channels do not route. |
+| `TeamsChannelId` | Single line | Onboarding | Written by onboarding, read by nothing. Channel uploads never reach a bot; the channel inbox finds the channel folder through `RootFolder` and `DriveId`, not this column. |
 
 ## Duplicates and conflicts
 
@@ -204,12 +244,18 @@ but slow, so bind soon after onboarding:
    and apply the whole plan again. `--only <listItemId>` limits a rollback to named rows, for
    example the new client's own, which was unbound before
    ([human-steps H-12 → Rollback](operations/human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries)).
-5. **Canary:** a synthetic document, never a real one, uploaded by an identity bound to that
-   client, lands in the client's `Dokumenty księgowe` channel folder. Then delete the canary
-   file.
-6. Tell the client to use the bot in a 1:1 chat. In Teams, they switch to the BCR organisation,
-   open chat and search for "Asystent BCR". Their files are in their team → "Dokumenty
-   księgowe" → Files. In Phase 0 the app is available to everyone in the org
+5. **Canary:** a synthetic document, never a real one, lands in the client's
+   `Dokumenty księgowe` channel folder, then is deleted. Once the channel inbox is in `enforce`,
+   the canary is a synthetic PDF that a guest of that client's Team posts in the channel: it must
+   move into its taxonomy folder inside the channel within a few minutes (`inbox.filed` with the
+   row's `listItemId`). Until then, it is an upload through the bot by an identity bound to that
+   client, as in [human-steps H-12](operations/human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries).
+6. **Tell the client how to send documents.** A guest cannot attach files in a chat with the bot,
+   so: in Teams, switch to the BCR organisation, open their Team, channel "Dokumenty księgowe",
+   and add the file as an attachment to a post, or on the „Udostępnione” tab. Filed documents
+   appear in the same channel, in its taxonomy folders. The bot ("Asystent BCR", in a 1:1 chat)
+   still answers `pomoc` and still files what someone who *can* attach sends it. In Phase 0 the
+   app is available to everyone in the org
    ([tenant-hardening T-10](operations/tenant-hardening.md#t-10-teams-app-availability-for-the-bot)).
    If availability is ever restricted to groups, add the guest to that group first; nothing
    does it automatically.
@@ -262,6 +308,10 @@ staff uploads would then show as `unmapped`. A staff upload goes to quarantine a
 staff file documents into client folders by hand in SharePoint. There is no staff routing in
 Phase 0: the old "admin → route by the document's NIP" path is what the incident was.
 
+The channel inbox does not file staff files either. A file a staff member or a member puts at the
+top of a client's "Dokumenty księgowe" channel folder stays exactly there: file it by hand into
+the right subfolder, or remove it if it was put in the wrong client's channel.
+
 Until the full implementation is done, staff do not upload through the bot at all.
 
 ## Changing a client
@@ -277,7 +327,8 @@ Until the full implementation is done, staff do not upload through the bot at al
 ## Offboarding a client
 
 1. Set `Status = Inactive`. Do not delete the row: it keeps the history, and retries and audits
-   refer to the `ClientId`.
+   refer to the `ClientId`. Within the Directory refresh (5 minutes) its channel folder is no
+   longer swept either.
 2. Remove the guests from the Team. On the next run, the tool clears `UserAadObjectIds`.
 3. Never reuse the `ClientId`.
 
