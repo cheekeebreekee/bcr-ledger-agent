@@ -73,11 +73,10 @@ done
 
 # The template replaces every app setting, and what-if cannot show that. If
 # the apps already run, a setting set by hand and not recorded in the
-# parameters file would be deleted or reverted: refuse (read-only check).
-if [[ -n "$(az functionapp list -g "$RG" --query "[].name" -o tsv 2>/dev/null)" ]]; then
-  echo "==> Comparing the template's app settings with the running apps (read-only)"
-  node "$ROOT/tools/check-app-settings.mjs" --live -g "$RG" -p "$PARAMS"
-fi
+# parameters file would be deleted or reverted: the gate compares them and
+# stops on any difference (read-only). It passes a resource group that does
+# not exist yet, or has no Function Apps; any az failure stops here.
+bash "$ROOT/infrastructure/app-settings-gate.sh" "$RG" "$PARAMS"
 
 echo "==> Ensuring resource group $RG exists in $LOCATION"
 az group create --name "$RG" --location "$LOCATION" --output none

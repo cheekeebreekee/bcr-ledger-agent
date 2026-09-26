@@ -222,6 +222,7 @@ bcr-ledger-agent/
 │   ├── main.bicep                       # Azure resources and every app setting (lesson 20)
 │   ├── main.dev.parameters.json
 │   ├── deploy.sh                        # Bicep + zip-deploy wrapper. New environments only; refuses dev.
+│   ├── app-settings-gate.sh             # before any Bicep deploy: template vs running app settings
 │   ├── quarantine/                      # quarantine site script, and the managed identity's site grant
 │   └── ir/                              # IR evidence store
 ├── tools/                               # operator tools: directory-bindings, inventory-misfiled, ir0/

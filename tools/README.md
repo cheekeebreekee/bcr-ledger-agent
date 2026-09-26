@@ -678,7 +678,10 @@ or a literal, which are not secrets. The storage and App Insights connection
 strings, the package URL and the Key Vault secrets are only named, or checked
 as a boolean inside the `az` query, so they never reach the tool. Run it
 before any Bicep deploy to an existing app, and after changing a setting by
-hand (then record the change in the parameters file).
+hand (then record the change in the parameters file). `deploy.sh` and the
+Deploy workflow run it through `infrastructure/app-settings-gate.sh`, which
+skips it only when `az group exists` answers `false` or the resource group
+holds no Function Apps, and stops the deploy on any `az` failure.
 
 Exit codes: `0` clean (warnings allowed); `1` an error or drift; `2` a usage
 error.

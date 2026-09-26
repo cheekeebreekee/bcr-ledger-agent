@@ -100,16 +100,15 @@ jobs:
 
       # The template replaces every app setting, and what-if cannot show that.
       # If the apps already run, a setting set by hand and not recorded in the
-      # parameters file would be deleted or reverted: stop here. Read-only.
+      # parameters file would be deleted or reverted: the gate compares them
+      # and stops on any difference (read-only). It passes a resource group
+      # that does not exist yet, or has no Function Apps; any az failure stops
+      # the run. The same script as deploy.sh.
       - name: App settings (template vs running apps)
         shell: bash
         run: |
-          RG="rg-bcr-ledger-${ENV_NAME}"
-          if [[ -n "$(az functionapp list -g "$RG" --query "[].name" -o tsv 2>/dev/null)" ]]; then
-            node tools/check-app-settings.mjs --live -g "$RG" -p "infrastructure/main.${ENV_NAME}.parameters.json"
-          else
-            echo "No Function Apps in $RG yet: nothing to compare."
-          fi
+          bash infrastructure/app-settings-gate.sh "rg-bcr-ledger-${ENV_NAME}" \
+            "infrastructure/main.${ENV_NAME}.parameters.json"
 
       - name: Deploy Bicep
         uses: azure/arm-deploy@v2
