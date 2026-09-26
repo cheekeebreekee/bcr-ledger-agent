@@ -247,17 +247,15 @@ describe('ClaudeClassifier: results', () => {
   // Four of BCR's own sales invoices were filed as purchases when the model
   // was asked without an identity. It must not guess.
   it('flags an invoice without a client identity as DIRECTION_UNRESOLVED, with lowered confidence', async () => {
-    const create = jest
-      .fn()
-      .mockResolvedValue(
-        answer({
-          category: 'faktury_zakupu',
-          year: 2026,
-          month: 9,
-          confidence: 0.97,
-          client_role: 'buyer',
-        }),
-      );
+    const create = jest.fn().mockResolvedValue(
+      answer({
+        category: 'faktury_zakupu',
+        year: 2026,
+        month: 9,
+        confidence: 0.97,
+        client_role: 'buyer',
+      }),
+    );
     const { c } = classifier(create);
     const result = (await c.classify(ctx())) as Classification;
     expect(result.reviewReasons).toEqual([DIRECTION_UNRESOLVED]);
@@ -312,7 +310,7 @@ describe('ClaudeClassifier: results', () => {
         parties: [
           {
             role: 'seller',
-            nip: '865-256-72-40',
+            nip: '123-456-78-90',
             company_name: ' Dostawca Sp. z o.o. ',
             person_name: null,
           },
@@ -324,7 +322,7 @@ describe('ClaudeClassifier: results', () => {
     const { c } = classifier(create);
     const result = (await c.classify(ctx())) as Classification;
     expect(result.parties).toEqual([
-      { role: 'seller', nip: '8652567240', companyName: 'Dostawca Sp. z o.o.' },
+      { role: 'seller', nip: '1234567890', companyName: 'Dostawca Sp. z o.o.' },
       { role: 'unknown', personName: 'Jan Kowalski' },
     ]);
   });
