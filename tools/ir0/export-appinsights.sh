@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
 # IR-0 evidence: export the ledger ingestion's routing and upload traces from
-# Application Insights before retention (30 days) deletes them.
+# Application Insights before retention deletes them (90 days on the ledger's
+# component; the script reads retentionInDays and warns if --days is shorter).
 #
 # Usage:
 #   tools/ir0/export-appinsights.sh --app <component name | app id GUID>
 #       [--resource-group <rg>]           needed when --app is a name
-#       [--days 30 | --start <UTC> --end <UTC>]   UTC as 2026-09-25T00:00:00Z
+#       [--days 90 | --start <UTC> --end <UTC>]   UTC as 2026-09-25T00:00:00Z
 #       [--chunk-hours 24] [--all-traces] [--out-dir <dir>]
 #
 #   --all-traces  also export every trace in the window, unfiltered, so that
@@ -42,7 +43,7 @@ ROW_LIMIT=500000
 
 APP=""
 RG=""
-DAYS=30
+DAYS=90
 START=""
 END=""
 CHUNK_HOURS=24
@@ -135,7 +136,12 @@ mkdir -p "$OUT_DIR"
 chmod 700 "$OUT_DIR"
 [[ -z "$(ls -A "$OUT_DIR")" ]] || die "$OUT_DIR is not empty; evidence exports never overwrite"
 
-RETENTION_EDGE=$((NOW_EPOCH - 30 * 86400))
+RETENTION_DAYS=90
+if [[ -n "$RG" && ! "$APP" =~ $GUID_RE ]]; then
+  r=$(az monitor app-insights component show --resource-group "$RG" --app "$APP" --query retentionInDays --output tsv 2>/dev/null || true)
+  [[ "$r" =~ ^[0-9]+$ ]] && RETENTION_DAYS=$r
+fi
+RETENTION_EDGE=$((NOW_EPOCH - RETENTION_DAYS * 86400))
 echo
 echo "IR-0 App Insights export (read-only)"
 echo "  app        $APP${RG:+ (resource group $RG)}"
@@ -143,7 +149,10 @@ echo "  window     $START .. $END  (${CHUNK_HOURS} h chunks)"
 echo "  signed in  $(az account show --query user.name --output tsv)"
 echo "  out        $OUT_DIR"
 if ((START_EPOCH < RETENTION_EDGE)); then
-  echo "  ⚠ the window starts before $(from_epoch "$RETENTION_EDGE"); with 30-day retention those rows are already gone"
+  echo "  ⚠ the window starts before $(from_epoch "$RETENTION_EDGE"); with ${RETENTION_DAYS}-day retention those rows are already gone"
+fi
+if ((START_EPOCH > RETENTION_EDGE + 86400)); then
+  echo "  ⚠ the component keeps ${RETENTION_DAYS} days, but the window starts later: pass --days ${RETENTION_DAYS} to export all of it"
 fi
 echo
 
