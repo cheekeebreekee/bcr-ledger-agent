@@ -42,7 +42,7 @@ const HTML = `<!doctype html>
 <h1>Moje dokumenty</h1>
 <section>
 <p>Twoje dokumenty znajdziesz w swoim zespole w Teams: kanał „Dokumenty księgowe” → karta „Udostępnione”.</p>
-<p>Nowe dokumenty wysyłaj w prywatnym czacie z Asystentem BCR.</p>
+<p>Nowe dokumenty dodawaj w tym samym kanale: jako załącznik do wpisu albo na karcie „Udostępnione”. Asystent BCR przeniesie każdy plik do odpowiedniego folderu.</p>
 </section>
 </main>
 </body>
