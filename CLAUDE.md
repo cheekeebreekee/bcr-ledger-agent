@@ -178,7 +178,9 @@ Two intakes share the classifier, the taxonomy, the client SharePoint factory an
    pages is sent as a copy of its first 20 (`services/pdfPreview.ts`; the original is filed).
    Only the bound client's own identity is primed into the prompt. A classifier's
    **retry later** (429, 529, 5xx, timeout, connection, 401–404) stops the chain: the document is
-   `rejected` with `RetryLater` (the card's Polish text says to send it again), never filed.
+   `rejected` with `RetryLater` (the card's Polish text says to send it again), never filed —
+   until its bound: the 3rd timeout, 5xx or lost connection for the same bytes and client row
+   (24 h, per worker) files it into `98_` with `RETRY_EXHAUSTED` instead of refusing it again.
 5. **Direction** — `services/invoiceDirection.ts`, inside classification: sales ⇄ purchase only
    from the bound client's own NIP on one side of the parties, else the model's `client_role`
    (it can only match the primed NIP or name), and only when the parties do not contradict it:
@@ -226,8 +228,11 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
    primed with this row only; the policy's folder is built with `buildFolderPath` from the
    category alone (review → `98_Nieposortowane/YYYY/MM` of the tick). Cached per (`driveItemId`,
    `eTag`) for 1 h; the file is read by id, size-capped, only if Claude reads it. A **retry
-   later** leaves the file where it is for the next tick: `inbox.retry_later` with the status,
-   `retryLater` in `inbox.tick`, no failure counted, never `98_`. In `shadow`, `inbox.would_move`
+   later** leaves the file where it is for a later tick: `inbox.retry_later` with the status,
+   `retryLater` in `inbox.tick`, no failure counted. A timeout, 5xx or lost connection counts
+   against that (`driveItemId`, `eTag`): the file waits 10, 20, 40, 80 min (`retryLaterWaiting`,
+   outside the budget), and the 5th such answer (about 2.5 h) sorts it to `98_` with
+   `RETRY_EXHAUSTED`; a 429/529/401–404 never counts and never reaches `98_`. In `shadow`, `inbox.would_move`
    is logged once per (`driveItemId`, `eTag`) per worker, and a version already reported is
    skipped before the budget (`alreadyReported`): the budget is for files that need work.
 6. **Move** — only with 60 s left: `ensureInboxFolder()` under the channel folder, then
@@ -280,7 +285,12 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
   direction settled or flagged). `{ outcome: 'retry_later' }` — 429, 529, other 5xx, timeouts,
   lost connections, 401/402/403/404 — is **not a result**: `ClassificationService` stops there
   (never the fallback), the bot path answers `RetryLater`, the inbox leaves the file for the next
-  tick; a transient failure must never park a classifiable document in `98_`.
+  tick; a transient failure must never park a classifiable document in `98_`. It is bounded,
+  though (`services/retryLaterBound.ts`): only a reason the document may cause itself — a
+  timeout, a 5xx other than 529, a lost connection — counts per document (inbox: per
+  `driveItemId`+`eTag`, 5 with a doubling backoff; bot: per client row + content hash, 3), and
+  at the bound the document goes to `98_` with `RETRY_EXHAUSTED`, never retried forever. 429,
+  529 and 401–404 never count.
   `{ outcome: 'no_result', reason }` — unsupported type, oversize, `pdf_trim_failed`, 400/413/422,
   refusal, truncated or malformed output — lets `FallbackClassifier` file it into
   `98_Nieposortowane/YYYY/MM/` for manual review (`NOT_CLASSIFIED`, with `unclassifiedReason`).
@@ -289,7 +299,7 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
   `CLASSIFICATION_ACCEPT_THRESHOLD` (default 0.70; zod refuses anything outside 0.70–0.95 at cold
   start, so a 0.69 result is never filed under its category) and the reasons `NOT_CLASSIFIED`,
   `UNKNOWN_CATEGORY`, `MODEL_UNSORTED`, `DIRECTION_UNRESOLVED`, `DATE_MISSING`, `LOW_CONFIDENCE`
-  (and the inbox's `PROCESSING_FAILED`) send a document to `98_` of *this* month with the
+  (and `RETRY_EXHAUSTED`, and the inbox's `PROCESSING_FAILED`) send a document to `98_` of *this* month with the
   suggestion kept for the logs. Don't add a second threshold in a classifier, the service or a
   caller. The old `ANTHROPIC_CONFIDENCE_THRESHOLD` is not read (it would stop cold start at the
   live 0.6); a set value only logs `config.retired_setting`.

@@ -220,6 +220,20 @@ where it is for the next tick (`inbox.retry_later` with the API's status), count
 is never moved to `98_` for it. The 26 September evaluation found 529 "Overloaded" answers
 parking classifiable documents in review; that is what this prevents.
 
+**But it is bounded** ([`retryLaterBound.ts`](./packages/document-ingestion/src/services/retryLaterBound.ts)).
+A document the model cannot read inside the 45 s timeout (a long scan under the 100-page
+limit), or one the API answers with a 500 every time, would otherwise be retried forever and
+never reach a person. So a retry-later reason the document may cause itself — `timeout`,
+`server_error` (a 5xx other than 529), `connection` — counts against that document; `rate_limited`
+(429), `overloaded` (529), `unavailable` (401–404) and `conflict` (409) are about the service or
+the account and never count. In the channel inbox the count is per (`driveItemId`, `eTag`): after
+each counted answer the file waits 10, 20, 40, then 80 minutes (skipped without using the file
+budget, `retryLaterWaiting`), and the fifth counted answer, about 2.5 hours after the first,
+sorts it to `98_` unclassified with `RETRY_EXHAUSTED`. On the bot path it is per client row and
+SHA-256 of the bytes, for 24 hours: the third counted answer files the document into `98_` with
+`RETRY_EXHAUSTED` instead of a third "send it again". Both are in memory per worker, like the
+inbox's failure count; a worker restart only means a few more attempts.
+
 **The acceptance policy is the only place a threshold or review reason is applied.** A
 suggestion is filed under its category only when the category exists and is not the review
 bucket, a dated category has a usable year and month, an invoice's direction is settled, and the
@@ -227,8 +241,8 @@ confidence is at least `CLASSIFICATION_ACCEPT_THRESHOLD` (default 0.70; the conf
 anything outside 0.70–0.95 at cold start, so a 0.69 result can never be filed under its category).
 Otherwise it goes to `98_Nieposortowane/<YYYY>/<MM>/` of the current month, with one or more
 reasons — `NOT_CLASSIFIED` (with the model's `unclassifiedReason`), `UNKNOWN_CATEGORY`,
-`MODEL_UNSORTED`, `DIRECTION_UNRESOLVED`, `DATE_MISSING`, `LOW_CONFIDENCE`, and the inbox's
-`PROCESSING_FAILED` — and with the suggestion kept (category, month, confidence) for the logs and
+`MODEL_UNSORTED`, `DIRECTION_UNRESOLVED`, `DATE_MISSING`, `LOW_CONFIDENCE`, `RETRY_EXHAUSTED`,
+and the inbox's `PROCESSING_FAILED` — and with the suggestion kept (category, month, confidence) for the logs and
 the reviewer. The folder is always built with `buildFolderPath` from the category; a classifier's
 own folder path is never used. `ANTHROPIC_CONFIDENCE_THRESHOLD`, the setting this replaced, is
 no longer read.
@@ -599,7 +613,8 @@ inbox**, and ingestion sweeps it.
   direction, §4); the acceptance policy's folder is built by `buildFolderPath` from the category
   alone (the model's folder path is never used), and review goes to
   `98_Nieposortowane/YYYY/MM` of the tick's month. A "retry later" leaves the file where it is
-  for the next tick: not a failure, never `98_`. In `enforce` the folder chain is created **under the channel
+  for a later tick: not a failure. A timeout, 5xx or lost connection counts against the version
+  and starts a backoff; the fifth sorts it to `98_` with `RETRY_EXHAUSTED` (§4). In `enforce` the folder chain is created **under the channel
   folder**, and the file is moved by id:
   `PATCH /drives/{d}/items/{id}?@microsoft.graph.conflictBehavior=fail` with
   `If-Match: <listed eTag>` and `parentReference.id` = the target folder, and on a 409
@@ -636,14 +651,14 @@ inbox**, and ingestion sweeps it.
   `inbox.sorted_to_review` (`clientId`, `listItemId`, `teamId`, `driveItemId`, the decision's
   fields of §4, `nameSuffix`), `inbox.would_move` (shadow, the same fields and `review`),
   `inbox.retry_later` (`clientId`, `listItemId`, `driveItemId`, `classifier`, `reason`, the API's
-  `status`), `inbox.failed` (`clientId`, `listItemId`, `driveItemId`, `stage`
+  `status`, `counted`, `retryLaterAttempt`, `maxRetryLaterAttempts`, `retryAfterMs`), `inbox.failed` (`clientId`, `listItemId`, `driveItemId`, `stage`
   — `check`, `download`, `classify`, `folder`, `move` or `review_fallback` — `attempt`, and under
   `err` the error's `code`, `httpStatus`, Graph's `status` and any `targetErrorKind`),
   `inbox.skipped` (once per file and reason per worker, with a `reason`: `not_guest`,
   `not_in_team`, `unknown_user`, `modified_by_other`, `unverified` with Graph's `status`, or
   `changed`), `inbox.row_failed` (`stage` `resolve` or `list`, and `err` as above), and one
   `inbox.tick` per tick: `mode`, `rows`, `candidates`, `filed`, `sortedToReview`, `wouldMove`,
-  `alreadyReported`, `retryLater`, `skippedNotClient`, `skippedUnverified`, `skippedYoung`, `skippedIneligible`,
+  `alreadyReported`, `retryLater`, `retryLaterWaiting`, `skippedNotClient`, `skippedUnverified`, `skippedYoung`, `skippedIneligible`,
   `skippedBeforeCutoff`, `skippedChanged`, `deferred`, `failed`, `rowsFailed`, `durationMs`.
   Never a file name, title, path or NIP.
 
@@ -789,7 +804,8 @@ and site grants through the onboarding repo's `Grant-TeamSiteAccess.ps1` runbook
 | Failure | Behaviour |
 |---|---|
 | Claude is off, gives no answer (unsupported or oversize file, a PDF that cannot be shortened, 400/413/422, refusal, malformed output), or an answer the acceptance policy does not accept (below `CLASSIFICATION_ACCEPT_THRESHOLD`, unsettled invoice direction, no date) | Filed in `98_Nieposortowane/<YYYY>/<MM>/` in the client's own space, for manual review, with the reasons and the suggestion in the log line. |
-| Claude answers 429, 529, another 5xx, times out, loses the connection, or 401–404 (after the SDK's one retry) | Not a classification. Bot path: the document is `rejected` with `RetryLater` (`document.retry_later`). Channel inbox: the file stays for the next tick (`inbox.retry_later`), no failure counted. Never filed to `98_` for it. |
+| Claude answers 429, 529, another 5xx, times out, loses the connection, or 401–404 (after the SDK's one retry) | Not a classification. Bot path: the document is `rejected` with `RetryLater` (`document.retry_later`). Channel inbox: the file stays for a later tick (`inbox.retry_later`), no failure counted. A 429, 529 or 401–404 never files it to `98_`. |
+| The same document times out, gets a 5xx other than 529, or loses the connection again and again | Bounded: the inbox's fifth such answer for a file version (after a 10/20/40/80 min backoff), or the bot path's third for the same bytes and client, files it into `98_` with `RETRY_EXHAUSTED` and the last status, for a person to look at. |
 | Uploader not bound to exactly one client | Quarantine, with the reason. |
 | Directory cannot be refreshed for over 15 min | Everything goes to quarantine (`stale_directory`). |
 | Uploader's only row is not bound (`RootFolder`, `DriveId` or `TeamId` missing) | Quarantine (`unbound_target`). |

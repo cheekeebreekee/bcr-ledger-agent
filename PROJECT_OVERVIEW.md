@@ -259,8 +259,9 @@ The category id maps to a literal SharePoint path through
 suggestion under its category only at or above `CLASSIFICATION_ACCEPT_THRESHOLD` (default
 `0.70`), with a usable date for a dated category and a settled direction for an invoice;
 anything else, and a document no model answered for, goes to `98_Nieposortowane/RRRR/MM/` with
-the reasons logged. A 429, 529, 5xx or timeout from the API is "retry later", never review
-([`ARCHITECTURE.md` §4](ARCHITECTURE.md#4-classification-pipeline)).
+the reasons logged. A 429, 529, 5xx or timeout from the API is "retry later", never review;
+only a document that keeps timing out or getting a 5xx is, at a bound, filed for review with
+`RETRY_EXHAUSTED` ([`ARCHITECTURE.md` §4](ARCHITECTURE.md#4-classification-pipeline)).
 
 **Client identity is injected per request** through `ClassifierContext.client`, but only when
 the uploader is bound to a client. The invoice direction is then settled from that identity only

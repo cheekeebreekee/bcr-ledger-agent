@@ -15,7 +15,13 @@ import {
   type SharePointTarget,
 } from '@bcr/shared';
 import { AcceptancePolicy } from './acceptancePolicy';
-import { BatchIngestor, RETRY_LATER, type BatchIngestorDeps } from './batchIngestor';
+import {
+  BatchIngestor,
+  MAX_RETRY_LATER_ATTEMPTS,
+  RETRY_LATER,
+  RETRY_LATER_WINDOW_MS,
+  type BatchIngestorDeps,
+} from './batchIngestor';
 import {
   ClassificationService,
   FallbackClassifier,
@@ -420,6 +426,158 @@ describe('BatchIngestor — classification outcomes', () => {
 
       expect(results.map((r) => r.error?.code)).toEqual([RETRY_LATER, RETRY_LATER]);
       expect(sp.uploads).toEqual([]);
+    });
+
+    // Review finding: a document the model always times out on (a long scan)
+    // was answered "send it again" on every send, and never stored.
+    it('files a document that times out on every send for review at the bound, not refusing it forever', async () => {
+      const create = jest.fn().mockRejectedValue(new Anthropic.APIConnectionTimeoutError());
+      const { deps, sp } = setup(clientA);
+      const real = new BatchIngestor({ ...deps, classification: realClassification(create) });
+      const { log, lines } = recordingLogger();
+
+      const sends = [];
+      for (let i = 0; i < MAX_RETRY_LATER_ATTEMPTS; i += 1) {
+        sends.push((await real.ingestBatch(payload(['skan.pdf']), log))[0]);
+      }
+
+      expect(sends.map((r) => r?.error?.code ?? r?.status)).toEqual([
+        RETRY_LATER,
+        RETRY_LATER,
+        'uploaded',
+      ]);
+      expect(sp.uploads.map((u) => [u.factory, u.args.folderPath])).toEqual([
+        ['client', '98_Nieposortowane/2026/09'],
+      ]);
+      expect(sends[2]?.result?.classification).toEqual({
+        documentType: 'Nieposortowane',
+        categoryId: 'nieposortowane',
+        confidence: 0,
+        classifier: '',
+      });
+      expect(
+        lines
+          .filter((l) => l['event'] === 'document.retry_later')
+          .map((l) => [l['reason'], l['counted'], l['retryLaterAttempt']]),
+      ).toEqual([
+        ['timeout', true, 1],
+        ['timeout', true, 2],
+        ['timeout', true, 3],
+      ]);
+      expect(lines.find((l) => l['event'] === 'document.filed')).toMatchObject({
+        review: true,
+        category: 'nieposortowane',
+        reviewReasons: ['RETRY_EXHAUSTED'],
+        unclassifiedReason: 'timeout',
+        retryLaterAttempts: MAX_RETRY_LATER_ATTEMPTS,
+        unclassified: true,
+        folder: '98_Nieposortowane/2026/09',
+      });
+
+      // Filed: the next send of the same bytes starts again.
+      const [again] = await real.ingestBatch(payload(['skan.pdf']), log);
+      expect(again?.error?.code).toBe(RETRY_LATER);
+    });
+
+    it.each([
+      [529, 'Overloaded'],
+      [429, 'Rate limited'],
+      [401, 'Unauthorized'],
+    ])('never files a document for a %i, however often it is sent', async (status, message) => {
+      const create = jest
+        .fn()
+        .mockRejectedValue(
+          Anthropic.APIError.generate(status, { type: 'error' }, message, new Headers()),
+        );
+      const { deps, sp } = setup(clientA);
+      const real = new BatchIngestor({ ...deps, classification: realClassification(create) });
+      const { log, lines } = recordingLogger();
+
+      for (let i = 0; i < MAX_RETRY_LATER_ATTEMPTS * 2; i += 1) {
+        const [result] = await real.ingestBatch(payload(), log);
+        expect(result?.error?.code).toBe(RETRY_LATER);
+      }
+      expect(sp.uploads).toEqual([]);
+      expect(
+        lines.filter((l) => l['event'] === 'document.retry_later').every((l) => !l['counted']),
+      ).toBe(true);
+    });
+  });
+
+  describe('the retry-later bound', () => {
+    const timeout: ClassificationOutcome = {
+      kind: 'retry_later',
+      classifier: 'claude',
+      reason: 'timeout',
+    };
+
+    function bytes(name: string, content: string) {
+      return {
+        ...payload(),
+        documents: [
+          {
+            filename: name,
+            contentType: 'application/pdf',
+            contentBase64: Buffer.from(content).toString('base64'),
+          },
+        ],
+      };
+    }
+
+    it('counts per client and per content, whatever the file is called', async () => {
+      const classify = jest.fn(async (): Promise<ClassificationOutcome> => timeout);
+      const { ingestor, deps, sp } = setup(clientA, { classify });
+      const log = recordingLogger().log;
+      const clientB: DirectoryClientResolution = {
+        ...clientA,
+        clientId: '0003',
+        listItemId: '12',
+        teamId: 'team-0003',
+        target: { ...clientTarget, sitePath: '/sites/ClientB' },
+      };
+
+      await ingestor.ingestBatch(bytes('a.pdf', 'A'), log);
+      await ingestor.ingestBatch(bytes('renamed.pdf', 'A'), log);
+      // Other bytes, and the same bytes for another client: their first.
+      const [other] = await ingestor.ingestBatch(bytes('b.pdf', 'B'), log);
+      (deps.resolver.resolve as jest.Mock).mockResolvedValueOnce(clientB);
+      const [forB] = await ingestor.ingestBatch(bytes('a.pdf', 'A'), log);
+      expect([other?.error?.code, forB?.error?.code]).toEqual([RETRY_LATER, RETRY_LATER]);
+      expect(sp.uploads).toEqual([]);
+
+      // The third send of A for client A reaches the bound.
+      const [third] = await ingestor.ingestBatch(bytes('a.pdf', 'A'), log);
+      expect(third?.status).toBe('uploaded');
+      expect(sp.uploads.map((u) => u.args.folderPath)).toEqual(['98_Nieposortowane/2026/09']);
+    });
+
+    it('starts again after a success, and after the window', async () => {
+      let now = Date.parse('2026-09-25T10:00:00Z');
+      const classify = jest
+        .fn()
+        .mockResolvedValueOnce(timeout)
+        .mockResolvedValueOnce(timeout)
+        .mockResolvedValueOnce(decided(invoice))
+        .mockResolvedValue(timeout);
+      const { ingestor, sp } = setup(clientA, { classify, now: () => new Date(now) });
+      const { log, lines } = recordingLogger();
+
+      await ingestor.ingestBatch(payload(), log);
+      await ingestor.ingestBatch(payload(), log);
+      const [filed] = await ingestor.ingestBatch(payload(), log);
+      expect(filed?.result?.folderPath).toBe('01_Faktury/02_Faktury_zakupu/2026/09');
+
+      await ingestor.ingestBatch(payload(), log);
+      await ingestor.ingestBatch(payload(), log);
+      now += RETRY_LATER_WINDOW_MS;
+      const [afterWindow] = await ingestor.ingestBatch(payload(), log);
+      expect(afterWindow?.error?.code).toBe(RETRY_LATER);
+      expect(sp.uploads).toHaveLength(1);
+      expect(
+        lines
+          .filter((l) => l['event'] === 'document.retry_later')
+          .map((l) => l['retryLaterAttempt']),
+      ).toEqual([1, 2, 1, 2, 1]);
     });
   });
 });

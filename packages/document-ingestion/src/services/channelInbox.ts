@@ -10,10 +10,12 @@ import {
 import {
   decisionLogFields,
   processingFailedDecision,
+  retryExhaustedDecision,
   type AcceptanceDecision,
 } from './acceptancePolicy';
 import type { ClassificationOutcome } from './classificationService';
 import { boundClientRows, type ClientDirectorySnapshot } from './clientDirectoryReader';
+import { doublingBackoff, RetryLaterBound } from './retryLaterBound';
 import {
   ContentTooLargeError,
   graphStatus,
@@ -63,6 +65,22 @@ export const CLASSIFICATION_CACHE_TTL_MS = 60 * 60 * 1000;
 
 /** Processing failures after which a file is sorted to review unclassified. */
 export const MAX_PROCESSING_ATTEMPTS = 3;
+
+/**
+ * "Retry later" answers a file's version may cause (a timeout, a 5xx, a lost
+ * connection) after which it is sorted to review with `RETRY_EXHAUSTED`
+ * (`retryLaterBound.ts`). 429, 529 and 401–404 never count.
+ */
+export const MAX_RETRY_LATER_ATTEMPTS = 5;
+
+/**
+ * The wait after a counted "retry later" before the file is read again:
+ * doubling from 10 minutes, at most 2 hours. With five attempts the fifth is
+ * about 2.5 hours after the first, long enough for an API incident to pass,
+ * and the file costs a tick's two 45 s attempts five times, not every tick.
+ */
+export const RETRY_LATER_BACKOFF_MS = 10 * 60 * 1000;
+export const RETRY_LATER_BACKOFF_MAX_MS = 2 * 60 * 60 * 1000;
 
 /** Files whose classification, failure count or log line are remembered at once. */
 const MAX_TRACKED_FILES = 1000;
@@ -131,6 +149,10 @@ export interface ChannelInboxDeps {
   readonly classificationCacheTtlMs?: number;
   /** Defaults to {@link MAX_PROCESSING_ATTEMPTS}. */
   readonly maxAttempts?: number;
+  /** Defaults to {@link MAX_RETRY_LATER_ATTEMPTS}. */
+  readonly maxRetryLaterAttempts?: number;
+  /** First backoff after a counted "retry later"; defaults to {@link RETRY_LATER_BACKOFF_MS}. */
+  readonly retryLaterBackoffMs?: number;
   readonly now?: () => Date;
   /** Injected in tests; defaults to the `ingestion/channelInbox` logger. */
   readonly log?: Logger;
@@ -156,9 +178,15 @@ export interface InboxTickSummary {
   readonly alreadyReported: number;
   /**
    * The classifier could not answer now (429, 529, 5xx, a timeout): left in
-   * the inbox for the next tick, not a failure, never sent to review.
+   * the inbox for a later tick, not a failure. Only a reason the file may
+   * cause (a timeout, a 5xx, a lost connection) counts towards its bound.
    */
   readonly retryLater: number;
+  /**
+   * Waiting out the backoff after a counted "retry later": not read, and not
+   * counted against the file budget.
+   */
+  readonly retryLaterWaiting: number;
   /**
    * Created, or last changed, by someone who is not a guest of this row's
    * Team; no creator id; or no such user: left untouched.
@@ -261,7 +289,10 @@ interface Tick {
  * copies, never deletes, never moves across drives and never overwrites. In
  * `shadow` it does everything but write, and logs what it would move once per
  * version of a file. A classifier that cannot answer now leaves the file for
- * the next tick. Logs carry ids, codes, counts and taxonomy paths only.
+ * a later tick; when the reason may be the file's own (a timeout, a 5xx), the
+ * file waits out a backoff, and after {@link MAX_RETRY_LATER_ATTEMPTS} such
+ * answers it goes to review (`RETRY_EXHAUSTED`) instead of being retried
+ * forever. Logs carry ids, codes, counts and taxonomy paths only.
  */
 export class ChannelInbox {
   private readonly log: Logger;
@@ -274,6 +305,8 @@ export class ChannelInbox {
   private readonly placements = new Map<string, CachedPlacement>();
   private readonly failures = new Map<string, number>();
   private readonly reportedSkips = new Set<string>();
+  /** Counted "retry later" answers, per (driveItemId, eTag). */
+  private readonly retryLaters: RetryLaterBound;
   /** Shadow: the (driveItemId, eTag) pairs whose `inbox.would_move` this worker logged. */
   private readonly reportedMoves = new Set<string>();
   /** The row to start the next tick with (its list item id). */
@@ -288,6 +321,13 @@ export class ChannelInbox {
     this.cacheTtlMs = deps.classificationCacheTtlMs ?? CLASSIFICATION_CACHE_TTL_MS;
     this.maxAttempts = deps.maxAttempts ?? MAX_PROCESSING_ATTEMPTS;
     this.onlyRows = deps.onlyRows?.length ? new Set(deps.onlyRows) : undefined;
+    this.retryLaters = new RetryLaterBound({
+      maxAttempts: deps.maxRetryLaterAttempts ?? MAX_RETRY_LATER_ATTEMPTS,
+      backoffMs: doublingBackoff(
+        deps.retryLaterBackoffMs ?? RETRY_LATER_BACKOFF_MS,
+        RETRY_LATER_BACKOFF_MAX_MS,
+      ),
+    });
   }
 
   get mode(): InboxSweepMode {
@@ -310,6 +350,7 @@ export class ChannelInbox {
         wouldMove: 0,
         alreadyReported: 0,
         retryLater: 0,
+        retryLaterWaiting: 0,
         skippedNotClient: 0,
         skippedUnverified: 0,
         skippedYoung: 0,
@@ -429,6 +470,11 @@ export class ChannelInbox {
         tick.counts.alreadyReported += 1;
         continue;
       }
+      // Nor does a version waiting out its backoff after a "retry later".
+      if (this.retryLaters.isWaiting(versionKey(candidate), this.now().getTime())) {
+        tick.counts.retryLaterWaiting += 1;
+        continue;
+      }
       if (this.outOfBudget(tick)) {
         tick.counts.deferred += 1;
         continue;
@@ -528,6 +574,12 @@ export class ChannelInbox {
       await this.sortUnclassified(ids, sharePoint, inbox, candidate, tick, { counted: false });
       return;
     }
+    // Reached its bound on an earlier tick, and the move did not happen then.
+    const exhausted = this.retryLaters.exhausted(versionKey(candidate), this.now().getTime());
+    if (exhausted) {
+      await this.sortRetryExhausted(ids, sharePoint, inbox, candidate, tick, exhausted);
+      return;
+    }
 
     let stage: Stage = 'check';
     try {
@@ -546,7 +598,7 @@ export class ChannelInbox {
         candidate.name,
         folderId,
       );
-      this.forget(driveItemId);
+      this.forget(candidate);
       const event = decision.review ? 'inbox.sorted_to_review' : 'inbox.filed';
       if (decision.review) tick.counts.sortedToReview += 1;
       else tick.counts.filed += 1;
@@ -561,6 +613,10 @@ export class ChannelInbox {
         event,
       );
     } catch (err) {
+      if (err instanceof ClassificationDeferred) {
+        await this.deferClassification(err, ids, sharePoint, inbox, candidate, tick);
+        return;
+      }
       if (this.leftForLater(err, tick, ids, candidate)) return;
       const attempt = attemptsBefore + 1;
       remember(this.failures, driveItemId, attempt);
@@ -586,12 +642,52 @@ export class ChannelInbox {
   }
 
   /**
+   * The classifier could not answer now: `inbox.retry_later` with the API's
+   * status, not a failure. A reason the file may cause counts towards its
+   * bound and starts a backoff; at the bound, the file is sorted to review
+   * with `RETRY_EXHAUSTED` (this tick if there is time, else the next).
+   */
+  private async deferClassification(
+    err: ClassificationDeferred,
+    ids: RowIds,
+    sharePoint: InboxSharePoint,
+    inbox: InboxFolder,
+    candidate: InboxCandidate,
+    tick: Tick,
+  ): Promise<void> {
+    tick.counts.retryLater += 1;
+    const nowMs = this.now().getTime();
+    const verdict = this.retryLaters.record(versionKey(candidate), err.reason, err.status, nowMs);
+    tick.log.warn(
+      {
+        event: 'inbox.retry_later',
+        clientId: ids.clientId,
+        listItemId: ids.listItemId,
+        driveItemId: candidate.item.id,
+        classifier: err.classifier,
+        reason: err.reason,
+        ...(err.status !== undefined ? { status: err.status } : {}),
+        counted: verdict.counted,
+        retryLaterAttempt: verdict.attempts,
+        maxRetryLaterAttempts: this.retryLaters.maxAttempts,
+        ...(verdict.notBefore !== undefined ? { retryAfterMs: verdict.notBefore - nowMs } : {}),
+      },
+      'inbox.retry_later',
+    );
+    if (verdict.exhausted) {
+      await this.sortRetryExhausted(ids, sharePoint, inbox, candidate, tick, {
+        attempts: verdict.attempts,
+        reason: err.reason,
+        ...(err.status !== undefined ? { status: err.status } : {}),
+      });
+    }
+  }
+
+  /**
    * Not failures, and never counted towards the review fallback: a file that
    * changed since it was listed (`skippedChanged`, logged once as
-   * `inbox.skipped` `changed`), one the tick has no time left for
-   * (`deferred`), and one the classifier could not answer for now
-   * (`retryLater`, logged as `inbox.retry_later` with the API's status). All
-   * are left where they are for the next tick.
+   * `inbox.skipped` `changed`) and one the tick has no time left for
+   * (`deferred`). Both are left where they are for the next tick.
    */
   private leftForLater(
     err: unknown,
@@ -607,22 +703,6 @@ export class ChannelInbox {
     if (err instanceof InboxItemChangedError) {
       tick.counts.skippedChanged += 1;
       this.reportSkipOnce(tick, ids, candidate, 'changed');
-      return true;
-    }
-    if (err instanceof ClassificationDeferred) {
-      tick.counts.retryLater += 1;
-      tick.log.warn(
-        {
-          event: 'inbox.retry_later',
-          clientId: ids.clientId,
-          listItemId: ids.listItemId,
-          driveItemId: candidate.item.id,
-          classifier: err.classifier,
-          reason: err.reason,
-          ...(err.status !== undefined ? { status: err.status } : {}),
-        },
-        'inbox.retry_later',
-      );
       return true;
     }
     return false;
@@ -712,6 +792,8 @@ export class ChannelInbox {
     }
     if (downloadFailure !== undefined) throw new StageFailure('download', downloadFailure);
     if (outcome.kind === 'retry_later') throw new ClassificationDeferred(outcome);
+    // Classified: earlier "retry later" answers no longer count.
+    this.retryLaters.forget(versionKey(candidate));
 
     remember(this.placements, candidate.item.id, {
       eTag: candidate.eTag,
@@ -721,11 +803,30 @@ export class ChannelInbox {
     return outcome.decision;
   }
 
+  /** At the retry-later bound: into review with `RETRY_EXHAUSTED` and the last status. */
+  private async sortRetryExhausted(
+    ids: RowIds,
+    sharePoint: InboxSharePoint,
+    inbox: InboxFolder,
+    candidate: InboxCandidate,
+    tick: Tick,
+    last: { readonly attempts: number; readonly reason: string; readonly status?: number },
+  ): Promise<void> {
+    await this.sortUnclassified(ids, sharePoint, inbox, candidate, tick, {
+      counted: false,
+      decision: retryExhaustedDecision(this.now(), last.reason),
+      extra: {
+        retryLaterAttempts: last.attempts,
+        ...(last.status !== undefined ? { status: last.status } : {}),
+      },
+    });
+  }
+
   /**
-   * After {@link MAX_PROCESSING_ATTEMPTS} failures: into
-   * `98_Nieposortowane/YYYY/MM` without classifying, so the inbox drains. If
-   * even that fails, the file stays and is logged. The same version check,
-   * `If-Match` and time limit apply as to any move.
+   * After {@link MAX_PROCESSING_ATTEMPTS} failures, or at the retry-later
+   * bound: into `98_Nieposortowane/YYYY/MM` without classifying, so the inbox
+   * drains. If even that fails, the file stays and is logged. The same version
+   * check, `If-Match` and time limit apply as to any move.
    */
   private async sortUnclassified(
     ids: RowIds,
@@ -733,12 +834,17 @@ export class ChannelInbox {
     inbox: InboxFolder,
     candidate: InboxCandidate,
     tick: Tick,
-    opts: { readonly counted: boolean },
+    opts: {
+      readonly counted: boolean;
+      readonly decision?: AcceptanceDecision;
+      readonly extra?: Record<string, unknown>;
+    },
   ): Promise<void> {
     const driveItemId = candidate.item.id;
-    const decision = processingFailedDecision(this.now());
+    const decision = opts.decision ?? processingFailedDecision(this.now());
+    const extra = { unclassified: true, ...opts.extra };
     if (this.deps.mode === 'shadow') {
-      this.reportWouldMove(tick, ids, candidate, decision, { unclassified: true });
+      this.reportWouldMove(tick, ids, candidate, decision, extra);
       return;
     }
     try {
@@ -750,7 +856,7 @@ export class ChannelInbox {
         candidate.name,
         folderId,
       );
-      this.forget(driveItemId);
+      this.forget(candidate);
       tick.counts.sortedToReview += 1;
       tick.log.info(
         {
@@ -759,7 +865,7 @@ export class ChannelInbox {
           driveItemId,
           ...decisionLogFields(decision),
           nameSuffix: moved.nameSuffix,
-          unclassified: true,
+          ...extra,
         },
         'inbox.sorted_to_review',
       );
@@ -781,9 +887,10 @@ export class ChannelInbox {
     }
   }
 
-  private forget(driveItemId: string): void {
-    this.placements.delete(driveItemId);
-    this.failures.delete(driveItemId);
+  private forget(candidate: InboxCandidate): void {
+    this.placements.delete(candidate.item.id);
+    this.failures.delete(candidate.item.id);
+    this.retryLaters.forget(versionKey(candidate));
   }
 
   private summary(tick: Tick): InboxTickSummary {

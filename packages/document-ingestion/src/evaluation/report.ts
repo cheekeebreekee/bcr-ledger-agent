@@ -32,7 +32,9 @@ export function goNoGo(summary: EvaluationSummary): GoNoGo {
   const d = summary.direction;
   const direction =
     !d || d.scored === 0 ? 'NOT MEASURED' : d.correct === d.scored ? 'PASS' : 'FAIL';
-  // A "retry later" is never filed, so none reached 98_; left over, the run is incomplete.
+  // A "retry later" is never filed, so none reached 98_; left over, the run is
+  // incomplete. A retry-exhausted document was filed for review by the bound,
+  // as production would: it is reported, and it does not hold the verdict.
   const transient = summary.retryLater === 0 ? 'PASS' : 'INCOMPLETE';
   return {
     category,
@@ -61,7 +63,7 @@ export function renderReport(
     '|---|---|---|',
     `| Category ≥ ${pct(CATEGORY_BAR)} of answered | ${verdict.category} | ${ratio(summary.category)} |`,
     `| Direction 100% when the client is a party | ${verdict.direction} | ${directionDetail(summary)} |`,
-    `| No transient error filed to 98_ | ${verdict.transient} | ${summary.retryLater} left as "retry later", none filed |`,
+    `| No transient error filed to 98_ | ${verdict.transient} | ${summary.retryLater} left as "retry later", none filed; ${summary.retryExhausted} retry exhausted (a timeout, 5xx or lost connection on every pass: filed for review) |`,
     `| Review rate (reported) | — | ${ratio(summary.review)} filed to 98_ |`,
     '',
     `**${verdict.go ? 'GO' : 'NO-GO'}**`,
@@ -69,7 +71,8 @@ export function renderReport(
     '## Totals',
     '',
     `- Documents: ${summary.documents}; answered by the model: ${summary.answered}; ` +
-      `no model answer (fallback): ${summary.noResult}; retry later: ${summary.retryLater}; ` +
+      `no model answer (fallback): ${summary.noResult}; retry exhausted: ${summary.retryExhausted}; ` +
+      `retry later: ${summary.retryLater}; ` +
       `unreadable: ${summary.unreadable}.`,
     `- Filed correctly: ${summary.filedCorrectly}; filed under a wrong category: ${summary.filedWrongly}.`,
     `- Month (documents whose truth has one): ${ratio(summary.month)}.`,
@@ -128,6 +131,8 @@ function resultOf(r: DocumentResult): string {
       return 'unreadable';
     case 'retry_later':
       return `retry later (${r.reason ?? ''}${r.status ? ` ${r.status}` : ''})`;
+    case 'retry_exhausted':
+      return `retry exhausted, review (${r.reason ?? ''}${r.status ? ` ${r.status}` : ''})`;
     case 'no_result':
       return `no model answer (${r.reason ?? 'unknown'})`;
     default:

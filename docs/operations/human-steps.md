@@ -2111,7 +2111,9 @@ changes only the ingestion app.
 the classifier moves to `claude-opus-5` with structured output; one acceptance threshold,
 `CLASSIFICATION_ACCEPT_THRESHOLD` (0.70–0.95), replaces `ANTHROPIC_CONFIDENCE_THRESHOLD` (0.6);
 a 429/529/5xx/timeout is "retry later" (the inbox leaves the file, the bot says send it again),
-never `98_`; a PDF over 100 pages is classified from its first 20; invoice direction comes only
+never `98_`, except a document that keeps timing out or getting a 5xx, which a bound files for
+review with `RETRY_EXHAUSTED` (the inbox's fifth such answer, about 2.5 h; the bot's third
+send); a PDF over 100 pages is classified from its first 20; invoice direction comes only
 from the client's own NIP or name (without it: review, `DIRECTION_UNRESOLVED`); the category
 rules from the 26 September evaluation; shadow logs each file once and no longer starves the
 budget; filing lines carry `confidence`, `model`, `month`, `reviewReasons` and the taxonomy
@@ -2165,7 +2167,7 @@ build is running. If gate G1 is lifted first, this release still goes first.
    |---|---|
    | Category accuracy | ≥ 95% of the documents the model answered |
    | Direction | 100% of the invoices where the client is a party: no `wrong`, and no `unresolved` either |
-   | Transient errors | None filed to `98_`: the report's "retry later" count is `0` (a document still "retry later" after the retry pass is not filed, but the run is incomplete: run it again) |
+   | Transient errors | None filed to `98_`: the report's "retry later" count is `0` (a document still "retry later" after the retry passes, a 429 or 529, is not filed, but the run is incomplete: run it again). A "retry exhausted" row is a document that timed out or got a 5xx on each of the three passes, scored as filed for review as the bot path would file it: read each one. A long scan is expected there; several, or short documents, mean an API incident: run again |
    | Review rate | Reported, and read by Roman: every `98_` row in the report has a reason |
 
    Record the verdict, the report's totals and its file's sha256 in the incident's status table.
@@ -2252,7 +2254,10 @@ build is running. If gate G1 is lifted first, this release still goes first.
    `inbox.retry_later` or `document.retry_later` now and then is the API being busy, and the
    file is simply taken on a later tick; on every tick for an hour, check
    [status.anthropic.com](https://status.anthropic.com), and `status` 401/403/404 means the key or
-   the model setting is wrong.
+   the model setting is wrong. A document that keeps timing out is not retried forever: its
+   `inbox.retry_later` lines carry `counted: true` and `retryLaterAttempt` 1 to 5, the file waits
+   10, 20, 40 and 80 minutes between them (`retryLaterWaiting` in `inbox.tick`), and the fifth
+   sorts it to `98_` (`inbox.sorted_to_review`, `reviewReasons` `RETRY_EXHAUSTED`, `status`).
 
 5. **Bicep: nothing to deploy.** The template already matches what now runs (step 4's clean
    comparison), so the first Bicep deploy after [Lifting gate G1](#lifting-gate-g1) keeps

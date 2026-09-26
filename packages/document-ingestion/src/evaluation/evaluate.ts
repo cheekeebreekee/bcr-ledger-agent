@@ -4,10 +4,12 @@ import {
   type ClassifierContext,
   type DocumentCategory,
 } from '@bcr/shared';
-import type { AcceptanceDecision } from '../services/acceptancePolicy';
+import { retryExhaustedDecision, type AcceptanceDecision } from '../services/acceptancePolicy';
+import { MAX_RETRY_LATER_ATTEMPTS } from '../services/batchIngestor';
 import type { ClassificationOutcome } from '../services/classificationService';
 import type { ClaudeUsage } from '../services/claudeClassifier';
 import { isDirectedInvoice } from '../services/invoiceDirection';
+import { RetryLaterBound } from '../services/retryLaterBound';
 import { INVOICE_FAMILY, type TruthEntry } from './truth';
 
 /** What classified one document: the real service, with a per-document usage sink. */
@@ -24,7 +26,11 @@ export interface RunOptions {
   readonly client?: { readonly nip: string; readonly companyName: string };
   /** Documents classified at once. Default 2. */
   readonly concurrency?: number;
-  /** Extra passes over documents that came back "retry later". Default 1. */
+  /**
+   * Extra passes over documents that came back "retry later". Default 2: with
+   * the first, as many sends as the bot path allows a document before it files
+   * it for review (`RETRY_EXHAUSTED`).
+   */
   readonly retryPasses?: number;
   readonly retryDelayMs?: number;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -37,12 +43,17 @@ export type DirectionVerdict = 'correct' | 'unresolved' | 'wrong' | 'not_scored'
 
 export interface DocumentResult {
   readonly truth: TruthEntry;
-  /** `answered`: the model classified it; `no_result`: the fallback did; the rest filed nothing. */
-  readonly outcome: 'answered' | 'no_result' | 'retry_later' | 'unreadable';
+  /**
+   * `answered`: the model classified it; `no_result`: the fallback did;
+   * `retry_exhausted`: a timeout, 5xx or lost connection on every pass up to
+   * the bot path's bound, so filed for review as production would; the rest
+   * filed nothing.
+   */
+  readonly outcome: 'answered' | 'no_result' | 'retry_exhausted' | 'retry_later' | 'unreadable';
   readonly decision?: AcceptanceDecision;
   /** The category the model suggested, before the policy (answered only). */
   readonly suggested?: string;
-  /** `retry_later` or `no_result`: the code. */
+  /** `retry_later`, `retry_exhausted` or `no_result`: the code. */
   readonly reason?: string;
   readonly status?: number;
   readonly categoryCorrect?: boolean;
@@ -61,19 +72,24 @@ export interface DocumentResult {
 /**
  * Classifies every labelled document with the real classification service
  * (Claude and the acceptance policy) and scores it. Documents that come back
- * "retry later" are tried again after a pause, up to `retryPasses` times;
- * whatever still is is reported as such, never as a classification.
+ * "retry later" are tried again after a pause, up to `retryPasses` times,
+ * each pass counting like a resend on the bot path: a document that gets a
+ * timeout, 5xx or lost connection on {@link MAX_RETRY_LATER_ATTEMPTS} passes
+ * is scored as filed for review (`RETRY_EXHAUSTED`), as the bot path would
+ * file it. Whatever is still "retry later" after the last pass (429, 529,
+ * too few passes) is reported as such, never as a classification.
  */
 export async function runEvaluation(opts: RunOptions): Promise<DocumentResult[]> {
   const results = new Map<string, DocumentResult>();
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const bound = new RetryLaterBound({ maxAttempts: MAX_RETRY_LATER_ATTEMPTS });
   let pending = [...opts.entries];
-  const passes = 1 + Math.max(0, opts.retryPasses ?? 1);
+  const passes = 1 + Math.max(0, opts.retryPasses ?? 2);
   let done = 0;
   for (let pass = 0; pass < passes && pending.length > 0; pass += 1) {
     if (pass > 0) await sleep(opts.retryDelayMs ?? 30_000);
     await pool(pending, Math.max(1, opts.concurrency ?? 2), async (entry) => {
-      results.set(entry.file, await classifyOne(entry, opts));
+      results.set(entry.file, await classifyOne(entry, opts, bound));
       if (pass === 0) opts.onProgress?.((done += 1), opts.entries.length);
     });
     pending = pending.filter((e) => results.get(e.file)?.outcome === 'retry_later');
@@ -81,7 +97,11 @@ export async function runEvaluation(opts: RunOptions): Promise<DocumentResult[]>
   return opts.entries.map((e) => results.get(e.file) as DocumentResult);
 }
 
-async function classifyOne(truth: TruthEntry, opts: RunOptions): Promise<DocumentResult> {
+async function classifyOne(
+  truth: TruthEntry,
+  opts: RunOptions,
+  bound: RetryLaterBound,
+): Promise<DocumentResult> {
   let content: Buffer;
   try {
     content = await opts.readDocument(truth.file);
@@ -94,6 +114,7 @@ async function classifyOne(truth: TruthEntry, opts: RunOptions): Promise<Documen
     usage.outputTokens += u.outputTokens;
     usage.model = u.model;
   });
+  const now = (opts.now ?? (() => new Date()))();
   const outcome = await service.classify(
     {
       filename: truth.file,
@@ -101,15 +122,15 @@ async function classifyOne(truth: TruthEntry, opts: RunOptions): Promise<Documen
       readContent: async () => content,
       ...(opts.client ? { client: opts.client } : {}),
     },
-    (opts.now ?? (() => new Date()))(),
+    now,
   );
   if (outcome.kind === 'retry_later') {
-    return {
-      ...blank(truth, 'retry_later'),
-      ...usage,
-      reason: outcome.reason,
-      ...(outcome.status !== undefined ? { status: outcome.status } : {}),
-    };
+    const status = outcome.status !== undefined ? { status: outcome.status } : {};
+    if (bound.record(truth.file, outcome.reason, outcome.status, now.getTime()).exhausted) {
+      const decision = retryExhaustedDecision(now, outcome.reason);
+      return { ...score(truth, decision, opts.client !== undefined), ...usage, ...status };
+    }
+    return { ...blank(truth, 'retry_later'), ...usage, reason: outcome.reason, ...status };
   }
   return { ...score(truth, outcome.decision, opts.client !== undefined), ...usage };
 }
@@ -140,10 +161,15 @@ export function score(
     outputTokens: 0,
     model: decision.model,
   };
-  if (decision.reviewReasons.includes('NOT_CLASSIFIED')) {
+  const unanswered = decision.reviewReasons.includes('NOT_CLASSIFIED')
+    ? 'no_result'
+    : decision.reviewReasons.includes('RETRY_EXHAUSTED')
+      ? 'retry_exhausted'
+      : undefined;
+  if (unanswered) {
     return {
       ...base,
-      outcome: 'no_result',
+      outcome: unanswered,
       ...(decision.unclassifiedReason ? { reason: decision.unclassifiedReason } : {}),
       direction: 'not_scored',
       filedCorrectly: false,
@@ -237,6 +263,8 @@ export interface EvaluationSummary {
   readonly documents: number;
   readonly answered: number;
   readonly noResult: number;
+  /** Filed for review after a timeout, 5xx or lost connection on every pass. */
+  readonly retryExhausted: number;
   readonly retryLater: number;
   readonly unreadable: number;
   readonly category: Ratio;
@@ -292,6 +320,7 @@ export function summarize(
     documents: results.length,
     answered: answered.length,
     noResult: results.filter((r) => r.outcome === 'no_result').length,
+    retryExhausted: results.filter((r) => r.outcome === 'retry_exhausted').length,
     retryLater: results.filter((r) => r.outcome === 'retry_later').length,
     unreadable: results.filter((r) => r.outcome === 'unreadable').length,
     category: { hit: answered.filter((r) => r.categoryCorrect).length, of: answered.length },

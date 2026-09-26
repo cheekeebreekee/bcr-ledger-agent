@@ -10,8 +10,11 @@ import Anthropic from '@anthropic-ai/sdk';
 import { AcceptancePolicy } from './acceptancePolicy';
 import {
   ChannelInbox,
+  CLASSIFICATION_CACHE_TTL_MS,
   CLASSIFY_RESERVE_MS,
   INBOX_TICK_HARD_LIMIT_MS,
+  MAX_RETRY_LATER_ATTEMPTS,
+  RETRY_LATER_BACKOFF_MS,
   WRITE_RESERVE_MS,
   selectCandidates,
   type ChannelInboxDeps,
@@ -1676,19 +1679,30 @@ describe('ChannelInbox: retry later', () => {
     expect(tenant.pathOf(id)).toContain('/01_Faktury/02_Faktury_zakupu/2026/09/');
   });
 
-  it('does not log would_move for a retry in shadow, and tries again next tick', async () => {
+  it('does not log would_move for a retry in shadow, and tries again after the backoff', async () => {
     const classify = jest
       .fn()
       .mockResolvedValueOnce({ outcome: 'retry_later', reason: 'timeout' })
       .mockResolvedValue(invoice);
+    let now = NOW;
     const { tenant, inbox, events } = setup({
       mode: 'shadow',
       classification: serviceOf({ name: 'claude', classify }),
+      deps: { now: () => now },
     });
     tenant.addFile('inbox-a', { name: 'faktura.pdf' });
 
     expect(await inbox.sweep()).toMatchObject({ retryLater: 1, wouldMove: 0 });
     expect(events('inbox.retry_later')[0]).not.toHaveProperty('status');
+    expect(events('inbox.retry_later')[0]).toMatchObject({
+      counted: true,
+      retryLaterAttempt: 1,
+      maxRetryLaterAttempts: MAX_RETRY_LATER_ATTEMPTS,
+      retryAfterMs: RETRY_LATER_BACKOFF_MS,
+    });
+    now = new Date(NOW.getTime() + 2 * 60_000);
+    expect(await inbox.sweep()).toMatchObject({ retryLaterWaiting: 1, wouldMove: 0 });
+    now = new Date(NOW.getTime() + RETRY_LATER_BACKOFF_MS);
     expect(await inbox.sweep()).toMatchObject({ retryLater: 0, wouldMove: 1 });
     expect(classify).toHaveBeenCalledTimes(2);
   });
@@ -1714,6 +1728,194 @@ describe('ChannelInbox: retry later', () => {
     for (let i = 0; i < 4; i += 1) await inbox.sweep();
 
     expect(tenant.pathOf(id)).toBe(`${CHANNEL}/faktura.pdf`);
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  // Review finding: a document that always times out (a long scan) was
+  // retried every tick forever, never reaching a person, and took about 90 s
+  // and a budget slot of every tick.
+  it('sorts a file that times out on every attempt to 98_ (RETRY_EXHAUSTED) after the bound, with a backoff', async () => {
+    const create = jest.fn().mockRejectedValue(new Anthropic.APIConnectionTimeoutError());
+    const claude = new ClaudeClassifier({
+      apiKey: 'k',
+      model: 'claude-opus-5',
+      maxContentBytes: 1024,
+      client: { messages: { create } } as never,
+      log: silent,
+    });
+    let now = NOW.getTime();
+    const { tenant, inbox, events } = setup({
+      classification: serviceOf(claude, new FallbackClassifier()),
+      deps: { now: () => new Date(now) },
+    });
+    const id = tenant.addFile('inbox-a', { name: 'skan.pdf' });
+
+    // A tick every 2 minutes for 3 hours.
+    const ticks: (InboxTickSummary & { minute: number })[] = [];
+    for (let minute = 0; minute <= 180; minute += 2) {
+      now = NOW.getTime() + minute * 60_000;
+      ticks.push({ ...(await inbox.sweep()), minute });
+    }
+
+    // Five attempts, 10, 20, 40 and 80 minutes apart; none in between.
+    expect(create).toHaveBeenCalledTimes(MAX_RETRY_LATER_ATTEMPTS);
+    expect(ticks.filter((t) => t.retryLater > 0).map((t) => t.minute)).toEqual([
+      0, 10, 30, 70, 150,
+    ]);
+    // Every other tick up to minute 150 waits: 76 ticks, 5 of them attempts.
+    expect(ticks.filter((t) => t.retryLaterWaiting > 0)).toHaveLength(76 - 5);
+    expect(ticks.every((t) => t.failed === 0 && t.filed === 0)).toBe(true);
+    expect(ticks.filter((t) => t.sortedToReview > 0).map((t) => t.minute)).toEqual([150]);
+    expect(
+      events('inbox.retry_later').map((l) => [l['reason'], l['counted'], l['retryLaterAttempt']]),
+    ).toEqual([1, 2, 3, 4, 5].map((n) => ['timeout', true, n]));
+    expect(events('inbox.failed')).toEqual([]);
+
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/98_Nieposortowane/2026/09/skan.pdf`);
+    expect(events('inbox.sorted_to_review')).toEqual([
+      expect.objectContaining({
+        driveItemId: id,
+        category: 'nieposortowane',
+        reviewReasons: ['RETRY_EXHAUSTED'],
+        unclassifiedReason: 'timeout',
+        retryLaterAttempts: MAX_RETRY_LATER_ATTEMPTS,
+        unclassified: true,
+        folder: '98_Nieposortowane/2026/09',
+      }),
+    ]);
+  });
+
+  it.each([
+    ['rate_limited', 429],
+    ['overloaded', 529],
+    ['unavailable', 401],
+  ])('never counts a %s (%i) against the file: no backoff, never 98_', async (reason, status) => {
+    const classify = jest.fn(async () => ({ outcome: 'retry_later' as const, reason, status }));
+    let now = NOW.getTime();
+    const { tenant, inbox, events } = setup({
+      classification: serviceOf({ name: 'claude', classify }, new FallbackClassifier()),
+      deps: { now: () => new Date(now) },
+    });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    const ticks = [];
+    for (let i = 0; i < MAX_RETRY_LATER_ATTEMPTS * 2; i += 1) {
+      now = NOW.getTime() + i * 2 * 60_000;
+      ticks.push(await inbox.sweep());
+    }
+
+    expect(classify).toHaveBeenCalledTimes(MAX_RETRY_LATER_ATTEMPTS * 2);
+    expect(ticks.every((t) => t.retryLater === 1 && t.retryLaterWaiting === 0)).toBe(true);
+    expect(ticks.every((t) => t.sortedToReview === 0 && t.failed === 0)).toBe(true);
+    expect(events('inbox.retry_later').every((l) => l['counted'] === false)).toBe(true);
+    expect(events('inbox.retry_later')[0]).toMatchObject({ retryLaterAttempt: 0 });
+    expect(events('inbox.retry_later')[0]).not.toHaveProperty('retryAfterMs');
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/faktura.pdf`);
+  });
+
+  it('spends no file budget on a file waiting out its backoff', async () => {
+    const classify = jest.fn(async (ctx: ClassifierContext) =>
+      ctx.filename === 'a.pdf' ? { outcome: 'retry_later' as const, reason: 'timeout' } : invoice,
+    );
+    let now = NOW.getTime();
+    const { tenant, inbox } = setup({
+      classification: serviceOf({ name: 'claude', classify }),
+      deps: { now: () => new Date(now), maxFilesPerTick: 1 },
+    });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+    const b = tenant.addFile('inbox-a', { name: 'b.pdf' });
+
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, deferred: 1, filed: 0 });
+    now += 2 * 60_000;
+    expect(await inbox.sweep()).toMatchObject({ retryLaterWaiting: 1, filed: 1, deferred: 0 });
+    expect(tenant.pathOf(b)).toContain('/01_Faktury/02_Faktury_zakupu/2026/09/');
+  });
+
+  it('forgets earlier timeouts once the file is classified', async () => {
+    const timeout = { outcome: 'retry_later', reason: 'timeout' };
+    const classify = jest
+      .fn()
+      .mockResolvedValueOnce(timeout)
+      .mockResolvedValueOnce(timeout)
+      .mockResolvedValueOnce(invoice)
+      .mockResolvedValueOnce(timeout)
+      .mockResolvedValue(invoice);
+    let now = NOW.getTime();
+    let failMove = true;
+    const { tenant, inbox, events } = setup({
+      classification: serviceOf({ name: 'claude', classify }),
+      deps: { now: () => new Date(now), maxRetryLaterAttempts: 3, retryLaterBackoffMs: 0 },
+    });
+    const id = tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.overrides.push([
+      new RegExp(`^PATCH .*/${id}$`),
+      (_c, next) => {
+        if (!failMove) return next();
+        failMove = false;
+        throw graphError(400);
+      },
+    ]);
+
+    await inbox.sweep();
+    await inbox.sweep();
+    // Classified on the third attempt, and the move fails: a failure.
+    expect(await inbox.sweep()).toMatchObject({ failed: 1, sortedToReview: 0 });
+    // The cached placement expires; the next timeout is the first again, not
+    // the third that would reach the bound.
+    now += CLASSIFICATION_CACHE_TTL_MS;
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, sortedToReview: 0 });
+    expect(events('inbox.retry_later').at(-1)).toMatchObject({ retryLaterAttempt: 1 });
+    expect(await inbox.sweep()).toMatchObject({ filed: 1, sortedToReview: 0 });
+    expect(events('inbox.sorted_to_review')).toEqual([]);
+  });
+
+  it('at the bound without time to move, moves it on the next tick without classifying again', async () => {
+    let now = NOW.getTime();
+    const classify = jest.fn(async () => {
+      now += INBOX_TICK_HARD_LIMIT_MS - WRITE_RESERVE_MS + 1;
+      return { outcome: 'retry_later' as const, reason: 'server_error', status: 500 };
+    });
+    const { tenant, inbox, events } = setup({
+      classification: serviceOf({ name: 'claude', classify }),
+      deps: { now: () => new Date(now), maxRetryLaterAttempts: 1 },
+    });
+    const id = tenant.addFile('inbox-a', { name: 'a.pdf' });
+
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, deferred: 1, sortedToReview: 0 });
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/a.pdf`);
+
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 0, sortedToReview: 1 });
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(tenant.pathOf(id)).toContain('/98_Nieposortowane/');
+    expect(events('inbox.sorted_to_review')[0]).toMatchObject({
+      reviewReasons: ['RETRY_EXHAUSTED'],
+      unclassifiedReason: 'server_error',
+      status: 500,
+      retryLaterAttempts: 1,
+    });
+  });
+
+  it('in shadow, reports a file at the bound once as would_move RETRY_EXHAUSTED, and writes nothing', async () => {
+    const classify = jest.fn(async () => ({ outcome: 'retry_later' as const, reason: 'timeout' }));
+    const { tenant, inbox, events } = setup({
+      mode: 'shadow',
+      classification: serviceOf({ name: 'claude', classify }),
+      deps: { maxRetryLaterAttempts: 2, retryLaterBackoffMs: 0 },
+    });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, wouldMove: 0 });
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 1, wouldMove: 1 });
+    expect(await inbox.sweep()).toMatchObject({ retryLater: 0, alreadyReported: 1 });
+    expect(classify).toHaveBeenCalledTimes(2);
+    expect(events('inbox.would_move')).toEqual([
+      expect.objectContaining({
+        review: true,
+        reviewReasons: ['RETRY_EXHAUSTED'],
+        unclassified: true,
+        retryLaterAttempts: 2,
+      }),
+    ]);
     expect(tenant.writes()).toEqual([]);
   });
 });
@@ -1930,6 +2132,7 @@ describe('ChannelInbox: logs', () => {
       wouldMove: 0,
       alreadyReported: 0,
       retryLater: 0,
+      retryLaterWaiting: 0,
       skippedNotClient: 0,
       skippedUnverified: 0,
       skippedYoung: 0,

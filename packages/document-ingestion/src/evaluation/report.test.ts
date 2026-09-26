@@ -6,6 +6,7 @@ function summary(over: Partial<EvaluationSummary> = {}): EvaluationSummary {
     documents: 40,
     answered: 40,
     noResult: 0,
+    retryExhausted: 0,
     retryLater: 0,
     unreadable: 0,
     category: { hit: 38, of: 40 },
@@ -166,9 +167,22 @@ describe('renderReport', () => {
       },
       { ...base, truth: { file: 'i.pdf', category: 'umowy', month: '' }, outcome: 'no_result' },
       { ...base, truth: { file: 'j.pdf', category: 'umowy', month: '' }, outcome: 'unreadable' },
+      {
+        ...base,
+        truth: { file: 'k.pdf', category: 'umowy', month: '' },
+        outcome: 'retry_exhausted',
+        reason: 'timeout',
+      },
+      {
+        ...base,
+        truth: { file: 'l.pdf', category: 'umowy', month: '' },
+        outcome: 'retry_exhausted',
+        reason: 'server_error',
+        status: 500,
+      },
     ];
 
-    const text = renderReport(summary({ retryLater: 2 }), results, meta);
+    const text = renderReport(summary({ retryLater: 2, retryExhausted: 2 }), results, meta);
 
     expect(text).toContain('# Classification evaluation — 2026-09-26 10:00 UTC');
     expect(text).toContain(
@@ -179,7 +193,8 @@ describe('renderReport', () => {
       '| Direction 100% when the client is a party | PASS | 10/10 correct, 0 unresolved, 0 wrong |',
     );
     expect(text).toContain(
-      '| No transient error filed to 98_ | INCOMPLETE | 2 left as "retry later", none filed |',
+      '| No transient error filed to 98_ | INCOMPLETE | 2 left as "retry later", none filed; ' +
+        '2 retry exhausted (a timeout, 5xx or lost connection on every pass: filed for review) |',
     );
     expect(text).toContain('**NO-GO**');
     expect(text).toContain('about $11.00 at list price for `claude-opus-5`');
@@ -189,6 +204,9 @@ describe('renderReport', () => {
     expect(text).toContain('review (category wrong)');
     expect(text).toContain('retry later (overloaded 529)');
     expect(text).toContain('retry later (timeout)');
+    expect(text).toContain('retry exhausted, review (timeout)');
+    expect(text).toContain('retry exhausted, review (server_error 500)');
+    expect(text).toContain('retry exhausted: 2; retry later: 2;');
     expect(text).toContain('no model answer (pdf_trim_failed)');
     expect(text).toContain('no model answer (unknown)');
     expect(text).toContain('| unreadable |');

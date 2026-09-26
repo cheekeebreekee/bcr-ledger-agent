@@ -1,7 +1,9 @@
 import type { Classification } from '@bcr/shared';
-import { AcceptancePolicy } from '../services/acceptancePolicy';
+import { AcceptancePolicy, retryExhaustedDecision } from '../services/acceptancePolicy';
+import { MAX_RETRY_LATER_ATTEMPTS } from '../services/batchIngestor';
 import type { ClassificationOutcome } from '../services/classificationService';
 import { contentTypeOf, runEvaluation, score, summarize, type DocumentResult } from './evaluate';
+import { goNoGo } from './report';
 import type { TruthEntry } from './truth';
 
 const NOW = new Date('2026-09-26T10:00:00.000Z');
@@ -30,6 +32,18 @@ const sale: TruthEntry = {
 };
 
 describe('score', () => {
+  it('scores a retry-exhausted document as unanswered, never as a wrong category', () => {
+    const r = score(sale, retryExhaustedDecision(NOW, 'server_error'), true);
+    expect(r).toMatchObject({
+      outcome: 'retry_exhausted',
+      reason: 'server_error',
+      direction: 'not_scored',
+      filedCorrectly: false,
+      filedWrongly: false,
+    });
+    expect(r).not.toHaveProperty('categoryCorrect');
+  });
+
   it('counts a sale filed as a sale, in its month, as correct', () => {
     const r = score(
       sale,
@@ -214,6 +228,63 @@ describe('runEvaluation', () => {
     expect(calls).toEqual(['a.txt', 'b.txt', 'b.txt']);
     expect(sleeps).toEqual([5]);
     expect(progress).toEqual([1, 2, 3]);
+  });
+
+  // Review finding: a document that always timed out stayed "retry later"
+  // on every run, so the release could never reach GO, although production
+  // files it for review at the bound.
+  it('scores a document that times out on every pass as filed for review, as the bot path would', async () => {
+    const calls: string[] = [];
+    const sleeps: number[] = [];
+    const run = (files: string[]) =>
+      runEvaluation({
+        entries: files.map((file) => ({ file, category: 'umowy', month: '' })),
+        readDocument: async (file) => Buffer.from(file),
+        makeService: () => ({
+          classify: async (ctx): Promise<ClassificationOutcome> => {
+            calls.push(ctx.filename);
+            if (ctx.filename === 'slow.pdf') {
+              return { kind: 'retry_later', classifier: 'claude', reason: 'timeout' };
+            }
+            if (ctx.filename === 'busy.pdf') {
+              return {
+                kind: 'retry_later',
+                classifier: 'claude',
+                reason: 'overloaded',
+                status: 529,
+              };
+            }
+            return { kind: 'decided', decision: decide({ category: 'umowy' }) };
+          },
+        }),
+        concurrency: 1,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+        now: () => NOW,
+      });
+
+    const results = await run(['ok.pdf', 'slow.pdf', 'busy.pdf']);
+
+    // The default is two retry passes: as many sends as the bot path allows.
+    expect(calls.filter((c) => c === 'slow.pdf')).toHaveLength(MAX_RETRY_LATER_ATTEMPTS);
+    expect(sleeps).toEqual([30_000, 30_000]);
+    expect(results.map((r) => [r.truth.file, r.outcome])).toEqual([
+      ['ok.pdf', 'answered'],
+      ['slow.pdf', 'retry_exhausted'],
+      ['busy.pdf', 'retry_later'],
+    ]);
+    expect(results[1]).toMatchObject({
+      reason: 'timeout',
+      decision: { review: true, reviewReasons: ['RETRY_EXHAUSTED'] },
+      filedWrongly: false,
+    });
+    const summary = summarize(results, false);
+    expect(summary).toMatchObject({ answered: 1, retryExhausted: 1, retryLater: 1 });
+    expect(summary.review).toEqual({ hit: 1, of: 2 });
+    // A 529 left over still makes the run incomplete; the exhausted one does not.
+    expect(goNoGo(summary).transient).toBe('INCOMPLETE');
+    expect(goNoGo(summarize(await run(['ok.pdf', 'slow.pdf']), false)).transient).toBe('PASS');
   });
 
   it('passes the client identity and the content type, and runs with its defaults', async () => {

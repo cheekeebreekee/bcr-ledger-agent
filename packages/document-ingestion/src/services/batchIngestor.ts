@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   LedgerAgentError,
   ValidationError,
@@ -12,9 +12,14 @@ import {
   type ResolvedClient,
   type SharePointTarget,
 } from '@bcr/shared';
-import { decisionLogFields } from './acceptancePolicy';
+import {
+  decisionLogFields,
+  retryExhaustedDecision,
+  type AcceptanceDecision,
+} from './acceptancePolicy';
 import type { ClassificationOutcome } from './classificationService';
 import type { ClientResolver } from './clientResolver';
+import { RetryLaterBound, type RetryLaterLast } from './retryLaterBound';
 import { SharePointTargetError, type SharePointService } from './sharePointService';
 
 /**
@@ -31,6 +36,18 @@ export const BATCH_DEADLINE_MS = 150_000;
  * a timeout). Such a document is never filed, not even for review.
  */
 export const RETRY_LATER = 'RetryLater';
+
+/**
+ * "Retry later" answers the same document (same client, same bytes) may get
+ * for a reason it may cause itself (a timeout, a 5xx, a lost connection)
+ * before it is filed for review with `RETRY_EXHAUSTED` instead: the third
+ * send of a document the model cannot read in time is filed, not refused
+ * again. 429, 529 and 401–404 never count (`retryLaterBound.ts`).
+ */
+export const MAX_RETRY_LATER_ATTEMPTS = 3;
+
+/** How long those answers are remembered, from the first. */
+export const RETRY_LATER_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** Where documents are written, as a narrow interface so tests can supply fakes. */
 export interface SharePointFactoryLike {
@@ -60,6 +77,8 @@ export interface BatchIngestorDeps {
   readonly newId?: () => string;
   /** Defaults to {@link BATCH_DEADLINE_MS}. */
   readonly batchDeadlineMs?: number;
+  /** Defaults to {@link MAX_RETRY_LATER_ATTEMPTS}. */
+  readonly maxRetryLaterAttempts?: number;
 }
 
 /**
@@ -77,17 +96,28 @@ export interface BatchIngestorDeps {
  * never blocks the rest. A document not started within the batch deadline, or
  * one the classifier could not answer for now, is returned `rejected` with
  * {@link RETRY_LATER}: never filed late, and never filed for review because
- * the model was overloaded.
+ * the model was overloaded. Only a document that keeps getting a "retry
+ * later" it may cause itself is, at the {@link MAX_RETRY_LATER_ATTEMPTS}-th
+ * send, filed for review (`RETRY_EXHAUSTED`) rather than refused forever.
  */
 export class BatchIngestor {
   private readonly now: () => Date;
   private readonly newId: () => string;
   private readonly deadlineMs: number;
+  /**
+   * Counted "retry later" answers per client row and content hash. In memory
+   * on this worker: a resend that reaches another worker starts again there.
+   */
+  private readonly retryLaters: RetryLaterBound;
 
   constructor(private readonly deps: BatchIngestorDeps) {
     this.now = deps.now ?? (() => new Date());
     this.newId = deps.newId ?? randomUUID;
     this.deadlineMs = deps.batchDeadlineMs ?? BATCH_DEADLINE_MS;
+    this.retryLaters = new RetryLaterBound({
+      maxAttempts: deps.maxRetryLaterAttempts ?? MAX_RETRY_LATER_ATTEMPTS,
+      windowMs: RETRY_LATER_WINDOW_MS,
+    });
   }
 
   async ingestBatch(
@@ -220,7 +250,18 @@ export class BatchIngestor {
       },
       at,
     );
+    // Hashed only when a "retry later" is, or was, in play.
+    let key: string | undefined;
+    const keyOf = () => (key ??= retryKey(client, content));
+    let decision: AcceptanceDecision;
+    let exhausted: RetryLaterLast | undefined;
     if (outcome.kind === 'retry_later') {
+      const verdict = this.retryLaters.record(
+        keyOf(),
+        outcome.reason,
+        outcome.status,
+        at.getTime(),
+      );
       docLog.warn(
         {
           event: 'document.retry_later',
@@ -229,16 +270,28 @@ export class BatchIngestor {
           classifier: outcome.classifier,
           reason: outcome.reason,
           ...(outcome.status !== undefined ? { status: outcome.status } : {}),
+          counted: verdict.counted,
+          retryLaterAttempt: verdict.attempts,
+          maxRetryLaterAttempts: this.retryLaters.maxAttempts,
         },
         'document.retry_later',
       );
-      return {
-        filename: document.filename,
-        status: 'rejected',
-        error: { code: RETRY_LATER, message: rejectionMessage(RETRY_LATER) },
+      if (!verdict.exhausted) {
+        return {
+          filename: document.filename,
+          status: 'rejected',
+          error: { code: RETRY_LATER, message: rejectionMessage(RETRY_LATER) },
+        };
+      }
+      exhausted = {
+        attempts: verdict.attempts,
+        reason: outcome.reason,
+        ...(outcome.status !== undefined ? { status: outcome.status } : {}),
       };
+      decision = retryExhaustedDecision(at, outcome.reason);
+    } else {
+      decision = outcome.decision;
     }
-    const { decision } = outcome;
 
     const item = await this.deps.clientSharePointFactory.forTarget(client.target).uploadDocument({
       folderPath: decision.folderPath,
@@ -246,6 +299,8 @@ export class BatchIngestor {
       contentType: document.contentType,
       content,
     });
+    // Filed, for review or not: its earlier "retry later" answers are spent.
+    if (this.retryLaters.size > 0) this.retryLaters.forget(keyOf());
     docLog.info(
       {
         event: 'document.filed',
@@ -254,6 +309,13 @@ export class BatchIngestor {
         driveItemId: item.id,
         review: decision.review,
         ...decisionLogFields(decision),
+        ...(exhausted
+          ? {
+              unclassified: true,
+              retryLaterAttempts: exhausted.attempts,
+              ...(exhausted.status !== undefined ? { status: exhausted.status } : {}),
+            }
+          : {}),
       },
       'document.filed',
     );
@@ -336,6 +398,11 @@ interface BatchContext {
   readonly batchId: string;
   readonly uploaderOid: string;
   readonly log: Logger;
+}
+
+/** One document of one client: the row and a hash of the bytes, never a name. */
+function retryKey(client: DirectoryClientResolution, content: Buffer): string {
+  return `${client.listItemId}|${createHash('sha256').update(content).digest('hex')}`;
 }
 
 /**

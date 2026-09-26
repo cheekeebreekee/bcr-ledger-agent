@@ -3,6 +3,7 @@ import {
   AcceptancePolicy,
   decisionLogFields,
   processingFailedDecision,
+  retryExhaustedDecision,
   reviewFolderPath,
 } from './acceptancePolicy';
 
@@ -206,6 +207,30 @@ describe('processingFailedDecision', () => {
       model: '',
       month: '',
       reviewReasons: ['PROCESSING_FAILED'],
+    });
+  });
+});
+
+describe('retryExhaustedDecision', () => {
+  it('is review, unclassified, for this month, with the last retry-later reason', () => {
+    const decision = retryExhaustedDecision(NOW, 'timeout');
+    expect(decision).toEqual({
+      review: true,
+      category: 'nieposortowane',
+      documentType: 'Nieposortowane',
+      folderPath: '98_Nieposortowane/2026/09',
+      confidence: 0,
+      classifier: '',
+      model: '',
+      month: '',
+      reviewReasons: ['RETRY_EXHAUSTED'],
+      unclassifiedReason: 'timeout',
+    });
+    expect(decisionLogFields(decision)).toMatchObject({
+      category: 'nieposortowane',
+      reviewReasons: ['RETRY_EXHAUSTED'],
+      unclassifiedReason: 'timeout',
+      folder: '98_Nieposortowane/2026/09',
     });
   });
 });

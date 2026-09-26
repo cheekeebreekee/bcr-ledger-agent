@@ -120,7 +120,7 @@ async function runCommand(argv: readonly string[], deps: CliDeps): Promise<numbe
     makeService,
     ...(client ? { client } : {}),
     concurrency: wholeNumber(values.concurrency, 2, 1, 4, '--concurrency'),
-    retryPasses: wholeNumber(values['retry-passes'], 1, 0, 5, '--retry-passes'),
+    retryPasses: wholeNumber(values['retry-passes'], 2, 0, 5, '--retry-passes'),
     retryDelayMs: wholeNumber(values['retry-delay-ms'], 30_000, 0, 600_000, '--retry-delay-ms'),
     ...(deps.sleep ? { sleep: deps.sleep } : {}),
     ...(deps.now ? { now: deps.now } : {}),
@@ -141,6 +141,7 @@ async function runCommand(argv: readonly string[], deps: CliDeps): Promise<numbe
   deps.stderr(
     `\ncategory ${summary.category.hit}/${summary.category.of} (${verdict.category}), ` +
       `direction ${verdict.direction}, retry later ${summary.retryLater}, ` +
+      `retry exhausted ${summary.retryExhausted}, ` +
       `review ${summary.review.hit}/${summary.review.of}, ` +
       `tokens ${summary.inputTokens}/${summary.outputTokens}: ${verdict.go ? 'GO' : 'NO-GO'}` +
       `${values.out ? `; report written to ${values.out}` : ''}\n`,

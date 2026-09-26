@@ -18,6 +18,9 @@ import { DIRECTION_UNRESOLVED, isDirectedInvoice } from './invoiceDirection';
  *  - `NOT_CLASSIFIED`: no classifier had an answer (Claude off, an
  *    unsupported or oversize file, a 400, malformed output, a refusal);
  *  - `PROCESSING_FAILED`: the channel inbox gave up after repeated failures;
+ *  - `RETRY_EXHAUSTED`: the classifier answered "retry later" for a reason
+ *    the document may cause (a timeout, a 5xx, a lost connection) up to the
+ *    bound (`retryLaterBound.ts`); never for a 429, 529 or 401–404;
  *  - `UNKNOWN_CATEGORY`: a category the taxonomy does not have;
  *  - `MODEL_UNSORTED`: the model itself chose `nieposortowane`;
  *  - `DIRECTION_UNRESOLVED`: a sales or purchase invoice not tied to the
@@ -28,6 +31,7 @@ import { DIRECTION_UNRESOLVED, isDirectedInvoice } from './invoiceDirection';
 export type ReviewReason =
   | 'NOT_CLASSIFIED'
   | 'PROCESSING_FAILED'
+  | 'RETRY_EXHAUSTED'
   | 'UNKNOWN_CATEGORY'
   | 'MODEL_UNSORTED'
   | 'DIRECTION_UNRESOLVED'
@@ -37,6 +41,7 @@ export type ReviewReason =
 const REASON_ORDER: readonly ReviewReason[] = [
   'NOT_CLASSIFIED',
   'PROCESSING_FAILED',
+  'RETRY_EXHAUSTED',
   'UNKNOWN_CATEGORY',
   'MODEL_UNSORTED',
   'DIRECTION_UNRESOLVED',
@@ -71,7 +76,10 @@ export interface AcceptanceDecision {
   readonly reviewReasons: readonly ReviewReason[];
   /** On review: the category the classifier suggested, when it named a real one. */
   readonly suggestedCategory?: DocumentCategory;
-  /** With `NOT_CLASSIFIED`: why the model had no answer (`pdf_trim_failed`, …). */
+  /**
+   * With `NOT_CLASSIFIED`: why the model had no answer (`pdf_trim_failed`, …).
+   * With `RETRY_EXHAUSTED`: the last retry-later reason (`timeout`, …).
+   */
   readonly unclassifiedReason?: string;
 }
 
@@ -165,13 +173,26 @@ export class AcceptancePolicy {
  * unclassified, for the month of `now`.
  */
 export function processingFailedDecision(now: Date): AcceptanceDecision {
+  return unclassifiedDecision(now, 'PROCESSING_FAILED');
+}
+
+/**
+ * A document the classifier kept answering "retry later" for, for a reason
+ * the document may cause, up to the bound: review, unclassified, for the month
+ * of `now`, with the last reason (`timeout`, `server_error`, `connection`).
+ */
+export function retryExhaustedDecision(now: Date, lastReason: string): AcceptanceDecision {
+  return { ...unclassifiedDecision(now, 'RETRY_EXHAUSTED'), unclassifiedReason: lastReason };
+}
+
+function unclassifiedDecision(now: Date, reason: ReviewReason): AcceptanceDecision {
   return {
     ...reviewPlacement(now),
     confidence: 0,
     classifier: '',
     model: '',
     month: '',
-    reviewReasons: ['PROCESSING_FAILED'],
+    reviewReasons: [reason],
   };
 }
 
