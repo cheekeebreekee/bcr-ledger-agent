@@ -9,7 +9,8 @@
  *
  * Both the AI classifier and the deterministic fallback build paths through
  * {@link buildFolderPath}, so they can never drift apart. The same
- * {@link categoryCatalog} also drives the Claude prompt and tool schema.
+ * {@link categoryCatalog} also drives the Claude prompt (the descriptions are
+ * the model's classification rules) and the output schema's category enum.
  */
 
 /** Stable identifiers for every routable category. */
@@ -63,9 +64,14 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     dated: true,
     polishLabel: 'Faktura sprzedaży',
     description:
-      'Faktura, na której KLIENT jest sprzedawcą/wystawcą (sprzedaje towar lub usługę). ' +
-      'Dane sprzedawcy zgadzają się z nazwą i NIP klienta.',
-    examples: ['Faktura VAT wystawiona przez klienta dla kontrahenta'],
+      'Faktura, na której KLIENT jest sprzedawcą/wystawcą (sprzedaje towar lub usługę): ' +
+      'dane sprzedawcy zgadzają się z nazwą lub NIP klienta. Dowolna postać faktury: ' +
+      'VAT, KSeF, zaliczkowa, rozliczeniowa, uproszczona (także paragon fiskalny z NIP-em ' +
+      'nabywcy, do 450 zł) i zagraniczna (invoice, factuur, Rechnung), jeśli wskazuje nabywcę.',
+    examples: [
+      'Faktura VAT wystawiona przez klienta dla kontrahenta',
+      'Faktura eksportowa usług z odwrotnym obciążeniem',
+    ],
   },
   {
     id: 'faktury_zakupu',
@@ -73,9 +79,16 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     dated: true,
     polishLabel: 'Faktura zakupu',
     description:
-      'Faktura, na której KLIENT jest nabywcą/kupującym. Dane nabywcy zgadzają się ' +
-      'z nazwą i NIP klienta, a sprzedawcą jest inny podmiot.',
-    examples: ['Faktura kosztowa od dostawcy', 'Faktura za usługi obce'],
+      'Faktura, na której KLIENT jest nabywcą/kupującym: dane nabywcy zgadzają się z nazwą ' +
+      'lub NIP klienta, a sprzedawcą jest inny podmiot. Dowolna postać faktury: VAT, KSeF, ' +
+      'zaliczkowa, rozliczeniowa, uproszczona (także paragon fiskalny z NIP-em nabywcy, do ' +
+      '450 zł) i zagraniczna (invoice, factuur, Rechnung, bilet, rachunek hotelowy), jeśli ' +
+      'wskazuje nabywcę.',
+    examples: [
+      'Faktura kosztowa od dostawcy',
+      'Paragon fiskalny z NIP-em nabywcy',
+      'Zagraniczna faktura za hotel lub bilet wystawiona na klienta',
+    ],
   },
   {
     id: 'faktury_korekty',
@@ -94,8 +107,14 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     polishLabel: 'Nota / dowód księgowy',
     description:
       'Nota księgowa, nota obciążeniowa/uznaniowa, polecenie księgowania lub inny ' +
-      'dowód księgowy niebędący fakturą VAT.',
-    examples: ['Nota księgowa', 'Nota obciążeniowa', 'Dowód wewnętrzny PK'],
+      'dowód księgowy niebędący fakturą VAT. Także paragon, potwierdzenie płatności kartą ' +
+      'i zagraniczny paragon (klantenbon, receipt, Kassenbon) BEZ danych nabywcy.',
+    examples: [
+      'Nota księgowa',
+      'Nota obciążeniowa',
+      'Dowód wewnętrzny PK',
+      'Paragon ze stacji paliw bez danych nabywcy',
+    ],
   },
   {
     id: 'wyciagi_bankowe',
@@ -121,9 +140,10 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     dated: false,
     polishLabel: 'Umowa',
     description:
-      'Umowa handlowa, umowa z kontrahentem, aneks do umowy (z wyłączeniem umów ' +
+      'Umowa handlowa, umowa z kontrahentem, aneks do umowy, polisa ubezpieczeniowa ' +
+      'oraz ogólne warunki ubezpieczenia (OWU) i warunki polisy (z wyłączeniem umów ' +
       'o pracę, które trafiają do kadr).',
-    examples: ['Umowa najmu', 'Umowa o współpracy', 'Aneks do umowy'],
+    examples: ['Umowa najmu', 'Umowa o współpracy', 'Aneks do umowy', 'Polisa OC', 'OWU'],
   },
   {
     id: 'dokumenty_firmowe',
@@ -210,8 +230,8 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     polishLabel: 'Inne',
     description:
       'Dokument rozpoznany jako księgowy/firmowy, ale niepasujący do żadnej ' +
-      'z powyższych kategorii.',
-    examples: ['Dokument niepasujący do pozostałych kategorii'],
+      'z powyższych kategorii. Także faktura pro forma, która nie jest dowodem księgowym.',
+    examples: ['Faktura pro forma', 'Dokument niepasujący do pozostałych kategorii'],
   },
   {
     id: 'nieposortowane',
