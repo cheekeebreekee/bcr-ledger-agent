@@ -197,7 +197,7 @@ traces
 | project timestamp, itemCount, operation_Id, msg,
     invocationId = tostring(m.invocationId), conversationId = tostring(m.conversationId),
     activityId = tostring(m.activityId), userAadObjectId = tostring(m.userAadObjectId),
-    clientId = tostring(m.clientId), title = tostring(m.title),
+    clientId = tostring(m.clientId), title = tostring(m['title']),
     resolution = tostring(m.resolution), matchedBy = tostring(m.matchedBy),
     sitePath = tostring(m.sitePath), promotedFromFallback = tobool(m.promotedFromFallback),
     directionCorrection = tostring(m.directionCorrection),

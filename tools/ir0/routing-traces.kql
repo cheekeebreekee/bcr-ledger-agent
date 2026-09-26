@@ -64,7 +64,9 @@ traces
     userObjectId = tostring(j.userObjectId),
     source = tostring(j.source),
     clientId = tostring(j.clientId),
-    title = tostring(j.title),
+    // j['title'], not j.title: the query API refuses the dotted form with
+    // "The request had some invalid properties".
+    title = tostring(j['title']),
     resolution = tostring(j.resolution),
     matchedBy = tostring(j.matchedBy),
     siteHostname = tostring(j.siteHostname),
