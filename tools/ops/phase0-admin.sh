@@ -132,7 +132,16 @@ step_quarantine() {
 # --- membership read for the ingestion identity ------------------------------------
 step_membership() {
   local s=infrastructure/identity/grant-ingestion-membership-read.sh
-  [[ -x $s || -f $s ]] || die "$s is not on this branch yet"
+  [[ -f $s ]] || die "$s is not on this branch yet"
+  # Your own az login's Graph token already carries AppRoleAssignment.ReadWrite.All,
+  # so no further consent is needed. It stays in the environment of this run only.
+  if [[ -z ${GRAPH_TOKEN:-} ]]; then
+    GRAPH_TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
+    export GRAPH_TOKEN
+  fi
+  echo 'Grant the ingestion managed identity Directory.Read.All (application, read-only),'
+  echo 'which the upload-time Team-membership check needs. Do it >= 24 h before H-12:'
+  echo 'a managed identity picks up a new role only when its cached token expires.'
   bash "$s" --resource-group "$RG" --function-app "$INGEST"
   ask 'Apply the grant shown above?' || return 0
   bash "$s" --resource-group "$RG" --function-app "$INGEST" --apply

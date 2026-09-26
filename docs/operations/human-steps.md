@@ -881,10 +881,16 @@ exactly one app role, `Directory.Read.All` on Microsoft Graph, to exactly one pr
 Function App's system-assigned managed identity. It refuses any principal that is not a managed
 identity, and it removes nothing.
 
+**The short route:** `tools/ops/phase0-admin.sh membership` runs the dry run, asks, then
+`--apply`, with your own `az` login's Graph token as `GRAPH_TOKEN`. On 26 September that token's
+`scp` carried `AppRoleAssignment.ReadWrite.All` and `Directory.AccessAsUser.All`, which is what
+the script checks for **[verify]** on the first `--apply`. If Graph refuses it, use the
+route below.
+
 **Tokens.** `az`, signed in as for the Variables above, is used only to read the Function App's
-identity. Every Graph call uses `GRAPH_TOKEN`, the delegated token from H-4a's registration,
-because the Azure CLI's own token cannot write app role assignments in this tenant
-(`AADSTS65002`). The dry run needs only what H-4a consented (`Directory.Read.All`). `--apply` also needs
+identity. Every Graph call uses `GRAPH_TOKEN`: your `az` Graph token (the short route above), or
+the delegated token from H-4a's registration. The Azure CLI app cannot be given new scopes in this
+tenant (`AADSTS65002`), so if its token lacks `AppRoleAssignment.ReadWrite.All`, use H-4a's. The dry run needs only what H-4a consented (`Directory.Read.All`). `--apply` also needs
 `AppRoleAssignment.ReadWrite.All` consented on that registration, and a token of the Global
 Admin: the script refuses `--apply` without that scope. If you would rather not consent it, use
 Graph Explorer as in [`admin-sharepoint-grant.md`](../admin-sharepoint-grant.md) Step 1, with the
