@@ -40,7 +40,7 @@ entries are recorded for deletion.
 |---|---|---|---|
 | `bot-app-password` | Key Vault; **also plaintext in developers' `.env` files** | The bot, as `MICROSOFT_APP_PASSWORD` | Rotation deferred ([accepted](#accepted-risks)). Phase 3 replaces it with a federated credential. |
 | `anthropic-api-key` | Key Vault; **also plaintext in developers' `.env` files** | Ingestion, as `ANTHROPIC_API_KEY` | Rotation deferred ([accepted](#accepted-risks)). |
-| Storage account key | **In plain text in the `AzureWebJobsStorage` app setting** of both apps (`functionApp.bicep` reads it with `listKeys()`) | The Functions runtime | `az functionapp config appsettings set` prints it unless you pass `-o none`. The fix is identity-based storage access. It is not yet in the plan. The Bicep drift fix (G1) only records what runs, so it is a change of its own. |
+| Storage account key | **In plain text in the `AzureWebJobsStorage` app setting** of both apps (`functionApp.bicep` reads it with `listKeys()`) | The Functions runtime | `az functionapp config appsettings set` prints it unless you pass `-o none`. The fix is identity-based storage access, or at least a Key Vault reference: [follow-up F1](#follow-ups-from-the-g1-review). The Bicep drift fix (G1) only records what runs, so it is a change of its own. |
 | Function keys | Azure platform | Not used | Functions are `authLevel: 'anonymous'`; each handler checks the JWT itself. |
 
 Everything else in the app settings is configuration, not a secret. Key Vault values reach the
@@ -217,9 +217,9 @@ registry whose bindings cannot change without two approvals.
 
 Both managed identities hold *Key Vault Secrets User* at resource-group scope (`main.bicep`). So
 each can read every secret: the ingestion identity can read the bot's secret, and the bot can
-read the Anthropic key. **Status: Phase 1**, after the Bicep drift fix (gate G1, which only records what runs): assignments per
-secret and at vault scope, and an audit check that no Key Vault assignment exists at
-resource-group scope.
+read the Anthropic key. **Status: Phase 1**, after the Bicep drift fix (gate G1, which only
+records what runs): assignments per secret, and an audit check that no Key Vault assignment
+exists at resource-group scope. Recorded as [follow-up F2](#follow-ups-from-the-g1-review).
 
 ### T12. Public data planes
 
@@ -397,6 +397,32 @@ keeps them in place) and what the client is told.
   dependencies at the `yarn.lock` versions and install scripts disabled; packaging fails on a
   compiled file with no source behind it.
 
+### Follow-ups from the G1 review
+
+Recorded, **not implemented**. G1 makes the template record what runs; each item below changes
+what runs, so each is a change of its own, rehearsed on a throwaway resource group first as in
+[Lifting gate G1](operations/human-steps.md#lifting-gate-g1) (G1-a), and never tried on dev
+first.
+
+- **F1. `AzureWebJobsStorage` without the account key.** `modules/functionApp.bicep` builds the
+  connection string from `storage.listKeys().keys[0]`. So the storage account key sits in plain
+  text in both apps' settings (see the secrets inventory), every template deploy writes key 1
+  back, and rotating key 1 breaks both apps until the next deploy. The fix is identity-based
+  host storage (`AzureWebJobsStorage__accountName`, with blob, queue and table data roles for
+  each app's managed identity on the account); a Key Vault reference to a secret holding the
+  connection string is the smaller first step. **[verify]** how the zip deploy works without
+  the key: on Linux Consumption `config-zip` uploads the package with the storage connection
+  string and points `WEBSITE_RUN_FROM_PACKAGE` at it with a SAS. `tools/check-app-settings.mjs`
+  changes with it: `AzureWebJobsStorage__accountName` joins its `PLATFORM_SETTINGS`.
+- **F2. Key Vault access per secret (T11).** Replace the two resource-group-scope *Key Vault
+  Secrets User* assignments in `main.bicep` with one per secret, scoped to it: the bot's
+  identity on `bot-app-password`, the ingestion identity on `anthropic-api-key`. A secret must
+  exist before an assignment on it can be created, so the secrets are seeded before the deploy
+  that adds them. A Bicep deploy (incremental mode) never deletes the old assignments: once the
+  new ones are verified (both apps resolve their references), delete those two with
+  `az role assignment delete`, as a recorded step. Then the audit check T11 asks for: no Key
+  Vault role assignment at resource-group scope.
+
 ## Accepted risks
 
 | Risk | Why it is accepted | Owner | Until | What limits it meanwhile |
@@ -428,9 +454,9 @@ keeps them in place) and what the client is told.
 - [x] TLS ≥ 1.2 (`minTlsVersion: '1.2'`)
 - [x] FTP disabled (`ftpsState: 'Disabled'`)
 - [ ] No stored credentials: **not yet**. The bot uses a client secret (T15), and the storage key
-      is in an app setting.
+      is in an app setting (follow-up F1).
 - [x] Key Vault soft-delete and purge protection
-- [ ] Key Vault access per secret, at vault scope (T11, Phase 1)
+- [ ] Key Vault access per secret (T11, Phase 1; follow-up F2)
 - [x] App role `Documents.Ingest` required on every call
 - [x] Caller app id pinned to the bot (P0)
 - [x] Uploads never overwrite (`conflictBehavior=fail`, P0)
