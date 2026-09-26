@@ -61,12 +61,12 @@ unzip -p artifacts/teams-app.zip manifest.json | jq -r '
     (.bots | map(.scopes | join(",")) | join(";")),
     ((.staticTabs // []) | length),
     (.id == .bots[0].botId) ] | join(" ")'
-# must print:  0.2.0 personal 0 true
+# must print:  0.2.1 personal 0 true
 ```
 
-That is: manifest version `0.2.0`, the bot installable in `personal` scope only
+That is: manifest version `0.2.1`, the bot installable in `personal` scope only
 (no `team`, no `groupchat`), no static tabs, and `id` equal to `botId`. After the
-upload, the admin centre must show version 0.2.0 for the app.
+upload, the admin centre must show version 0.2.1 for the app.
 
 ## What you need to add before publishing
 

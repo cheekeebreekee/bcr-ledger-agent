@@ -679,7 +679,7 @@ unzip -p "$OUT" manifest.json | jq -r \
    (.id == .bots[0].botId and (.id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"; "i")))'
 ```
 
-The last command must print `0.2.0`, `personal`, `0` and `true`, one per line: `true` only when
+The last command must print `0.2.1`, `personal`, `0` and `true`, one per line: `true` only when
 `id` and `botId` are the same GUID. Anything else: do not upload it.
 
 **Change.** In the Teams admin centre:

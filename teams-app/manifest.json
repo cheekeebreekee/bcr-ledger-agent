@@ -1,7 +1,7 @@
 {
   "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
   "manifestVersion": "1.17",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "id": "REPLACE-WITH-BOT-APP-ID",
   "developer": {
     "name": "BCR Platform",
@@ -14,8 +14,8 @@
     "full": "Asystent Archiwizacji Dokumentów BCR"
   },
   "description": {
-    "short": "Automatycznie archiwizuje dokumenty (faktury, umowy, raporty) w SharePoint.",
-    "full": "Wyślij mi w prywatnym czacie dokument (fakturę, paragon, umowę, wyciąg bankowy, raport lub deklarację), a ja przeanalizuję jego treść, rozpoznam typ i datę, a następnie umieszczę go w odpowiednim folderze Twojej firmy. Klasyfikacja odbywa się na podstawie zawartości dokumentu — nazwa pliku nie ma znaczenia. Dokumenty, których nie uda się jednoznacznie rozpoznać, trafiają do folderu do ręcznej weryfikacji przez księgowego."
+    "short": "Porządkuje dokumenty w kanale „Dokumenty księgowe” Twojego zespołu.",
+    "full": "Wrzuć dokumenty (faktury, paragony, umowy, wyciągi bankowe, raporty, deklaracje) do kanału „Dokumenty księgowe” w zespole swojej firmy — jako załącznik do wpisu albo na karcie „Udostępnione”. Asystent przeanalizuje treść każdego pliku, rozpozna typ i datę, a następnie przeniesie go do odpowiedniego folderu w tym samym kanale. Nazwa pliku nie ma znaczenia. Dokumenty, których nie uda się jednoznacznie rozpoznać, trafiają do folderu „98_Nieposortowane” do weryfikacji przez księgowego. Napisz „pomoc” w czacie z asystentem, aby zobaczyć instrukcję."
   },
   "icons": {
     "color": "color.png",
