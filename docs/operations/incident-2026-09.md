@@ -708,7 +708,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-10: manifest 0.2.0 and availability (T-10) | Teams Admin | todo | | |
 | H-11: gate `enforce` after 24 h clean | Yahor | done early, by Yahor's decision (no real clients use the agent) | 2026-09-26 13:59:20Z | 1 refusal in log mode, a channel `conversationUpdate` (correct); a real guest's personal chat passed |
 | H-12: ingestion deploy, further site grants, bindings, canaries | Yahor | deployed and PESKOVOI bound; canary pending | 2026-09-26 14:00:17Z | zip `038b69ab…` from `9951450`; health `p0/identity-only/membershipCheck=enforce`; old `/api/ingest` and `/api/user-target` 404; Directory columns added; apply log `c92c663d…` (row 0002: staff id removed, guest bound, `Dokumenty księgowe`); no TEST row exists; `ANTHROPIC_ENABLED=true` 14:06:03Z |
-| H-13: ingestion grant on BCR GROUP downgraded to `read` | Global Admin | todo | | any other application `write`/`owner` entry on BCR GROUP (application id and roles), and Roman's decision on it |
+| H-13: ingestion grant on BCR GROUP downgraded to `read` | Yahor (Global Admin) | done | 2026-09-26 | Graph Explorer PATCH → `roles: ["read"]` for the ingestion managed identity. The only other application entry is the onboarding Function App (`write`), which writes the Client Directory rows: kept |
 | H-14: `FALLBACK_*` settings removed, pre-Phase-0 packages deleted | Yahor | todo | | |
 | IR-2 relocation complete, allow-lists issued | Roman + second person | todo | | |
 | IR-3: phase-2 notices to every affected client | Roman + IOD | todo | | |
