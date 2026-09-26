@@ -1,8 +1,10 @@
 import {
+  DOCUMENT_EXTRACTION_FIELDS,
   getCategory,
   invoiceCategoryForDirection,
   type ClassifierContext,
   type DocumentCategory,
+  type DocumentExtractionField,
 } from '@bcr/shared';
 import { retryExhaustedDecision, type AcceptanceDecision } from '../services/acceptancePolicy';
 import { MAX_RETRY_LATER_ATTEMPTS } from '../services/batchIngestor';
@@ -10,7 +12,7 @@ import type { ClassificationOutcome } from '../services/classificationService';
 import type { ClaudeUsage } from '../services/claudeClassifier';
 import { isDirectedInvoice } from '../services/invoiceDirection';
 import { RetryLaterBound } from '../services/retryLaterBound';
-import { INVOICE_FAMILY, type TruthEntry } from './truth';
+import { FIELD_COMPARATORS, INVOICE_FAMILY, type TruthEntry } from './truth';
 
 /** What classified one document: the real service, with a per-document usage sink. */
 export type ServiceFactory = (onUsage: (usage: ClaudeUsage) => void) => {
@@ -64,6 +66,11 @@ export interface DocumentResult {
   readonly filedCorrectly: boolean;
   /** Filed under a category that is not the truth's: a mis-filing. */
   readonly filedWrongly: boolean;
+  /**
+   * Per invoice field the truth gives: whether the extraction read it right.
+   * Answered documents only; a field the model left `null` is a miss.
+   */
+  readonly fields?: Readonly<Partial<Record<DocumentExtractionField, boolean>>>;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly model: string;
@@ -183,6 +190,7 @@ export function score(
   const categoryCorrect = family(suggested) === family(truth.category);
   const direction = directionVerdict(truth, decision, identityGiven);
   const monthCorrect = truth.month ? decision.month === truth.month : undefined;
+  const fields = scoreFields(truth, decision);
   const dated = getCategory(decision.category).dated;
   const filedCorrectly =
     !decision.review &&
@@ -198,7 +206,24 @@ export function score(
     ...(monthCorrect !== undefined ? { monthCorrect } : {}),
     filedCorrectly,
     filedWrongly: !decision.review && !filedCorrectly,
+    ...(fields ? { fields } : {}),
   };
+}
+
+/** Each field the truth gives, compared the way the truth was normalised. */
+function scoreFields(
+  truth: TruthEntry,
+  decision: AcceptanceDecision,
+): Partial<Record<DocumentExtractionField, boolean>> | undefined {
+  if (!truth.fields) return undefined;
+  const out: Partial<Record<DocumentExtractionField, boolean>> = {};
+  for (const field of DOCUMENT_EXTRACTION_FIELDS) {
+    const expected = truth.fields[field];
+    if (expected === undefined) continue;
+    const read = decision.extraction?.[field] ?? null;
+    out[field] = read !== null && FIELD_COMPARATORS[field](read) === expected;
+  }
+  return out;
 }
 
 function directionVerdict(
@@ -289,6 +314,11 @@ export interface EvaluationSummary {
   readonly filedCorrectly: number;
   readonly filedWrongly: number;
   readonly confidenceBuckets: readonly ({ readonly label: string } & Ratio)[];
+  /**
+   * Extraction accuracy per invoice field, over the answered documents whose
+   * truth gives that field. Fields no truth gives are left out.
+   */
+  readonly extraction: readonly ({ readonly field: DocumentExtractionField } & Ratio)[];
   readonly reasons: Readonly<Record<string, number>>;
   readonly inputTokens: number;
   readonly outputTokens: number;
@@ -355,6 +385,10 @@ export function summarize(
       );
       return { label, hit: inBucket.filter((r) => r.categoryCorrect).length, of: inBucket.length };
     }),
+    extraction: DOCUMENT_EXTRACTION_FIELDS.map((field) => {
+      const scored = answered.filter((r) => r.fields?.[field] !== undefined);
+      return { field, hit: scored.filter((r) => r.fields?.[field]).length, of: scored.length };
+    }).filter((f) => f.of > 0),
     reasons,
     inputTokens: results.reduce((n, r) => n + r.inputTokens, 0),
     outputTokens: results.reduce((n, r) => n + r.outputTokens, 0),

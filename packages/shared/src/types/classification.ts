@@ -32,7 +32,60 @@ export interface Classification {
    * are only flags: the acceptance policy is what sends a document to review.
    */
   readonly reviewReasons?: readonly string[];
+  /**
+   * The searchable fields of an invoice, receipt or note, read from the
+   * content in the same model call and validated after it. Only for the
+   * categories the taxonomy marks `invoiceFields`; absent otherwise. Client
+   * data: written to the document index, never logged.
+   */
+  readonly extraction?: DocumentExtraction;
 }
+
+/**
+ * The fields the document index is searched by, for an invoice, a receipt or
+ * a note. Every value is normalised or `null` (not on the document, or not
+ * valid — a wrong NIP or amount is worse than none): see
+ * `parsers/invoiceFields.ts`. Seller and buyer come from the parties.
+ */
+export interface DocumentExtraction {
+  /** As printed, whitespace collapsed. */
+  readonly invoiceNumber: string | null;
+  /** `YYYY-MM-DD`. */
+  readonly issueDate: string | null;
+  /** `YYYY-MM-DD`: the date of sale or of the service, when printed. */
+  readonly saleDate: string | null;
+  /** ISO 4217, e.g. `PLN`. */
+  readonly currency: string | null;
+  /** Decimal strings with two places, e.g. `1234.50`; negative on a correction. */
+  readonly netAmount: string | null;
+  readonly vatAmount: string | null;
+  readonly grossAmount: string | null;
+  /** Ten digits with a valid checksum. */
+  readonly sellerNip: string | null;
+  readonly sellerName: string | null;
+  readonly buyerNip: string | null;
+  readonly buyerName: string | null;
+  /** Upper-cased; see `normalizeKsefNumber`. */
+  readonly ksefNumber: string | null;
+}
+
+/** The keys of {@link DocumentExtraction}, in a stable order. */
+export const DOCUMENT_EXTRACTION_FIELDS = [
+  'invoiceNumber',
+  'issueDate',
+  'saleDate',
+  'currency',
+  'netAmount',
+  'vatAmount',
+  'grossAmount',
+  'sellerNip',
+  'sellerName',
+  'buyerNip',
+  'buyerName',
+  'ksefNumber',
+] as const satisfies readonly (keyof DocumentExtraction)[];
+
+export type DocumentExtractionField = (typeof DOCUMENT_EXTRACTION_FIELDS)[number];
 
 /** The role a party plays in a document. */
 export type PartyRole = 'seller' | 'buyer' | 'issuer' | 'recipient' | 'unknown';

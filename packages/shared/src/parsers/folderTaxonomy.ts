@@ -51,6 +51,11 @@ export interface CategoryDefinition {
   readonly description: string;
   /** Representative example documents. */
   readonly examples: readonly string[];
+  /**
+   * An invoice, receipt or note: the classifier also reads its number, dates,
+   * currency, amounts, parties and KSeF number for the document index.
+   */
+  readonly invoiceFields?: true;
 }
 
 /**
@@ -62,6 +67,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     id: 'faktury_sprzedazy',
     segments: ['01_Faktury', '01_Faktury_sprzedaży'],
     dated: true,
+    invoiceFields: true,
     polishLabel: 'Faktura sprzedaży',
     description:
       'Faktura, na której KLIENT jest sprzedawcą/wystawcą (sprzedaje towar lub usługę): ' +
@@ -77,6 +83,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     id: 'faktury_zakupu',
     segments: ['01_Faktury', '02_Faktury_zakupu'],
     dated: true,
+    invoiceFields: true,
     polishLabel: 'Faktura zakupu',
     description:
       'Faktura, na której KLIENT jest nabywcą/kupującym: dane nabywcy zgadzają się z nazwą ' +
@@ -94,6 +101,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     id: 'faktury_korekty',
     segments: ['01_Faktury', '03_Korekty_i_anulowania'],
     dated: true,
+    invoiceFields: true,
     polishLabel: 'Korekta / anulowanie',
     description:
       'Faktura korygująca, nota korygująca lub dokument anulowania faktury — ' +
@@ -104,6 +112,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     id: 'faktury_noty',
     segments: ['01_Faktury', '04_Noty_i_dowody_księgowe'],
     dated: true,
+    invoiceFields: true,
     polishLabel: 'Nota / dowód księgowy',
     description:
       'Nota księgowa, nota obciążeniowa/uznaniowa, polecenie księgowania lub inny ' +
@@ -259,6 +268,14 @@ export function getCategory(id: DocumentCategory): CategoryDefinition {
     throw new Error(`Unknown document category: ${id}`);
   }
   return def;
+}
+
+/**
+ * Whether a category's documents carry invoice fields (an invoice, a
+ * correction, a note or receipt): the `01_Faktury` family.
+ */
+export function hasInvoiceFields(category: unknown): boolean {
+  return isDocumentCategory(category) && getCategory(category).invoiceFields === true;
 }
 
 /** Type guard for values coming from the model or other untrusted sources. */

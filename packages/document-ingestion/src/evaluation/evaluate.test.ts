@@ -322,6 +322,66 @@ describe('contentTypeOf', () => {
   });
 });
 
+describe('score: invoice fields', () => {
+  const extraction = {
+    invoiceNumber: 'FV 12/2026',
+    issueDate: '2026-09-12',
+    saleDate: null,
+    currency: 'PLN',
+    netAmount: '1000.00',
+    vatAmount: '230.00',
+    grossAmount: '1230.00',
+    sellerNip: '5260250274',
+    sellerName: 'Dostawca S.A.',
+    buyerNip: null,
+    buyerName: null,
+    ksefNumber: null,
+  };
+  const truth: TruthEntry = {
+    file: 'fv.pdf',
+    category: 'faktury_zakupu',
+    month: '2026-09',
+    fields: {
+      invoiceNumber: 'FV12/2026',
+      grossAmount: '1230.00',
+      vatAmount: '23.00',
+      buyerNip: '1234567819',
+      sellerName: 'dostawca s a',
+    },
+  };
+
+  it('scores each field the truth gives; a null read is a miss', () => {
+    const decision = decide(
+      { category: 'faktury_zakupu', year: 2026, month: 9, direction: 'zakup' },
+      { extraction },
+    );
+    expect(score(truth, decision, true).fields).toEqual({
+      invoiceNumber: true,
+      grossAmount: true,
+      vatAmount: false,
+      buyerNip: false,
+      sellerName: true,
+    });
+  });
+
+  it('scores every field a miss when nothing was extracted, and nothing without truth fields', () => {
+    const decision = decide({
+      category: 'faktury_zakupu',
+      year: 2026,
+      month: 9,
+      direction: 'zakup',
+    });
+    expect(Object.values(score(truth, decision, true).fields ?? {})).toEqual([
+      false,
+      false,
+      false,
+      false,
+      false,
+    ]);
+    expect(score(sale, decision, true).fields).toBeUndefined();
+  });
+});
+
 describe('summarize', () => {
   const r = (
     over: Partial<DocumentResult> & Pick<DocumentResult, 'truth' | 'outcome'>,
@@ -410,5 +470,22 @@ describe('summarize', () => {
       ['0.90-1.00', 1, 1],
     ]);
     expect(summarize(results, false).direction).toBeUndefined();
+    expect(s.extraction).toEqual([]);
+  });
+
+  it('adds up invoice-field accuracy over answered documents, per field given', () => {
+    const invoice: TruthEntry = { file: 'i.pdf', category: 'faktury_noty', month: '' };
+    const s = summarize(
+      [
+        r({ truth: invoice, outcome: 'answered', fields: { grossAmount: true, sellerNip: false } }),
+        r({ truth: invoice, outcome: 'answered', fields: { grossAmount: false } }),
+        r({ truth: invoice, outcome: 'no_result', fields: { grossAmount: false } }),
+      ],
+      true,
+    );
+    expect(s.extraction).toEqual([
+      { field: 'grossAmount', hit: 1, of: 2 },
+      { field: 'sellerNip', hit: 0, of: 1 },
+    ]);
   });
 });

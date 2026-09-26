@@ -22,7 +22,7 @@ function rootLoggerOptions(): pino.LoggerOptions {
   timestamp: pino.stdTimeFunctions.isoTime,
   // Secrets, plus the client data that turned App Insights into a register of
   // every client's uploads: file names (KSeF names embed a NIP), SharePoint
-  // locations, client titles, extracted parties. Logs carry ids instead
+  // locations, client titles, extracted parties, invoice fields. Logs carry ids instead
   // (documentId, clientId, listItemId, driveItemId). Pino redacts one level
   // deep with `*.x`; top-level keys are listed explicitly.
   redact: {
@@ -51,6 +51,8 @@ function rootLoggerOptions(): pino.LoggerOptions {
       '*.parties',
       'nip',
       '*.nip',
+      'extraction',
+      '*.extraction',
     ],
     censor: '[REDACTED]',
   },

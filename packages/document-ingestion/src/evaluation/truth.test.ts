@@ -40,6 +40,53 @@ describe('parseTruth', () => {
     ]);
   });
 
+  it('reads invoice fields in their compared form', () => {
+    const [entry] = parseTruth([
+      {
+        file: 'fv.pdf',
+        category: 'faktury_zakupu',
+        month: '2026-09',
+        fields: {
+          invoiceNumber: 'fv 12 / 2026',
+          issueDate: '2026-09-12',
+          currency: 'pln',
+          grossAmount: '1 230,00',
+          sellerNip: '526-025-02-74',
+          sellerName: 'Dostawca S.A.',
+        },
+      },
+    ]);
+    expect(entry?.fields).toEqual({
+      invoiceNumber: 'FV12/2026',
+      issueDate: '2026-09-12',
+      currency: 'PLN',
+      grossAmount: '1230.00',
+      sellerNip: '5260250274',
+      sellerName: 'dostawca s a',
+    });
+  });
+
+  it('leaves out an empty fields object', () => {
+    expect(parseTruth([{ file: 'x.pdf', category: 'umowy', month: '', fields: {} }])).toEqual([
+      { file: 'x.pdf', category: 'umowy', month: '' },
+    ]);
+  });
+
+  it.each([
+    [
+      'a truth NIP with a wrong checksum',
+      [{ file: 'x.pdf', category: 'faktury_noty', month: '', fields: { sellerNip: '5260250275' } }],
+      /fields\.sellerNip.*not a valid value/,
+    ],
+    [
+      'an unknown invoice field',
+      [{ file: 'x.pdf', category: 'faktury_noty', month: '', fields: { total: '1.00' } }],
+      /total/,
+    ],
+  ])('refuses %s', (_label, json, message) => {
+    expect(() => parseTruth(json)).toThrow(message);
+  });
+
   it.each([
     ['a path, not a file name', [{ file: '../x.pdf', category: 'umowy', month: '' }], /file name/],
     ['an unknown category', [{ file: 'x.pdf', category: 'invoice', month: '' }], /category id/],
