@@ -310,11 +310,23 @@ whole defence:
   taxonomy folder, built with `buildFolderPath` from the category enum; the model's own path is
   never used (T8).
 - **A staff file placed in a client inbox is left alone.** A file is processed only if its
-  creator is a `Guest` and a member of that row's Team. A document a staff member or a member
-  drops into a client's channel by mistake is not filed, not classified and not sent to
-  Anthropic; it stays where they put it, for them to remove. (The client can already see it
-  there: that exposure is the mistake, not the sweep's.) A copy a staff member makes into the
-  channel is created by them, and is left alone the same way.
+  creator **and** its last modifier are each a `Guest` and a member of that row's Team. A
+  document a staff member or a member drops into a client's channel by mistake is not filed,
+  not classified and not sent to Anthropic; it stays where they put it, for them to remove.
+  (The client can already see it there: that exposure is the mistake, not the sweep's.) A copy a
+  staff member makes into the channel is created by them, and is left alone the same way. So is
+  a guest's file that a staff member **replaced** with other content ("Replace" on an upload of
+  the same name): `createdBy` stays the guest, but `lastModifiedBy` is staff, and the file is
+  skipped as `modified_by_other`.
+- **A staff decision about a file is never undone.** The sweep lists a channel once and then
+  works for minutes, and a file's id survives a move within its library. Before it reads a file
+  and again before it moves it, the file must still be at the top of the channel folder at the
+  `eTag` it was listed with, and the move carries `If-Match` with that `eTag` (Graph answers 412
+  when it no longer matches). So a file staff moved out of the channel meanwhile (for example a
+  document of client B that a guest in both Teams posted in A's channel, moved to an Owners-only
+  folder), one filed by hand into a subfolder, a renamed one, or one whose content was replaced
+  is left where it now is. It is never pulled back into A's channel, never renamed back, and
+  never filed by the old content's classification.
 - **A guest in two Teams uploading into A's inbox is filed within A.** Unlike the bot path, the
   inbox does not refuse a guest who is also in B's Team: the file is already in A's space, and
   the sweep can only move it inside A's channel folder, never to B. If the guest meant B, staff
@@ -324,24 +336,42 @@ whole defence:
 - **A file can never leave its drive.** Only the channel folder's direct children are candidates,
   and a listed child whose parent or drive is not that folder is dropped. The target folder chain
   is created under the channel folder, never at the drive root. The move is a `PATCH` by id with
-  `conflictBehavior=fail` and the `_n` rule (T2), which Graph does not perform across drives;
-  afterwards the item must be the same item, in the row's drive, under the target folder, or it
-  is refused and logged (`sharepoint.drive_mismatch`). Nothing is copied or deleted.
+  `If-Match`, `conflictBehavior=fail` and the `_n` rule (T2), which Graph does not perform
+  across drives; afterwards the item must be the same item, in the row's drive, under the target
+  folder, or it is refused and logged (`sharepoint.drive_mismatch`). Nothing is copied or
+  deleted.
+- **No overwrite on a move rests on observed behaviour.** Microsoft documents
+  `conflictBehavior` for actions that create an item, and `if-match` for a move, but not
+  `conflictBehavior` for a move. That a move onto a taken name fails with 409 (and takes `_1`)
+  rather than replacing the file there is Graph's observed default in this tenant, proved by
+  the H-12 canary's same-name move in the dedicated canary Team before any real client's channel
+  is written, and to be proved again the same way after any change to the move.
 - **BCR GROUP and the quarantine are never swept.** The sweep uses the client SharePoint factory,
   so a row whose site resolves to either is refused before anything is listed
   (`sharepoint.forbidden_site`, T3); a channel folder in another drive than the row's `DriveId`
   is refused too.
 - **Fail closed.** An uploader who cannot be read is left for the next tick; an unavailable
   Directory sweeps nothing; `shadow` writes nothing; `off`, the default, does nothing.
+- **A rollout starts in a channel with no client data.** `INBOX_SWEEP_MODE` is one switch for
+  every row, so `INBOX_SWEEP_ROWS` limits the first `shadow` and `enforce` to a dedicated,
+  synthetic canary Team's row; a real client's row is added only after the canary's moves,
+  its same-name `_1` included, have been seen, and after that client's own `shadow` lines have
+  been reviewed. BCR's canary guest never joins a real client's Team.
 
 **Residual risk.** A guest of the Team can already rename, move or delete files in their
 channel; the sweep adds no capability to anyone. The sweep reads the metadata of every file at
 the top of each client's channel folder, staff files included, but reads the content only of
-files it processes. That `createdBy.user.id` is the guest's Entra object id for a file attached
-to a channel post is verified by the H-12 shadow canary, not by documentation; if it were not,
-the sweep would leave the canary untouched (`skippedNotClient`), not misfile it.
+files it processes. That `createdBy.user.id` and `lastModifiedBy.user.id` are the guest's Entra
+object id for a file attached to a channel post is verified by the H-12 shadow canary, not by
+documentation; if they were not, the sweep would leave the canary untouched (`skippedNotClient`),
+not misfile it. Between the re-check and the move there remains a window of one request in
+which a person's move could race the sweep's; `If-Match` closes it on Graph's side. Moving a
+file may leave the channel post that carried it pointing at its old place; the owner decides,
+before each client's channel is swept, whether older attachments move (`INBOX_CREATED_AFTER`
+keeps them in place) and what the client is told.
 
-**Status: Mitigated by design; off until H-12** sets `INBOX_SWEEP_MODE=shadow`, then `enforce`.
+**Status: Mitigated by design; off until H-12's channel-inbox step** sets
+`INBOX_SWEEP_MODE=shadow`, then `enforce`, first for the canary Team's row only.
 
 ### Also fixed in Phase 0
 
@@ -395,9 +425,9 @@ the sweep would leave the canary untouched (`skippedNotClient`), not misfile it.
 - [x] Caller app id pinned to the bot (P0)
 - [x] Uploads never overwrite (`conflictBehavior=fail`, P0)
 - [x] Routing by uploader identity only; content never picks the client (P0)
-- [x] Channel inbox: the file's location picks the client; only this Team's guests' uploads are
-      processed; moves by id inside the channel folder, never across drives, never overwriting
-      (T18)
+- [x] Channel inbox: the file's location picks the client; only files this Team's guests created
+      and last changed are processed; moves by id inside the channel folder, only on the version
+      listed (`If-Match`), never across drives, never overwriting (T18)
 - [x] Structured logging with secrets redacted, and from Phase 0 also file names, titles, URLs,
       paths, parties and NIPs
 - [x] No secrets in source: `.env` and `local.settings.json` are git-ignored, and the `*.example`

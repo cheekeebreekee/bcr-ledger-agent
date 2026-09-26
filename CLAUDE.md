@@ -97,8 +97,8 @@ versions with install scripts disabled (checking each top-level version against 
 `node_modules`), and vendors the just-built `@bcr/shared`. `artifacts/*.zip` are git-ignored build
 output: never commit one, and deploy only a zip built for that deploy. Before deploying, still
 check the vendored copy: `unzip -p artifacts/<pkg>.zip node_modules/@bcr/shared/dist/config.js |
-grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths`, `membershipCheckMode` and
-`inboxSweepMode`) must be greater than 0.
+grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths`, `membershipCheckMode`,
+`inboxSweepMode` and `inboxSweepRows`) must be greater than 0.
 
 CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test, plus `bicep build` and
 `bicep lint`.
@@ -167,25 +167,38 @@ Two intakes share the classifier, the taxonomy, the client SharePoint factory an
 runs it with injected collaborators (`runtime.ts#channelInbox`). `INBOX_SWEEP_MODE` is
 `off` (default: returns at once) | `shadow` (lists, checks, classifies, logs `inbox.would_move`,
 writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep`.
+`INBOX_SWEEP_ROWS` (list item ids; empty = all) narrows the rows, for a canary-first rollout
+(`build.inboxSweepRows`: `all` | `listed`); `INBOX_CREATED_AFTER` leaves older files in place.
 
 1. **Rows** — `boundClientRows(snapshot)` in `clientDirectoryReader.ts`: exactly the rows the
-   snapshot routes to (active, not admin, bound, not excluded). Unavailable snapshot → nothing.
+   snapshot routes to (active, not admin, bound, not excluded), then only those in
+   `INBOX_SWEEP_ROWS` if it is set. Unavailable snapshot → nothing.
 2. **Inbox** — the **client** factory's `SharePointService.resolveInbox()`: the row's `RootFolder`,
    one folder at the root of its `DriveId`, behind the same site guard and drive check as uploads.
 3. **Candidates** — `listInboxChildren()`: direct children only, every page, anything whose
    `parentReference` is not this folder in this drive dropped. `selectCandidates()`: a file,
-   `0 < size ≤ 100 MiB`, not `~$`/`.`, older than `INBOX_MIN_AGE_MS`, with `createdBy.user.id`.
-4. **Uploader** — `userType` `Guest` (`services/userDirectory.ts`) **and** a member of this row's
-   Team (`TeamMembershipReader.teamsOf`, cached). Anything else is left untouched.
-5. **Classify** — same `ClassificationService`, primed with this row only; `applyInvoiceDirection`
-   from the row's NIP; `inboxPlacement()` builds the folder with `buildFolderPath` from the
-   category alone (fallback / no date → `98_Nieposortowane/YYYY/MM`). Cached per
-   (`driveItemId`, `eTag`) for 1 h; the file is read by id, size-capped, only if Claude reads it.
-6. **Move** — `ensureInboxFolder()` under the channel folder, then `moveWithinInbox()`: PATCH by id,
-   `conflictBehavior=fail`, `_1`…`_10` on 409, then assert same item, same drive, new parent.
-   Three failures (per worker) → moved to `98_` unclassified. Budget `INBOX_MAX_FILES_PER_TICK`,
-   150 s deadline, rows round-robin. Logs `inbox.filed|sorted_to_review|would_move|failed|
-   skipped|row_failed|tick`, ids and counts only.
+   `0 < size ≤ 100 MiB`, not `~$`/`.`, with an `eTag`, created after `INBOX_CREATED_AFTER` if
+   set, older than `INBOX_MIN_AGE_MS`, with `createdBy.user.id`.
+4. **Uploader** — the creator **and** the last modifier (`lastModifiedBy`) are each `userType`
+   `Guest` (`services/userDirectory.ts`) **and** a member of this row's Team
+   (`TeamMembershipReader.teamsOf`, cached). Anything else is left untouched (`not_guest`,
+   `not_in_team`, `modified_by_other`, …); an unreadable user is `unverified` and waits.
+5. **Classify** — only with 120 s left before the tick's 270 s limit, and only after
+   `checkInboxItem()` re-reads the item: still a direct child at the **listed `eTag`**. Same
+   `ClassificationService`, primed with this row only; `applyInvoiceDirection` from the row's NIP;
+   `inboxPlacement()` builds the folder with `buildFolderPath` from the category alone (fallback /
+   no date → `98_Nieposortowane/YYYY/MM`). Cached per (`driveItemId`, `eTag`) for 1 h; the file is
+   read by id, size-capped, only if Claude reads it.
+6. **Move** — only with 60 s left: `ensureInboxFolder()` under the channel folder, then
+   `moveWithinInbox()`: re-check, PATCH by id with `If-Match: <listed eTag>` and
+   `conflictBehavior=fail`, `_1`…`_10` on 409, then assert same item, same drive, new parent. A
+   re-check miss or a 412 is `InboxItemChangedError`: left where it is now (`skippedChanged`,
+   `inbox.skipped` `changed`), never a failure. Three failures (per worker) → moved to `98_`
+   unclassified. Budget `INBOX_MAX_FILES_PER_TICK`, nothing new after 150 s, rows round-robin; a
+   file out of time is `deferred`. Every sweep Graph call runs `withoutSdkRetries` + our bounded
+   retry (the SDK would sleep through `Retry-After` past the 5-minute `functionTimeout`, which
+   restarts the worker and every bot upload on it). Logs `inbox.filed|sorted_to_review|
+   would_move|failed|skipped|row_failed|tick`, ids and counts only.
 
 ### Invariants — break these and documents mis-file
 
@@ -201,16 +214,25 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
   Nothing in the file, its name or the model's output picks another row, and the sweep never
   reads a row other than the one it is sweeping.
 - **The channel inbox processes only this Team's guests' uploads.** A file is touched only when its
-  creator is `userType` `Guest` **and** a member of the row's Team. Staff, members, guests of
-  other Teams, files with no user creator, and uploaders that cannot be read are left exactly
-  where they are (fail closed). A guest who is also in other Teams is fine here: the file is
-  already in this client's space.
-- **Inbox moves stay inside the channel folder, by id, and never overwrite.** Only the channel
-  folder's direct children are candidates (never recurse — subfolders are the filed area); the
-  target chain is created under the channel folder, never the drive root; the move is a PATCH by
-  id with `conflictBehavior=fail` and the `_n` rule, and afterwards the item must be the same
-  item, in the row's drive, under the target folder. Never copy, never delete, never move across
-  drives, never touch an item outside the inbox's direct children. `shadow` writes nothing.
+  creator **and** its last modifier are each `userType` `Guest` **and** a member of the row's
+  Team. Staff, members, guests of other Teams, a guest's file that staff replaced (`createdBy`
+  survives a replace; `lastModifiedBy` does not), files with no user creator, and users that
+  cannot be read are left exactly where they are (fail closed). A guest who is also in other
+  Teams is fine here: the file is already in this client's space.
+- **Inbox moves stay inside the channel folder, by id, only on the version listed, and never
+  overwrite.** Only the channel folder's direct children are candidates (never recurse —
+  subfolders are the filed area); before the download and again before the move the item must
+  still be a direct child at the listed `eTag`, and the PATCH carries `If-Match` with it, so a
+  file someone moved out (an Owners-only folder, a manual subfolder), renamed or replaced after
+  the listing is never pulled back or filed by stale content. The target chain is created under
+  the channel folder, never the drive root; the move is a PATCH by id with
+  `conflictBehavior=fail` and the `_n` rule, and afterwards the item must be the same item, in
+  the row's drive, under the target folder. Never copy, never delete, never move across drives,
+  never touch an item outside the inbox's direct children. `shadow` writes nothing. **No
+  overwrite on a move is Graph's observed default, not a documented parameter:** Microsoft
+  documents `conflictBehavior` for creating items and `if-match` for move/update, not
+  `conflictBehavior` for a move. The H-12 canary's same-name move (`_1`) is the proof in this
+  tenant; keep it in any rollout of a changed move.
 - **`ClaudeClassifier.classify()` never throws and never rejects.** Unsupported type, oversize, API
   error, malformed output, low confidence → return `null` so `FallbackClassifier` files the document
   into `98_Nieposortowane/YYYY/MM/` for manual review. Preserve this contract.

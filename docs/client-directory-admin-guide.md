@@ -84,20 +84,28 @@ nothing is lost.
 3. **Which files.** Only files directly in that folder, not in its subfolders (the subfolders are
    where filed documents live). A file must be unchanged for `INBOX_MIN_AGE_MS` (2 minutes by
    default), between 1 byte and 100 MiB, and not an Office lock file (`~$…`) or a hidden one.
-4. **Whose files.** Only files **created by a guest who is a member of this row's Team**. A file
-   put there by staff, by a member, or by a guest of another Team is left exactly where it is.
-   A guest who is also in another client's Team is fine here: the file is already in this
-   client's space, and it is filed inside it.
+4. **Whose files.** Only files **created, and last changed, by guests who are members of this
+   row's Team**. A file put there by staff, by a member, or by a guest of another Team is left
+   exactly where it is, and so is a client's file that a staff member overwrote with another file
+   of the same name. A guest who is also in another client's Team is fine here: the file is
+   already in this client's space, and it is filed inside it.
 5. **Where it goes.** The file is classified like a bot upload, as this row's client, and moved,
    by id and under its own name, into the taxonomy folder **inside the same channel folder**, for
    example `Dokumenty księgowe/01_Faktury/02_Faktury_zakupu/2026/09/`. A name already taken gets
    `_1`, `_2` and so on; nothing is overwritten, copied or deleted. What cannot be classified, and
    a file whose processing failed three times, goes to `98_Nieposortowane/YYYY/MM` inside the
    same channel folder, for an accountant.
+6. **Your changes win.** If you move a waiting file out of the channel folder, file it by hand into
+   a subfolder, rename it or replace it while the sweep is working, the sweep leaves it where you
+   put it: it only moves a file that is still exactly as it listed it (`inbox.skipped` with
+   `changed` in the logs).
 
 So, for a row to be swept, it must be bound by the tool exactly as for bot routing, and the
 client's contact must be a guest of the client's Team. The `UserAadObjectIds` column plays no part
-in the channel inbox; it still decides the bot chat.
+in the channel inbox; it still decides the bot chat. While the ingestion setting
+`INBOX_SWEEP_ROWS` is set (during a rollout, `/api/health` shows `"inboxSweepRows":"listed"`),
+only the rows whose list item ids it names are swept: a newly bound client waits until its id is
+added, or the setting is cleared.
 
 ## What quarantine means
 
@@ -244,12 +252,14 @@ but slow, so bind soon after onboarding:
    and apply the whole plan again. `--only <listItemId>` limits a rollback to named rows, for
    example the new client's own, which was unbound before
    ([human-steps H-12 → Rollback](operations/human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries)).
-5. **Canary:** a synthetic document, never a real one, lands in the client's
-   `Dokumenty księgowe` channel folder, then is deleted. Once the channel inbox is in `enforce`,
-   the canary is a synthetic PDF that a guest of that client's Team posts in the channel: it must
-   move into its taxonomy folder inside the channel within a few minutes (`inbox.filed` with the
-   row's `listItemId`). Until then, it is an upload through the bot by an identity bound to that
-   client, as in [human-steps H-12](operations/human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries).
+5. **Proof, by ids:** a guest cannot send a file through the bot, and BCR's canary guest never
+   joins a real client's Team. Once the channel inbox is on, the new row's first `inbox.tick`
+   lines show it swept with `rowsFailed` `0` (its site, drive and channel folder resolve), and
+   the client's first document shows as `inbox.filed` (or `inbox.sorted_to_review`) with the
+   row's `listItemId`. If `INBOX_SWEEP_ROWS` is set, add the row's list item id first
+   ([human-steps H-12](operations/human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries),
+   the channel-inbox step). A synthetic document the client's contact posts by arrangement is
+   a canary too; never a real document of another client.
 6. **Tell the client how to send documents.** A guest cannot attach files in a chat with the bot,
    so: in Teams, switch to the BCR organisation, open their Team, channel "Dokumenty księgowe",
    and add the file as an attachment to a post, or on the „Udostępnione” tab. Filed documents
@@ -310,7 +320,11 @@ Phase 0: the old "admin → route by the document's NIP" path is what the incide
 
 The channel inbox does not file staff files either. A file a staff member or a member puts at the
 top of a client's "Dokumenty księgowe" channel folder stays exactly there: file it by hand into
-the right subfolder, or remove it if it was put in the wrong client's channel.
+the right subfolder, or remove it if it was put in the wrong client's channel. The same holds if
+a staff member uploads a file with the same name as a client's waiting file and chooses
+**Replace**: the file now holds staff's content, so the sweep leaves it, and it must be sorted by
+hand. Whatever you do with a waiting file (move it away, file it, rename it) the sweep does not
+undo.
 
 Until the full implementation is done, staff do not upload through the bot at all.
 
