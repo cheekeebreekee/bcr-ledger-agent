@@ -140,6 +140,13 @@ jobs:
       - name: bicep lint
         run: bicep lint infrastructure/main.bicep
 
+      # The document index database: a standalone template, never part of
+      # main.bicep, deployed on its own by infrastructure/db-deploy.sh.
+      - name: bicep build and lint (db.bicep)
+        run: |
+          bicep build infrastructure/db.bicep --outdir /tmp/bicep-out
+          bicep lint infrastructure/db.bicep
+
       # A Bicep deploy replaces every app setting, so a setting the code needs
       # and the template lacks is an outage at the next deploy, and one the
       # template still sets after the code stopped reading it lingers for
