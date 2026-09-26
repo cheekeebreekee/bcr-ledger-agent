@@ -255,15 +255,28 @@ function stripLineComment(text) {
 // The code side: envMap, schema defaults, direct process.env reads
 // ---------------------------------------------------------------------------
 
-/** `[{ field, env }]` from the `const envMap = { ... }` of a config.ts. */
+/**
+ * `[{ field, env }]` from the `const envMap = { ... }` of a config.ts, one
+ * `field: 'ENV',` per line. Any other line that is not a comment is an error:
+ * skipping it would drop a setting the code reads.
+ */
 export function parseEnvMap(source, where = 'config.ts') {
   const m = /const\s+envMap\s*=\s*\{/.exec(source);
   if (!m) throw new CliError(`${where}: no \`const envMap = {\``);
   const start = m.index + m[0].length;
   const body = source.slice(start, skipBalanced(source, start, '}', 'ts') - 1);
-  const entries = [...body.matchAll(/^\s*([A-Za-z_$][\w$]*)\s*:\s*'([^']+)'\s*,?\s*$/gm)].map(
-    (e) => ({ field: e[1], env: e[2] }),
-  );
+  const entries = [];
+  for (const raw of body.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')) {
+    const text = raw.trim();
+    if (text === '' || text.startsWith('//')) continue;
+    const e = /^([A-Za-z_$][\w$]*)\s*:\s*'([^']+)'\s*,?\s*(?:\/\/.*)?$/.exec(text);
+    if (!e) {
+      throw new CliError(
+        `${where}: cannot read the envMap line "${text}": write one \`field: 'ENV_NAME',\` per line`,
+      );
+    }
+    entries.push({ field: e[1], env: e[2] });
+  }
   if (entries.length === 0) throw new CliError(`${where}: envMap has no entries`);
   return entries;
 }
@@ -378,7 +391,13 @@ export function directEnvReads(repo, dirs) {
  * The settings in `var <variable> = ...`: `[{ name, expr, when }]`, where
  * `expr` is the Bicep expression of its value and `when` the parameter a
  * `<param> ? { ... } : {}` object depends on ('!param' for the else object).
- * Keys are read one per line, as this repo writes app settings.
+ *
+ * Settings are read one per line, as this repo writes them. A line that holds
+ * more is an error, never a guess: read as one setting it would hide the
+ * others from every check, and give the first a value no check can compare.
+ * So a setting line with a comma or a second `NAME:` outside strings and
+ * brackets, a value that does not end on its line, and an object with a
+ * setting on its opening line (`{ A: 'x' }`) all fail.
  */
 export function bicepSettings(source, variable, where = 'main.bicep') {
   const m = new RegExp(`^var\\s+${variable}\\s*=\\s*`, 'm').exec(source);
@@ -386,6 +405,12 @@ export function bicepSettings(source, variable, where = 'main.bicep') {
   // The value: to the end of its first line, taking in any bracket opened there.
   const start = m.index + m[0].length;
   const text = source.slice(start, scanTo(source, start, '\n', 'bicep'));
+  const refuse = (why) => {
+    throw new CliError(`${where}: \`var ${variable}\`: ${why}. Write one setting per line.`);
+  };
+
+  const inline = objectOpenedWithSetting(text);
+  if (inline !== undefined) refuse(`an object opens with a setting on its line (${inline})`);
 
   // Spans of conditional objects: `cond ? { ... }` and its `: { ... }`.
   const spans = [];
@@ -406,14 +431,74 @@ export function bicepSettings(source, variable, where = 'main.bicep') {
   const line = /^[ \t]*(?:'([^']+)'|([A-Za-z_]\w*))[ \t]*:[ \t]*(\S.*)$/gm;
   for (const s of text.matchAll(line)) {
     const span = spans.find((x) => s.index >= x.from && s.index < x.to);
-    settings.push({
-      name: s[1] ?? s[2],
-      expr: stripLineComment(s[3]),
-      ...(span ? { when: span.when } : {}),
-    });
+    const name = s[1] ?? s[2];
+    const expr = stripLineComment(s[3]);
+    const extra = moreThanOneSetting(expr);
+    if (extra) refuse(`the line of ${name} holds ${extra}`);
+    settings.push({ name, expr, ...(span ? { when: span.when } : {}) });
   }
   if (settings.length === 0) throw new CliError(`${where}: \`var ${variable}\` sets no settings`);
   return settings;
+}
+
+/**
+ * Why the value expression of a setting line holds more than that one value,
+ * or undefined. Outside strings and brackets: a comma, a `:` that no ternary
+ * `?` before it pairs with (a second `NAME:`), or a bracket that closes the
+ * enclosing object. `??`, `.?` and `::` are neither.
+ */
+function moreThanOneSetting(expr) {
+  let ternaries = 0;
+  let i = 0;
+  try {
+    while (i < expr.length) {
+      const c = expr[i];
+      if (c === ',') return 'a comma outside any string or bracket';
+      if (c === '}' || c === ')' || c === ']') return `the '${c}' of the enclosing object`;
+      if (c === '?' && expr[i + 1] === '?') {
+        i += 2;
+      } else if (c === '?') {
+        if (expr[i - 1] !== '.') ternaries++;
+        i++;
+      } else if (c === ':' && expr[i + 1] === ':') {
+        i += 2;
+      } else if (c === ':') {
+        if (ternaries === 0) return 'a second `NAME:`';
+        ternaries--;
+        i++;
+      } else {
+        i = skipToken(expr, i, 'bicep');
+      }
+    }
+  } catch (err) {
+    return `a value that does not end on its line (${err.message})`;
+  }
+  return undefined;
+}
+
+/**
+ * The line on which an object has a setting after its `{`, or undefined: a
+ * `{ A: 'x' }` or `flag ? { A: 'x' } : {}` would otherwise be skipped whole.
+ * `{}` and `{` alone on the rest of its line are fine.
+ */
+function objectOpenedWithSetting(text) {
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === "'" || (c === '/' && (text[i + 1] === '/' || text[i + 1] === '*'))) {
+      i = skipToken(text, i, 'bicep');
+      continue;
+    }
+    if (c === '{') {
+      const eol = text.indexOf('\n', i) < 0 ? text.length : text.indexOf('\n', i);
+      const rest = stripLineComment(text.slice(i + 1, eol)).trim();
+      if (rest !== '' && !rest.startsWith('}')) {
+        return JSON.stringify(text.slice(text.lastIndexOf('\n', i) + 1, eol).trim());
+      }
+    }
+    i++;
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------

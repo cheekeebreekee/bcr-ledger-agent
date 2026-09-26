@@ -663,7 +663,11 @@ code's default. Every setting Bicep sets must be read by that app's code or be
 a platform setting (`FUNCTIONS_*`, `AzureWebJobsStorage`, …); a stale one is
 an error. A secret-named setting must be a Key Vault reference, and
 `WEBSITE_RUN_FROM_PACKAGE` must not be in Bicep at all (the zip deploy owns
-it). A file or Bicep variable the check cannot find fails it.
+it). A file or Bicep variable the check cannot find fails it, and so does a
+line it cannot read as exactly one setting: settings are read one per line
+(in Bicep and in each `envMap`), so two on one line (`A: 'x', B: 'y'`, or
+`{ A: 'x' }` on the line that opens the object) is an error rather than a
+setting silently left out of every check.
 
 **Live** (`--live`). Compares what a deploy with that parameters file would
 write with the running apps: a setting running but not in Bicep (a deploy would

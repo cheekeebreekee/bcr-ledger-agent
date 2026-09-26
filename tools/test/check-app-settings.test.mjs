@@ -13,6 +13,7 @@ import {
   evaluate,
   liveCheck,
   main,
+  parseEnvMap,
   resolveParams,
   schemaDefaults,
   staticCheck,
@@ -391,6 +392,100 @@ var after = { NOT_THIS: 'z' }
       { name: 'ONLY_WHEN', expr: "'x'", when: 'flag' },
       { name: 'ONLY_UNLESS', expr: "'y'", when: '!flag' },
     ]);
+  });
+
+  test('Bicep settings: a line holding more than one setting is refused, never half-read', () => {
+    const refused = (body) => () => bicepSettings(`var s = {\n${body}\n}\n`, 's', 'x.bicep');
+    const cases = [
+      // Read as one setting, B would vanish from every check and A's value
+      // would stop being compared.
+      ["  A: 'x', B: 'y'", /line of A holds a comma outside any string or bracket/],
+      ["  A: 'x',", /line of A holds a comma/],
+      ["  A: 'x' B: 'y'", /line of A holds a second `NAME:`/],
+      ["  A: 'x' 'B': 'y'", /line of A holds a second `NAME:`/],
+      ['  A: flag ? one : two B: three', /line of A holds a second `NAME:`/],
+      ["  A: concat(\n    'x'\n  )", /line of A holds a value that does not end on its line/],
+      ["  A: 'x' }", /line of A holds the '\}' of the enclosing object/],
+    ];
+    const missed = [];
+    for (const [body, why] of cases) {
+      try {
+        refused(body)();
+        missed.push(`${body}: accepted`);
+      } catch (err) {
+        if (!(err instanceof CliError) || !why.test(err.message)) {
+          missed.push(`${body}: ${err.message}`);
+        } else if (!/x\.bicep: `var s`: .*Write one setting per line\./.test(err.message)) {
+          missed.push(`${body}: message lacks the file, the variable or the fix: ${err.message}`);
+        }
+      }
+    }
+    assert.deepEqual(missed, []);
+  });
+
+  test('Bicep settings: an object with a setting on its opening line is refused', () => {
+    const missed = [];
+    for (const source of [
+      "var s = { A: 'x', B: 'y' }\n",
+      "var s = { A: 'x' }\n",
+      "var s = union(\n  {\n    A: 'x'\n  },\n  flag ? { B: 'y' } : {}\n)\n",
+      "var s = {\n  A: 'x'\n  C: flag ? { D: 'z' } : {}\n}\n",
+    ]) {
+      try {
+        bicepSettings(source, 's');
+        missed.push(`accepted: ${source}`);
+      } catch (err) {
+        const why = /an object opens with a setting on its line/;
+        if (!(err instanceof CliError) || !why.test(err.message)) {
+          missed.push(`${source}: ${err.message}`);
+        }
+      }
+    }
+    assert.deepEqual(missed, []);
+  });
+
+  test('Bicep settings: ternaries, ??, .?, :: and colons inside strings are one setting', () => {
+    const source = `var s = union(
+  {
+    A: flag ? botAppId : otherAppId
+    B: environmentName == 'prod' ? 'info' : 'debug' // a comment, with: a colon
+    C: first ?? second
+    D: thing.?name ?? 'x'
+    E: parent::child.properties.name
+    F: 'a: b, c'
+    G: flag ? (other ? 'x' : 'y') : 'z'
+    H: '\${host}:443'
+  },
+  flag
+    ? {}
+    : {
+        I: '{ J: 1 }'
+      }
+)
+`;
+    assert.deepEqual(
+      bicepSettings(source, 's').map((s) => s.name),
+      ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'],
+    );
+  });
+
+  test('envMap: a line with two entries, or any line it cannot read, is refused', () => {
+    const map = (body) => `const envMap = {\n${body}\n} as const;\n`;
+    assert.deepEqual(
+      parseEnvMap(map("  // a comment\n  a: 'A', // trailing\n  /* block */\n  b: 'B',\n")),
+      [
+        { field: 'a', env: 'A' },
+        { field: 'b', env: 'B' },
+      ],
+    );
+    for (const body of ["  a: 'A', b: 'B',", '  a: `A`,', "  a: 'A',\n  ...rest,"]) {
+      assert.throws(
+        () => parseEnvMap(map(body), 'x/config.ts'),
+        (err) =>
+          err instanceof CliError && /x\/config\.ts: cannot read the envMap line/.test(err.message),
+        body,
+      );
+    }
   });
 
   test('evaluate: parameters, literals, interpolation, a boolean ternary; the rest is runtime', () => {
