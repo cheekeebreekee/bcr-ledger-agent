@@ -650,6 +650,29 @@ From the 90-day trace export (read by counts and account types only; ids stay in
   data, and who opened them (Purview, H-2 step 2), decides the notice scope. The `{NIP}@` and
   Public-team exposures (W2, W3, W7) are separate from the ledger and stay in scope.
 
+## IR-1 findings (26 September)
+
+Read-only inventory of BCR GROUP, PESKOVOI and TEST (every library), joined to the 90-day IR-0
+export. Counts only here; the register is in the evidence.
+
+- **45 files written by the ingestion identity:** TEST 39 (15 in June, 24 in July), PESKOVOI 3
+  (July, in its own `01_Faktury/02_Faktury_zakupu`), and 3 IR-0 records for BCR GROUP.
+- **BCR GROUP holds none of them now.** The three fallback uploads the logs record are not in any
+  of its libraries: someone moved or deleted them after July. With the audit log off (below),
+  there is no record of who. Ask Yahor and Roman.
+- **Several PESKOVOI documents sit in TEST's library.** TEST's Team is staff only (Yahor and two
+  staff members), so no client could open them there. IR-2 decides whether they move to PESKOVOI
+  (two-person sign-off).
+- **Who can read where:** PESKOVOI's Team holds its own guest, its own `{NIP}@` mailbox (sign-in
+  blocked in T-1) and staff. BCR GROUP holds Roman, Yahor and `AuthoriseMe@` (T-7); it was Public
+  until 23 September, so while the fallback files were there any internal account could have
+  joined. None of the other clients' `{NIP}@` accounts is a member now.
+- **The Microsoft 365 unified audit log was off** until 26 September (Purview showed "Start
+  recording user and admin activity"). There is no Purview record of who opened, moved or deleted
+  any file before that date, so H-2 step 2 has nothing to export for the past. Yahor and Roman
+  opened the July documents themselves (Yahor, 26 September); nobody can show from the logs that
+  nobody else did. Roman and the IOD weigh that in IR-3.
+
 ## Status
 
 Update this table as steps complete. Evidence columns hold hashes, commit ids and dates only,
@@ -664,7 +687,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-1: IR-3 (1), processor notice phase 1 to PESKOVOI | Roman + IOD | todo | | |
 | H-1: IR-3 (2), breach-register entry | IOD | todo | | register entry id |
 | H-2: IR-0 A, trace export | Yahor | done (local; not yet in the store) | 2026-09-26 | 90 days, 2026-06-28 → 09-26: `ir0-appinsights-2026-09-26T13-34-08Z/SHA256SUMS` sha256 `1ac442f02f8478b3…`, 5,103 rows (72 routing). The first 30-day run (`…12-04-00Z`) held no application log and is superseded. Findings: [IR-0 A findings](#ir-0-a-findings-26-september) |
-| H-2: IR-0 B, Purview export (file operations, group events, sign-in events) and audit-log state | Global Admin | todo | | `SHA256SUMS` |
+| H-2: IR-0 B, Purview export (file operations, group events, sign-in events) and audit-log state | Global Admin | not possible: unified audit log was off; turned on 2026-09-26 | 2026-09-26 | no past records exist; recording from 26 Sep |
 | H-2: Entra sign-in log, last 7 days, for the `{NIP}@` accounts and `AuthoriseMe@` | Global Admin | todo | | `SHA256SUMS` |
 | H-2: IR-0 C, Directory export | Yahor | done (local; not yet in the store) | 2026-09-26 13:23Z | `ir0-directory-20260926T132344Z/SHA256SUMS` sha256 `73c91c57e1624de8…`; 1 row (0002, Active) with 2 versions, fields included |
 | H-2: evidence store created, readers verified, uploader write removed, laptop copies deleted | Roman, Yahor | todo | | |
@@ -673,7 +696,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-4: tenant hardening T-1 … T-9 | per step | todo | | [`tenant-hardening.md`](tenant-hardening.md#status) |
 | T-4 checked again after H-6b | BCR GROUP site owner | todo | | time, and any folder locked, in [`tenant-hardening.md`](tenant-hardening.md#status) |
 | T-4b: client-site root folders locked after H-3 (end of W4 for the items in them: the later of the lock and H-3) | SharePoint Admin | todo | | sites, lock times and H-3's time in [`tenant-hardening.md`](tenant-hardening.md#status) |
-| IR-1 inventory: run with an Owner's or site collection admin's token and `--expect-root-folders` for every site; `--ir0` restored from the store; exit 0 | Yahor, or an Owner of each site | todo | | `SHA256SUMS`; any temporary site collection admin added and removed |
+| IR-1 inventory: run with an Owner's or site collection admin's token and `--expect-root-folders` for every site; `--ir0` restored from the store; exit 0 | Yahor | done before T-4/T-4b (so nothing was hidden), `--all-drives`, `--ir0` = the 90-day export; exit 0 | 2026-09-26 13:50Z | `ir1-inventory-2026-09-26T13-50-09Z.json` sha256 `b79b2cdc91d3a614…`; see [IR-1 findings](#ir-1-findings-26-september) |
 | T-4b: items outside the locked folders checked after IR-1, and locked one by one | SharePoint Admin | todo | | per site: done, and the number of items locked (the items themselves in the evidence store) |
 | H-5, H-6: quarantine site and ingestion write grant | Yahor (Global Admin) | done | 2026-09-26 | communication site, Polish, sharing off, owners Yahor + Roman; four columns; Grant-TeamSiteAccess job `eced5ff6` → `granted` to the ingestion managed identity |
 | H-5b: canary guest invited, in no Team; whether it reached the bot before H-10 | Global Admin | todo | | the canary guest's object id (the one object id this page holds; see the top) |
