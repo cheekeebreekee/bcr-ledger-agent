@@ -731,7 +731,7 @@ laptops (`.env`) are an accepted risk, recorded in
 
 | Step | Owner | Done | Before-state saved as | Notes |
 |---|---|---|---|---|
-| T-1 | | | | |
+| T-1 | Yahor (Global Admin) | 2026-09-26, sign-in blocked on the three `{NIP}@` accounts (0002, 0003, 0004); `accountEnabled=false` verified | audit output kept off-repo (holds NIPs) | Licences not removed yet: convert to shared mailboxes first (T-2) |
 | T-2 | | | | |
 | T-3 | | | | Time made Private, from Purview |
 | T-4 | | | | Folders locked, and the time; whether `98_Nieposortowane` was created first; the check after H-6b, its time, and any folder it locked |

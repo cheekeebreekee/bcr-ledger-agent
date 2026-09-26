@@ -641,12 +641,12 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | Phase-0 contract committed | Yahor | done | 2026-09-25 | `21b0883` |
 | H-1: IR-3 (1), processor notice phase 1 to PESKOVOI | Roman + IOD | todo | | |
 | H-1: IR-3 (2), breach-register entry | IOD | todo | | register entry id |
-| H-2: IR-0 A, trace export | Yahor | todo | | `SHA256SUMS` |
+| H-2: IR-0 A, trace export | Yahor | done (local; not yet in the store) | 2026-09-26 | `ir0-appinsights-2026-09-26T12-04-00Z/SHA256SUMS` sha256 `59f6a338105ea2ed…`; 273 routing rows, 30 × 24 h chunks, `--all-traces` |
 | H-2: IR-0 B, Purview export (file operations, group events, sign-in events) and audit-log state | Global Admin | todo | | `SHA256SUMS` |
 | H-2: Entra sign-in log, last 7 days, for the `{NIP}@` accounts and `AuthoriseMe@` | Global Admin | todo | | `SHA256SUMS` |
 | H-2: IR-0 C, Directory export | Yahor | todo | | `SHA256SUMS` |
 | H-2: evidence store created, readers verified, uploader write removed, laptop copies deleted | Roman, Yahor | todo | | |
-| H-3: `ANTHROPIC_ENABLED=false` (mandatory) | Yahor | todo | | time of the change; if H-6b did not follow the same working day, Roman's decision (interim writes accepted, or ingestion stopped until H-6b) |
+| H-3: `ANTHROPIC_ENABLED=false` (mandatory) | Yahor | done | 2026-09-26 11:58:09Z | H-5/H-6/H-6b not done the same day (Saturday): interim writes to BCR GROUP's `98_Nieposortowane` accepted until H-6b, pending Roman's confirmation |
 | BCR GROUP made Private (time from Purview) | — | done | *record* | T-3 |
 | H-4: tenant hardening T-1 … T-9 | per step | todo | | [`tenant-hardening.md`](tenant-hardening.md#status) |
 | T-4 checked again after H-6b | BCR GROUP site owner | todo | | time, and any folder locked, in [`tenant-hardening.md`](tenant-hardening.md#status) |
@@ -657,8 +657,8 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-5b: canary guest invited, in no Team; whether it reached the bot before H-10 | Global Admin | todo | | the canary guest's object id (the one object id this page holds; see the top) |
 | H-6b: running build's fallback re-pointed at the quarantine | Yahor | todo | | `FALLBACK_*` names; values in the evidence store (`SHA256SUMS`); which guest verified it (canary or TEST) |
 | H-7: Directory check; duplicate `0002` resolved; per-row decisions, incl. which sites get a grant in H-12 | Yahor, Roman | todo | | |
-| H-8: app settings added | Yahor | todo | | |
-| H-9: bot deploy, gate in `log` | Yahor | todo | | sha256 of the saved pre-Phase-0 bot package |
+| H-8: app settings added | Yahor | done | 2026-09-26 | shape check clean; `MICROSOFT_APP_TYPE` was already `SingleTenant` (no live change) |
+| H-9: bot deploy, gate in `log` | Yahor | deployed 12:16:59Z; TEST guest `pomoc` pending | 2026-09-26 | pre-Phase-0 bot `b1c74ec5…29cfa`, ingestion `19e4f769…1dc14a` (saved); deployed zip `56963ff9…a5278` from `b742acc`; `bot runtime initialised` with `botGateMode=log` |
 | H-10: manifest 0.2.0 and availability (T-10) | Teams Admin | todo | | |
 | H-11: gate `enforce` after 24 h clean | Yahor | todo | | |
 | H-12: ingestion deploy, further site grants, bindings, canaries | Yahor, Roman reviews | todo | | apply log hash; sha256 of the saved pre-Phase-0 ingestion package |
