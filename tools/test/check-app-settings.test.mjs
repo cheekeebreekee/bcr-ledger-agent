@@ -616,6 +616,49 @@ describe('this repo', () => {
       .map(([k]) => k);
     assert.deepEqual(runtime, []);
   });
+
+  // The classification release: a deploy must never put the old model back or
+  // re-add the retired threshold, and must write a threshold the code accepts.
+  test('the template and both parameter files carry the classification release', (t) => {
+    const template = readFileSync(join(REPO, 'infrastructure/main.bicep'), 'utf8');
+    const dist = join(REPO, 'packages/shared/dist/config.js');
+    const schema = existsSync(dist)
+      ? createRequire(import.meta.url)(dist).ingestionConfigSchema.shape
+          .classificationAcceptThreshold
+      : undefined;
+    if (!schema) t.diagnostic('@bcr/shared is not built: the threshold range is checked by hand');
+    const offenders = [];
+    for (const env of ['dev', 'prod', undefined]) {
+      const file = env
+        ? JSON.parse(
+            readFileSync(join(REPO, `infrastructure/main.${env}.parameters.json`), 'utf8'),
+          ).parameters
+        : {};
+      const params = resolveParams(
+        bicepParams(template),
+        Object.fromEntries(Object.entries(file).map(([k, v]) => [k, v.value])),
+      );
+      const settings = Object.fromEntries(
+        bicepSettings(template, 'ingestionAppSettings').map((s) => [
+          s.name,
+          evaluate(s.expr, params),
+        ]),
+      );
+      const where = env ?? 'template defaults';
+      if (settings.ANTHROPIC_MODEL?.value !== 'claude-opus-5') {
+        offenders.push(`${where}: ANTHROPIC_MODEL ${JSON.stringify(settings.ANTHROPIC_MODEL)}`);
+      }
+      if ('ANTHROPIC_CONFIDENCE_THRESHOLD' in settings) {
+        offenders.push(`${where}: sets the retired ANTHROPIC_CONFIDENCE_THRESHOLD`);
+      }
+      const threshold = settings.CLASSIFICATION_ACCEPT_THRESHOLD?.value;
+      const accepted = schema
+        ? schema.safeParse(threshold).success && threshold !== ''
+        : Number(threshold) >= 0.7 && Number(threshold) <= 0.95;
+      if (!accepted) offenders.push(`${where}: CLASSIFICATION_ACCEPT_THRESHOLD ${threshold}`);
+    }
+    assert.deepEqual(offenders, []);
+  });
 });
 
 // ---------------------------------------------------------------------------

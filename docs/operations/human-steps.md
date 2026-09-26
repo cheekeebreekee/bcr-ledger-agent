@@ -2123,6 +2123,14 @@ either. The old build's forced tool call is only known to work on the old model.
 build does not read `ANTHROPIC_CONFIDENCE_THRESHOLD` at all (it only warns that it is still set),
 so its 0.6 cannot stop the cold start.
 
+**The template already records the release values** (gate G1: every setting dev runs with is in
+`main.dev.parameters.json`). The release commit set `anthropicModel` to `claude-opus-5`, added
+`classificationAcceptThreshold` (`CLASSIFICATION_ACCEPT_THRESHOLD=0.70`) and dropped
+`ANTHROPIC_CONFIDENCE_THRESHOLD` from `main.bicep`. So from that merge until step 4 is done,
+`check-app-settings --live` against dev reports exactly those three names, and **no Bicep deploy
+to dev and no G1-b may run in between**: the template would switch the model under whichever
+build is running. If gate G1 is lifted first, this release still goes first.
+
 1. **Evaluate, before anything is deployed (the go/no-go).** On Yahor's machine, with the 43
    documents of the 26 September evaluation in a git-ignored folder (for example
    `tools/out/evaluations/2026-09-26-docs/`; they are client data: never commit, upload or paste
@@ -2192,7 +2200,21 @@ so its 0.6 cannot stop the cold start.
      <deploy time, UTC>
    ```
 
-3. **Switch the settings.** One restart:
+3. **Compare, naming the three changes** (read-only; [`deployment.md` §3a](../deployment.md#3a-app-settings)),
+   from the commit that was deployed in step 2:
+
+   ```bash
+   node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json \
+     --expect ANTHROPIC_MODEL,CLASSIFICATION_ACCEPT_THRESHOLD,ANTHROPIC_CONFIDENCE_THRESHOLD
+   ```
+
+   Exactly three `note` lines, all on ingestion: `ANTHROPIC_MODEL` from
+   `claude-opus-4-5-20251101` to `claude-opus-5`, `CLASSIFICATION_ACCEPT_THRESHOLD` added as
+   `0.70`, `ANTHROPIC_CONFIDENCE_THRESHOLD` deleted. **Any `drift` line: stop.** A setting was
+   changed in Azure and not recorded; record it in `main.dev.parameters.json` in a commit of its
+   own first, as the standing rules require, and compare again.
+
+4. **Switch the settings.** One restart:
 
    ```bash
    az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
@@ -2201,9 +2223,16 @@ so its 0.6 cannot stop the cold start.
      --setting-names ANTHROPIC_CONFIDENCE_THRESHOLD
    ```
 
-   **Verify.** The next cold start's `classification.config` shows `model` `claude-opus-5` and
-   `acceptThreshold` `0.7`, and no `config.retired_setting` follows it. Then, once files flow,
-   the filing lines carry the new fields, and "retry later" is visible on its own:
+   **Verify.** The comparison is now clean, with no `--expect`:
+
+   ```bash
+   node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json
+   ```
+
+   It must end with `✔ no errors, no drift`. The next cold start's `classification.config` shows
+   `model` `claude-opus-5` and `acceptThreshold` `0.7`, and no `config.retired_setting` follows
+   it. Then, once files flow, the filing lines carry the new fields, and "retry later" is
+   visible on its own:
 
    ```bash
    aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
@@ -2225,18 +2254,22 @@ so its 0.6 cannot stop the cold start.
    [status.anthropic.com](https://status.anthropic.com), and `status` 401/403/404 means the key or
    the model setting is wrong.
 
-4. **Bicep.** `main.bicep` still sets `ANTHROPIC_MODEL=claude-opus-4-5-20251101` and
-   `ANTHROPIC_CONFIDENCE_THRESHOLD`, and not `CLASSIFICATION_ACCEPT_THRESHOLD`. Nothing here
-   deploys Bicep ("dev" is production); the template is brought in line with the drift fix
-   (gate G1).
+5. **Bicep: nothing to deploy.** The template already matches what now runs (step 4's clean
+   comparison), so the first Bicep deploy after [Lifting gate G1](#lifting-gate-g1) keeps
+   `claude-opus-5` and the threshold. Record the date of step 4 and both comparisons in the
+   incident's status table.
 
 **Rollback.** First set the model back, so the old build never runs on the new model:
 
 ```bash
 az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
-  ANTHROPIC_MODEL=claude-opus-4-5-20251101 ANTHROPIC_CONFIDENCE_THRESHOLD=0.6
+  ANTHROPIC_MODEL=claude-opus-4-5-20251101
 ```
 
 Then deploy the `document-ingestion-p0-$STAMP.zip` saved in step 2, the same way. The old build
-ignores `CLASSIFICATION_ACCEPT_THRESHOLD`; leave it. Files the new build filed stay
-where they are, and files it left as "retry later" are taken by the old build on its next tick.
+ignores `CLASSIFICATION_ACCEPT_THRESHOLD` and, without `ANTHROPIC_CONFIDENCE_THRESHOLD`, uses its
+own default, the same 0.6; leave both as they are. Files the new build filed stay where they
+are, and files it left as "retry later" are taken by the old build on its next tick. Then
+record the model in the template, in a commit of its own: `"anthropicModel"` back to
+`claude-opus-4-5-20251101` in `main.dev.parameters.json`, until the next attempt. `--live` is
+then clean again; until that commit, no Bicep deploy to dev.

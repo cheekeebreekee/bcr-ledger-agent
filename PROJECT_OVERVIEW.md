@@ -187,8 +187,8 @@ difference, and CI checks that Bicep sets every setting the code needs.
 | `QUARANTINE_DRIVE_NAME` | **New.** Default `Documents`; on this tenant, `Dokumenty` |
 | `QUARANTINE_ROOT_FOLDER` | **New.** Default `Kwarantanna` |
 | `FORBIDDEN_TARGET_SITE_PATHS` | **New, required.** Sites no row may route to: at least `/sites/BCRGROUPSp.zo.o`. Each entry exactly `/sites/<name>` or `/teams/<name>`. The quarantine path is added automatically. |
-| `ANTHROPIC_ENABLED`, `ANTHROPIC_API_KEY` (Key Vault), `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_CONTENT_BYTES` | Classification. The model defaults to `claude-opus-5`; the running app was set to `claude-opus-4-5-20251101` and is switched at the classification release. |
-| `CLASSIFICATION_ACCEPT_THRESHOLD` | **New.** The one acceptance threshold: default `0.70`, and anything outside 0.70–0.95 stops ingestion at cold start. It replaces `ANTHROPIC_CONFIDENCE_THRESHOLD`, which is no longer read (a set value only logs `config.retired_setting`; remove it). |
+| `ANTHROPIC_ENABLED`, `ANTHROPIC_API_KEY` (Key Vault), `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_CONTENT_BYTES` | Classification. The model defaults to `claude-opus-5`, in the code and in `main.bicep` and both parameter files; the running app was set to `claude-opus-4-5-20251101` and is switched at the classification release. |
+| `CLASSIFICATION_ACCEPT_THRESHOLD` | **New.** The one acceptance threshold: default `0.70`, and anything outside 0.70–0.95 stops ingestion at cold start. Bicep sets it from `classificationAcceptThreshold` (`0.70`). It replaces `ANTHROPIC_CONFIDENCE_THRESHOLD`, which is no longer read (a set value only logs `config.retired_setting`; the classification release deletes it, and the template no longer sets it). |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING`, `LOG_LEVEL` | |
 
 **Removed in Phase 0:** `FALLBACK_CLIENT_ID`, `FALLBACK_SITE_HOSTNAME`, `FALLBACK_SITE_PATH`,

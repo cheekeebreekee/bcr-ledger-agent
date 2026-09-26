@@ -458,7 +458,10 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
   `thinking` field `claude-opus-5` thinks adaptively, and `max_tokens` covers thinking **and**
   the answer. The same request works on `claude-opus-4-5-20251101`, the model the running app
   was set to before the classification release; the operator switches `ANTHROPIC_MODEL` at that
-  deploy (`docs/operations/human-steps.md`, *Classification release*).
+  deploy (`docs/operations/human-steps.md`, *Classification release*). `main.bicep` and both
+  parameter files already record the release (`claude-opus-5`, `CLASSIFICATION_ACCEPT_THRESHOLD`,
+  no `ANTHROPIC_CONFIDENCE_THRESHOLD`), so until that switch `--live` against dev reports exactly
+  those three names, and no Bicep deploy to dev may run in between.
 - If `tsc -b` keeps seeing stale `@bcr/shared` types, delete the physical copy Yarn sometimes leaves
   at `packages/<pkg>/node_modules/@bcr/shared` so resolution falls back to the root symlink.
 

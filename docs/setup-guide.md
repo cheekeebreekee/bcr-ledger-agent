@@ -290,7 +290,7 @@ change to dev's settings.
     "inboxMaxFilesPerTick":       { "value": "" },
     "enableAnthropic":            { "value": true },
     "anthropicModel":             { "value": "claude-opus-5" },
-    "anthropicConfidenceThreshold": { "value": "0.6" },
+    "classificationAcceptThreshold": { "value": "0.70" },
     "botGateMode":                { "value": "enforce" },
     "logLevel":                   { "value": "info" }
   }
