@@ -1,0 +1,15 @@
+{
+  // The DB integration tests: type-checked (`type-check`) and compiled by
+  // ts-jest (`test:db`), never built into dist.
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "declaration": false,
+    "declarationMap": false,
+    "rootDir": "..",
+    "types": ["jest", "node"]
+  },
+  "include": ["./**/*.ts", "../src/**/*.ts"]
+}

@@ -49,6 +49,49 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: yarn test:tools
 
+  # The document index's isolation boundary, against a real PostgreSQL 16:
+  # migrations as a superuser, then the RLS matrix, verify.sql, the pooled
+  # connection a transaction leaves behind and the repositories, as a
+  # NON-superuser login granted ledger_app (packages/ledger-db/itest). No
+  # Azure: the service container is thrown away with the job.
+  db-integration:
+    name: DB integration (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-throwaway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      LEDGER_TEST_DATABASE_URL: postgres://postgres:ci-only-throwaway@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build
+        run: yarn build
+
+      - name: RLS matrix, verify.sql and repositories
+        run: yarn test:db
+
   # The deploy packages, built exactly as a deploy builds them, so a broken
   # package (orphan dist file, lockfile drift, a dependency the code requires
   # but does not declare) fails the PR instead of the deploy. Nothing is
