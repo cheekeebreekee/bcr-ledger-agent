@@ -21,6 +21,7 @@ describe('loadIngestionConfig', () => {
     expect(first.botCallerAppIds).toEqual(['00000000-0000-0000-0000-000000000001']);
     expect(first.forbiddenTargetSitePaths).toEqual(['/sites/BCRGROUP']);
     expect(first.membershipCheckMode).toBe('enforce');
+    expect(first.inboxSweepMode).toBe('off');
     expect(loadIngestionConfig({})).toBe(first);
   });
 
@@ -28,6 +29,22 @@ describe('loadIngestionConfig', () => {
     expect(loadIngestionConfig({ ...env, MEMBERSHIP_CHECK_MODE: 'off' }).membershipCheckMode).toBe(
       'off',
     );
+  });
+
+  it('reads the inbox sweep settings', () => {
+    const cfg = loadIngestionConfig({
+      ...env,
+      INBOX_SWEEP_MODE: 'shadow',
+      INBOX_MIN_AGE_MS: '60000',
+      INBOX_MAX_FILES_PER_TICK: '3',
+    });
+    expect(cfg.inboxSweepMode).toBe('shadow');
+    expect(cfg.inboxMinAgeMs).toBe(60000);
+    expect(cfg.inboxMaxFilesPerTick).toBe(3);
+  });
+
+  it('refuses to start on an INBOX_SWEEP_MODE it does not know', () => {
+    expect(() => loadIngestionConfig({ ...env, INBOX_SWEEP_MODE: 'on' })).toThrow(/INBOX_SWEEP_MODE/);
   });
 
   it('refuses to start on a MEMBERSHIP_CHECK_MODE it does not know', () => {

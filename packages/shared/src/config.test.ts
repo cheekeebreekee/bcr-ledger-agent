@@ -28,6 +28,9 @@ const ingestionEnvMap = {
   quarantineRootFolder: 'QUARANTINE_ROOT_FOLDER',
   forbiddenTargetSitePaths: 'FORBIDDEN_TARGET_SITE_PATHS',
   membershipCheckMode: 'MEMBERSHIP_CHECK_MODE',
+  inboxSweepMode: 'INBOX_SWEEP_MODE',
+  inboxMinAgeMs: 'INBOX_MIN_AGE_MS',
+  inboxMaxFilesPerTick: 'INBOX_MAX_FILES_PER_TICK',
   anthropicEnabled: 'ANTHROPIC_ENABLED',
   anthropicApiKey: 'ANTHROPIC_API_KEY',
   anthropicModel: 'ANTHROPIC_MODEL',
@@ -125,6 +128,57 @@ describe('ingestionConfigSchema', () => {
     expect(cfg.anthropicMaxContentBytes).toBe(10 * 1024 * 1024);
     expect(cfg.anthropicConfidenceThreshold).toBe(0.6);
     expect(cfg.membershipCheckMode).toBe('enforce');
+    expect(cfg.inboxSweepMode).toBe('off');
+    expect(cfg.inboxMinAgeMs).toBe(2 * 60 * 1000);
+    expect(cfg.inboxMaxFilesPerTick).toBe(20);
+  });
+
+  // The inbox sweep moves files in client channels. It is off unless set,
+  // and only an exact mode switches it on: a typo stops cold start instead.
+  it.each([
+    [undefined, 'off'],
+    ['', 'off'],
+    [' ', 'off'],
+    ['off', 'off'],
+    ['shadow', 'shadow'],
+    ['enforce', 'enforce'],
+  ])('reads INBOX_SWEEP_MODE=%j as %s', (value, expected) => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      INBOX_SWEEP_MODE: value,
+    });
+    expect(cfg.inboxSweepMode).toBe(expected);
+  });
+
+  it.each(['ENFORCE', 'on', 'true', 'log', 'dry-run'])(
+    'rejects INBOX_SWEEP_MODE=%j, naming the variable',
+    (value) => {
+      expect(() =>
+        loadConfig(ingestionConfigSchema, ingestionEnvMap, { ...baseEnv, INBOX_SWEEP_MODE: value }),
+      ).toThrow(/INBOX_SWEEP_MODE: must be 'off', 'shadow' or 'enforce'/);
+    },
+  );
+
+  it('reads the inbox age and budget overrides', () => {
+    const cfg = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+      ...baseEnv,
+      INBOX_MIN_AGE_MS: '300000',
+      INBOX_MAX_FILES_PER_TICK: '5',
+    });
+    expect(cfg.inboxMinAgeMs).toBe(300000);
+    expect(cfg.inboxMaxFilesPerTick).toBe(5);
+  });
+
+  it.each([
+    ['INBOX_MIN_AGE_MS', '-1'],
+    ['INBOX_MIN_AGE_MS', '1.5'],
+    ['INBOX_MIN_AGE_MS', 'soon'],
+    ['INBOX_MAX_FILES_PER_TICK', '0'],
+    ['INBOX_MAX_FILES_PER_TICK', '2.5'],
+  ])('rejects %s=%j, naming the variable', (name, value) => {
+    expect(() =>
+      loadConfig(ingestionConfigSchema, ingestionEnvMap, { ...baseEnv, [name]: value }),
+    ).toThrow(new RegExp(name));
   });
 
   // The runtime Team-membership check closes R46; only an exact `off` may

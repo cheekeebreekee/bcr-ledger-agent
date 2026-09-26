@@ -102,6 +102,18 @@ const numeric = (defaultValue: number) =>
       return n;
     });
 
+/**
+ * A whole number of at least `min`, from an env var, with a default.
+ * Empty/undefined → default. A fraction, a negative or a non-number fails
+ * at cold start: a budget or an age that parses to something else would
+ * silently change what the sweep does.
+ */
+const wholeNumber = (defaultValue: number, min: number) =>
+  numeric(defaultValue).refine(
+    (n) => Number.isInteger(n) && n >= min,
+    `must be a whole number of at least ${min}`,
+  );
+
 const logLevel = z
   .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace'])
   .optional()
@@ -251,6 +263,32 @@ export const ingestionConfigSchema = z.object({
         .optional(),
     )
     .transform((v) => v ?? 'enforce'),
+  // --- Channel-inbox intake (the client's Team → "Dokumenty księgowe") ---
+  /**
+   * What the inbox sweep timer does. `off` (the default, also when empty):
+   * returns at once. `shadow`: reads the inboxes, checks each uploader and
+   * classifies, then only logs what it would move; it creates no folder and
+   * moves nothing. `enforce`: moves each client upload into its taxonomy
+   * folder inside the same channel folder. Anything else fails at cold start,
+   * so a typo can never switch writes on.
+   */
+  inboxSweepMode: z
+    .preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z
+        .enum(['off', 'shadow', 'enforce'], {
+          errorMap: () => ({ message: "must be 'off', 'shadow' or 'enforce'" }),
+        })
+        .optional(),
+    )
+    .transform((v) => v ?? 'off'),
+  /**
+   * How long a file must be unmodified before the sweep touches it (ms).
+   * Younger files may still be uploading or being edited. Default 2 min.
+   */
+  inboxMinAgeMs: wholeNumber(2 * 60 * 1000, 0),
+  /** Most files taken into processing per sweep tick, across all clients. Default 20. */
+  inboxMaxFilesPerTick: wholeNumber(20, 1),
   // --- Claude (Anthropic) content classification ---
   anthropicEnabled: boolish(false),
   anthropicApiKey: optionalStr(),
@@ -267,6 +305,9 @@ export type IngestionConfig = z.infer<typeof ingestionConfigSchema>;
 
 /** `MEMBERSHIP_CHECK_MODE`: see {@link ingestionConfigSchema}. */
 export type MembershipCheckMode = IngestionConfig['membershipCheckMode'];
+
+/** `INBOX_SWEEP_MODE`: see {@link ingestionConfigSchema}. */
+export type InboxSweepMode = IngestionConfig['inboxSweepMode'];
 
 // ---------------------------------------------------------------------------
 // Loader
