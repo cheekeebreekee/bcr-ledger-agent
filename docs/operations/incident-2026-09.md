@@ -630,6 +630,26 @@ The per-client list of affected documents is sent separately, over a secure chan
 
 ---
 
+## IR-0 A findings (26 September)
+
+From the 90-day trace export (read by counts and account types only; ids stay in the evidence).
+
+- **Every ingestion request in the retained window was on 7–16 July 2026:** 30 documents
+  classified and uploaded (19 single-document requests, 11 batches), plus one Personal Tab lookup
+  (W5).
+- **Every routing line names one uploader: Yahor's staff account.** No client guest and no
+  `{NIP}@` account ever reached ingestion through the bot. This matches a Teams limit found the
+  same day: a guest cannot attach a file in a 1:1 chat at all ("Attach files: channel posts only").
+- **Resolutions:** 3 to BCR GROUP (the fallback), 3 to PESKOVOI's row (Yahor's id sits on it).
+  **No content promotion was ever logged** (`promoted fallback → …`: 0).
+- **Not covered:** 12–27 June. The App Insights component exists since 12 June, and those days
+  aged out before the incident was found. The first request of any kind in the retained window is
+  on 7 July.
+- **What it means for IR-1/IR-3:** the ledger's own write path put Yahor's July test uploads into
+  BCR GROUP's and PESKOVOI's library roots. Which of those files, if any, carry client personal
+  data, and who opened them (Purview, H-2 step 2), decides the notice scope. The `{NIP}@` and
+  Public-team exposures (W2, W3, W7) are separate from the ledger and stay in scope.
+
 ## Status
 
 Update this table as steps complete. Evidence columns hold hashes, commit ids and dates only,
@@ -643,7 +663,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | Phase-0 contract committed | Yahor | done | 2026-09-25 | `21b0883` |
 | H-1: IR-3 (1), processor notice phase 1 to PESKOVOI | Roman + IOD | todo | | |
 | H-1: IR-3 (2), breach-register entry | IOD | todo | | register entry id |
-| H-2: IR-0 A, trace export | Yahor | done (local; not yet in the store) | 2026-09-26 | `ir0-appinsights-2026-09-26T12-04-00Z/SHA256SUMS` sha256 `59f6a338105ea2ed…`; 273 routing rows, 30 × 24 h chunks, `--all-traces` |
+| H-2: IR-0 A, trace export | Yahor | done (local; not yet in the store) | 2026-09-26 | 90 days, 2026-06-28 → 09-26: `ir0-appinsights-2026-09-26T13-34-08Z/SHA256SUMS` sha256 `1ac442f02f8478b3…`, 5,103 rows (72 routing). The first 30-day run (`…12-04-00Z`) held no application log and is superseded. Findings: [IR-0 A findings](#ir-0-a-findings-26-september) |
 | H-2: IR-0 B, Purview export (file operations, group events, sign-in events) and audit-log state | Global Admin | todo | | `SHA256SUMS` |
 | H-2: Entra sign-in log, last 7 days, for the `{NIP}@` accounts and `AuthoriseMe@` | Global Admin | todo | | `SHA256SUMS` |
 | H-2: IR-0 C, Directory export | Yahor | done (local; not yet in the store) | 2026-09-26 13:23Z | `ir0-directory-20260926T132344Z/SHA256SUMS` sha256 `73c91c57e1624de8…`; 1 row (0002, Active) with 2 versions, fields included |
