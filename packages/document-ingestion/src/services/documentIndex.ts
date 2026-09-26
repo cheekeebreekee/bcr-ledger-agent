@@ -57,6 +57,37 @@ export const INDEX_OFF: DocumentIndex = {
   },
 };
 
+/**
+ * What the intakes call after filing: `index.record`, with its contract held
+ * even by an index that breaks it. A document already filed must never be
+ * reported as failed (the bot's user would send it again) or counted as a
+ * failed move because of the index: anything thrown is logged as
+ * `index.write_failed` (`reason` `error`) and swallowed.
+ */
+export async function recordFiling(
+  index: DocumentIndex,
+  doc: IndexedDocument,
+  log: Logger,
+): Promise<void> {
+  try {
+    await index.record(doc, log);
+  } catch (err) {
+    log.warn(
+      {
+        event: 'index.write_failed',
+        documentId: doc.documentId,
+        clientId: doc.client.clientNo,
+        listItemId: doc.client.listItemId,
+        driveItemId: doc.driveItemId,
+        source: doc.source,
+        reason: 'error',
+        err: err instanceof Error ? { name: err.name } : { type: typeof err },
+      },
+      'index.write_failed',
+    );
+  }
+}
+
 /** How long writes are skipped after the database could not be reached. */
 export const INDEX_UNAVAILABLE_COOLDOWN_MS = 60_000;
 

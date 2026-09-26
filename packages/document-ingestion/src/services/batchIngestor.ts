@@ -19,7 +19,7 @@ import {
 } from './acceptancePolicy';
 import type { ClassificationOutcome } from './classificationService';
 import type { ClientResolver } from './clientResolver';
-import { INDEX_OFF, type DocumentIndex } from './documentIndex';
+import { INDEX_OFF, recordFiling, type DocumentIndex } from './documentIndex';
 import { RetryLaterBound, type RetryLaterLast } from './retryLaterBound';
 import { SharePointTargetError, type SharePointService } from './sharePointService';
 
@@ -334,7 +334,8 @@ export class BatchIngestor {
       'document.filed',
     );
     // Filed: the index follows, in this client's scope. Never throws.
-    await this.index.record(
+    await recordFiling(
+      this.index,
       {
         documentId,
         source: 'bot',

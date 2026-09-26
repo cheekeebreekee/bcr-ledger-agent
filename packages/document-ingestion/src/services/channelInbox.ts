@@ -16,7 +16,7 @@ import {
 } from './acceptancePolicy';
 import type { ClassificationOutcome } from './classificationService';
 import { boundClientRows, type ClientDirectorySnapshot } from './clientDirectoryReader';
-import { INDEX_OFF, type DocumentIndex, type IndexedClient } from './documentIndex';
+import { INDEX_OFF, recordFiling, type DocumentIndex, type IndexedClient } from './documentIndex';
 import { doublingBackoff, RetryLaterBound } from './retryLaterBound';
 import {
   ContentTooLargeError,
@@ -847,7 +847,8 @@ export class ChannelInbox {
     tick: Tick,
     placement?: CachedPlacement,
   ): Promise<void> {
-    await this.index.record(
+    await recordFiling(
+      this.index,
       {
         documentId: randomUUID(),
         source: 'inbox',

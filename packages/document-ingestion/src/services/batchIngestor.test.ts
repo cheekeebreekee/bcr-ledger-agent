@@ -950,6 +950,24 @@ describe('BatchIngestor — the document index', () => {
     expect(index.docs).toEqual([]);
   });
 
+  it('still reports a filed document as uploaded when the index throws', async () => {
+    const index: DocumentIndex = {
+      mode: 'write',
+      record: jest.fn(async () => {
+        throw new Error('broken index');
+      }),
+    };
+    const { ingestor } = setup(bound, { index });
+    const { log, lines } = recordingLogger();
+    const [result] = await ingestor.ingestBatch(payload(), log);
+    expect(result?.status).toBe('uploaded');
+    expect(lines.find((l) => l['event'] === 'index.write_failed')).toMatchObject({
+      documentId: 'id-2',
+      reason: 'error',
+      err: { name: 'Error' },
+    });
+  });
+
   it('files the same with the index off (the default)', async () => {
     const { ingestor } = setup(bound);
     const [result] = await ingestor.ingestBatch(payload(), recordingLogger().log);

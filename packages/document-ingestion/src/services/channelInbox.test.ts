@@ -2314,6 +2314,22 @@ describe('ChannelInbox: the document index', () => {
     expect(index.record).not.toHaveBeenCalled();
   });
 
+  it('counts a moved file as filed, never failed, when the index throws', async () => {
+    const index: DocumentIndex = {
+      mode: 'write',
+      record: jest.fn(async () => {
+        throw new Error('broken index');
+      }),
+    };
+    const { tenant, inbox, events } = setup({ deps: { index } });
+    tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    const summary = await inbox.sweep();
+    expect(summary).toMatchObject({ filed: 1, failed: 0 });
+    expect(events('index.write_failed')).toEqual([
+      expect.objectContaining({ source: 'inbox', reason: 'error' }),
+    ]);
+  });
+
   it('files the same with the index off (the default)', async () => {
     const { tenant, inbox } = setup();
     tenant.addFile('inbox-a', { name: 'faktura.pdf' });
