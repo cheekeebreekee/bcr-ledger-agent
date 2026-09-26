@@ -761,7 +761,11 @@ export function compareApp({ app, functionApp, resourceGroup, intended, az }) {
     });
   }
   if (running.has(ZIP_DEPLOY_SETTING)) {
-    notes.push(`${ZIP_DEPLOY_SETTING}: running; a deploy writes it back unchanged`);
+    // Not "a deploy keeps it": this check never reads the URL, so it cannot
+    // vouch for the carry-over. The G1 rehearsal (human-steps.md) does.
+    notes.push(
+      `${ZIP_DEPLOY_SETTING}: running, not compared; functionApp.bicep carries it over with list()`,
+    );
   } else {
     notes.push(`${ZIP_DEPLOY_SETTING}: not set; the next zip deploy sets it`);
   }

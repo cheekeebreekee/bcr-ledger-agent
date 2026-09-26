@@ -717,7 +717,7 @@ describe('live comparison', () => {
     ]);
     const bot = r.report.find((x) => x.app === 'teams-bot');
     assert.ok(
-      bot.notes.some((n) => /WEBSITE_RUN_FROM_PACKAGE: running; a deploy writes it back/.test(n)),
+      bot.notes.some((n) => /WEBSITE_RUN_FROM_PACKAGE: running, not compared; .* list\(\)/.test(n)),
     );
     assert.ok(
       bot.notes.some((n) =>
