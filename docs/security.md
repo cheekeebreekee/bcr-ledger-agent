@@ -447,7 +447,13 @@ Phase 1–2).
 
 **Availability.** An index failure never blocks or undoes a filing: it is logged with ids, a
 reason code and the SQLSTATE only (a PostgreSQL message quotes the values it refused), and the
-missing rows can be backfilled. After a connection failure, writes are skipped for a minute.
+missing rows can be backfilled. After a connection failure, writes are skipped for a minute. A
+connection that dies while a write holds it (a server restart or maintenance, a network reset,
+a terminated backend) fails that one write and nothing else: node-postgres reports it as an
+`error` event on the connection, which `withClientTx` listens for as long as it holds it
+(`index.connection_error`, name and SQLSTATE); unheard, that event would end the worker and
+every upload on it. `itest/connection.itest.ts` terminates a backend mid-statement and while
+idle in a transaction.
 
 **Status: Mitigated by design; off until the
 [Document index release](operations/human-steps.md#document-index-release)** sets

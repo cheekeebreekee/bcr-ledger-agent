@@ -68,7 +68,8 @@ Coverage thresholds are **per package and they fail the run**: `shared` 85/85/80
 use the superuser URL in `LEDGER_TEST_DATABASE_URL`, as CI's `db-integration` job does), run
 the migrations as a superuser, then assert the RLS matrix for every table in schema `ledger`,
 `verify.sql` and its negatives, `client_id` immutability, the pooled connection a transaction
-leaves behind, and the repositories — as a non-superuser login granted `ledger_app`.
+leaves behind, a connection that dies mid-transaction (the transaction fails, the process and
+the pool live on), and the repositories — as a non-superuser login granted `ledger_app`.
 `src/functions/**`, `src/index.ts` and `src/runtime.ts` are excluded from coverage in the two
 Function App packages — they are HTTP registration and cold-start wiring. The logic lives in services
 with injected collaborators (e.g. `services/batchIngestor.ts`) and is tested there.

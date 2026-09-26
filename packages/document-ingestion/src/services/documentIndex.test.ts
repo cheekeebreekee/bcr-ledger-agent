@@ -84,6 +84,8 @@ function fakeDb(answer: (text: string) => unknown[] | Error) {
       return { rows: out };
     },
     release() {},
+    on() {},
+    removeListener() {},
   };
   const connect = jest.fn(async () => conn);
   return { db: new LedgerDb({ connect, end: async () => undefined }), statements, scopes, connect };

@@ -753,7 +753,10 @@ validates each after the call: an invalid value is `NULL`, never a guess.
 the filing is unaffected: the upload's result, the move and their log lines are the same with
 the index off, on or down. After a connection failure writes are skipped for a minute. The pool
 is small (2 connections per instance), every connection and statement has a timeout, and each
-connection gets its own Entra token (TLS verified).
+connection gets its own Entra token (TLS verified). A connection that dies while a transaction
+holds it fails that transaction only: `withClientTx` listens for the connection's `error` event
+while it is checked out (the pool listens only while it is idle; an unheard `error` ends the
+Node worker), logs `index.connection_error` and destroys the connection.
 
 **Reads.** `documentsRepo.monthlyCounts(tx)` and `documentsRepo.search(tx, filter, page)`
 (category, month range, gross range, counterparty NIP; keyset paging, newest first) run inside

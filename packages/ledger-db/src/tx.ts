@@ -1,3 +1,4 @@
+import { createLogger, type Logger } from '@bcr/shared';
 import { isCanonicalUuid } from './clientScope';
 import { LedgerDbError } from './errors';
 import { Sql } from './sql';
@@ -21,6 +22,12 @@ export interface ConnectionLike {
   query(config: { text: string; values: unknown[] }): Promise<QueryResultLike>;
   /** `true` (or an error) destroys the connection instead of returning it to the pool. */
   release(destroy?: boolean | Error): void;
+  /**
+   * node-postgres emits `error` on a connection whose socket dies. While the
+   * connection is checked out the pool no longer listens, so the holder must.
+   */
+  on(event: 'error', listener: (err: Error) => void): unknown;
+  removeListener(event: 'error', listener: (err: Error) => void): unknown;
 }
 
 /** A connection pool (node-postgres `Pool`), narrowed for tests. */
@@ -82,13 +89,25 @@ class ScopedTx implements ClientTx {
   }
 }
 
+export interface LedgerDbOptions {
+  /** Defaults to the `ledger-db/tx` logger. */
+  readonly log?: Logger;
+}
+
 /**
  * The document index's database handle. Its one way in is
  * {@link withClientTx}: every statement the app runs is inside a transaction
  * scoped to exactly one client, and row-level security does the rest.
  */
 export class LedgerDb {
-  constructor(private readonly pool: PoolLike) {}
+  private readonly log: Logger;
+
+  constructor(
+    private readonly pool: PoolLike,
+    opts: LedgerDbOptions = {},
+  ) {
+    this.log = opts.log ?? createLogger('ledger-db/tx');
+  }
 
   /**
    * Runs `fn` in a transaction scoped to `clientId`:
@@ -109,6 +128,16 @@ export class LedgerDb {
    *
    * `clientId` must be a canonical UUID, checked before a connection is taken.
    * A connection whose ROLLBACK fails is destroyed, not returned to the pool.
+   *
+   * A connection that dies while it is held (a server restart or maintenance,
+   * a network reset, `idle_in_transaction_session_timeout`, an operator's
+   * `pg_terminate_backend`) fails this transaction and nothing else. The
+   * pool listens for a connection's `error` only while it is idle; an `error`
+   * event nobody hears ends the process, and with it every upload on the
+   * worker, after the document is already filed. So the connection is
+   * listened to for as long as it is checked out: the failure is logged by
+   * name and SQLSTATE only, the pending statement rejects as usual, and the
+   * connection is destroyed, never pooled.
    */
   async withClientTx<T>(clientId: string, fn: (tx: ClientTx) => Promise<T>): Promise<T> {
     if (!isCanonicalUuid(clientId)) {
@@ -117,6 +146,21 @@ export class LedgerDb {
     const conn = await this.pool.connect();
     const tx = new ScopedTx(conn, clientId);
     let destroy = false;
+    let connectionLost = false;
+    const onConnectionError = (err: Error & { code?: unknown }): void => {
+      // node-postgres can emit twice for one death (the server's FATAL, then
+      // the socket's end): the first carries the SQLSTATE.
+      if (connectionLost) return;
+      connectionLost = true;
+      this.log.warn(
+        {
+          event: 'index.connection_error',
+          err: { name: err.name, ...(typeof err.code === 'string' ? { code: err.code } : {}) },
+        },
+        'index.connection_error',
+      );
+    };
+    conn.on('error', onConnectionError);
     try {
       await conn.query('BEGIN');
       await conn.query(`SET LOCAL ROLE ${LEDGER_APP_ROLE}`);
@@ -136,7 +180,9 @@ export class LedgerDb {
       throw err;
     } finally {
       tx.close();
-      conn.release(destroy ? true : undefined);
+      // Back in the pool, the pool's own listener takes over (pool.ts).
+      conn.removeListener('error', onConnectionError);
+      conn.release(destroy || connectionLost ? true : undefined);
     }
   }
 

@@ -30,6 +30,7 @@ export {
   assertClientTx,
   type ClientTx,
   type ConnectionLike,
+  type LedgerDbOptions,
   type PoolLike,
   type QueryResultLike,
 } from './tx';

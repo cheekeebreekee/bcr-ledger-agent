@@ -29,6 +29,8 @@ async function inTx<T>(
       return { rows: rows(call.text) };
     },
     release() {},
+    on() {},
+    removeListener() {},
   };
   const db = new LedgerDb({ connect: async () => conn, end: async () => undefined });
   const result = await db.withClientTx(clientId, fn);
