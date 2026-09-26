@@ -784,11 +784,15 @@ rg-bcr-ledger-<env>
 └── log-bcr-<env>-<sfx>       (Log Analytics workspace)
 ```
 
-All of it is declared in [`infrastructure/main.bicep`](./infrastructure/main.bicep), except the
-Phase-0 ingestion settings: a new environment gets those once, after its first deploy
-([`docs/setup-guide.md` §3d](./docs/setup-guide.md#3d-add-the-phase-0-settings-the-template-lacks)).
+All of it is declared in [`infrastructure/main.bicep`](./infrastructure/main.bicep), every app
+setting included: `main.<env>.parameters.json` holds each environment's values
+([`docs/setup-guide.md` §3a](./docs/setup-guide.md#3a-fill-in-parameter-file)). A deploy replaces
+every app setting, and what-if cannot show app-setting changes, so
+`tools/check-app-settings.mjs` checks the template against the code (CI) and, with `--live`,
+against the running apps (before any deploy to an existing environment).
 
-⚠️ **The template has drifted from what runs in "dev"**, which is production: it serves
-PESKOVOI. The routing settings were set by hand and are missing from the template. Until the
-drift fix (v2 gate G1) there is no deploy on push, and deploys are code-only with settings added
-by merge. See [`docs/operations/human-steps.md`](./docs/operations/human-steps.md#phase-0).
+⚠️ **"dev" is production: it serves PESKOVOI.** Its routing settings were set by hand during
+Phase 0; the template now records them (v2 gate G1), but there is still no deploy on push, and
+Bicep deploys to dev stay refused until a person has reviewed a what-if and a clean `--live`
+comparison. Until then deploys are code-only. See
+[`docs/operations/human-steps.md`](./docs/operations/human-steps.md#phase-0).

@@ -40,7 +40,7 @@ entries are recorded for deletion.
 |---|---|---|---|
 | `bot-app-password` | Key Vault; **also plaintext in developers' `.env` files** | The bot, as `MICROSOFT_APP_PASSWORD` | Rotation deferred ([accepted](#accepted-risks)). Phase 3 replaces it with a federated credential. |
 | `anthropic-api-key` | Key Vault; **also plaintext in developers' `.env` files** | Ingestion, as `ANTHROPIC_API_KEY` | Rotation deferred ([accepted](#accepted-risks)). |
-| Storage account key | **In plain text in the `AzureWebJobsStorage` app setting** of both apps (`functionApp.bicep` reads it with `listKeys()`) | The Functions runtime | `az functionapp config appsettings set` prints it unless you pass `-o none`. The fix is identity-based storage access. It is not yet in the plan; raise it with the Bicep drift fix. |
+| Storage account key | **In plain text in the `AzureWebJobsStorage` app setting** of both apps (`functionApp.bicep` reads it with `listKeys()`) | The Functions runtime | `az functionapp config appsettings set` prints it unless you pass `-o none`. The fix is identity-based storage access. It is not yet in the plan. The Bicep drift fix (G1) only records what runs, so it is a change of its own. |
 | Function keys | Azure platform | Not used | Functions are `authLevel: 'anonymous'`; each handler checks the JWT itself. |
 
 Everything else in the app settings is configuration, not a secret. Key Vault values reach the
@@ -217,7 +217,7 @@ registry whose bindings cannot change without two approvals.
 
 Both managed identities hold *Key Vault Secrets User* at resource-group scope (`main.bicep`). So
 each can read every secret: the ingestion identity can read the bot's secret, and the bot can
-read the Anthropic key. **Status: Phase 1**, with the Bicep drift fix (gate G1): assignments per
+read the Anthropic key. **Status: Phase 1**, after the Bicep drift fix (gate G1, which only records what runs): assignments per
 secret and at vault scope, and an audit check that no Key Vault assignment exists at
 resource-group scope.
 
@@ -292,8 +292,13 @@ A push to `main` ran the Bicep template and replaced every app setting. The temp
 from what was running: the routing settings were set by hand and missing from it, so one merge
 would have taken ingestion down.
 **Now:** there is no push trigger (`f5a2bd4`, gate G0). Phase-0 deploys are code-only, and
-settings are added with a merge. **Status: Mitigated (G0); Phase 1** adds the drift fix, a CI
-check that every setting the code reads exists in Bicep, `what-if`, and environment approval.
+settings are added with a merge. The template and `main.dev.parameters.json` record every
+setting dev runs with (gate G1). CI fails when the code reads a setting Bicep does not set, or
+Bicep sets one no code reads (`tools/check-app-settings.mjs`); `--live` compares the template
+with the running apps, which what-if cannot (it masks app settings), and `deploy.sh` and the
+Deploy workflow run it before any Bicep deploy to existing apps. **Status: Mitigated (G0, G1
+in review).** Bicep deploys to dev stay refused until a person reviews a what-if and a clean
+`--live` run; environment approval is still open.
 
 ### T18. Channel-inbox intake
 
@@ -400,7 +405,8 @@ keeps them in place) and what the client is told.
 ## 4. Data residency and retention
 
 - **Application Insights** keeps telemetry for 90 days on the running component (`retentionInDays`,
-  checked 26 September; `logAnalytics.bicep` says 30, one more drift item for G1). From Phase 0 it
+  checked 26 September; `appInsights.bicep` now pins 90, and the Log Analytics workspace's own
+  30 days is a separate setting). From Phase 0 it
   holds ids and codes, not names, file names or URLs.
 - **IR evidence store:** the pre-Phase-0 logs, the Purview export, the sign-in exports and the
   Directory export for the incident. It is immutable, readable by Roman, the IOD and

@@ -30,11 +30,16 @@ database. The containment has three strands, and this checklist puts them in one
 ### Standing rules for the whole phase
 
 - ⚠️ **Deploy code only: never Bicep.** Do not run `infrastructure/deploy.sh`, `yarn deploy:*`,
-  or the *Deploy* GitHub workflow. All three deploy `main.bicep` first. Its app settings have
-  drifted from what is running, and a Bicep deploy replaces every setting, which takes
-  ingestion down at cold start. Phase-0 deploys are zip deploys ([H-9](#h-9-deploy-the-bot-with-the-gate-in-log-mode),
-  [H-12](#h-12-the-change-window-ingestion-deploy-bindings-canaries)), and settings are added with
-  `az functionapp config appsettings set`, which merges rather than replaces.
+  or the *Deploy* GitHub workflow. All three deploy `main.bicep` first, and a Bicep deploy
+  replaces every app setting. The template now records the settings dev runs with (gate G1),
+  but Bicep deploys to dev stay refused until a person has reviewed a what-if and a clean
+  `node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json`.
+  Phase-0 deploys are zip deploys ([H-9](#h-9-deploy-the-bot-with-the-gate-in-log-mode),
+  [H-12](#h-12-the-change-window-ingestion-deploy-bindings-canaries)), and settings are changed with
+  `az functionapp config appsettings set … -o none`, which merges rather than replaces. **Record
+  every such change in `infrastructure/main.dev.parameters.json` (and `main.bicep` for a new
+  setting) in the same change**, or the first Bicep deploy reverts it; `--live` shows any
+  difference.
 - ⚠️ **Never roll ingestion back to a pre-Phase-0 build.** That build contains content promotion,
   the cross-client write path. A rollback reverts individual commits and is deployed as a new
   build. For an emergency there is a stop switch that files nothing anywhere
@@ -142,11 +147,11 @@ that site's folders are locked (T-4, T-4b).
 **Owner:** Yahor. **Status:** done, commit `f5a2bd4` (gate G0).
 
 A push to `main` used to deploy Bicep and both apps to "dev", which serves PESKOVOI. Because the
-template has drifted from what is running, one merge would have taken ingestion down.
+template had drifted from what was running, one merge would have taken ingestion down.
 
 **Verify.** `grep -n 'push' .github/workflows/deploy.yml` shows only the comment explaining why
 there is no push trigger. **Rollback.** None. The trigger comes back only after the Bicep drift
-fix (gate G1).
+fix (gate G1) has been reviewed: a what-if and a clean `check-app-settings --live` against dev.
 
 ### H-1: Start the GDPR notices (IR-3, day 0)
 
@@ -1791,8 +1796,9 @@ built fresh by the `package` script and checked as in H-9 step 3 and H-12 step 1
 is empty, and `/api/health` answers. **Rollback.** Not needed: the settings and the packages are
 only used by builds that must not come back.
 
-The stale `SHAREPOINT_*`, `CLIENT_NIP` and `CLIENT_COMPANY_NAME` settings are removed with the
-Bicep drift fix (gate G1), not here.
+The stale `SHAREPOINT_*`, `CLIENT_NIP` and `CLIENT_COMPANY_NAME` settings are gone from the
+template with the Bicep drift fix (gate G1). On 26 September neither they nor the `FALLBACK_*`
+settings were set on dev any more; the verify query above confirms it.
 
 ### H-15: Exit criteria
 

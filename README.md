@@ -120,8 +120,9 @@ bot's `TestAdapter` tests for card work, and a direct call to the ingestion API.
 | `yarn lint` | ESLint over the whole repo |
 | `yarn start:bot` | Start the Teams-bot Function App locally |
 | `yarn start:ingestion` | Start the document-ingestion Function App locally |
-| `yarn deploy:dev` | **Refused.** "dev" is production, and `infrastructure/deploy.sh` refuses it until the Bicep drift fix: a template deploy would replace the settings set by hand there. Deploy code only, as in [`human-steps.md`](./docs/operations/human-steps.md#phase-0). |
-| `yarn deploy:prod` | Deploy infra + code to a **new** `prod` environment. Then add the settings the template lacks ([`setup-guide.md` §3d](./docs/setup-guide.md#3d-add-the-phase-0-settings-the-template-lacks)), or ingestion will not start. |
+| `yarn deploy:dev` | **Refused.** "dev" is production, and a template deploy replaces every app setting. The template now records dev's settings (gate G1), but `infrastructure/deploy.sh` refuses dev until a person has reviewed a what-if and a clean `check-app-settings --live`. Deploy code only, as in [`human-steps.md`](./docs/operations/human-steps.md#phase-0). |
+| `yarn deploy:prod` | Deploy infra + code to a **new** `prod` environment, with every app setting from `main.prod.parameters.json` ([`setup-guide.md` §3a](./docs/setup-guide.md#3a-fill-in-parameter-file)). |
+| `yarn check:app-settings` | The app settings the code reads vs the ones Bicep sets (CI runs it). `node tools/check-app-settings.mjs --live -g <rg> -p <params>` also compares with the running apps, read-only. |
 
 ---
 
