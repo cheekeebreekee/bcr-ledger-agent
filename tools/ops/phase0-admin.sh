@@ -6,6 +6,7 @@
 # Usage:
 #   tools/ops/phase0-admin.sh consent       H-4a: operator-tool consents (restores + extends)
 #   tools/ops/phase0-admin.sh quarantine    H-5 columns + H-6 grant, after the site exists
+#   tools/ops/phase0-admin.sh site-grant /sites/<name>   write for ingestion on one Team site
 #   tools/ops/phase0-admin.sh membership    ingestion identity: read Team memberships
 #   tools/ops/phase0-admin.sh bricore       T-6: Bricore team to Private (Roman's call)
 #
@@ -129,6 +130,38 @@ step_quarantine() {
   echo 'Expect "outcome": "granted" or "exists". It takes about 5 minutes to take effect.'
 }
 
+# --- write grant on one client (or canary) Team site ---------------------------------
+step_site_grant() {
+  local path=${1:-} tok site sid web dir_site mi_appid job status
+  [[ $path =~ ^/(sites|teams)/[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]] || die 'usage: site-grant /sites/<name>'
+  [[ $(tr '[:upper:]' '[:lower:]' <<<"$path") != "$(tr '[:upper:]' '[:lower:]' <<<"$Q_PATH")" ]] \
+    || die 'that is the quarantine site; use the quarantine step'
+  echo "Signing in for a Graph token (device code, on stderr)…"
+  tok=$(operator_token) || die 'sign-in failed'
+  site=$(curl -sSf -H "Authorization: Bearer $tok" "$G/sites/$SP_HOST:$path?\$select=id,webUrl") || die "no site at $path"
+  sid=$(jq -r .id <<<"$site"); web=$(jq -r .webUrl <<<"$site")
+  dir_site=$(az functionapp config appsettings list -g "$RG" -n "$INGEST" \
+    --query "[?name=='CLIENT_DIRECTORY_SITE_ID'].value | [0]" -o tsv)
+  [[ $(cut -d, -f2 <<<"$sid") != "$(cut -d, -f2 <<<"$dir_site")" ]] || die 'that is BCR GROUP; stop'
+  mi_appid=$(az ad sp show --id "$(az functionapp identity show -g "$RG" -n "$INGEST" --query principalId -o tsv)" --query appId -o tsv)
+  [[ $mi_appid =~ ^[0-9a-f-]{36}$ ]] || die 'could not resolve the ingestion managed identity'
+  echo "Grant 'write' on $web to the ingestion managed identity ($mi_appid), via Grant-TeamSiteAccess."
+  ask 'Start the runbook?' || return 0
+  job=$(az automation runbook start -g "$ONB_RG" --automation-account-name "$AA" -n Grant-TeamSiteAccess \
+    --parameters SiteId="$sid" AppId="$mi_appid" AppDisplayName='BCR ledger ingestion' --query name -o tsv 2>/dev/null)
+  echo "  job $job"
+  for _ in $(seq 1 30); do
+    status=$(az automation job show -g "$ONB_RG" --automation-account-name "$AA" -n "$job" --query status -o tsv 2>/dev/null)
+    [[ $status == Completed || $status == Failed || $status == Stopped || $status == Suspended ]] && break
+    sleep 10
+  done
+  echo "  status: $status"
+  az rest --method get -o tsv --url \
+    "https://management.azure.com$(az automation account show -g "$ONB_RG" -n "$AA" --query id -o tsv 2>/dev/null)/jobs/$job/output?api-version=2023-11-01" \
+    | tail -3
+  echo 'Expect "granted" or "exists". It takes about 5 minutes to take effect.'
+}
+
 # --- membership read for the ingestion identity ------------------------------------
 step_membership() {
   local s=infrastructure/identity/grant-ingestion-membership-read.sh
@@ -164,7 +197,8 @@ preflight
 case "${1:-}" in
   consent) step_consent ;;
   quarantine) step_quarantine ;;
+  site-grant) step_site_grant "${2:-}" ;;
   membership) step_membership ;;
   bricore) step_bricore ;;
-  *) sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
