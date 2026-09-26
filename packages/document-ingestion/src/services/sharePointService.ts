@@ -1,6 +1,7 @@
 import { RetryHandlerOptions, type Client } from '@microsoft/microsoft-graph-client';
 import {
   createLogger,
+  LedgerAgentError,
   SharePointError,
   ValidationError,
   type DriveItemRef,
@@ -30,6 +31,16 @@ const MAX_NAME_SUFFIX = 10;
 
 const DEFAULT_RETRY: RetryOptions = { retries: 3, minTimeoutMs: 250, factor: 2 };
 
+/** Most pages of one inbox listing (200 items a page) read in one sweep. */
+const MAX_INBOX_PAGES = 25;
+
+/** A next page must be on Graph itself; anything else ends the listing as a failure. */
+const GRAPH_ORIGIN = 'https://graph.microsoft.com/';
+
+/** What the inbox reads of each child: facets, size, creator, age, and where it is. */
+const INBOX_ITEM_SELECT =
+  'id,name,eTag,size,file,folder,package,createdBy,lastModifiedDateTime,parentReference';
+
 export interface UploadDocumentArgs {
   readonly folderPath: string;
   readonly filename: string;
@@ -50,6 +61,8 @@ export interface UploadDocumentArgs {
  *  - `forbidden`: Graph refused access (401/403) — a missing or
  *    not-yet-propagated grant.
  *  - `site_not_found` / `drive_not_found`: the site or drive is gone.
+ *  - `inbox_unusable` (channel inbox only): the row is not bound, or its
+ *    channel folder is missing or is not one folder at the drive root.
  */
 export class SharePointTargetError extends SharePointError {
   constructor(
@@ -58,7 +71,8 @@ export class SharePointTargetError extends SharePointError {
       | 'site_not_found'
       | 'drive_not_found'
       | 'forbidden'
-      | 'forbidden_site',
+      | 'forbidden_site'
+      | 'inbox_unusable',
     message: string,
     cause?: unknown,
   ) {
@@ -72,6 +86,48 @@ export class SharePointTargetError extends SharePointError {
       cause,
     );
   }
+}
+
+/**
+ * The bytes behind a download were more than the caller's limit. Not a
+ * failure of the store: the caller asked for no more than this.
+ */
+export class ContentTooLargeError extends LedgerAgentError {
+  constructor(public readonly limitBytes: number) {
+    super('ContentTooLarge', 'The file is larger than the download limit', 413);
+  }
+}
+
+/**
+ * A bound client's channel folder ("Dokumenty księgowe"), resolved in the
+ * drive recorded for the row: that client's inbox.
+ */
+export interface InboxFolder {
+  readonly driveId: string;
+  readonly folderId: string;
+}
+
+/**
+ * A direct child of an inbox, as Graph lists it. The name is read to move the
+ * file under the same name and to hint the classifier; it is never logged.
+ */
+export interface InboxItem {
+  readonly id: string;
+  readonly name?: string;
+  readonly eTag?: string;
+  readonly size?: number;
+  readonly file?: { readonly mimeType?: string };
+  readonly folder?: unknown;
+  readonly package?: unknown;
+  readonly createdBy?: { readonly user?: { readonly id?: string } };
+  readonly lastModifiedDateTime?: string;
+  readonly parentReference?: { readonly driveId?: string; readonly id?: string };
+}
+
+/** Where a move ended: the same item, and the `_n` suffix its name took (0: none). */
+export interface InboxMoveResult {
+  readonly id: string;
+  readonly nameSuffix: number;
 }
 
 /** Resolves the Graph id of a site nothing may be filed to. May reject. */
@@ -111,6 +167,9 @@ export interface SharePointServiceOptions {
  *    the next free `_n` name on a 409 — no existence probes, so no race and
  *    no oracle telling a caller which names already exist
  *  - set list-item columns on an uploaded file (quarantine metadata)
+ *  - for the channel inbox: resolve a bound row's channel folder, list its
+ *    direct children, read one file (size-capped), and move a file by id into
+ *    a folder under the channel folder, never overwriting
  *
  * Accepted trade-off: a PUT that SharePoint committed but whose response was
  * lost (a network failure, or a 500/502/503/504 after the write) is retried,
@@ -173,6 +232,212 @@ export class SharePointService {
         );
       }
       return outcome;
+    }
+    throw new SharePointError('Too many filename collisions', 409);
+  }
+
+  // -------------------------------------------------------------------------
+  // Channel inbox. A bound row's channel folder is its client's inbox: files
+  // are listed there and moved, by id, into taxonomy folders inside it. Every
+  // call goes through the same resolved target as an upload, so the
+  // forbidden-site guard and the recorded-drive check hold here too.
+  // -------------------------------------------------------------------------
+
+  /**
+   * The row's channel folder: `RootFolder`, one folder at the root of the
+   * drive recorded for the row. Refused unless the row is bound (a channel
+   * folder and a recorded drive), the path resolves to a folder, and that
+   * folder is in the recorded drive.
+   */
+  async resolveInbox(): Promise<InboxFolder> {
+    const target = await this.getResolvedTarget();
+    const { rootFolder, expectedDriveId } = this.target;
+    if (!rootFolder || !expectedDriveId || target.driveId !== expectedDriveId) {
+      throw new SharePointTargetError(
+        'inbox_unusable',
+        'Only a bound row, with a channel folder and a recorded drive, has an inbox',
+      );
+    }
+    const folderPath = sanitizeFolderPath(rootFolder);
+    if (folderPath.includes('/')) {
+      throw new SharePointTargetError(
+        'inbox_unusable',
+        'The channel folder must be one folder at the root of the drive',
+      );
+    }
+    let folder: InboxItem | undefined;
+    try {
+      folder = (await this.withRetry(() =>
+        this.graph.api(`/drives/${target.driveId}/root:/${encodeGraphPath(folderPath)}`).get(),
+      )) as InboxItem | undefined;
+    } catch (err) {
+      throw inboxReadError(err, 'The channel folder could not be read');
+    }
+    if (folder?.parentReference?.driveId !== target.driveId) {
+      this.log.error(
+        { event: 'sharepoint.drive_mismatch', driveItemId: folder?.id },
+        'the channel folder is not in the recorded drive',
+      );
+      throw new SharePointTargetError(
+        'drive_mismatch',
+        'The channel folder is not in the drive recorded for this client',
+      );
+    }
+    if (!folder.folder || typeof folder.id !== 'string' || !folder.id) {
+      throw new SharePointTargetError('inbox_unusable', 'The channel folder is not a folder');
+    }
+    return { driveId: target.driveId, folderId: folder.id };
+  }
+
+  /**
+   * The inbox's DIRECT children, every page. Never recursive: the subfolders
+   * are where filed documents live. A child Graph returns with any other
+   * parent or drive is dropped (`inbox.unexpected_child`), so nothing outside
+   * the inbox is ever handed to the caller.
+   */
+  async listInboxChildren(inbox: InboxFolder): Promise<InboxItem[]> {
+    const children: InboxItem[] = [];
+    let unexpected = 0;
+    let path: string | undefined =
+      `/drives/${inbox.driveId}/items/${encodeURIComponent(inbox.folderId)}/children` +
+      `?$select=${INBOX_ITEM_SELECT}&$top=200`;
+    let pages = 0;
+    while (path !== undefined) {
+      pages += 1;
+      if (pages > MAX_INBOX_PAGES) {
+        this.log.warn(
+          { event: 'inbox.listing_truncated', pageCount: MAX_INBOX_PAGES },
+          'inbox.listing_truncated',
+        );
+        break;
+      }
+      const current: string = path;
+      let page: { value?: unknown; '@odata.nextLink'?: unknown };
+      try {
+        page = ((await this.withRetry(() => this.graph.api(current).get())) ?? {}) as typeof page;
+      } catch (err) {
+        throw inboxReadError(err, 'The channel folder could not be listed');
+      }
+      if (!Array.isArray(page.value)) {
+        throw new SharePointError('The folder listing had no value', 502);
+      }
+      for (const child of page.value as (InboxItem | undefined)[]) {
+        const parent = child?.parentReference;
+        if (
+          typeof child?.id === 'string' &&
+          child.id !== '' &&
+          parent?.id === inbox.folderId &&
+          parent.driveId === inbox.driveId
+        ) {
+          children.push(child);
+        } else {
+          unexpected += 1;
+        }
+      }
+      const next = page['@odata.nextLink'];
+      if (next === undefined || next === null) {
+        path = undefined;
+      } else if (typeof next === 'string' && next.startsWith(GRAPH_ORIGIN)) {
+        path = next;
+      } else {
+        throw new SharePointError('The folder listing pointed outside Graph', 502);
+      }
+    }
+    if (unexpected > 0) {
+      this.log.warn(
+        { event: 'inbox.unexpected_child', count: unexpected },
+        'inbox.unexpected_child',
+      );
+    }
+    return children;
+  }
+
+  /**
+   * An inbox file's bytes, by id, read up to `maxBytes`. More than that is a
+   * {@link ContentTooLargeError}, raised as soon as the limit is passed, so a
+   * file that grew after it was listed is never read whole.
+   */
+  async downloadInboxItem(inbox: InboxFolder, itemId: string, maxBytes: number): Promise<Buffer> {
+    let body: unknown;
+    try {
+      body = await this.withRetry(
+        () =>
+          this.graph
+            .api(`/drives/${inbox.driveId}/items/${encodeURIComponent(itemId)}/content`)
+            .getStream() as Promise<unknown>,
+      );
+    } catch (err) {
+      const status = graphStatus(err);
+      if (status === 401 || status === 403) {
+        throw new SharePointTargetError('forbidden', 'No access to the channel folder', err);
+      }
+      // A 404 here is the file gone since it was listed, not the folder.
+      throw new SharePointError('Download failed', 502, err);
+    }
+    return readCapped(body, maxBytes);
+  }
+
+  /**
+   * The folder chain `relativePath` (a taxonomy path) UNDER the inbox, never
+   * under the drive root, created where missing. Returns the last folder's id.
+   */
+  async ensureInboxFolder(inbox: InboxFolder, relativePath: string): Promise<string> {
+    return this.ensureFolderPath(inbox.driveId, sanitizeFolderPath(relativePath), inbox.folderId);
+  }
+
+  /**
+   * Move an inbox file, by id, into a folder of the same drive, keeping its
+   * name and never overwriting: `conflictBehavior=fail`, and on a 409 the
+   * next free `_n` name, as uploads do. Afterwards the item must be the same
+   * item, in the addressed drive, under the target folder; anything else is
+   * refused loudly (`drive_mismatch`). Nothing is copied or deleted.
+   */
+  async moveWithinInbox(
+    inbox: InboxFolder,
+    itemId: string,
+    name: string,
+    targetFolderId: string,
+  ): Promise<InboxMoveResult> {
+    const cleanName = sanitizeFilename(name);
+    const { name: base, ext } = splitExtension(cleanName);
+    for (let n = 0; n <= MAX_NAME_SUFFIX; n++) {
+      const candidate = n === 0 ? cleanName : `${base}_${n}${ext}`;
+      let moved: InboxItem | undefined;
+      try {
+        moved = (await this.withRetry(() =>
+          this.graph
+            .api(`/drives/${inbox.driveId}/items/${encodeURIComponent(itemId)}`)
+            .query({ '@microsoft.graph.conflictBehavior': 'fail' })
+            .patch({ parentReference: { id: targetFolderId }, name: candidate }),
+        )) as InboxItem | undefined;
+      } catch (err) {
+        const status = graphStatus(err);
+        if (status === 409) continue;
+        if (status === 401 || status === 403) {
+          throw new SharePointTargetError(
+            'forbidden',
+            'No write access to the channel folder',
+            err,
+          );
+        }
+        throw new SharePointError('Move failed', 502, err);
+      }
+      if (
+        moved?.id !== itemId ||
+        moved.parentReference?.driveId !== inbox.driveId ||
+        moved.parentReference?.id !== targetFolderId
+      ) {
+        this.log.error(
+          { event: 'sharepoint.drive_mismatch', driveItemId: itemId },
+          'moved item is not in the addressed folder and drive',
+        );
+        throw new SharePointTargetError(
+          'drive_mismatch',
+          'The moved item is not in the target folder of the addressed drive',
+        );
+      }
+      this.log.info({ driveItemId: itemId, nameSuffix: n }, 'moved within the channel folder');
+      return { id: moved.id, nameSuffix: n };
     }
     throw new SharePointError('Too many filename collisions', 409);
   }
@@ -287,13 +552,18 @@ export class SharePointService {
   }
 
   /**
-   * Walk the folder hierarchy from the drive root, creating each segment
-   * that doesn't yet exist. Idempotent — a 409 (folder already exists) is
-   * treated as success.
+   * Walk the folder hierarchy from `startParent` (the drive root unless
+   * given), creating each segment that doesn't yet exist. Idempotent — a 409
+   * (folder already exists) is treated as success. Returns the last folder's
+   * id.
    */
-  private async ensureFolderPath(driveId: string, folderPath: string): Promise<void> {
+  private async ensureFolderPath(
+    driveId: string,
+    folderPath: string,
+    startParent = 'root',
+  ): Promise<string> {
     const segments = folderPath.split('/').filter(Boolean);
-    let parent = 'root';
+    let parent = startParent;
 
     for (const segment of segments) {
       try {
@@ -328,6 +598,7 @@ export class SharePointService {
       }
       parent = item.id;
     }
+    return parent;
   }
 
   /** PUT that never overwrites. */
@@ -498,6 +769,59 @@ export function splitExtension(filename: string): { name: string; ext: string } 
   const i = filename.lastIndexOf('.');
   if (i <= 0) return { name: filename, ext: '' };
   return { name: filename.slice(0, i), ext: filename.slice(i) };
+}
+
+/**
+ * Read a download body — a web stream (what the Graph SDK's `getStream`
+ * returns on Node's fetch), a Node stream, or bytes — stopping with a
+ * {@link ContentTooLargeError} as soon as it passes `maxBytes`.
+ */
+export async function readCapped(body: unknown, maxBytes: number): Promise<Buffer> {
+  if (body instanceof ArrayBuffer) return readCapped(new Uint8Array(body), maxBytes);
+  if (body instanceof Uint8Array) {
+    if (body.byteLength > maxBytes) throw new ContentTooLargeError(maxBytes);
+    return Buffer.from(body);
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const take = (chunk: unknown): void => {
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk as Uint8Array);
+    total += bytes.length;
+    if (total > maxBytes) throw new ContentTooLargeError(maxBytes);
+    chunks.push(bytes);
+  };
+  if (body && typeof (body as ReadableStream<Uint8Array>).getReader === 'function') {
+    const reader = (body as ReadableStream<Uint8Array>).getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        take(value);
+      }
+    } catch (err) {
+      await reader.cancel().catch(() => undefined);
+      throw err;
+    }
+    return Buffer.concat(chunks);
+  }
+  if (body && typeof (body as AsyncIterable<unknown>)[Symbol.asyncIterator] === 'function') {
+    // Leaving the loop by a throw closes the stream.
+    for await (const chunk of body as AsyncIterable<unknown>) take(chunk);
+    return Buffer.concat(chunks);
+  }
+  throw new SharePointError('The download returned no content', 502);
+}
+
+/** A failed inbox read: a missing grant, a missing folder, or anything else. */
+function inboxReadError(err: unknown, message: string): SharePointError {
+  const status = graphStatus(err);
+  if (status === 401 || status === 403) {
+    return new SharePointTargetError('forbidden', 'No access to the channel folder', err);
+  }
+  if (status === 404) {
+    return new SharePointTargetError('inbox_unusable', 'The channel folder was not found', err);
+  }
+  return new SharePointError(message, 502, err);
 }
 
 /** The name is taken. `afterUncertainFailure`: an earlier try at it may have been stored. */
