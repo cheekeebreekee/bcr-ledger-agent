@@ -12,6 +12,7 @@ import { forbiddenSiteKeys } from './services/sharePointService';
 import { createSharePointWiring } from './services/sharePointWiring';
 import { ClientDirectoryReader } from './services/clientDirectoryReader';
 import { ClientResolver } from './services/clientResolver';
+import { membershipCheckFor, TeamMembershipReader } from './services/teamMembership';
 import { ClassificationService, FallbackClassifier } from './services/classificationService';
 import { ClaudeClassifier } from './services/claudeClassifier';
 import { BatchIngestor } from './services/batchIngestor';
@@ -54,7 +55,18 @@ export const clientDirectory = new ClientDirectoryReader(graph, {
   allowedSiteHostname: config.quarantineSiteHostname,
 });
 
-export const clientResolver = new ClientResolver(clientDirectory, { quarantineTarget });
+/**
+ * The uploader's Teams, read from Entra as the managed identity (needs the
+ * Graph application permission granted by
+ * infrastructure/identity/grant-ingestion-membership-read.sh). `off` logs
+ * `membership.check_off` here, once per cold start.
+ */
+export const teamMembership = new TeamMembershipReader(graph);
+
+export const clientResolver = new ClientResolver(clientDirectory, {
+  quarantineTarget,
+  membership: membershipCheckFor(config.membershipCheckMode, teamMembership),
+});
 
 export const classification = new ClassificationService([
   ...(config.anthropicEnabled && config.anthropicApiKey

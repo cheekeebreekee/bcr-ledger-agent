@@ -19,6 +19,7 @@
     "QUARANTINE_DRIVE_NAME": "Documents",
     "QUARANTINE_ROOT_FOLDER": "Kwarantanna",
     "FORBIDDEN_TARGET_SITE_PATHS": "/sites/BCRGROUP",
+    "MEMBERSHIP_CHECK_MODE": "enforce",
     "ANTHROPIC_ENABLED": "true",
     "ANTHROPIC_API_KEY": "",
     "ANTHROPIC_MODEL": "claude-opus-4-5-20251101",

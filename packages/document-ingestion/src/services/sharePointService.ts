@@ -519,9 +519,11 @@ class StatusAbort extends AbortRetryError {
 
 /**
  * Retry a Graph SDK call on network failures, 500 and 502 only; any other
- * error stops at once with its status intact (see {@link StatusAbort}).
+ * error stops at once with its status intact (see {@link StatusAbort}). The
+ * SDK's own RetryHandler has already retried 429, 503 and 504. Also used by
+ * the Team-membership read (`teamMembership.ts`).
  */
-async function withGraphRetry<T>(call: () => Promise<T>, opts: RetryOptions): Promise<T> {
+export async function withGraphRetry<T>(call: () => Promise<T>, opts: RetryOptions): Promise<T> {
   try {
     return await retry(async () => {
       try {

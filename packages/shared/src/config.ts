@@ -232,6 +232,25 @@ export const ingestionConfigSchema = z.object({
       'FORBIDDEN_TARGET_SITE_PATHS entries must be site paths like /sites/BCRGROUP, not URLs',
     ),
   ),
+  /**
+   * Whether routing checks the uploader's Team membership at upload time.
+   * `enforce` (the default): a bound uploader's Teams, read from Entra, must
+   * be exactly their row's TeamId, or the upload is quarantined. `off` is an
+   * emergency escape only: it reopens R46 (a guest added to a second client's
+   * Team keeps filing into the first client's space), and is logged as a
+   * warning at every cold start. Empty means the default; anything else fails
+   * at cold start, so a typo can never switch the check off.
+   */
+  membershipCheckMode: z
+    .preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z
+        .enum(['enforce', 'off'], {
+          errorMap: () => ({ message: "must be 'enforce' or 'off'" }),
+        })
+        .optional(),
+    )
+    .transform((v) => v ?? 'enforce'),
   // --- Claude (Anthropic) content classification ---
   anthropicEnabled: boolish(false),
   anthropicApiKey: optionalStr(),
@@ -245,6 +264,9 @@ export const ingestionConfigSchema = z.object({
 });
 
 export type IngestionConfig = z.infer<typeof ingestionConfigSchema>;
+
+/** `MEMBERSHIP_CHECK_MODE`: see {@link ingestionConfigSchema}. */
+export type MembershipCheckMode = IngestionConfig['membershipCheckMode'];
 
 // ---------------------------------------------------------------------------
 // Loader

@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { Client } from '@microsoft/microsoft-graph-client';
 import type {
   Classification,
   ClientDirectoryEntry,
@@ -14,6 +15,12 @@ import {
   type ClientDirectorySnapshot,
 } from './clientDirectoryReader';
 import { applyInvoiceDirection, ClientResolver } from './clientResolver';
+import {
+  TeamMembershipReadError,
+  TeamMembershipReader,
+  type MembershipCheck,
+  type TeamMembershipSource,
+} from './teamMembership';
 
 const HOST = 'contoso.sharepoint.com';
 
@@ -115,6 +122,19 @@ const staffRow = makeEntry({
   target: { siteHostname: '', sitePath: '', driveName: 'Documents' },
 });
 
+/**
+ * Every client user is in exactly their row's Team: the state the binding
+ * tool leaves. Tests about membership itself build their own source.
+ */
+const TEAMS_OF: Readonly<Record<string, readonly string[]>> = {
+  [OID_A]: ['team-0002'],
+  [OID_B]: ['team-0003'],
+};
+const inOwnTeam: TeamMembershipSource = {
+  teamsOf: async (oid) => new Set(TEAMS_OF[oid] ?? []),
+};
+const enforce: MembershipCheck = { mode: 'enforce', source: inOwnTeam };
+
 const baseSource: IngestionSource = {
   tenantId: 'tenant-1',
   channelId: 'msteams',
@@ -129,6 +149,7 @@ const baseSource: IngestionSource = {
 describe('ClientResolver.resolve', () => {
   const resolver = new ClientResolver(makeReader([clientA, clientB, staffRow]), {
     quarantineTarget,
+    membership: enforce,
   });
 
   it('routes a bound guest to their own client', async () => {
@@ -148,10 +169,16 @@ describe('ClientResolver.resolve', () => {
 
   it('logs the routing decision with ids only — the Team id included', async () => {
     const { log, lines } = recordingLogger();
-    const r = new ClientResolver(makeReader([clientA]), { quarantineTarget, log });
+    const r = new ClientResolver(makeReader([clientA]), { quarantineTarget, membership: enforce, log });
     await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(lines).toEqual([
-      { clientId: '0002', listItemId: '11', teamId: 'team-0002', msg: 'routed to client via userAadObjectId' },
+      {
+        clientId: '0002',
+        listItemId: '11',
+        teamId: 'team-0002',
+        membership: 'verified',
+        msg: 'routed to client via userAadObjectId',
+      },
     ]);
   });
 
@@ -179,7 +206,7 @@ describe('ClientResolver.resolve', () => {
   it('quarantines a user id that sits on a client row and an admin row as conflict', async () => {
     const r = new ClientResolver(
       makeReader([clientA, { ...staffRow, userAadObjectIds: [OID_A] }]),
-      { quarantineTarget },
+      { quarantineTarget, membership: enforce },
     );
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toMatchObject({ source: 'quarantine', reason: 'conflict' });
@@ -188,7 +215,7 @@ describe('ClientResolver.resolve', () => {
   it('quarantines a user whose only row points at BCR GROUP as forbidden_target', async () => {
     const r = new ClientResolver(
       makeReader([{ ...clientA, target: { ...clientA.target, sitePath: '/sites/x/../BCRGROUP' } }]),
-      { quarantineTarget },
+      { quarantineTarget, membership: enforce },
     );
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toEqual({ source: 'quarantine', reason: 'forbidden_target', target: quarantineTarget });
@@ -206,7 +233,7 @@ describe('ClientResolver.resolve', () => {
       health: 'unavailable',
       fetchedAt: 0,
     };
-    const r = new ClientResolver(readerFor(unavailable), { quarantineTarget });
+    const r = new ClientResolver(readerFor(unavailable), { quarantineTarget, membership: enforce });
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toMatchObject({ source: 'quarantine', reason: 'stale_directory' });
   });
@@ -219,7 +246,7 @@ describe('ClientResolver.resolve', () => {
     ['DriveId', { target: { ...clientA.target, expectedDriveId: '' } }],
     ['TeamId', { teamId: '' }],
   ])('quarantines a user whose only row lacks %s as unbound_target', async (_missing, override) => {
-    const r = new ClientResolver(makeReader([{ ...clientA, ...override }, clientB]), { quarantineTarget });
+    const r = new ClientResolver(makeReader([{ ...clientA, ...override }, clientB]), { quarantineTarget, membership: enforce });
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toEqual({ source: 'quarantine', reason: 'unbound_target', target: quarantineTarget });
     const other = await r.resolve({ ...baseSource, userAadObjectId: OID_B });
@@ -239,7 +266,7 @@ describe('ClientResolver.resolve', () => {
       health: 'fresh',
       fetchedAt: 0,
     };
-    const r = new ClientResolver(readerFor(snapshot), { quarantineTarget });
+    const r = new ClientResolver(readerFor(snapshot), { quarantineTarget, membership: enforce });
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toMatchObject({ source: 'quarantine', reason: 'unbound_target' });
   });
@@ -247,7 +274,7 @@ describe('ClientResolver.resolve', () => {
   it('quarantines both users of rows that share a DriveId as conflict', async () => {
     const r = new ClientResolver(
       makeReader([clientA, { ...clientB, target: { ...clientB.target, expectedDriveId: 'b!drive-0002' } }]),
-      { quarantineTarget },
+      { quarantineTarget, membership: enforce },
     );
     for (const oid of [OID_A, OID_B]) {
       const resolved = await r.resolve({ ...baseSource, userAadObjectId: oid });
@@ -258,7 +285,7 @@ describe('ClientResolver.resolve', () => {
   it('quarantines a user whose row names a sub-site as forbidden_target', async () => {
     const r = new ClientResolver(
       makeReader([{ ...clientA, target: { ...clientA.target, sitePath: '/sites/ClientB/sub' } }, clientB]),
-      { quarantineTarget },
+      { quarantineTarget, membership: enforce },
     );
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toMatchObject({ source: 'quarantine', reason: 'forbidden_target' });
@@ -267,10 +294,220 @@ describe('ClientResolver.resolve', () => {
   it('falls back to the title as companyName when no aliases are set', async () => {
     const r = new ClientResolver(
       makeReader([{ ...clientA, companyNameAliases: [] }]),
-      { quarantineTarget },
+      { quarantineTarget, membership: enforce },
     );
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved.source === 'directory' && resolved.companyName).toBe('[0002] Client A');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Team membership at upload time (R46): the row's Team, and no other
+// ---------------------------------------------------------------------------
+
+describe('ClientResolver.resolve — Team membership', () => {
+  /** A membership source that answers from a table, recording who it was asked about. */
+  function source(teams: readonly string[] | Error): TeamMembershipSource & { calls: string[] } {
+    const calls: string[] = [];
+    return {
+      calls,
+      teamsOf: async (oid) => {
+        calls.push(oid);
+        if (teams instanceof Error) throw teams;
+        return new Set(teams);
+      },
+    };
+  }
+
+  function resolverWith(
+    membership: MembershipCheck,
+    entries: ClientDirectoryEntry[] = [clientA, clientB, staffRow],
+  ) {
+    const { log, lines } = recordingLogger();
+    const r = new ClientResolver(makeReader(entries), { quarantineTarget, membership, log });
+    return { r, lines };
+  }
+
+  const uploadBy = (oid: string | undefined) => ({ ...baseSource, userAadObjectId: oid });
+
+  it("routes when the uploader's Teams are exactly the row's Team", async () => {
+    const { r } = resolverWith({ mode: 'enforce', source: source(['team-0002']) });
+    expect(await r.resolve(uploadBy(OID_A))).toMatchObject({ source: 'directory', clientId: '0002' });
+  });
+
+  it('compares Team ids case-insensitively, on both sides', async () => {
+    const { r } = resolverWith({ mode: 'enforce', source: source(['TEAM-0002']) }, [
+      { ...clientA, teamId: 'Team-0002' },
+    ]);
+    expect(await r.resolve(uploadBy(OID_A))).toMatchObject({ source: 'directory' });
+  });
+
+  it.each([
+    ["not in the row's Team", ['team-0099'], false, 1],
+    ["in the row's Team and another client's (the R46 guest)", ['team-0002', 'team-0003'], true, 1],
+    ["in the row's Team and two others", ['team-0003', 'team-0002', 'team-0099'], true, 2],
+    ['in no Team at all', [], false, 0],
+  ] as const)(
+    'quarantines an uploader %s as membership_mismatch, logging ids and counts only',
+    async (_label, teams, inRowTeam, otherTeamCount) => {
+      const { r, lines } = resolverWith({ mode: 'enforce', source: source(teams) });
+      expect(await r.resolve(uploadBy(OID_A))).toEqual({
+        source: 'quarantine',
+        reason: 'membership_mismatch',
+        target: quarantineTarget,
+      });
+      expect(lines).toEqual([
+        {
+          event: 'membership.mismatch',
+          clientId: '0002',
+          listItemId: '11',
+          teamId: 'team-0002',
+          teamCount: teams.length,
+          inRowTeam,
+          otherTeamCount,
+          msg: 'membership.mismatch',
+        },
+      ]);
+    },
+  );
+
+  it.each([
+    ['a missing grant (403)', new TeamMembershipReadError('no', 403), { status: 403 }],
+    ['a user Graph does not know (404)', new TeamMembershipReadError('no', 404), { status: 404 }],
+    ['Graph down after retries', new TeamMembershipReadError('no', 502), { status: 502 }],
+    ['a network failure', new TeamMembershipReadError('no'), {}],
+    ['any other error', new Error('boom'), {}],
+  ])('quarantines as membership_unverified when the read fails: %s', async (_label, error, extra) => {
+    const { r, lines } = resolverWith({ mode: 'enforce', source: source(error) });
+    expect(await r.resolve(uploadBy(OID_A))).toEqual({
+      source: 'quarantine',
+      reason: 'membership_unverified',
+      target: quarantineTarget,
+    });
+    expect(lines).toEqual([
+      {
+        event: 'membership.unverified',
+        clientId: '0002',
+        listItemId: '11',
+        teamId: 'team-0002',
+        ...extra,
+        msg: 'membership.unverified',
+      },
+    ]);
+  });
+
+  it.each([
+    ['staff', OID_STAFF, 'staff'],
+    ['an unmapped user', '9d1e2f3a-4b5c-4d6e-8f70-81a2b3c4d5e6', 'unmapped'],
+    ['no user id', undefined, 'unmapped'],
+  ])('does not read the Teams of %s: they are quarantined already', async (_label, oid, reason) => {
+    const teams = source(['team-0002']);
+    const { r } = resolverWith({ mode: 'enforce', source: teams });
+    expect(await r.resolve(uploadBy(oid))).toMatchObject({ source: 'quarantine', reason });
+    expect(teams.calls).toEqual([]);
+  });
+
+  it('does not read the Teams of a user whose row is not bound', async () => {
+    const teams = source(['team-0002']);
+    const { r } = resolverWith({ mode: 'enforce', source: teams }, [{ ...clientA, teamId: '' }]);
+    expect(await r.resolve(uploadBy(OID_A))).toMatchObject({ reason: 'unbound_target' });
+    expect(teams.calls).toEqual([]);
+  });
+
+  it('asks about the uploader, lower-cased', async () => {
+    const teams = source(['team-0002']);
+    const { r } = resolverWith({ mode: 'enforce', source: teams });
+    await r.resolve(uploadBy(OID_A.toUpperCase()));
+    expect(teams.calls).toEqual([OID_A]);
+  });
+
+  it('with the check off, routes without reading Teams, and says so in the routing log', async () => {
+    const { r, lines } = resolverWith({ mode: 'off' });
+    expect(await r.resolve(uploadBy(OID_A))).toMatchObject({ source: 'directory', clientId: '0002' });
+    expect(lines).toEqual([
+      expect.objectContaining({
+        membership: 'unchecked',
+        msg: 'routed to client via userAadObjectId',
+      }),
+    ]);
+  });
+
+  // End to end through the real reader: its cache decides how soon a new
+  // Team shows up, and a failure must never be remembered as a pass.
+  describe('through TeamMembershipReader', () => {
+    const TEAM_A = '11111111-aaaa-4aaa-8aaa-111111111111';
+    const TEAM_B = '22222222-bbbb-4bbb-8bbb-222222222222';
+    const teamEntry = (id: string) => ({
+      '@odata.type': '#microsoft.graph.group',
+      id,
+      resourceProvisioningOptions: ['Team'],
+    });
+
+    function graphAnswering(answer: () => unknown) {
+      let calls = 0;
+      const client = {
+        api: () => ({
+          get: async () => {
+            calls += 1;
+            return answer();
+          },
+        }),
+      } as unknown as Client;
+      return { client, calls: () => calls };
+    }
+
+    const rowA = { ...clientA, teamId: TEAM_A };
+
+    it('hit: a second upload within 5 minutes reuses the read', async () => {
+      let now = 0;
+      const g = graphAnswering(() => ({ value: [teamEntry(TEAM_A)] }));
+      const reader = new TeamMembershipReader(g.client, { now: () => now, retry: { retries: 0 } });
+      const { r } = resolverWith({ mode: 'enforce', source: reader }, [rowA]);
+      expect(await r.resolve(uploadBy(OID_A))).toMatchObject({ source: 'directory' });
+      now += 4 * 60 * 1000;
+      expect(await r.resolve(uploadBy(OID_A))).toMatchObject({ source: 'directory' });
+      expect(g.calls()).toBe(1);
+    });
+
+    it('expiry: after 5 minutes a newly joined Team is seen, and the upload is held', async () => {
+      let now = 0;
+      let teams = [teamEntry(TEAM_A)];
+      const g = graphAnswering(() => ({ value: teams }));
+      const reader = new TeamMembershipReader(g.client, { now: () => now, retry: { retries: 0 } });
+      const { r } = resolverWith({ mode: 'enforce', source: reader }, [rowA]);
+      expect(await r.resolve(uploadBy(OID_A))).toMatchObject({ source: 'directory' });
+      teams = [teamEntry(TEAM_A), teamEntry(TEAM_B)];
+      now += 5 * 60 * 1000;
+      expect(await r.resolve(uploadBy(OID_A))).toMatchObject({ reason: 'membership_mismatch' });
+      expect(g.calls()).toBe(2);
+    });
+
+    it('miss: another uploader is read separately', async () => {
+      const g = graphAnswering(() => ({ value: [teamEntry(TEAM_A)] }));
+      const reader = new TeamMembershipReader(g.client, { retry: { retries: 0 } });
+      const { r } = resolverWith({ mode: 'enforce', source: reader }, [
+        rowA,
+        { ...clientB, teamId: TEAM_B },
+      ]);
+      expect(await r.resolve(uploadBy(OID_A))).toMatchObject({ source: 'directory' });
+      expect(await r.resolve(uploadBy(OID_B))).toMatchObject({ reason: 'membership_mismatch' });
+      expect(g.calls()).toBe(2);
+    });
+
+    it('a failed read is not cached: held now, routed once the read works', async () => {
+      let denied = true;
+      const g = graphAnswering(() => {
+        if (denied) throw Object.assign(new Error('Forbidden'), { statusCode: 403 });
+        return { value: [teamEntry(TEAM_A)] };
+      });
+      const reader = new TeamMembershipReader(g.client, { retry: { retries: 0 } });
+      const { r, lines } = resolverWith({ mode: 'enforce', source: reader }, [rowA]);
+      expect(await r.resolve(uploadBy(OID_A))).toMatchObject({ reason: 'membership_unverified' });
+      expect(lines[0]).toMatchObject({ event: 'membership.unverified', status: 403 });
+      denied = false;
+      expect(await r.resolve(uploadBy(OID_A))).toMatchObject({ source: 'directory' });
+      expect(g.calls()).toBe(2);
+    });
   });
 });
 
@@ -292,6 +529,7 @@ function makeClassification(overrides: Partial<Classification> = {}): Classifica
 describe('ClientResolver.resolvePostClassification', () => {
   const resolver = new ClientResolver(makeReader([clientA, clientB, staffRow]), {
     quarantineTarget,
+    membership: enforce,
   });
 
   it('flips a nieposortowane invoice to faktury_zakupu when the bound client is the buyer', async () => {

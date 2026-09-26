@@ -37,7 +37,9 @@ export interface ClientDirectoryEntry {
    * Team (M365 group) id from the `TeamId` column, when recorded. Written by
    * the binding tool together with RootFolder and DriveId; a client row
    * without it routes nobody (`unbound_target`), and two rows sharing it are a
-   * target conflict. Logged with the routing decision and `document.filed`.
+   * target conflict. An upload routes only when this is the uploader's one
+   * and only Team (`membership_mismatch` otherwise). Logged with the routing
+   * decision and `document.filed`.
    */
   readonly teamId?: string;
   /**
@@ -72,6 +74,14 @@ export interface ClientDirectoryEntry {
  *  - `unbound_target`: the uploader's one row lacks RootFolder, DriveId or
  *    TeamId — the binding tool, which writes all three together, has not
  *    bound it — so it routes nobody.
+ *  - `membership_mismatch`: the uploader's Teams, read from Entra at upload
+ *    time, are not exactly the row's `TeamId`: they are not in that Team, or
+ *    they are also in another one. A guest added to a second client's Team
+ *    after being bound would otherwise file that client's documents into the
+ *    first client's space.
+ *  - `membership_unverified`: the uploader's Teams could not be read (no
+ *    grant, not yet in the token, the user gone, Graph down after retries),
+ *    so the row's Team cannot be shown to be their only one.
  */
 export type QuarantineReason =
   | 'unmapped'
@@ -80,7 +90,9 @@ export type QuarantineReason =
   | 'stale_directory'
   | 'forbidden_target'
   | 'target_unwritable'
-  | 'unbound_target';
+  | 'unbound_target'
+  | 'membership_mismatch'
+  | 'membership_unverified';
 
 /** The uploader is bound to exactly one active client row. */
 export interface DirectoryClientResolution {

@@ -20,7 +20,20 @@ describe('loadIngestionConfig', () => {
     const first = loadIngestionConfig(env);
     expect(first.botCallerAppIds).toEqual(['00000000-0000-0000-0000-000000000001']);
     expect(first.forbiddenTargetSitePaths).toEqual(['/sites/BCRGROUP']);
+    expect(first.membershipCheckMode).toBe('enforce');
     expect(loadIngestionConfig({})).toBe(first);
+  });
+
+  it('reads MEMBERSHIP_CHECK_MODE=off, the emergency escape', () => {
+    expect(loadIngestionConfig({ ...env, MEMBERSHIP_CHECK_MODE: 'off' }).membershipCheckMode).toBe(
+      'off',
+    );
+  });
+
+  it('refuses to start on a MEMBERSHIP_CHECK_MODE it does not know', () => {
+    expect(() => loadIngestionConfig({ ...env, MEMBERSHIP_CHECK_MODE: 'disabled' })).toThrow(
+      /MEMBERSHIP_CHECK_MODE/,
+    );
   });
 
   it('fails fast, naming the variable, when a required setting is missing', () => {
