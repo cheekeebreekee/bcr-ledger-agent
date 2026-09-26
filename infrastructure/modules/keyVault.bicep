@@ -13,11 +13,9 @@ resource kv 'Microsoft.KeyVault/vaults@2024-04-01-preview' = {
     enableSoftDelete: true
     softDeleteRetentionInDays: 7
     enablePurgeProtection: true
+    // No networkAcls: the running vault has none, which is the same as
+    // defaultAction Allow. Network rules would be a change, not a record.
     publicNetworkAccess: 'Enabled'
-    networkAcls: {
-      defaultAction: 'Allow'
-      bypass: 'AzureServices'
-    }
   }
 }
 

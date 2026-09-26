@@ -12,6 +12,12 @@
 //
 // Subscription scope is intentionally avoided so the same template can be
 // deployed by any contributor with `Contributor` on the target RG.
+//
+// A deploy REPLACES every app setting of both Function Apps with the ones
+// below, so this template, with main.<env>.parameters.json, must record every
+// setting the apps run with. A setting changed by hand in Azure has to be
+// changed here in the same change, or the next deploy reverts it. What-if
+// cannot show app-setting changes: it reads no app-setting values.
 // =============================================================================
 
 targetScope = 'resourceGroup'
@@ -34,17 +40,56 @@ param botTenantId string = tenant().tenantId
 @description('App Registration ID for the ingestion API.')
 param ingestionAppId string
 
-@description('SharePoint site hostname, e.g. contoso.sharepoint.com.')
-param sharePointSiteHostname string
+// ---- Ingestion: routing, quarantine and guards ------------------------------
+// Values, not secrets. Each maps to one app setting; what it must look like is
+// in packages/shared/src/config.ts, and ingestion refuses to start on a bad one.
 
-@description('SharePoint site path, must start with /, e.g. /sites/BCR-Ledger.')
-param sharePointSitePath string
+@description('BOT_CALLER_APP_IDS: app ids allowed to call the ingestion API, comma-separated. Today the bot only.')
+param botCallerAppIds string = botAppId
 
-@description('SharePoint drive (library) name to upload into.')
-param sharePointDriveName string = 'Documents'
+@description('CLIENT_DIRECTORY_SITE_ID: three-part Graph id <host>,<siteGuid>,<webGuid> of the site holding the Client Directory (BCR GROUP).')
+param clientDirectorySiteId string
 
-@description('Optional root folder prefix inside the drive.')
-param sharePointRootFolder string = ''
+@description('CLIENT_DIRECTORY_LIST_ID: Graph list id of the Client Directory.')
+param clientDirectoryListId string
+
+@description('CLIENT_DIRECTORY_CACHE_TTL_MS: how long a Directory snapshot is cached (ms).')
+param clientDirectoryCacheTtlMs string = '300000'
+
+@description('CLIENT_DIRECTORY_MAX_STALE_MS: oldest snapshot still routed on when refreshes fail (ms).')
+param clientDirectoryMaxStaleMs string = '900000'
+
+@description('QUARANTINE_SITE_HOSTNAME: the tenant\'s SharePoint host, e.g. contoso.sharepoint.com. Also the only host a Directory row may name.')
+param quarantineSiteHostname string
+
+@description('QUARANTINE_SITE_PATH: the staff-only quarantine site, /sites/<name>.')
+param quarantineSitePath string
+
+@description('QUARANTINE_DRIVE_NAME: the quarantine site\'s library (Dokumenty on a Polish tenant).')
+param quarantineDriveName string = 'Documents'
+
+@description('QUARANTINE_ROOT_FOLDER: the folder inside that library.')
+param quarantineRootFolder string = 'Kwarantanna'
+
+@description('FORBIDDEN_TARGET_SITE_PATHS: site paths no Directory row may route to, comma-separated; at least the site holding the Client Directory.')
+param forbiddenTargetSitePaths string
+
+// ---- Ingestion: channel-inbox sweep ----------------------------------------
+
+@description('INBOX_SWEEP_MODE: off, shadow (reads and logs only) or enforce (moves files).')
+@allowed(['off', 'shadow', 'enforce'])
+param inboxSweepMode string = 'off'
+
+@description('INBOX_SWEEP_ROWS: Client Directory list item ids the sweep may touch, comma-separated. Empty: every bound row.')
+param inboxSweepRows string = ''
+
+@description('INBOX_CREATED_AFTER: files created at or before this ISO 8601 UTC time are left in place. Empty: no cutoff.')
+param inboxCreatedAfter string = ''
+
+@description('INBOX_MAX_FILES_PER_TICK: most files taken into processing per sweep tick. Empty: the code default (20).')
+param inboxMaxFilesPerTick string = ''
+
+// ---- Ingestion: Claude classification ---------------------------------------
 
 @description('Enable Claude (Anthropic) content classification?')
 param enableAnthropic bool = true
@@ -55,11 +100,17 @@ param anthropicModel string = 'claude-opus-4-5-20251101'
 @description('Minimum classification confidence; below this → manual review.')
 param anthropicConfidenceThreshold string = '0.6'
 
-@description('Client legal/company name for this SharePoint space.')
-param clientCompanyName string = ''
+// ---- Bot --------------------------------------------------------------------
 
-@description('Client tax id (NIP); used to decide invoice direction.')
-param clientNip string = ''
+@description('BOT_GATE_MODE: what the bot does with an activity that fails the gate. enforce refuses it; log only records it.')
+@allowed(['log', 'enforce'])
+param botGateMode string = 'enforce'
+
+// ---- Both apps --------------------------------------------------------------
+
+@description('LOG_LEVEL of both Function Apps.')
+@allowed(['fatal', 'error', 'warn', 'info', 'debug', 'trace'])
+param logLevel string = environmentName == 'prod' ? 'info' : 'debug'
 
 @description('Tags applied to every resource.')
 param tags object = {
@@ -128,6 +179,56 @@ module plan 'modules/appServicePlan.bicep' = {
   }
 }
 
+// ---- App settings -----------------------------------------------------------
+// Each app's whole set, with the runtime settings in modules/functionApp.bicep:
+// a deploy replaces every app setting, so a setting missing here is deleted.
+// A setting left out gets the code's default. Secrets are Key Vault
+// references, never values.
+
+var botAppSettings = {
+  MICROSOFT_APP_ID: botAppId
+  MICROSOFT_APP_TYPE: 'SingleTenant'
+  MICROSOFT_APP_TENANT_ID: botTenantId
+  MICROSOFT_APP_PASSWORD: '@Microsoft.KeyVault(SecretUri=${keyVault.outputs.uri}secrets/bot-app-password/)'
+  INGESTION_BASE_URL: 'https://${ingestionFunction.outputs.defaultHostname}'
+  INGESTION_SCOPE: 'api://${ingestionAppId}/.default'
+  BOT_GATE_MODE: botGateMode
+  LOG_LEVEL: logLevel
+}
+
+var ingestionAppSettings = union(
+  {
+    AZURE_TENANT_ID: botTenantId
+    INGESTION_APP_ID: ingestionAppId
+    EXPECTED_AUDIENCE: 'api://${ingestionAppId}'
+    BOT_CALLER_APP_IDS: botCallerAppIds
+    CLIENT_DIRECTORY_SITE_ID: clientDirectorySiteId
+    CLIENT_DIRECTORY_LIST_ID: clientDirectoryListId
+    CLIENT_DIRECTORY_CACHE_TTL_MS: clientDirectoryCacheTtlMs
+    CLIENT_DIRECTORY_MAX_STALE_MS: clientDirectoryMaxStaleMs
+    QUARANTINE_SITE_HOSTNAME: quarantineSiteHostname
+    QUARANTINE_SITE_PATH: quarantineSitePath
+    QUARANTINE_DRIVE_NAME: quarantineDriveName
+    QUARANTINE_ROOT_FOLDER: quarantineRootFolder
+    FORBIDDEN_TARGET_SITE_PATHS: forbiddenTargetSitePaths
+    INBOX_SWEEP_MODE: inboxSweepMode
+    INBOX_SWEEP_ROWS: inboxSweepRows
+    INBOX_CREATED_AFTER: inboxCreatedAfter
+    INBOX_MAX_FILES_PER_TICK: inboxMaxFilesPerTick
+    // Not string(enableAnthropic): ARM spells that 'True'. The code reads either,
+    // but the running value is 'true', and this template records it.
+    ANTHROPIC_ENABLED: enableAnthropic ? 'true' : 'false'
+    LOG_LEVEL: logLevel
+  },
+  enableAnthropic
+    ? {
+        ANTHROPIC_MODEL: anthropicModel
+        ANTHROPIC_CONFIDENCE_THRESHOLD: anthropicConfidenceThreshold
+        ANTHROPIC_API_KEY: '@Microsoft.KeyVault(SecretUri=${keyVault.outputs.uri}secrets/anthropic-api-key/)'
+      }
+    : {}
+)
+
 // ---- Bot Function App -------------------------------------------------------
 
 module botFunction 'modules/functionApp.bicep' = {
@@ -139,15 +240,7 @@ module botFunction 'modules/functionApp.bicep' = {
     planId: plan.outputs.id
     storageAccountName: storage.outputs.name
     appInsightsConnectionString: appInsights.outputs.connectionString
-    appSettings: [
-      { name: 'MICROSOFT_APP_ID', value: botAppId }
-      { name: 'MICROSOFT_APP_TYPE', value: 'SingleTenant' }
-      { name: 'MICROSOFT_APP_TENANT_ID', value: botTenantId }
-      { name: 'MICROSOFT_APP_PASSWORD', value: '@Microsoft.KeyVault(SecretUri=${keyVault.outputs.uri}secrets/bot-app-password/)' }
-      { name: 'INGESTION_BASE_URL', value: 'https://${ingestionFunction.outputs.defaultHostname}' }
-      { name: 'INGESTION_SCOPE', value: 'api://${ingestionAppId}/.default' }
-      { name: 'LOG_LEVEL', value: environmentName == 'prod' ? 'info' : 'debug' }
-    ]
+    appSettings: botAppSettings
   }
 }
 
@@ -162,26 +255,7 @@ module ingestionFunction 'modules/functionApp.bicep' = {
     planId: plan.outputs.id
     storageAccountName: storage.outputs.name
     appInsightsConnectionString: appInsights.outputs.connectionString
-    appSettings: union(
-      [
-        { name: 'AZURE_TENANT_ID', value: botTenantId }
-        { name: 'INGESTION_APP_ID', value: ingestionAppId }
-        { name: 'EXPECTED_AUDIENCE', value: 'api://${ingestionAppId}' }
-        { name: 'SHAREPOINT_SITE_HOSTNAME', value: sharePointSiteHostname }
-        { name: 'SHAREPOINT_SITE_PATH', value: sharePointSitePath }
-        { name: 'SHAREPOINT_DRIVE_NAME', value: sharePointDriveName }
-        { name: 'SHAREPOINT_ROOT_FOLDER', value: sharePointRootFolder }
-        { name: 'CLIENT_COMPANY_NAME', value: clientCompanyName }
-        { name: 'CLIENT_NIP', value: clientNip }
-        { name: 'ANTHROPIC_ENABLED', value: string(enableAnthropic) }
-        { name: 'LOG_LEVEL', value: environmentName == 'prod' ? 'info' : 'debug' }
-      ],
-      enableAnthropic ? [
-        { name: 'ANTHROPIC_MODEL', value: anthropicModel }
-        { name: 'ANTHROPIC_CONFIDENCE_THRESHOLD', value: anthropicConfidenceThreshold }
-        { name: 'ANTHROPIC_API_KEY', value: '@Microsoft.KeyVault(SecretUri=${keyVault.outputs.uri}secrets/anthropic-api-key/)' }
-      ] : []
-    )
+    appSettings: ingestionAppSettings
   }
 }
 
