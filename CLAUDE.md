@@ -181,8 +181,11 @@ Two intakes share the classifier, the taxonomy, the client SharePoint factory an
    `rejected` with `RetryLater` (the card's Polish text says to send it again), never filed.
 5. **Direction** — `services/invoiceDirection.ts`, inside classification: sales ⇄ purchase only
    from the bound client's own NIP on one side of the parties, else the model's `client_role`
-   (it can only match the primed NIP or name). No identity, or the client on neither side →
-   `DIRECTION_UNRESOLVED`, confidence ≤ 0.5, review. It never changes the client.
+   (it can only match the primed NIP or name), and only when the parties do not contradict it:
+   with a client NIP, the side the model names (seller/issuer, or buyer/recipient) must carry
+   no NIP but the client's. No identity, the client on neither side, or a `client_role` the
+   extracted NIPs contradict → `DIRECTION_UNRESOLVED`, confidence ≤ 0.5, review. It never
+   changes the client.
 6. **Upload** — `sharePointServiceFactory.ts` returns a per-target cached `SharePointService`, which
    resolves site+drive ids (refusing a drive that differs from the row's `DriveId`, and a site
    whose site-collection id is BCR GROUP's or the quarantine site's: `SharePointTargetError`

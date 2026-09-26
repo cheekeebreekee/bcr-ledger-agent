@@ -1,4 +1,5 @@
 import type { Classification, DocumentParty } from '@bcr/shared';
+import { AcceptancePolicy } from './acceptancePolicy';
 import {
   DIRECTION_UNRESOLVED,
   DIRECTION_UNRESOLVED_MAX_CONFIDENCE,
@@ -9,6 +10,7 @@ import {
 
 const CLIENT = { nip: '1111111111', companyName: 'Klient Testowy Sp. z o.o.' };
 const OTHER_NIP = '2222222222';
+const THIRD_NIP = '3333333333';
 
 function invoice(
   over: {
@@ -72,9 +74,15 @@ describe('settleInvoiceDirection', () => {
     expect(settled.fields).toMatchObject({ category: 'faktury_zakupu', direction: 'zakup' });
   });
 
-  it("uses the model's match of the primed name when the NIP is not on the document", () => {
+  it("uses the model's match of the primed name when the client's side shows no NIP", () => {
     const settled = settleInvoiceDirection(
-      invoice({ parties: [{ role: 'seller', nip: OTHER_NIP }], clientRole: 'seller' }),
+      invoice({
+        parties: [
+          { role: 'seller', companyName: CLIENT.companyName },
+          { role: 'buyer', nip: OTHER_NIP },
+        ],
+        clientRole: 'seller',
+      }),
       CLIENT,
     );
     expect(settled.fields).toMatchObject({
@@ -82,6 +90,89 @@ describe('settleInvoiceDirection', () => {
       direction: 'sprzedaz',
       directionSource: 'model',
     });
+    expect(settled.reviewReasons).toBeUndefined();
+  });
+
+  it('counts the issuer with the seller and the recipient with the buyer', () => {
+    const parties: DocumentParty[] = [
+      { role: 'issuer', nip: CLIENT.nip },
+      { role: 'recipient', nip: OTHER_NIP },
+    ];
+    // Only the client's NIP on the named side: the model's role stands.
+    const seller = settleInvoiceDirection(invoice({ parties, clientRole: 'seller' }), CLIENT);
+    expect(seller.fields).toMatchObject({ direction: 'sprzedaz', directionSource: 'model' });
+    // The recipient carries someone else's NIP: 'buyer' is contradicted.
+    const buyer = settleInvoiceDirection(invoice({ parties, clientRole: 'buyer' }), CLIENT);
+    expect(buyer.reviewReasons).toEqual([DIRECTION_UNRESOLVED]);
+    expect(buyer.fields['direction']).toBeUndefined();
+  });
+
+  // Review finding: the model's client_role decided the direction even when
+  // the extracted NIPs showed the client on neither side.
+  it.each([
+    [
+      'seller',
+      [
+        { role: 'seller', nip: OTHER_NIP },
+        { role: 'buyer', nip: THIRD_NIP },
+      ],
+    ],
+    [
+      'buyer',
+      [
+        { role: 'seller', nip: OTHER_NIP },
+        { role: 'buyer', nip: THIRD_NIP },
+      ],
+    ],
+    ['seller', [{ role: 'seller', nip: OTHER_NIP }]],
+    ['buyer', [{ role: 'buyer', nip: `PL ${THIRD_NIP}` }]],
+    ['seller', [{ role: 'issuer', nip: OTHER_NIP }]],
+    ['buyer', [{ role: 'recipient', nip: OTHER_NIP }]],
+  ] as [ClientRole, DocumentParty[]][])(
+    "does not trust client_role '%s' when that side carries another NIP: %j",
+    (clientRole, parties) => {
+      const settled = settleInvoiceDirection(
+        invoice({ parties, clientRole, confidence: 0.95 }),
+        CLIENT,
+      );
+      expect(settled.fields['direction']).toBeUndefined();
+      expect(settled.fields['directionSource']).toBeUndefined();
+      expect(settled.reviewReasons).toEqual([DIRECTION_UNRESOLVED]);
+      expect(settled.confidence).toBe(DIRECTION_UNRESOLVED_MAX_CONFIDENCE);
+    },
+  );
+
+  it('sends a confident invoice between two other parties to review, never to sales', () => {
+    const settled = settleInvoiceDirection(
+      invoice({
+        parties: [
+          { role: 'seller', nip: OTHER_NIP },
+          { role: 'buyer', nip: THIRD_NIP },
+        ],
+        clientRole: 'seller',
+        confidence: 0.95,
+      }),
+      CLIENT,
+    );
+    const decision = new AcceptancePolicy(0.7).decide(
+      settled,
+      new Date('2026-09-26T10:00:00.000Z'),
+    );
+    expect(decision).toMatchObject({
+      review: true,
+      category: 'nieposortowane',
+      suggestedCategory: 'faktury_zakupu',
+      folderPath: '98_Nieposortowane/2026/09',
+    });
+    expect(decision.reviewReasons).toContain(DIRECTION_UNRESOLVED);
+  });
+
+  it('still trusts a name-only identity: there is no NIP to contradict it', () => {
+    const settled = settleInvoiceDirection(
+      invoice({ parties: [{ role: 'seller', nip: OTHER_NIP }], clientRole: 'buyer' }),
+      { nip: '', companyName: CLIENT.companyName },
+    );
+    expect(settled.fields).toMatchObject({ direction: 'zakup', directionSource: 'model' });
   });
 
   it('accepts a name-only identity for the model match', () => {
@@ -145,29 +236,54 @@ describe('settleInvoiceDirection', () => {
     },
   );
 
-  it('picks only between the two invoice folders, whatever the parties say (property)', () => {
+  it('never settles a direction the NIPs contradict (property)', () => {
     const roles: DocumentParty['role'][] = ['seller', 'buyer', 'issuer', 'recipient', 'unknown'];
-    const nips = [CLIENT.nip, OTHER_NIP, ''];
+    const nips = [CLIENT.nip, OTHER_NIP, THIRD_NIP, ''];
     const clientRoles: ClientRole[] = ['seller', 'buyer', 'none', 'unknown'];
+    // For each direction: the client's role, the roles on its side, and the
+    // role opposite it.
+    const side: Record<string, { own: string; broad: readonly string[]; opposite: string }> = {
+      sprzedaz: { own: 'seller', broad: ['seller', 'issuer'], opposite: 'buyer' },
+      zakup: { own: 'buyer', broad: ['buyer', 'recipient'], opposite: 'seller' },
+    };
     const offenders: string[] = [];
     for (const role of roles) {
-      for (const nip of nips) {
-        for (const other of nips) {
-          for (const clientRole of clientRoles) {
-            for (const client of [CLIENT, undefined]) {
-              const parties: DocumentParty[] = [
-                { role, nip },
-                { role: 'buyer', nip: other },
-              ];
-              const settled = settleInvoiceDirection(invoice({ parties, clientRole }), client);
-              const category = settled.fields['category'];
-              const ok =
-                isDirectedInvoice(category) &&
-                (settled.reviewReasons?.includes(DIRECTION_UNRESOLVED)
-                  ? settled.confidence <= DIRECTION_UNRESOLVED_MAX_CONFIDENCE &&
-                    settled.fields['direction'] === undefined
-                  : client !== undefined);
-              if (!ok) offenders.push(JSON.stringify({ role, nip, other, clientRole, client }));
+      for (const otherRole of roles) {
+        for (const nip of nips) {
+          for (const other of nips) {
+            for (const clientRole of clientRoles) {
+              for (const client of [CLIENT, undefined]) {
+                const parties: DocumentParty[] = [
+                  { role, nip },
+                  { role: otherRole, nip: other },
+                ];
+                const settled = settleInvoiceDirection(invoice({ parties, clientRole }), client);
+                const category = settled.fields['category'];
+                const direction = settled.fields['direction'];
+                // A settled direction agrees with the NIPs: the client's NIP is
+                // never on the opposite role, and the chosen side either holds
+                // the client's NIP or carries no NIP of anyone else.
+                const s = typeof direction === 'string' ? side[direction] : undefined;
+                const clientNip = client?.nip ?? '';
+                const agrees =
+                  s !== undefined &&
+                  !parties.some((p) => p.role === s.opposite && p.nip === clientNip) &&
+                  (parties.some((p) => p.role === s.own && p.nip === clientNip) ||
+                    parties.every(
+                      (p) => !s.broad.includes(p.role) || !p.nip || p.nip === clientNip,
+                    ));
+                const ok =
+                  isDirectedInvoice(category) &&
+                  (settled.reviewReasons?.includes(DIRECTION_UNRESOLVED)
+                    ? settled.confidence <= DIRECTION_UNRESOLVED_MAX_CONFIDENCE &&
+                      direction === undefined
+                    : client !== undefined && agrees);
+                if (!ok) {
+                  offenders.push(
+                    JSON.stringify({ role, otherRole, nip, other, clientRole, client, direction }),
+                  );
+                }
+              }
             }
           }
         }

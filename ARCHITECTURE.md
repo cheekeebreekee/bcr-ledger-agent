@@ -195,10 +195,15 @@ the folder. Classifiers only suggest; the policy files.
      settles sales (`faktury_sprzedazy`) vs purchase (`faktury_zakupu`) from the bound client's
      **own** identity, passed per call in `ClassifierContext.client`: its NIP on exactly one side
      of the parties, or else the model's `client_role`, which the prompt lets it answer only by
-     matching that NIP or name. Without an identity, or with the client on neither side, it does
-     not guess: the invoice is flagged `DIRECTION_UNRESOLVED` with its confidence capped at 0.5,
-     and goes to review. It picks between two folders of the client it was given; it never
-     looks anything up in the Directory.
+     matching that NIP or name. The model's role counts only when the extracted parties do not
+     contradict it: when the client has a NIP, the side the model names (seller or issuer for
+     `seller`, buyer or recipient for `buyer`) must carry no NIP but the client's. A purchase
+     between two other companies, answered `seller` from a name guess or from text in the
+     document, is therefore not filed as the client's sale. Without an identity, with the client
+     on neither side, or with a role the NIPs contradict, it does not guess: the invoice is
+     flagged `DIRECTION_UNRESOLVED` with its confidence capped at 0.5, and goes to review. It
+     picks between two folders of the client it was given; it never looks anything up in the
+     Directory.
    - **Contract.** The classifier **never throws**, and returns one of three things: the
      suggestion; `retry_later` for a failure that is not about the document (429, 529 and other
      5xx, a timeout, a lost connection, and 401/402/403/404, an account or configuration fault);
