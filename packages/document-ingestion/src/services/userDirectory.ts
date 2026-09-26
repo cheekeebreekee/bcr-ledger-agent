@@ -1,7 +1,7 @@
 import type { Client } from '@microsoft/microsoft-graph-client';
 import { LedgerAgentError } from '@bcr/shared';
 import type { RetryOptions } from '../utils/retry';
-import { graphStatus, withGraphRetry } from './sharePointService';
+import { graphStatus, withGraphRetry, withoutSdkRetries } from './sharePointService';
 
 /** How long a successful read of one user's type is reused (ms). */
 export const USER_TYPE_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -44,6 +44,12 @@ export interface UserTypeReaderOptions {
   /** Retry policy for network failures, 500 and 502. Injected short in tests. */
   readonly retry?: RetryOptions;
   readonly maxCachedUsers?: number;
+  /**
+   * `false`: switch the Graph SDK's own retries off and retry 429/503/504
+   * here, with bounded backoff (the channel-inbox sweep, which must end well
+   * inside the timer's time limit). Default `true`.
+   */
+  readonly sdkRetries?: boolean;
 }
 
 interface CachedType {
@@ -66,6 +72,7 @@ export class UserTypeReader implements UserTypeSource {
   private readonly now: () => number;
   private readonly retry: RetryOptions;
   private readonly maxCachedUsers: number;
+  private readonly sdkRetries: boolean;
   private readonly cache = new Map<string, CachedType>();
   private readonly inFlight = new Map<string, Promise<string | null>>();
 
@@ -77,6 +84,7 @@ export class UserTypeReader implements UserTypeSource {
     this.now = opts.now ?? Date.now;
     this.retry = opts.retry ?? DEFAULT_RETRY;
     this.maxCachedUsers = opts.maxCachedUsers ?? DEFAULT_MAX_CACHED_USERS;
+    this.sdkRetries = opts.sdkRetries ?? true;
   }
 
   async userTypeOf(userAadObjectId: string): Promise<string | null> {
@@ -104,10 +112,13 @@ export class UserTypeReader implements UserTypeSource {
   private async read(oid: string): Promise<string | null> {
     let user: { userType?: unknown } | undefined;
     try {
-      user = (await withGraphRetry(
-        () => this.graph.api(`/users/${oid}?$select=userType`).get() as Promise<typeof user>,
-        this.retry,
-      )) as typeof user;
+      const request = () => {
+        const r = this.graph.api(`/users/${oid}?$select=userType`);
+        return (this.sdkRetries ? r : withoutSdkRetries(r)).get() as Promise<typeof user>;
+      };
+      user = (await withGraphRetry(request, this.retry, {
+        sdkRetries: this.sdkRetries,
+      })) as typeof user;
     } catch (err) {
       const status = graphStatus(err);
       if (status === 404) return null;

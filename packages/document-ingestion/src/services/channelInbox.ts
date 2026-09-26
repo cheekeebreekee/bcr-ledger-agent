@@ -18,6 +18,7 @@ import { applyInvoiceDirection } from './clientResolver';
 import {
   ContentTooLargeError,
   graphStatus,
+  InboxItemChangedError,
   SharePointTargetError,
   type InboxFolder,
   type InboxItem,
@@ -27,10 +28,33 @@ import { TeamMembershipReadError, type TeamMembershipSource } from './teamMember
 import { UserTypeReadError, type UserTypeSource } from './userDirectory';
 
 /**
- * How long one sweep may start new work. The host's `functionTimeout` is
- * 5 minutes; what is not started by then waits for the next tick.
+ * How long one sweep may start new work (a row, or a file). The host's
+ * `functionTimeout` is 5 minutes; what is not started by then waits for the
+ * next tick.
  */
 export const INBOX_TICK_DEADLINE_MS = 150_000;
+
+/**
+ * When a tick's work must be over, 30 s inside the host's 5-minute
+ * `functionTimeout`. A timed-out invocation restarts the language worker, and
+ * with it every upload the bot is sending through that worker, so a file
+ * already started does not run on towards it: each stage below starts only
+ * with its reserve left, and a file that would pass the limit waits.
+ */
+export const INBOX_TICK_HARD_LIMIT_MS = 270_000;
+
+/**
+ * Time left before {@link INBOX_TICK_HARD_LIMIT_MS} that reading and
+ * classifying a file needs: Claude's two 45 s attempts and their backoff,
+ * plus the download and a re-check.
+ */
+export const CLASSIFY_RESERVE_MS = 120_000;
+
+/**
+ * Time left that creating the folder chain and moving need: about two dozen
+ * Graph calls, each with the SDK's retries off and our bounded retry.
+ */
+export const WRITE_RESERVE_MS = 60_000;
 
 /** Largest file the sweep takes from an inbox; anything bigger stays where it is. */
 export const MAX_INBOX_FILE_BYTES = 100 * 1024 * 1024;
@@ -51,6 +75,7 @@ export type InboxSharePoint = Pick<
   SharePointService,
   | 'resolveInbox'
   | 'listInboxChildren'
+  | 'checkInboxItem'
   | 'downloadInboxItem'
   | 'ensureInboxFolder'
   | 'moveWithinInbox'
@@ -82,8 +107,21 @@ export interface ChannelInboxDeps {
   readonly maxFilesPerTick: number;
   /** Most bytes read of one file for the classifier; more and it is not read. */
   readonly maxDownloadBytes: number;
+  /**
+   * `INBOX_SWEEP_ROWS`: when not empty, only these Directory rows (list item
+   * ids) are swept, and only if the snapshot routes to them. Empty or absent:
+   * every routed row.
+   */
+  readonly onlyRows?: readonly string[];
+  /**
+   * `INBOX_CREATED_AFTER` (epoch ms): a file created at or before it is left
+   * where it is. Absent: no cutoff.
+   */
+  readonly createdAfterMs?: number;
   /** Defaults to {@link INBOX_TICK_DEADLINE_MS}. */
   readonly tickDeadlineMs?: number;
+  /** Defaults to {@link INBOX_TICK_HARD_LIMIT_MS}. */
+  readonly tickHardLimitMs?: number;
   /** Defaults to {@link CLASSIFICATION_CACHE_TTL_MS}. */
   readonly classificationCacheTtlMs?: number;
   /** Defaults to {@link MAX_PROCESSING_ATTEMPTS}. */
@@ -96,7 +134,7 @@ export interface ChannelInboxDeps {
 /** The `inbox.tick` line: counts only. */
 export interface InboxTickSummary {
   readonly mode: InboxSweepMode;
-  /** Bound client rows whose channel folder was due to be swept. */
+  /** Bound client rows due to be swept (only those in `INBOX_SWEEP_ROWS`, when it is set). */
   readonly rows: number;
   /** Direct children that are files old enough, with a creator id. */
   readonly candidates: number;
@@ -106,15 +144,25 @@ export interface InboxTickSummary {
   readonly sortedToReview: number;
   /** Would have been moved (shadow). */
   readonly wouldMove: number;
-  /** Not a guest of this row's Team, no creator id, or no such user: left untouched. */
+  /**
+   * Created, or last changed, by someone who is not a guest of this row's
+   * Team; no creator id; or no such user: left untouched.
+   */
   readonly skippedNotClient: number;
   /** The uploader could not be read this tick: left untouched, read again next tick. */
   readonly skippedUnverified: number;
   /** Modified within `INBOX_MIN_AGE_MS`. */
   readonly skippedYoung: number;
-  /** Empty, over 100 MiB, or an Office lock / hidden file. */
+  /** Empty, over 100 MiB, an Office lock / hidden file, or no `eTag`. */
   readonly skippedIneligible: number;
-  /** Candidates left for the next tick by the budget or the deadline. */
+  /** Created at or before `INBOX_CREATED_AFTER`: left where it is. */
+  readonly skippedBeforeCutoff: number;
+  /**
+   * Moved, renamed, replaced or deleted by someone since the listing: left
+   * where it is now, and seen afresh by the next listing.
+   */
+  readonly skippedChanged: number;
+  /** Candidates left for the next tick by the budget, the deadline or the time limit. */
   readonly deferred: number;
   /** Files whose processing failed this tick. */
   readonly failed: number;
@@ -138,12 +186,23 @@ export interface InboxCandidate {
   readonly item: InboxItem;
   readonly name: string;
   readonly creatorId: string;
+  /** `lastModifiedBy.user.id`, lower-cased; empty when the last change was not a user's. */
+  readonly modifierId: string;
+  /** The listed version. Every read and write of the item is checked against it. */
   readonly eTag: string;
 }
 
-type Stage = 'download' | 'classify' | 'folder' | 'move';
+type Stage = 'check' | 'download' | 'classify' | 'folder' | 'move';
 
-type UploaderVerdict = 'client' | 'not_guest' | 'not_in_team' | 'unknown_user' | 'unverified';
+type UploaderVerdict =
+  | 'client'
+  | 'not_guest'
+  | 'not_in_team'
+  | 'unknown_user'
+  | 'modified_by_other'
+  | 'unverified';
+
+type SkipReason = Exclude<UploaderVerdict, 'client'> | 'changed';
 
 interface CachedPlacement {
   readonly eTag: string;
@@ -177,23 +236,29 @@ interface Tick {
  *
  * Who the client is follows from WHERE the file is: the one bound Directory
  * row whose drive and channel folder hold it. Never from who uploaded it and
- * never from what it says. A file is taken only when its creator is a guest
- * and a member of that row's Team (a guest who is also in other Teams is
- * fine: the file is already in this client's space, and nothing crosses).
- * Anything else — a staff or member upload, a guest of another Team — is
- * left untouched.
+ * never from what it says. A file is taken only when its creator AND whoever
+ * changed it last are guests and members of that row's Team (a guest who is
+ * also in other Teams is fine: the file is already in this client's space,
+ * and nothing crosses). Anything else — a staff or member upload, a guest's
+ * file that staff replaced, a guest of another Team — is left untouched.
  *
- * It never recurses (subfolders are the filed area), never copies, never
- * deletes, never moves across drives and never overwrites. In `shadow` it
- * does everything but write, and logs what it would move. Logs carry ids and
- * counts only.
+ * It acts only on the version it listed: right before it reads a file, and
+ * again before it moves it, the item must still be a direct child of the
+ * channel folder at the listed `eTag`, and the move itself is sent with
+ * `If-Match`. A file someone moved, renamed or replaced meanwhile is left
+ * where it now is. It never recurses (subfolders are the filed area), never
+ * copies, never deletes, never moves across drives and never overwrites. In
+ * `shadow` it does everything but write, and logs what it would move. Logs
+ * carry ids and counts only.
  */
 export class ChannelInbox {
   private readonly log: Logger;
   private readonly now: () => Date;
   private readonly deadlineMs: number;
+  private readonly hardLimitMs: number;
   private readonly cacheTtlMs: number;
   private readonly maxAttempts: number;
+  private readonly onlyRows: ReadonlySet<string> | undefined;
   private readonly placements = new Map<string, CachedPlacement>();
   private readonly failures = new Map<string, number>();
   private readonly reportedSkips = new Set<string>();
@@ -205,8 +270,10 @@ export class ChannelInbox {
     this.log = deps.log ?? createLogger('ingestion/channelInbox');
     this.now = deps.now ?? (() => new Date());
     this.deadlineMs = deps.tickDeadlineMs ?? INBOX_TICK_DEADLINE_MS;
+    this.hardLimitMs = deps.tickHardLimitMs ?? INBOX_TICK_HARD_LIMIT_MS;
     this.cacheTtlMs = deps.classificationCacheTtlMs ?? CLASSIFICATION_CACHE_TTL_MS;
     this.maxAttempts = deps.maxAttempts ?? MAX_PROCESSING_ATTEMPTS;
+    this.onlyRows = deps.onlyRows?.length ? new Set(deps.onlyRows) : undefined;
   }
 
   get mode(): InboxSweepMode {
@@ -231,6 +298,8 @@ export class ChannelInbox {
         skippedUnverified: 0,
         skippedYoung: 0,
         skippedIneligible: 0,
+        skippedBeforeCutoff: 0,
+        skippedChanged: 0,
         deferred: 0,
         failed: 0,
         rowsFailed: 0,
@@ -263,7 +332,9 @@ export class ChannelInbox {
     if (snapshot.health !== 'fresh') {
       tick.log.warn({ event: 'inbox.directory_unavailable' }, 'inbox.directory_unavailable');
     }
-    const rows = this.inTurn(boundClientRows(snapshot));
+    const routed = boundClientRows(snapshot);
+    const onlyRows = this.onlyRows;
+    const rows = this.inTurn(onlyRows ? routed.filter((r) => onlyRows.has(r.listItemId)) : routed);
     tick.counts.rows = rows.length;
     let lastTurn = -1;
     for (const [index, row] of rows.entries()) {
@@ -285,11 +356,17 @@ export class ChannelInbox {
     return start <= 0 ? rows : [...rows.slice(start), ...rows.slice(0, start)];
   }
 
+  /** Whether a new row or file may start: the file budget and the 150 s deadline. */
   private outOfBudget(tick: Tick): boolean {
     return (
       tick.processed >= this.deps.maxFilesPerTick ||
       this.now().getTime() - tick.startedAt >= this.deadlineMs
     );
+  }
+
+  /** Whether a stage that needs `reserveMs` may still start before the hard limit. */
+  private hasTimeFor(tick: Tick, reserveMs: number): boolean {
+    return this.hardLimitMs - (this.now().getTime() - tick.startedAt) >= reserveMs;
   }
 
   private async sweepRow(row: ClientDirectoryEntry, tick: Tick): Promise<void> {
@@ -315,10 +392,17 @@ export class ChannelInbox {
       return;
     }
 
-    const selected = selectCandidates(children, this.now(), this.deps.minAgeMs);
+    const selected = selectCandidates(children, {
+      now: this.now(),
+      minAgeMs: this.deps.minAgeMs,
+      ...(this.deps.createdAfterMs !== undefined
+        ? { createdAfterMs: this.deps.createdAfterMs }
+        : {}),
+    });
     tick.counts.candidates += selected.candidates.length;
     tick.counts.skippedYoung += selected.young;
     tick.counts.skippedIneligible += selected.ineligible;
+    tick.counts.skippedBeforeCutoff += selected.beforeCutoff;
     tick.counts.skippedNotClient += selected.noCreator;
 
     for (const [index, candidate] of selected.candidates.entries()) {
@@ -326,7 +410,7 @@ export class ChannelInbox {
         tick.counts.deferred += selected.candidates.length - index;
         return;
       }
-      const uploader = await this.uploaderVerdict(candidate.creatorId, ids.teamId);
+      const uploader = await this.uploaderVerdict(candidate, ids.teamId);
       if (uploader.verdict !== 'client') {
         if (uploader.verdict === 'unverified') tick.counts.skippedUnverified += 1;
         else tick.counts.skippedNotClient += 1;
@@ -339,17 +423,34 @@ export class ChannelInbox {
   }
 
   /**
-   * The inbox is for the client's own uploads: its creator must be a guest
-   * AND in this row's Team. Anything that cannot be read is `unverified`
-   * (with Graph's status, when there was one), and the file waits.
+   * The inbox is for the client's own uploads: the file's creator must be a
+   * guest AND in this row's Team, and so must whoever changed it last — a
+   * guest's file that staff replaced holds staff's content. Anything that
+   * cannot be read is `unverified` (with Graph's status, when there was one),
+   * and the file waits.
    */
   private async uploaderVerdict(
-    creatorId: string,
+    candidate: InboxCandidate,
+    teamId: string,
+  ): Promise<{ verdict: UploaderVerdict; status?: number }> {
+    const creator = await this.userVerdict(candidate.creatorId, teamId);
+    if (creator.verdict !== 'client' || candidate.modifierId === candidate.creatorId) {
+      return creator;
+    }
+    if (!candidate.modifierId) return { verdict: 'modified_by_other' };
+    const modifier = await this.userVerdict(candidate.modifierId, teamId);
+    if (modifier.verdict === 'client' || modifier.verdict === 'unverified') return modifier;
+    return { verdict: 'modified_by_other' };
+  }
+
+  /** One user: a guest, and a member of this row's Team? */
+  private async userVerdict(
+    userId: string,
     teamId: string,
   ): Promise<{ verdict: UploaderVerdict; status?: number }> {
     let userType: string | null;
     try {
-      userType = await this.deps.users.userTypeOf(creatorId);
+      userType = await this.deps.users.userTypeOf(userId);
     } catch (err) {
       return unverified(err);
     }
@@ -357,7 +458,7 @@ export class ChannelInbox {
     if (userType.toLowerCase() !== 'guest') return { verdict: 'not_guest' };
     let teams: ReadonlySet<string>;
     try {
-      teams = await this.deps.membership.teamsOf(creatorId);
+      teams = await this.deps.membership.teamsOf(userId);
     } catch (err) {
       return unverified(err);
     }
@@ -371,8 +472,8 @@ export class ChannelInbox {
     tick: Tick,
     ids: RowIds,
     candidate: InboxCandidate,
-    reason: Exclude<UploaderVerdict, 'client'>,
-    status: number | undefined,
+    reason: SkipReason,
+    status?: number,
   ): void {
     const key = `${candidate.item.id}|${reason}`;
     if (this.reportedSkips.has(key)) return;
@@ -405,9 +506,9 @@ export class ChannelInbox {
       return;
     }
 
-    let stage: Stage = 'classify';
+    let stage: Stage = 'check';
     try {
-      const placement = await this.placementFor(row, sharePoint, inbox, candidate);
+      const placement = await this.placementFor(row, sharePoint, inbox, candidate, tick);
       if (this.deps.mode === 'shadow') {
         tick.counts.wouldMove += 1;
         tick.log.info(
@@ -422,10 +523,16 @@ export class ChannelInbox {
         );
         return;
       }
+      if (!this.hasTimeFor(tick, WRITE_RESERVE_MS)) throw new OutOfTime();
       stage = 'folder';
       const folderId = await sharePoint.ensureInboxFolder(inbox, placement.folderPath);
       stage = 'move';
-      const moved = await sharePoint.moveWithinInbox(inbox, driveItemId, candidate.name, folderId);
+      const moved = await sharePoint.moveWithinInbox(
+        inbox,
+        { id: driveItemId, eTag: candidate.eTag },
+        candidate.name,
+        folderId,
+      );
       this.forget(driveItemId);
       const event = placement.review ? 'inbox.sorted_to_review' : 'inbox.filed';
       if (placement.review) tick.counts.sortedToReview += 1;
@@ -441,6 +548,7 @@ export class ChannelInbox {
         event,
       );
     } catch (err) {
+      if (this.leftForLater(err, tick, ids, candidate)) return;
       const attempt = attemptsBefore + 1;
       remember(this.failures, driveItemId, attempt);
       tick.counts.failed += 1;
@@ -465,22 +573,55 @@ export class ChannelInbox {
   }
 
   /**
+   * Not failures, and never counted towards the review fallback: a file that
+   * changed since it was listed (`skippedChanged`, logged once as
+   * `inbox.skipped` `changed`), and one the tick has no time left for
+   * (`deferred`). Both are left where they are for the next tick.
+   */
+  private leftForLater(
+    err: unknown,
+    tick: Tick,
+    ids: RowIds,
+    candidate: InboxCandidate,
+    opts: { readonly countDeferred: boolean } = { countDeferred: true },
+  ): boolean {
+    if (err instanceof OutOfTime) {
+      if (opts.countDeferred) tick.counts.deferred += 1;
+      return true;
+    }
+    if (err instanceof InboxItemChangedError) {
+      tick.counts.skippedChanged += 1;
+      this.reportSkipOnce(tick, ids, candidate, 'changed');
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Classify once per (driveItemId, eTag) an hour, so a file whose move keeps
    * failing is not sent to the model every tick. The classifier is primed
    * with THIS row's client identity only, as on the bot path, and the result
    * may only flip invoice direction; it never chooses the client.
+   *
+   * Before anything is read, the tick must have {@link CLASSIFY_RESERVE_MS}
+   * left, and the item must still be the listed version at the top of the
+   * inbox: a file moved elsewhere or replaced since is never downloaded.
    */
   private async placementFor(
     row: ClientDirectoryEntry,
     sharePoint: InboxSharePoint,
     inbox: InboxFolder,
     candidate: InboxCandidate,
+    tick: Tick,
   ): Promise<InboxPlacement> {
     const now = this.now();
     const cached = this.placements.get(candidate.item.id);
     if (cached && cached.eTag === candidate.eTag && now.getTime() - cached.at < this.cacheTtlMs) {
       return cached.placement;
     }
+
+    if (!this.hasTimeFor(tick, CLASSIFY_RESERVE_MS)) throw new OutOfTime();
+    await sharePoint.checkInboxItem(inbox, { id: candidate.item.id, eTag: candidate.eTag });
 
     // Read lazily: the fallback classifier never reads, so nothing is
     // downloaded when Claude is off. A failed read is a failed attempt, not a
@@ -497,12 +638,17 @@ export class ChannelInbox {
       return content;
     };
     const companyName = row.companyNameAliases[0] ?? row.title;
-    const classified = await this.deps.classification.classify({
-      filename: candidate.name,
-      contentType: candidate.item.file?.mimeType || 'application/octet-stream',
-      readContent,
-      ...(row.nip || companyName ? { client: { nip: row.nip, companyName } } : {}),
-    });
+    let classified: Classification;
+    try {
+      classified = await this.deps.classification.classify({
+        filename: candidate.name,
+        contentType: candidate.item.file?.mimeType || 'application/octet-stream',
+        readContent,
+        ...(row.nip || companyName ? { client: { nip: row.nip, companyName } } : {}),
+      });
+    } catch (err) {
+      throw new StageFailure('classify', err);
+    }
     if (downloadFailure !== undefined) throw new StageFailure('download', downloadFailure);
 
     const directed = row.nip
@@ -520,7 +666,8 @@ export class ChannelInbox {
   /**
    * After {@link MAX_PROCESSING_ATTEMPTS} failures: into
    * `98_Nieposortowane/YYYY/MM` without classifying, so the inbox drains. If
-   * even that fails, the file stays and is logged.
+   * even that fails, the file stays and is logged. The same version check,
+   * `If-Match` and time limit apply as to any move.
    */
   private async sortUnclassified(
     ids: RowIds,
@@ -548,8 +695,14 @@ export class ChannelInbox {
       return;
     }
     try {
+      if (!this.hasTimeFor(tick, WRITE_RESERVE_MS)) throw new OutOfTime();
       const folderId = await sharePoint.ensureInboxFolder(inbox, folderPath);
-      const moved = await sharePoint.moveWithinInbox(inbox, driveItemId, candidate.name, folderId);
+      const moved = await sharePoint.moveWithinInbox(
+        inbox,
+        { id: driveItemId, eTag: candidate.eTag },
+        candidate.name,
+        folderId,
+      );
       this.forget(driveItemId);
       tick.counts.sortedToReview += 1;
       tick.log.info(
@@ -564,6 +717,8 @@ export class ChannelInbox {
         'inbox.sorted_to_review',
       );
     } catch (err) {
+      // A file already counted as failed this tick is not also deferred.
+      if (this.leftForLater(err, tick, ids, candidate, { countDeferred: !opts.counted })) return;
       if (!opts.counted) tick.counts.failed += 1;
       tick.log.error(
         {
@@ -597,47 +752,75 @@ export class ChannelInbox {
 // Pure helpers (exported for unit tests).
 // ---------------------------------------------------------------------------
 
+export interface CandidateRules {
+  readonly now: Date;
+  /** `INBOX_MIN_AGE_MS`: unmodified for at least this long. */
+  readonly minAgeMs: number;
+  /** `INBOX_CREATED_AFTER` (epoch ms): created strictly after it. */
+  readonly createdAfterMs?: number;
+}
+
 /**
  * The direct children the sweep may take, oldest first: files (never a folder
  * or a package), with a name that is not an Office lock file (`~$`) or hidden
- * (`.`), more than 0 bytes and at most 100 MiB, unmodified for `minAgeMs`,
- * and with a creator id. The rest are counted, never touched.
+ * (`.`), more than 0 bytes and at most 100 MiB, with an `eTag` (every later
+ * read and write is checked against it), created after the cutoff when there
+ * is one, unmodified for `minAgeMs`, and with a creator id. The rest are
+ * counted, never touched.
  */
 export function selectCandidates(
   children: readonly InboxItem[],
-  now: Date,
-  minAgeMs: number,
-): { candidates: InboxCandidate[]; young: number; ineligible: number; noCreator: number } {
+  rules: CandidateRules,
+): {
+  candidates: InboxCandidate[];
+  young: number;
+  ineligible: number;
+  beforeCutoff: number;
+  noCreator: number;
+} {
+  const { now, minAgeMs, createdAfterMs } = rules;
   const picked: { candidate: InboxCandidate; modified: number }[] = [];
   let young = 0;
   let ineligible = 0;
+  let beforeCutoff = 0;
   let noCreator = 0;
   for (const item of children) {
     if (!item.file || item.folder || item.package) continue;
     const name = item.name ?? '';
     const size = item.size;
+    const eTag = item.eTag ?? '';
     if (
       !name ||
       name.startsWith('~$') ||
       name.startsWith('.') ||
       typeof size !== 'number' ||
       size <= 0 ||
-      size > MAX_INBOX_FILE_BYTES
+      size > MAX_INBOX_FILE_BYTES ||
+      !eTag
     ) {
       ineligible += 1;
       continue;
+    }
+    if (createdAfterMs !== undefined) {
+      const created = Date.parse(item.createdDateTime ?? '');
+      // Unreadable counts as before: the cutoff exists to leave files alone.
+      if (!Number.isFinite(created) || created <= createdAfterMs) {
+        beforeCutoff += 1;
+        continue;
+      }
     }
     const modified = Date.parse(item.lastModifiedDateTime ?? '');
     if (!Number.isFinite(modified) || now.getTime() - modified < minAgeMs) {
       young += 1;
       continue;
     }
-    const creatorId = item.createdBy?.user?.id?.trim().toLowerCase() ?? '';
-    if (!GUID.test(creatorId)) {
+    const creatorId = userIdOf(item.createdBy);
+    if (!creatorId) {
       noCreator += 1;
       continue;
     }
-    picked.push({ candidate: { item, name, creatorId, eTag: item.eTag ?? '' }, modified });
+    const modifierId = userIdOf(item.lastModifiedBy);
+    picked.push({ candidate: { item, name, creatorId, modifierId, eTag }, modified });
   }
   picked.sort(
     (a, b) =>
@@ -648,7 +831,19 @@ export function selectCandidates(
           ? 1
           : 0),
   );
-  return { candidates: picked.map((p) => p.candidate), young, ineligible, noCreator };
+  return {
+    candidates: picked.map((p) => p.candidate),
+    young,
+    ineligible,
+    beforeCutoff,
+    noCreator,
+  };
+}
+
+/** A user's object id from a `createdBy`/`lastModifiedBy` identity set; '' when none. */
+function userIdOf(identity: { readonly user?: { readonly id?: string } } | undefined): string {
+  const id = identity?.user?.id?.trim().toLowerCase() ?? '';
+  return GUID.test(id) ? id : '';
 }
 
 /**
@@ -686,6 +881,13 @@ function datePartsOf(c: Classification): { year: number; month: number } {
     throw new Error('A dated category needs a numeric year and month');
   }
   return { year, month };
+}
+
+/** The tick has too little time left for the next stage: the file waits, not a failure. */
+class OutOfTime extends Error {
+  constructor() {
+    super('Not enough time left in this tick');
+  }
 }
 
 /** A failure in a stage other than the one being run when it surfaced. */

@@ -1,4 +1,4 @@
-import type { Client } from '@microsoft/microsoft-graph-client';
+import { RetryHandlerOptions, type Client } from '@microsoft/microsoft-graph-client';
 import { USER_TYPE_CACHE_TTL_MS, UserTypeReadError, UserTypeReader } from './userDirectory';
 
 const OID = 'ae3987d3-9a3a-4ff8-bcf7-713d24e79c48';
@@ -106,5 +106,60 @@ describe('UserTypeReader.userTypeOf', () => {
     await reader.userTypeOf(OID_2);
     await reader.userTypeOf(OID);
     expect(paths).toHaveLength(3);
+  });
+});
+
+// The channel-inbox sweep's reader: a tick must end inside the timer's
+// limit, so the SDK may not sleep through Retry-After; throttling is retried
+// here instead, a bounded number of times.
+describe('UserTypeReader with sdkRetries: false', () => {
+  function recordingGraph(answers: (() => unknown)[]) {
+    const middleware: unknown[][] = [];
+    const api = () => {
+      const seen: unknown[] = [];
+      const request = {
+        middlewareOptions(options: unknown[]) {
+          seen.push(...options);
+          return request;
+        },
+        get: async () => {
+          middleware.push(seen);
+          const next = answers.shift();
+          return next ? next() : { userType: 'Guest' };
+        },
+      };
+      return request;
+    };
+    return { client: { api } as unknown as Client, middleware };
+  }
+
+  it('switches the SDK retries off and retries a 429 itself', async () => {
+    const { client, middleware } = recordingGraph([
+      () => {
+        throw graphError(429);
+      },
+      () => ({ userType: 'Guest' }),
+    ]);
+    const reader = new UserTypeReader(client, {
+      sdkRetries: false,
+      retry: { retries: 1, minTimeoutMs: 0 },
+    });
+    await expect(reader.userTypeOf(OID)).resolves.toBe('Guest');
+    expect(middleware).toHaveLength(2);
+    for (const options of middleware) {
+      expect(options).toEqual([expect.any(RetryHandlerOptions)]);
+      expect((options[0] as RetryHandlerOptions).maxRetries).toBe(0);
+    }
+  });
+
+  it('by default leaves a 429 to the SDK, as the upload path always has', async () => {
+    const { client, middleware } = recordingGraph([
+      () => {
+        throw graphError(429);
+      },
+    ]);
+    const reader = new UserTypeReader(client, { retry: { retries: 1, minTimeoutMs: 0 } });
+    await expect(reader.userTypeOf(OID)).rejects.toMatchObject({ status: 429 });
+    expect(middleware).toEqual([[]]);
   });
 });

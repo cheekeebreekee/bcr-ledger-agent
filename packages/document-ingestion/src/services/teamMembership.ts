@@ -1,7 +1,7 @@
 import type { Client } from '@microsoft/microsoft-graph-client';
 import { createLogger, LedgerAgentError, type Logger, type MembershipCheckMode } from '@bcr/shared';
 import type { RetryOptions } from '../utils/retry';
-import { graphStatus, withGraphRetry } from './sharePointService';
+import { graphStatus, withGraphRetry, withoutSdkRetries } from './sharePointService';
 
 /** How long a successful read of one user's Teams is reused (ms). */
 export const MEMBERSHIP_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -55,6 +55,13 @@ export interface TeamMembershipReaderOptions {
   readonly retry?: RetryOptions;
   readonly maxCachedUsers?: number;
   readonly maxPages?: number;
+  /**
+   * `false`: switch the Graph SDK's own retries off and retry 429/503/504
+   * here, with bounded backoff (the channel-inbox sweep's own reader, which
+   * must end well inside the timer's time limit). Default `true`, as the
+   * upload path has always read.
+   */
+  readonly sdkRetries?: boolean;
 }
 
 /** One entry of `/users/{id}/memberOf`: a group, a directory role or an administrative unit. */
@@ -108,6 +115,7 @@ export class TeamMembershipReader implements TeamMembershipSource {
   private readonly retry: RetryOptions;
   private readonly maxCachedUsers: number;
   private readonly maxPages: number;
+  private readonly sdkRetries: boolean;
   private readonly cache = new Map<string, CachedTeams>();
   private readonly inFlight = new Map<string, Promise<ReadonlySet<string>>>();
 
@@ -120,6 +128,7 @@ export class TeamMembershipReader implements TeamMembershipSource {
     this.retry = opts.retry ?? DEFAULT_RETRY;
     this.maxCachedUsers = opts.maxCachedUsers ?? DEFAULT_MAX_CACHED_USERS;
     this.maxPages = opts.maxPages ?? DEFAULT_MAX_PAGES;
+    this.sdkRetries = opts.sdkRetries ?? true;
   }
 
   async teamsOf(userAadObjectId: string): Promise<ReadonlySet<string>> {
@@ -159,8 +168,12 @@ export class TeamMembershipReader implements TeamMembershipSource {
       try {
         page =
           (await withGraphRetry(
-            () => this.graph.api(current).get() as Promise<MemberOfPage>,
+            () => {
+              const r = this.graph.api(current);
+              return (this.sdkRetries ? r : withoutSdkRetries(r)).get() as Promise<MemberOfPage>;
+            },
             this.retry,
+            { sdkRetries: this.sdkRetries },
           )) ?? {};
       } catch (err) {
         throw new TeamMembershipReadError(

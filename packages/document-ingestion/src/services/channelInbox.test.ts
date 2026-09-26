@@ -8,6 +8,9 @@ import type {
 } from '@bcr/shared';
 import {
   ChannelInbox,
+  CLASSIFY_RESERVE_MS,
+  INBOX_TICK_HARD_LIMIT_MS,
+  WRITE_RESERVE_MS,
   inboxPlacement,
   reviewFolderPath,
   selectCandidates,
@@ -68,6 +71,9 @@ interface FakeItem {
   size?: number;
   eTag: string;
   createdBy?: string;
+  /** Who changed it last: the creator unless set; `null` for an application. */
+  modifiedBy?: string | null;
+  createdDateTime?: string;
   lastModifiedDateTime: string;
   content?: Buffer;
 }
@@ -76,6 +82,7 @@ interface Call {
   readonly method: 'get' | 'post' | 'put' | 'patch' | 'delete' | 'stream';
   readonly path: string;
   readonly query: Record<string, string>;
+  readonly headers: Record<string, string>;
   readonly body: unknown;
 }
 
@@ -170,22 +177,36 @@ class FakeTenant {
     return this.calls.filter((c) => c.method !== 'get' && c.method !== 'stream');
   }
 
+  /** Moves an item elsewhere in its drive, as a person would: a new eTag, same id. */
+  relocate(id: string, parentId: string, name?: string): void {
+    const item = this.item(id);
+    item.parentId = parentId;
+    if (name !== undefined) item.name = name;
+    item.eTag = `${item.eTag}~`;
+  }
+
   get client(): Client {
     const api = (path: string) => {
       const query: Record<string, string> = {};
+      const headers: Record<string, string> = {};
+      const call = (method: Call['method'], body?: unknown) =>
+        this.respond({ method, path, query, headers, body });
       const request = {
         query(q: Record<string, string>) {
           Object.assign(query, q);
           return request;
         },
-        header: () => request,
+        header(key: string, value: string) {
+          headers[key] = value;
+          return request;
+        },
         middlewareOptions: () => request,
-        get: () => this.respond({ method: 'get', path, query, body: undefined }),
-        getStream: () => this.respond({ method: 'stream', path, query, body: undefined }),
-        post: (body: unknown) => this.respond({ method: 'post', path, query, body }),
-        put: (body: unknown) => this.respond({ method: 'put', path, query, body }),
-        patch: (body: unknown) => this.respond({ method: 'patch', path, query, body }),
-        delete: () => this.respond({ method: 'delete', path, query, body: undefined }),
+        get: () => call('get'),
+        getStream: () => call('stream'),
+        post: (body: unknown) => call('post', body),
+        put: (body: unknown) => call('put', body),
+        patch: (body: unknown) => call('patch', body),
+        delete: () => call('delete'),
       };
       return request;
     };
@@ -259,10 +280,18 @@ class FakeTenant {
       if (!item || item.driveId !== m[1] || item.folder) throw graphError(404);
       return new Response(item.content ?? Buffer.alloc(0)).body;
     }
+    if (call.method === 'get' && (m = /^\/drives\/([^/]+)\/items\/([^/:]+)$/.exec(route))) {
+      const item = this.items.get(decodeURIComponent(m[2] ?? ''));
+      if (!item || item.driveId !== m[1]) throw graphError(404);
+      return this.json(item);
+    }
     if (call.method === 'patch' && (m = /^\/drives\/([^/]+)\/items\/([^/]+)$/.exec(route))) {
       const driveId = m[1] ?? '';
       const item = this.items.get(decodeURIComponent(m[2] ?? ''));
       if (!item || item.driveId !== driveId) throw graphError(404);
+      // As Graph documents for update and move: a stale If-Match is a 412.
+      const ifMatch = call.headers['If-Match'];
+      if (ifMatch !== undefined && ifMatch !== item.eTag) throw graphError(412);
       const body = call.body as { parentReference?: { id?: string }; name?: string };
       const targetId = body.parentReference?.id ?? item.parentId ?? '';
       const target = this.items.get(targetId);
@@ -315,6 +344,13 @@ class FakeTenant {
       ...(item.createdBy
         ? { createdBy: { user: { id: item.createdBy } } }
         : { createdBy: { application: { id: 'app' } } }),
+      ...(() => {
+        const modifier = item.modifiedBy === undefined ? item.createdBy : item.modifiedBy;
+        return modifier
+          ? { lastModifiedBy: { user: { id: modifier } } }
+          : { lastModifiedBy: { application: { id: 'app' } } };
+      })(),
+      createdDateTime: item.createdDateTime ?? OLD,
       ...(item.parentId === null
         ? { root: {} }
         : { parentReference: { driveId: item.driveId, id: item.parentId } }),
@@ -501,14 +537,16 @@ describe('ChannelInbox: filing a client upload', () => {
     expect(tenant.writes().some((c) => c.path.includes('/items/root/'))).toBe(false);
   });
 
-  it('moves with PATCH by id and conflictBehavior=fail, and never copies, uploads or deletes', async () => {
+  it('moves with PATCH by id, If-Match on the listed eTag and conflictBehavior=fail, and never copies, uploads or deletes', async () => {
     const { tenant, inbox } = setup();
     const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    const listedETag = tenant.item(id).eTag;
     await inbox.sweep();
 
     const patches = tenant.writes().filter((c) => c.method === 'patch');
     expect(patches).toHaveLength(1);
     expect(patches[0]?.path).toBe(`/drives/drive-a/items/${id}`);
+    expect(patches[0]?.headers).toEqual({ 'If-Match': listedETag });
     expect(patches[0]?.query).toEqual({ '@microsoft.graph.conflictBehavior': 'fail' });
     expect(patches[0]?.body).toEqual({
       parentReference: { id: tenant.item(id).parentId },
@@ -697,6 +735,86 @@ describe('ChannelInbox: what is never touched', () => {
     ]);
   });
 
+  // createdBy survives a "Replace": staff dropping a same-named file over a
+  // guest's upload leaves the guest as creator and staff's content inside.
+  it('leaves a guest’s file that staff replaced: not classified, not read, not moved', async () => {
+    const { tenant, inbox, classify, events } = setup({
+      classification: new ClassificationService([contentReadingClassifier(invoice)]),
+    });
+    const id = tenant.addFile('inbox-a', {
+      name: 'skan.pdf',
+      createdBy: GUEST_A,
+      modifiedBy: STAFF,
+    });
+    const spy = jest.spyOn(ClassificationService.prototype, 'classify');
+
+    const summary = await inbox.sweep();
+
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+    expect(classify).not.toHaveBeenCalled();
+    expect(tenant.calls.some((c) => c.method === 'stream')).toBe(false);
+    expect(tenant.writes()).toEqual([]);
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/skan.pdf`);
+    expect(summary.skippedNotClient).toBe(1);
+    expect(events('inbox.skipped')).toEqual([
+      expect.objectContaining({ driveItemId: id, reason: 'modified_by_other' }),
+    ]);
+  });
+
+  it.each([
+    ['a guest of another Team', GUEST_B],
+    ['no user (an application)', null],
+    ['a user who no longer exists', DELETED],
+  ])('leaves a guest’s file last changed by %s', async (_label, modifier) => {
+    const { tenant, inbox, events } = setup({ rows: [rowA, rowB] });
+    const id = tenant.addFile('inbox-a', {
+      name: 'x.pdf',
+      createdBy: GUEST_A,
+      modifiedBy: modifier,
+    });
+
+    await inbox.sweep();
+
+    expect(tenant.writes()).toEqual([]);
+    expect(events('inbox.skipped')[0]).toMatchObject({
+      driveItemId: id,
+      reason: 'modified_by_other',
+    });
+  });
+
+  it('files a guest’s file that another guest of the same Team changed', async () => {
+    const { tenant, inbox } = setup();
+    const id = tenant.addFile('inbox-a', {
+      name: 'x.pdf',
+      createdBy: GUEST_A,
+      modifiedBy: GUEST_AB,
+    });
+    await inbox.sweep();
+    expect(tenant.pathOf(id)).toContain('/01_Faktury/');
+  });
+
+  it('waits when the last modifier cannot be read', async () => {
+    const { tenant, inbox, events } = setup();
+    const id = tenant.addFile('inbox-a', {
+      name: 'x.pdf',
+      createdBy: GUEST_A,
+      modifiedBy: GUEST_AB,
+    });
+    tenant.overrides.push([
+      new RegExp(`^GET /users/${GUEST_AB}\\?`),
+      () => {
+        throw graphError(503);
+      },
+    ]);
+
+    const summary = await inbox.sweep();
+
+    expect(summary).toMatchObject({ skippedUnverified: 1, skippedNotClient: 0 });
+    expect(tenant.writes()).toEqual([]);
+    expect(events('inbox.skipped')[0]).toMatchObject({ driveItemId: id, reason: 'unverified' });
+  });
+
   it('logs a skipped file once per worker, however many ticks see it', async () => {
     const { tenant, inbox, events } = setup();
     tenant.addFile('inbox-a', { name: 'x.pdf', createdBy: STAFF });
@@ -784,6 +902,155 @@ describe('ChannelInbox: what is never touched', () => {
   });
 });
 
+// The listing is minutes old by the time a later file is moved. A person may
+// have filed it by hand, or staff may have moved it out of the channel (for
+// example a document of another client, posted by a guest in both Teams)
+// meanwhile. The id survives any move within the library; the eTag does not.
+describe('ChannelInbox: it acts only on the version it listed', () => {
+  it.each([
+    ['moved into a sibling channel’s staff-only folder', 'staff-only'],
+    ['filed by hand into a subfolder of the channel', 'manual-subfolder'],
+  ])('never pulls back a file %s after the listing, and writes nothing', async (_label, where) => {
+    const tenant = new FakeTenant();
+    const general = tenant.addFolder('drive-a', 'root-drive-a', 'General');
+    const staffOnly = tenant.addFolder('drive-a', general, 'Staff only');
+    const manual = tenant.addFolder('drive-a', 'inbox-a', 'Ręcznie');
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf', createdBy: GUEST_AB });
+    const destination = where === 'staff-only' ? staffOnly : manual;
+    const { inbox, events, classify } = setup({
+      tenant,
+      classify: jest.fn(async () => {
+        // Someone moves it while the sweep is classifying it.
+        tenant.relocate(id, destination);
+        return invoice;
+      }),
+    });
+
+    const summary = await inbox.sweep();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(tenant.item(id).parentId).toBe(destination);
+    expect(tenant.calls.filter((c) => c.method === 'patch')).toEqual([]);
+    expect(events('inbox.filed')).toEqual([]);
+    expect(events('inbox.failed')).toEqual([]);
+    expect(summary).toMatchObject({ filed: 0, failed: 0, skippedChanged: 1 });
+    expect(events('inbox.skipped')).toEqual([
+      expect.objectContaining({ driveItemId: id, reason: 'changed' }),
+    ]);
+  });
+
+  it('never downloads or classifies a file that left the inbox after the listing', async () => {
+    const tenant = new FakeTenant();
+    const staffOnly = tenant.addFolder('drive-a', 'root-drive-a', 'Staff only');
+    const id = tenant.addFile('inbox-a', { name: 'b-doc.pdf' });
+    tenant.overrides.push([
+      /^GET \/drives\/drive-a\/items\/inbox-a\/children/,
+      (_c, next) => {
+        const page = next();
+        tenant.relocate(id, staffOnly);
+        return page;
+      },
+    ]);
+    const { inbox, classify } = setup({
+      tenant,
+      classification: new ClassificationService([contentReadingClassifier(invoice)]),
+    });
+    const spy = jest.spyOn(ClassificationService.prototype, 'classify');
+
+    const summary = await inbox.sweep();
+
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+    expect(classify).not.toHaveBeenCalled();
+    expect(tenant.calls.some((c) => c.method === 'stream')).toBe(false);
+    expect(tenant.writes()).toEqual([]);
+    expect(summary.skippedChanged).toBe(1);
+  });
+
+  it('does not rename back a file renamed after the listing', async () => {
+    const tenant = new FakeTenant();
+    const id = tenant.addFile('inbox-a', { name: 'skan.pdf' });
+    const { inbox } = setup({
+      tenant,
+      classify: jest.fn(async () => {
+        tenant.relocate(id, 'inbox-a', 'faktura-wrzesien.pdf');
+        return invoice;
+      }),
+    });
+
+    await inbox.sweep();
+
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/faktura-wrzesien.pdf`);
+    expect(tenant.writes().filter((c) => c.method === 'patch')).toEqual([]);
+  });
+
+  it('does not file a file by its old content once it has been replaced; the next tick reads it again', async () => {
+    const tenant = new FakeTenant();
+    const id = tenant.addFile('inbox-a', { name: 'skan.pdf' });
+    let replaced = false;
+    const classify = jest.fn(async () => {
+      if (!replaced) {
+        replaced = true;
+        tenant.item(id).eTag = '"replaced by the guest"';
+      }
+      return invoice;
+    });
+    const { inbox } = setup({ tenant, classify });
+
+    const first = await inbox.sweep();
+    expect(first).toMatchObject({ filed: 0, skippedChanged: 1, failed: 0 });
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/skan.pdf`);
+
+    const second = await inbox.sweep();
+    expect(classify).toHaveBeenCalledTimes(2);
+    expect(second.filed).toBe(1);
+  });
+
+  it('reads a 412 on the move as changed, and never counts it towards the review fallback', async () => {
+    const { tenant, inbox, events } = setup({ deps: { maxAttempts: 1 } });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    tenant.overrides.push([
+      /^PATCH /,
+      () => {
+        throw graphError(412);
+      },
+    ]);
+
+    const ticks = [await inbox.sweep(), await inbox.sweep()];
+
+    expect(ticks.map((t) => [t.failed, t.skippedChanged, t.sortedToReview])).toEqual([
+      [0, 1, 0],
+      [0, 1, 0],
+    ]);
+    expect(events('inbox.failed')).toEqual([]);
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/faktura.pdf`);
+  });
+
+  it('holds the review fallback to the listed version too', async () => {
+    const tenant = new FakeTenant();
+    const elsewhere = tenant.addFolder('drive-a', 'root-drive-a', 'Staff only');
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    const { inbox, events } = setup({ tenant, deps: { maxAttempts: 1 } });
+    tenant.overrides.push([
+      /^POST \/drives\/drive-a\/items\/inbox-a\/children$/,
+      (call, next) => {
+        const { name } = call.body as { name: string };
+        if (name === '01_Faktury') throw graphError(400);
+        // The fallback's folder is being created: someone moves the file now.
+        if (name === '98_Nieposortowane') tenant.relocate(id, elsewhere);
+        return next();
+      },
+    ]);
+
+    const summary = await inbox.sweep();
+
+    expect(tenant.item(id).parentId).toBe(elsewhere);
+    expect(tenant.calls.filter((c) => c.method === 'patch')).toEqual([]);
+    expect(summary).toMatchObject({ failed: 1, skippedChanged: 1, sortedToReview: 0 });
+    expect(events('inbox.failed').map((l) => l['stage'])).toEqual(['folder']);
+  });
+});
+
 describe('ChannelInbox: which rows are swept', () => {
   it('sweeps only bound, routed client rows', async () => {
     const rows = [
@@ -820,6 +1087,55 @@ describe('ChannelInbox: which rows are swept', () => {
 
     expect(summary.rows).toBe(0);
     expect(tenant.calls).toEqual([]);
+  });
+
+  it('with INBOX_SWEEP_ROWS, sweeps only the listed rows, and never another client’s channel', async () => {
+    const { tenant, inbox } = setup({ rows: [rowA, rowB], deps: { onlyRows: ['12'] } });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+    const inB = tenant.addFile('inbox-b', { name: 'b.pdf', createdBy: GUEST_B });
+
+    const summary = await inbox.sweep();
+
+    expect(summary).toMatchObject({ rows: 1, filed: 1 });
+    expect(tenant.pathOf(inB)).toContain('/01_Faktury/');
+    expect(tenant.calls.filter((c) => /ClientA|drive-a|inbox-a/.test(c.path))).toEqual([]);
+  });
+
+  it('never sweeps a listed row the directory does not route to', async () => {
+    const unbound = clientRow('20', '/sites/ClientB', { driveId: null, teamId: TEAM_B });
+    const { tenant, inbox } = setup({ rows: [rowA, unbound], deps: { onlyRows: ['20'] } });
+    tenant.addFile('inbox-b', { name: 'b.pdf', createdBy: GUEST_B });
+
+    const summary = await inbox.sweep();
+
+    expect(summary.rows).toBe(0);
+    expect(tenant.calls).toEqual([]);
+  });
+
+  it('with an empty INBOX_SWEEP_ROWS, sweeps every routed row', async () => {
+    const { inbox } = setup({ rows: [rowA, rowB], deps: { onlyRows: [] } });
+    expect((await inbox.sweep()).rows).toBe(2);
+  });
+
+  it('with INBOX_CREATED_AFTER, leaves files created before it where they are', async () => {
+    const { tenant, inbox, classify } = setup({
+      deps: { createdAfterMs: Date.parse('2026-09-26T09:00:00Z') },
+    });
+    const old = tenant.addFile('inbox-a', {
+      name: 'old.pdf',
+      createdDateTime: '2026-08-01T10:00:00Z',
+    });
+    const fresh = tenant.addFile('inbox-a', {
+      name: 'new.pdf',
+      createdDateTime: '2026-09-26T09:30:00Z',
+    });
+
+    const summary = await inbox.sweep();
+
+    expect(tenant.pathOf(old)).toBe(`${CHANNEL}/old.pdf`);
+    expect(tenant.pathOf(fresh)).toContain('/01_Faktury/');
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(summary).toMatchObject({ candidates: 1, skippedBeforeCutoff: 1, filed: 1 });
   });
 
   it('sweeps nothing on an unavailable directory', async () => {
@@ -1188,6 +1504,109 @@ describe('ChannelInbox: budget and deadline', () => {
     expect(summary).toMatchObject({ filed: 2, deferred: 1 });
   });
 
+  // A file started just before the deadline must not run the tick past the
+  // host's functionTimeout: that restarts the worker, and every upload on it.
+  it('does not start classifying a file without the time for it; the file waits, not failed', async () => {
+    let now = NOW.getTime();
+    const { tenant, inbox, classify, events } = setup({
+      deps: { now: () => new Date(now) },
+    });
+    const id = tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.overrides.push([
+      /^GET \/users\/[^/]+\?\$select=userType$/,
+      (_c, next) => {
+        // A slow uploader read: 160 s in, 110 s are left, under the reserve.
+        now = NOW.getTime() + INBOX_TICK_HARD_LIMIT_MS - CLASSIFY_RESERVE_MS + 10_000;
+        return next();
+      },
+    ]);
+
+    const summary = await inbox.sweep();
+
+    expect(classify).not.toHaveBeenCalled();
+    expect(tenant.calls.some((c) => /\/items\/item-\d+\?/.test(c.path))).toBe(false);
+    expect(summary).toMatchObject({ deferred: 1, failed: 0, filed: 0 });
+    expect(events('inbox.failed')).toEqual([]);
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/a.pdf`);
+  });
+
+  it('does not start the writes of a file classified too late; the next tick moves it without classifying again', async () => {
+    let now = NOW.getTime();
+    let slow = true;
+    const { tenant, inbox, classify } = setup({
+      deps: { now: () => new Date(now) },
+      classify: jest.fn(async () => {
+        if (slow) now += INBOX_TICK_HARD_LIMIT_MS - WRITE_RESERVE_MS + 1;
+        return invoice;
+      }),
+    });
+    const id = tenant.addFile('inbox-a', { name: 'a.pdf' });
+
+    const first = await inbox.sweep();
+    expect(first).toMatchObject({ deferred: 1, failed: 0, filed: 0 });
+    expect(tenant.writes()).toEqual([]);
+
+    slow = false;
+    const second = await inbox.sweep();
+    expect(second.filed).toBe(1);
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(tenant.pathOf(id)).toContain('/01_Faktury/');
+  });
+
+  it('does not start the review fallback’s writes without the time for them', async () => {
+    let now = NOW.getTime();
+    const { tenant, inbox, events } = setup({
+      deps: { now: () => new Date(now), maxAttempts: 1 },
+    });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.overrides.push([
+      /^POST \/drives\/drive-a\/items\/inbox-a\/children$/,
+      (call, next) => {
+        if ((call.body as { name: string }).name !== '01_Faktury') return next();
+        now += INBOX_TICK_HARD_LIMIT_MS;
+        throw graphError(400);
+      },
+    ]);
+
+    const summary = await inbox.sweep();
+
+    expect(summary).toMatchObject({ failed: 1, deferred: 0, sortedToReview: 0 });
+    expect(events('inbox.failed').map((l) => l['stage'])).toEqual(['folder']);
+    expect(tenant.writes().filter((c) => c.method === 'patch')).toEqual([]);
+  });
+
+  it('defers a file already failed three times when the tick has no time for its move', async () => {
+    let now = NOW.getTime();
+    let slowRead = false;
+    const { tenant, inbox } = setup({
+      deps: {
+        now: () => new Date(now),
+        maxAttempts: 1,
+        users: {
+          userTypeOf: async () => {
+            if (slowRead) now += INBOX_TICK_HARD_LIMIT_MS - WRITE_RESERVE_MS + 1;
+            return 'Guest';
+          },
+        },
+      },
+    });
+    const id = tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.overrides.push([
+      /^PATCH /,
+      () => {
+        throw graphError(400);
+      },
+    ]);
+    await inbox.sweep();
+    tenant.overrides.length = 0;
+    slowRead = true;
+
+    const summary = await inbox.sweep();
+
+    expect(summary).toMatchObject({ deferred: 1, failed: 0, sortedToReview: 0 });
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/a.pdf`);
+  });
+
   it('does not let one row with a backlog starve the others', async () => {
     const { tenant, inbox } = setup({ rows: [rowA, rowB], deps: { maxFilesPerTick: 1 } });
     tenant.addFile('inbox-a', { name: 'a1.pdf' });
@@ -1273,6 +1692,8 @@ describe('ChannelInbox: logs', () => {
       skippedUnverified: 0,
       skippedYoung: 0,
       skippedIneligible: 0,
+      skippedBeforeCutoff: 0,
+      skippedChanged: 0,
       deferred: 0,
       failed: 0,
       rowsFailed: 0,
@@ -1290,36 +1711,81 @@ describe('selectCandidates', () => {
     file: { mimeType: 'application/pdf' },
     eTag: 'e',
     createdBy: { user: { id: GUEST_A.toUpperCase() } },
+    lastModifiedBy: { user: { id: GUEST_AB.toUpperCase() } },
+    createdDateTime: OLD,
     lastModifiedDateTime: OLD,
     ...over,
   });
 
-  it('orders candidates oldest first, then by id, and lower-cases the creator id', () => {
+  it('orders candidates oldest first, then by id, and lower-cases the creator and modifier ids', () => {
     const picked = selectCandidates(
       [
         file({ id: 'b', lastModifiedDateTime: '2026-09-26T09:40:00Z' }),
         file({ id: 'c', lastModifiedDateTime: '2026-09-26T09:30:00Z' }),
         file({ id: 'a', lastModifiedDateTime: '2026-09-26T09:40:00Z' }),
       ],
-      NOW,
-      120_000,
+      { now: NOW, minAgeMs: 120_000 },
     );
     expect(picked.candidates.map((c) => c.item.id)).toEqual(['c', 'a', 'b']);
-    expect(picked.candidates[0]?.creatorId).toBe(GUEST_A);
+    expect(picked.candidates[0]).toMatchObject({ creatorId: GUEST_A, modifierId: GUEST_AB });
+  });
+
+  it('keeps an empty modifier id when the last change was not a user’s', () => {
+    const picked = selectCandidates(
+      [
+        file({ id: 'a', lastModifiedBy: { user: { id: 'SharePoint App' } } }),
+        file({ id: 'b', lastModifiedBy: {} }),
+      ],
+      { now: NOW, minAgeMs: 0 },
+    );
+    expect(picked.candidates.map((c) => c.modifierId)).toEqual(['', '']);
   });
 
   it('treats an unreadable modification time as young', () => {
-    const picked = selectCandidates([file({ id: 'a', lastModifiedDateTime: 'soon' })], NOW, 0);
+    const picked = selectCandidates([file({ id: 'a', lastModifiedDateTime: 'soon' })], {
+      now: NOW,
+      minAgeMs: 0,
+    });
     expect(picked).toMatchObject({ candidates: [], young: 1 });
+  });
+
+  it('leaves a file without an eTag: nothing could hold a later read or move to it', () => {
+    const noETag = file({ id: 'a' });
+    delete (noETag as { eTag?: string }).eTag;
+    const picked = selectCandidates([noETag, file({ id: 'b', eTag: '' })], {
+      now: NOW,
+      minAgeMs: 0,
+    });
+    expect(picked).toMatchObject({ candidates: [], ineligible: 2 });
+  });
+
+  it('with a cutoff, leaves files created at or before it, or with no readable creation time', () => {
+    const cutoff = Date.parse('2026-09-26T09:00:00Z');
+    const picked = selectCandidates(
+      [
+        file({ id: 'before', createdDateTime: '2026-09-25T12:00:00Z' }),
+        file({ id: 'at', createdDateTime: '2026-09-26T09:00:00Z' }),
+        file({ id: 'unknown', createdDateTime: 'yesterday' }),
+        file({ id: 'after', createdDateTime: '2026-09-26T09:00:01Z' }),
+      ],
+      { now: NOW, minAgeMs: 0, createdAfterMs: cutoff },
+    );
+    expect(picked.candidates.map((c) => c.item.id)).toEqual(['after']);
+    expect(picked.beforeCutoff).toBe(3);
   });
 
   it('ignores packages and folders without counting them', () => {
     const picked = selectCandidates(
       [file({ id: 'p', package: { type: 'oneNote' } }), file({ id: 'f', folder: {} })],
-      NOW,
-      0,
+      { now: NOW, minAgeMs: 0 },
     );
-    expect(picked).toEqual({ candidates: [], young: 0, ineligible: 0, noCreator: 0 });
+    expect(picked).toEqual({
+      candidates: [],
+      young: 0,
+      ineligible: 0,
+      beforeCutoff: 0,
+      noCreator: 0,
+    });
   });
 });
 
