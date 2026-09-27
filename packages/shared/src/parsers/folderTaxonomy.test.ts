@@ -192,6 +192,9 @@ describe('folderTaxonomy', () => {
       ['faktury_zakupu', /zagraniczna.*rachunek hotelowy/s],
       ['inne', /pro forma/],
       ['umowy', /OWU/],
+      // Yahor's decision, 2026-09-27: the client's contract with the accounting office.
+      ['onboarding_reguly', /umowa klienta z biurem rachunkowym/],
+      ['umowy', /umowy klienta z biurem rachunkowym, która trafia do onboarding_reguly/],
     ] as const)('%s says %s', (id, rule) => {
       expect(description(id)).toMatch(rule);
     });

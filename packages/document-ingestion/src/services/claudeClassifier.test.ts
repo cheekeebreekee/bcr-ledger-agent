@@ -245,6 +245,7 @@ describe('ClaudeClassifier: the request', () => {
       'BEZ danych nabywcy',
       'pro forma',
       'OWU',
+      'Umowa klienta z biurem rachunkowym',
       '450 zł',
       'rachunek hotelowy',
     ]) {

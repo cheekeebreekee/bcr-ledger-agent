@@ -562,6 +562,8 @@ export const SYSTEM_PROMPT: string = [
     'osobę), to faktura.',
   '- Faktura pro forma to inne. Polisa, ogólne warunki ubezpieczenia (OWU) i warunki ' +
     'polisy to umowy.',
+  '- Umowa klienta z biurem rachunkowym (usługi księgowe, kadrowe, płacowe) i aneks do niej ' +
+    'to onboarding_reguly, nie umowy.',
   '- Faktura korygująca i anulowanie faktury to faktury_korekty; nota księgowa, ' +
     'obciążeniowa lub uznaniowa to faktury_noty.',
   '- year i month to data dokumentu: data wystawienia faktury, data transakcji paragonu, ' +

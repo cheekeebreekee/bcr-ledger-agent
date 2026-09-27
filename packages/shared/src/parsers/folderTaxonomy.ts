@@ -151,7 +151,8 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     description:
       'Umowa handlowa, umowa z kontrahentem, aneks do umowy, polisa ubezpieczeniowa ' +
       'oraz ogólne warunki ubezpieczenia (OWU) i warunki polisy (z wyłączeniem umów ' +
-      'o pracę, które trafiają do kadr).',
+      'o pracę, które trafiają do kadr, oraz umowy klienta z biurem rachunkowym, ' +
+      'która trafia do onboarding_reguly).',
     examples: ['Umowa najmu', 'Umowa o współpracy', 'Aneks do umowy', 'Polisa OC', 'OWU'],
   },
   {
@@ -228,9 +229,15 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     dated: false,
     polishLabel: 'Onboarding i reguły',
     description:
-      'Dokumenty onboardingowe klienta oraz ustalone reguły księgowania ' +
-      'i instrukcje współpracy.',
-    examples: ['Karta klienta', 'Reguły księgowania', 'Instrukcja obiegu dokumentów'],
+      'Dokumenty onboardingowe klienta, w tym umowa klienta z biurem rachunkowym ' +
+      '(o usługi księgowe, kadrowe lub płacowe) z aneksami, oraz ustalone reguły ' +
+      'księgowania i instrukcje współpracy.',
+    examples: [
+      'Karta klienta',
+      'Umowa o świadczenie usług księgowych',
+      'Reguły księgowania',
+      'Instrukcja obiegu dokumentów',
+    ],
   },
   {
     id: 'inne',

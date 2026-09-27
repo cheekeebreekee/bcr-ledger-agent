@@ -424,7 +424,8 @@ only; its API is point 5.
 - **`parsers/folderTaxonomy.ts` is the single source of truth for folder layout.** `categoryCatalog`
   drives the Claude system prompt (its descriptions are the model's category rules: receipts
   without a buyer are `faktury_noty`, a receipt with the buyer's NIP and a foreign invoice naming
-  a buyer are invoices, pro forma is `inne`, OWU are `umowy`) *and* the output schema's category
+  a buyer are invoices, pro forma is `inne`, OWU are `umowy`, the client's contract with the accounting
+  office is `onboarding_reguly`) *and* the output schema's category
   enum *and* `buildFolderPath()`, so the model can never name a category the uploader can't build
   a path for. Add or rename a category there and nowhere else; never change an id (ids are folder
   keys, log values and evaluation labels); `dated: true` categories require `year`/`month` and
