@@ -1495,8 +1495,9 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
       - one `inbox.sweep_mode` at the restart, with `rows` naming only `<canary listItemId>`;
       - an `inbox.tick` about every 2 minutes, `mode` `shadow`, `rows` `1` (the number of ids in
         `INBOX_SWEEP_ROWS` that are bound), `rowsFailed` `0`;
-      - one `inbox.would_move` with `<canary listItemId>` and the PDF's `driveItemId` (repeated
-        each tick while in `shadow`), its `category` from the classifier;
+      - one `inbox.would_move` with `<canary listItemId>` and the PDF's `driveItemId` (once, not
+        repeated each tick nor after a restart: the shadow memo remembers it, and the next ticks
+        count it in `alreadyReported`), its `category` from the classifier;
       - no `inbox.skipped` for it. `not_guest`, `unknown_user` or `modified_by_other` means Graph
         does not record the guest as the creator, or the last modifier, of a channel attachment:
         stay in `shadow` and raise it, because the sweep then cannot tell a client's uploads

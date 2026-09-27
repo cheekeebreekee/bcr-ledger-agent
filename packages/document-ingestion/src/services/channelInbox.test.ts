@@ -26,6 +26,7 @@ import { ClaudeClassifier } from './claudeClassifier';
 import { buildSnapshot, type ClientDirectorySnapshot } from './clientDirectoryReader';
 import type { DocumentIndex, IndexedDocument } from './documentIndex';
 import type { InboxItem } from './sharePointService';
+import type { ShadowMemoKey } from './shadowMemo';
 import { createSharePointWiring } from './sharePointWiring';
 import { TeamMembershipReader } from './teamMembership';
 import { UserTypeReader } from './userDirectory';
@@ -1466,6 +1467,226 @@ describe('ChannelInbox: modes', () => {
     expect(second.filed).toBe(0);
     expect(events('inbox.tick_overlap')).toHaveLength(1);
     expect(events('inbox.tick')).toHaveLength(1);
+  });
+});
+
+/** A shadow memo in a Map, shared between "workers" like the table is. */
+function memoryMemo() {
+  const keys = new Set<string>();
+  const keyOf = (k: ShadowMemoKey) => `${k.listItemId}|${k.driveItemId}|${k.eTag}`;
+  const memo = {
+    has: jest.fn(async (k: ShadowMemoKey) => keys.has(keyOf(k))),
+    add: jest.fn(async (k: ShadowMemoKey) => {
+      keys.add(keyOf(k));
+    }),
+  };
+  return { memo, keys };
+}
+
+describe('ChannelInbox: the shadow memo', () => {
+  // 26 September 2026: the canary's 43 test documents were classified again
+  // after every worker restart, about 2,700 paid calls in six hours.
+  it('a restarted worker does not classify again what an earlier one reported', async () => {
+    const tenant = new FakeTenant();
+    const { memo, keys } = memoryMemo();
+    const ids = Array.from({ length: 43 }, (_, i) =>
+      tenant.addFile('inbox-a', { name: `doc-${String(i).padStart(2, '0')}.pdf` }),
+    );
+    const first = setup({
+      mode: 'shadow',
+      tenant,
+      deps: { shadowMemo: memo, maxFilesPerTick: 50 },
+    });
+    await first.inbox.sweep();
+    expect(first.classify).toHaveBeenCalledTimes(43);
+    expect(keys.size).toBe(43);
+    expect(memo.add).toHaveBeenCalledWith({
+      listItemId: '11',
+      driveItemId: ids[0],
+      eTag: expect.any(String),
+    });
+
+    // Three restarts, a tick each, and a second tick on the last worker.
+    const later = [1, 2, 3].map(() =>
+      setup({ mode: 'shadow', tenant, deps: { shadowMemo: memo, maxFilesPerTick: 50 } }),
+    );
+    const ticks = [];
+    for (const worker of later) ticks.push(await worker.inbox.sweep());
+    ticks.push(await later[2]!.inbox.sweep());
+
+    for (const worker of later) {
+      expect(worker.classify).not.toHaveBeenCalled();
+      expect(worker.events('inbox.would_move')).toEqual([]);
+    }
+    expect(ticks.map((t) => [t.wouldMove, t.alreadyReported, t.deferred])).toEqual([
+      [0, 43, 0],
+      [0, 43, 0],
+      [0, 43, 0],
+      [0, 43, 0],
+    ]);
+    // The last worker asked the memo once per file, then remembered.
+    expect(memo.has).toHaveBeenCalledTimes(43 + 3 * 43);
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  it('classifies a new version of a reported file once, on whichever worker sees it', async () => {
+    const tenant = new FakeTenant();
+    const { memo } = memoryMemo();
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    await setup({ mode: 'shadow', tenant, deps: { shadowMemo: memo } }).inbox.sweep();
+
+    tenant.item(id).eTag = '"replaced"';
+    const second = setup({ mode: 'shadow', tenant, deps: { shadowMemo: memo } });
+    await second.inbox.sweep();
+    const third = setup({ mode: 'shadow', tenant, deps: { shadowMemo: memo } });
+    await third.inbox.sweep();
+
+    expect(second.classify).toHaveBeenCalledTimes(1);
+    expect(second.events('inbox.would_move')).toHaveLength(1);
+    expect(third.classify).not.toHaveBeenCalled();
+  });
+
+  it('remembers a file shadow sent to 98_ unclassified, so it is not retried after a restart', async () => {
+    const tenant = new FakeTenant();
+    const { memo } = memoryMemo();
+    tenant.addFile('inbox-a', { name: 'x.pdf' });
+    const failing = setup({
+      mode: 'shadow',
+      tenant,
+      deps: { shadowMemo: memo },
+      classify: jest.fn(async () => {
+        throw new Error('no classifier result');
+      }),
+    });
+    for (let i = 0; i < 3; i += 1) await failing.inbox.sweep();
+    expect(failing.events('inbox.would_move')).toEqual([
+      expect.objectContaining({ unclassified: true }),
+    ]);
+
+    const next = setup({ mode: 'shadow', tenant, deps: { shadowMemo: memo } });
+    expect(await next.inbox.sweep()).toMatchObject({ alreadyReported: 1, wouldMove: 0 });
+    expect(next.classify).not.toHaveBeenCalled();
+  });
+
+  it('never classifies a file the memo cannot answer for: it waits, one warning per tick', async () => {
+    const memo = {
+      has: jest.fn(async () => {
+        throw Object.assign(new Error('storage down'), { statusCode: 503 });
+      }),
+      add: jest.fn(async () => undefined),
+    };
+    const { tenant, inbox, classify, events } = setup({
+      mode: 'shadow',
+      deps: { shadowMemo: memo },
+    });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.addFile('inbox-a', { name: 'b.pdf' });
+
+    const first = await inbox.sweep();
+    const second = await inbox.sweep();
+
+    expect(classify).not.toHaveBeenCalled();
+    expect(first).toMatchObject({ wouldMove: 0, deferred: 2, alreadyReported: 0 });
+    expect(second).toMatchObject({ wouldMove: 0, deferred: 2 });
+    expect(events('inbox.shadow_memo_failed')).toEqual([
+      expect.objectContaining({
+        listItemId: '11',
+        operation: 'read',
+        err: { name: 'Error', status: 503 },
+      }),
+      expect.objectContaining({ operation: 'read' }),
+    ]);
+    expect(memo.add).not.toHaveBeenCalled();
+  });
+
+  it('logs would_move even when the memo cannot record it, and says so once per tick', async () => {
+    const memo = {
+      has: jest.fn(async () => false),
+      add: jest.fn(async () => {
+        throw new Error('storage down');
+      }),
+    };
+    const { tenant, inbox, classify, events } = setup({
+      mode: 'shadow',
+      deps: { shadowMemo: memo },
+    });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.addFile('inbox-a', { name: 'b.pdf' });
+
+    const first = await inbox.sweep();
+    const second = await inbox.sweep();
+
+    expect(first).toMatchObject({ wouldMove: 2 });
+    expect(events('inbox.would_move')).toHaveLength(2);
+    expect(events('inbox.shadow_memo_failed')).toEqual([
+      expect.objectContaining({ operation: 'write', err: { name: 'Error' } }),
+    ]);
+    // This worker still remembers them.
+    expect(second).toMatchObject({ wouldMove: 0, alreadyReported: 2 });
+    expect(classify).toHaveBeenCalledTimes(2);
+  });
+
+  it('asks nothing of the memo for a file that is not the client’s own upload', async () => {
+    const { memo } = memoryMemo();
+    const { tenant, inbox } = setup({ mode: 'shadow', deps: { shadowMemo: memo } });
+    tenant.addFile('inbox-a', { name: 'x.pdf', createdBy: STAFF });
+
+    expect(await inbox.sweep()).toMatchObject({ skippedNotClient: 1 });
+    expect(memo.has).not.toHaveBeenCalled();
+    expect(memo.add).not.toHaveBeenCalled();
+  });
+
+  it('is never used in enforce', async () => {
+    const { memo } = memoryMemo();
+    const { tenant, inbox } = setup({ mode: 'enforce', deps: { shadowMemo: memo } });
+    tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    expect(await inbox.sweep()).toMatchObject({ filed: 1 });
+    expect(memo.has).not.toHaveBeenCalled();
+    expect(memo.add).not.toHaveBeenCalled();
+  });
+});
+
+// 27 September 2026, after the credit ran out: 43 files, each downloaded and
+// sent again every two minutes, all refused.
+describe('ChannelInbox: the account is refused', () => {
+  it('sends one request per 15 minutes for the whole inbox, not one per file per tick', async () => {
+    const create = jest.fn().mockRejectedValue(
+      new Anthropic.BadRequestError(
+        400,
+        {
+          type: 'error',
+          error: { type: 'invalid_request_error', message: 'Your credit balance is too low.' },
+        },
+        'bad',
+        new Headers(),
+      ),
+    );
+    let now = NOW.getTime();
+    const claude = new ClaudeClassifier({
+      apiKey: 'k',
+      model: 'claude-opus-5',
+      maxContentBytes: 1024,
+      client: { messages: { create } } as never,
+      log: silent,
+      now: () => now,
+    });
+    const { tenant, inbox, events } = setup({
+      mode: 'shadow',
+      classification: serviceOf(claude, new FallbackClassifier()),
+      deps: { now: () => new Date(now), maxFilesPerTick: 50 },
+    });
+    for (let i = 0; i < 43; i += 1) tenant.addFile('inbox-a', { name: `doc-${i}.pdf` });
+
+    // A tick every 2 minutes for an hour.
+    for (let minute = 0; minute < 60; minute += 2) {
+      now = NOW.getTime() + minute * 60_000;
+      await inbox.sweep();
+    }
+
+    expect(create).toHaveBeenCalledTimes(4);
+    expect(events('inbox.would_move')).toEqual([]);
+    expect(tenant.writes()).toEqual([]);
   });
 });
 

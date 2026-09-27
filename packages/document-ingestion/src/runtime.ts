@@ -16,11 +16,12 @@ import { ClientResolver } from './services/clientResolver';
 import { membershipCheckFor, TeamMembershipReader } from './services/teamMembership';
 import { AcceptancePolicy } from './services/acceptancePolicy';
 import { ClassificationService, FallbackClassifier } from './services/classificationService';
-import { ClaudeClassifier } from './services/claudeClassifier';
+import { ClaudeClassifier, classifierFingerprint } from './services/claudeClassifier';
 import { BatchIngestor } from './services/batchIngestor';
 import { UserTypeReader } from './services/userDirectory';
 import { ChannelInbox, MAX_INBOX_FILE_BYTES } from './services/channelInbox';
 import { INDEX_OFF, LedgerDocumentIndex, type DocumentIndex } from './services/documentIndex';
+import { TableShadowMemo } from './services/shadowMemo';
 
 export const config = loadIngestionConfig();
 
@@ -104,9 +105,14 @@ export const classification = new ClassificationService(
   ],
   { policy: new AcceptancePolicy(config.classificationAcceptThreshold) },
 );
+/** What decides a classification besides the document: see `classifierFingerprint`. */
+const classifierRelease = `${
+  claudeOn ? classifierFingerprint(config.anthropicModel) : 'fallback'
+}|${config.classificationAcceptThreshold}`;
 createLogger('ingestion/runtime').info(
   {
     event: 'classification.config',
+    release: classifierRelease,
     claude: claudeOn ? 'on' : 'off',
     model: claudeOn ? config.anthropicModel : '',
     acceptThreshold: config.classificationAcceptThreshold,
@@ -163,7 +169,14 @@ export const batchIngestor = new BatchIngestor({
  * (as are its SharePoint calls): a tick must end well inside the timer's
  * 5-minute limit, and the SDK would sleep through `Retry-After` for minutes.
  * The upload path keeps its reader, cache and retries as they were.
+ *
+ * In `shadow`, what was reported is kept in the host's storage account under
+ * this classifier release, so a restart does not pay to classify it again.
  */
+const shadowMemo =
+  config.inboxSweepMode === 'shadow' && config.webJobsStorage !== ''
+    ? TableShadowMemo.fromConnectionString(config.webJobsStorage, classifierRelease)
+    : undefined;
 export const channelInbox = new ChannelInbox({
   mode: config.inboxSweepMode,
   directory: clientDirectory,
@@ -179,12 +192,16 @@ export const channelInbox = new ChannelInbox({
   ...(config.inboxCreatedAfter !== undefined ? { createdAfterMs: config.inboxCreatedAfter } : {}),
   // Written only after a move, so never in shadow.
   index: documentIndex,
+  ...(shadowMemo ? { shadowMemo } : {}),
 });
 if (config.inboxSweepMode !== 'off') {
   createLogger('ingestion/runtime').info(
     {
       event: 'inbox.sweep_mode',
       mode: config.inboxSweepMode,
+      ...(config.inboxSweepMode === 'shadow'
+        ? { shadowMemo: shadowMemo ? 'table' : 'worker_memory' }
+        : {}),
       rows: config.inboxSweepRows.length ? config.inboxSweepRows : 'all',
       createdAfter:
         config.inboxCreatedAfter !== undefined

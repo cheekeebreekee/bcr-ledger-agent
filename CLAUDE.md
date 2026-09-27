@@ -280,9 +280,16 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
    `retryLater` in `inbox.tick`, no failure counted. A timeout, 5xx or lost connection counts
    against that (`driveItemId`, `eTag`): the file waits 10, 20, 40, 80 min (`retryLaterWaiting`,
    outside the budget), and the 5th such answer (about 2.5 h) sorts it to `98_` with
-   `RETRY_EXHAUSTED`; a 429/529/401–404 never counts and never reaches `98_`. In `shadow`, `inbox.would_move`
-   is logged once per (`driveItemId`, `eTag`) per worker, and a version already reported is
-   skipped before the budget (`alreadyReported`): the budget is for files that need work.
+   `RETRY_EXHAUSTED`; a 429/529/401–404 never counts and never reaches `98_`. A credit refusal
+   or a 401–404 also pauses `ClaudeClassifier` for 15 min per worker (`claude.paused`): every
+   call until then is the same `retry_later`, with no request and no download. In `shadow`,
+   `inbox.would_move` is logged once per (row, `driveItemId`, `eTag`, classifier release)
+   **across workers**: the shadow memo (`services/shadowMemo.ts`, table `inboxshadow` in
+   `AzureWebJobsStorage`, ids and hashes only) records each report, and a version already
+   reported is skipped before the budget (`alreadyReported`). A memo that cannot answer means
+   the file waits (`deferred`, `inbox.shadow_memo_failed`), never a paid classification. Before
+   the memo, every worker restart re-classified a shadowed inbox, and that used up BCR's
+   Anthropic credit on 26 September 2026 — never make shadow memory per-worker again.
 6. **Move** — only with 60 s left: `ensureInboxFolder()` under the channel folder, then
    `moveWithinInbox()`: re-check, PATCH by id with `If-Match: <listed eTag>` and
    `conflictBehavior=fail`, `_1`…`_10` on 409, then assert same item, same drive, new parent. A

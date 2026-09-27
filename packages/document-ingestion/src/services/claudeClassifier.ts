@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import {
   buildFolderPath,
@@ -52,7 +53,22 @@ export interface ClaudeClassifierOptions {
   readonly client?: Pick<Anthropic, 'messages'>;
   /** Injected in tests; defaults to the `ingestion/claude` logger. */
   readonly log?: Logger;
+  /** Injected in tests (epoch ms); defaults to `Date.now`. */
+  readonly now?: () => number;
 }
+
+/**
+ * After the API refuses the account itself — no credit left (`billing`), or a
+ * key or workspace it will not serve (`unavailable`, 401–404) — no request is
+ * sent for this long: until then every call is `retry_later` with the same
+ * reason and status, and no document is read. Neither state passes in
+ * minutes, and without the pause every waiting file was downloaded and sent
+ * again on every sweep tick, all refused. Per worker.
+ */
+export const CLAUDE_ACCOUNT_PAUSE_MS = 15 * 60 * 1000;
+
+/** The retry-later reasons that are about the account, not the request. */
+const ACCOUNT_REASONS: ReadonlySet<string> = new Set(['billing', 'unavailable']);
 
 /**
  * The SDK default is 10 minutes with 2 retries, far past the batch's 150 s
@@ -250,6 +266,9 @@ export class ClaudeClassifier implements Classifier {
   private readonly maxContentBytes: number;
   private readonly effort: ClaudeEffort;
   private readonly onUsage: ((usage: ClaudeUsage) => void) | undefined;
+  private readonly now: () => number;
+  /** The account refusal every call answers with until `until` (epoch ms). */
+  private pause: { readonly until: number; readonly refusal: ClassifierRetryLater } | undefined;
 
   constructor(opts: ClaudeClassifierOptions) {
     this.client =
@@ -263,12 +282,14 @@ export class ClaudeClassifier implements Classifier {
     this.maxContentBytes = opts.maxContentBytes;
     this.effort = opts.effort ?? CLAUDE_EFFORT;
     this.onUsage = opts.onUsage;
+    this.now = opts.now ?? Date.now;
     this.log = opts.log ?? createLogger('ingestion/claude');
   }
 
   async classify(
     ctx: ClassifierContext,
   ): Promise<Classification | ClassifierNoResult | ClassifierRetryLater> {
+    if (this.pause && this.now() < this.pause.until) return this.pause.refusal;
     try {
       let content: Buffer;
       try {
@@ -378,6 +399,19 @@ export class ClaudeClassifier implements Classifier {
         },
         'claude.retry_later',
       );
+      if (ACCOUNT_REASONS.has(failure.reason)) {
+        this.pause = { until: this.now() + CLAUDE_ACCOUNT_PAUSE_MS, refusal: failure };
+        this.log.warn(
+          {
+            event: 'claude.paused',
+            reason: failure.reason,
+            model: this.model,
+            ...(failure.status !== undefined ? { status: failure.status } : {}),
+            pauseMs: CLAUDE_ACCOUNT_PAUSE_MS,
+          },
+          'claude.paused',
+        );
+      }
       return failure;
     }
     return this.noResult(failure.reason, failure.status, apiErrorDetail(err));
@@ -520,6 +554,30 @@ function userInstruction(filename: string, preview: PdfPreview | undefined): str
       : []),
     'Sklasyfikuj dokument na podstawie jego TREŚCI, nie nazwy pliku.',
   ].join(' ');
+}
+
+/**
+ * A short digest of everything that decides this classifier's answer other
+ * than the document and the client: the model, effort and token cap, the
+ * output schema, and the prompts (with and without a client identity, the
+ * identity itself replaced by a fixed stand-in). A new release changes it;
+ * the shadow memo keys on it, so a new release classifies each file once.
+ */
+export function classifierFingerprint(model: string, effort: ClaudeEffort = CLAUDE_EFFORT): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        model,
+        effort,
+        maxTokens: CLAUDE_MAX_TOKENS,
+        schema: CLASSIFICATION_OUTPUT_SCHEMA,
+        withClient: systemPrompt({ nip: '0000000000', companyName: 'X' }),
+        withoutClient: systemPrompt(undefined),
+        instruction: userInstruction('x', { pages: 1, pageCount: 2 }),
+      }),
+    )
+    .digest('hex')
+    .slice(0, 16);
 }
 
 function parseOutput(message: Anthropic.Message): ModelOutput | null {

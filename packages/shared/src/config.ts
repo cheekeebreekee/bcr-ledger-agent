@@ -399,6 +399,13 @@ export const ingestionConfigSchema = z.object({
     (u) => u === '' || /^[A-Za-z0-9][A-Za-z0-9._@-]{0,62}$/.test(u),
     'must be a PostgreSQL login name (the Function App name)',
   ),
+  /**
+   * `AzureWebJobsStorage`: the Functions host's own storage account, set by
+   * Bicep. The channel inbox keeps its shadow memo there (table
+   * `inboxshadow`: ids and hashes only). Empty: the memo is this worker's
+   * memory only. A secret (an account key): never logged.
+   */
+  webJobsStorage: optionalStr(),
   applicationInsightsConnectionString: optionalStr(),
   logLevel,
 });

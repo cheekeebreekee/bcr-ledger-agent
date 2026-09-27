@@ -18,6 +18,7 @@ import type { ClassificationOutcome } from './classificationService';
 import { boundClientRows, type ClientDirectorySnapshot } from './clientDirectoryReader';
 import { INDEX_OFF, recordFiling, type DocumentIndex, type IndexedClient } from './documentIndex';
 import { doublingBackoff, RetryLaterBound } from './retryLaterBound';
+import { statusOf, type ShadowMemo, type ShadowMemoKey } from './shadowMemo';
 import {
   ContentTooLargeError,
   graphStatus,
@@ -148,6 +149,13 @@ export interface ChannelInboxDeps {
    * `enforce`, never in `shadow`. It never throws. Defaults to off.
    */
   readonly index?: DocumentIndex;
+  /**
+   * Shadow: which file versions were already reported, kept across worker
+   * restarts so a restart does not pay to classify them again. A version the
+   * memo cannot answer for is left for a later tick, never classified.
+   * Absent: this worker's memory only.
+   */
+  readonly shadowMemo?: ShadowMemo;
   /** Defaults to {@link INBOX_TICK_DEADLINE_MS}. */
   readonly tickDeadlineMs?: number;
   /** Defaults to {@link INBOX_TICK_HARD_LIMIT_MS}. */
@@ -179,8 +187,9 @@ export interface InboxTickSummary {
   /** Would have been moved (shadow): logged as `inbox.would_move` this tick. */
   readonly wouldMove: number;
   /**
-   * Shadow: unchanged since this worker logged its `inbox.would_move`. Not
-   * processed again, and not counted against the file budget.
+   * Shadow: unchanged since its `inbox.would_move` was logged, by this worker
+   * or, with the shadow memo, by any earlier one. Not processed again, and not
+   * counted against the file budget.
    */
   readonly alreadyReported: number;
   /**
@@ -212,7 +221,10 @@ export interface InboxTickSummary {
    * where it is now, and seen afresh by the next listing.
    */
   readonly skippedChanged: number;
-  /** Candidates left for the next tick by the budget, the deadline or the time limit. */
+  /**
+   * Candidates left for the next tick by the budget, the deadline or the time
+   * limit, or in shadow because the shadow memo could not be read.
+   */
   readonly deferred: number;
   /** Files whose processing failed this tick. */
   readonly failed: number;
@@ -269,6 +281,8 @@ interface Tick {
   readonly log: Logger;
   readonly counts: Mutable<Omit<InboxTickSummary, 'mode' | 'durationMs'>>;
   processed: number;
+  /** Shadow-memo operations whose failure this tick has logged already. */
+  readonly memoFailures: Set<'read' | 'write'>;
 }
 
 /**
@@ -296,16 +310,18 @@ interface Tick {
  * `If-Match`. A file someone moved, renamed or replaced meanwhile is left
  * where it now is. It never recurses (subfolders are the filed area), never
  * copies, never deletes, never moves across drives and never overwrites. In
- * `shadow` it does everything but write, and logs what it would move once per
- * version of a file. A classifier that cannot answer now leaves the file for
- * a later tick; when the reason may be the file's own (a timeout, a 5xx), the
- * file waits out a backoff, and after {@link MAX_RETRY_LATER_ATTEMPTS} such
- * answers it goes to review (`RETRY_EXHAUSTED`) instead of being retried
- * forever. Logs carry ids, codes, counts and taxonomy paths only.
+ * `shadow` it does everything but write to SharePoint, and logs what it would
+ * move once per version of a file and classifier release — across worker
+ * restarts too, through the shadow memo. A classifier that cannot answer now
+ * leaves the file for a later tick; when the reason may be the file's own (a
+ * timeout, a 5xx), the file waits out a backoff, and after
+ * {@link MAX_RETRY_LATER_ATTEMPTS} such answers it goes to review
+ * (`RETRY_EXHAUSTED`) instead of being retried forever. Logs carry ids, codes,
+ * counts and taxonomy paths only.
  *
  * In `enforce`, each file moved (filed, or sorted to review) is then recorded
  * in the document index under this row's client; an index failure is logged
- * and changes nothing here. `shadow` records nothing.
+ * and changes nothing here. `shadow` records nothing in the index.
  */
 export class ChannelInbox {
   private readonly log: Logger;
@@ -377,6 +393,7 @@ export class ChannelInbox {
         rowsFailed: 0,
       },
       processed: 0,
+      memoFailures: new Set(),
     };
     if (this.deps.mode === 'off') return this.summary(tick);
     // Timer ticks are singletons across instances; this also keeps a slow
@@ -501,6 +518,16 @@ export class ChannelInbox {
         this.reportSkipOnce(tick, ids, candidate, uploader.verdict, uploader.status);
         continue;
       }
+      // Reported by an earlier worker? A memo that cannot answer is a wait,
+      // never a paid classification.
+      if (this.deps.mode === 'shadow') {
+        const reported = await this.reportedEarlier(tick, ids, candidate);
+        if (reported !== false) {
+          if (reported === true) tick.counts.alreadyReported += 1;
+          else tick.counts.deferred += 1;
+          continue;
+        }
+      }
       tick.processed += 1;
       await this.processFile(row, ids, sharePoint, inbox, candidate, tick);
     }
@@ -603,7 +630,7 @@ export class ChannelInbox {
       const placement = await this.placementFor(row, sharePoint, inbox, candidate, tick);
       const decision = placement.decision;
       if (this.deps.mode === 'shadow') {
-        this.reportWouldMove(tick, ids, candidate, decision);
+        await this.reportWouldMove(tick, ids, candidate, decision);
         return;
       }
       if (!this.hasTimeFor(tick, WRITE_RESERVE_MS)) throw new OutOfTime();
@@ -730,14 +757,19 @@ export class ChannelInbox {
     return false;
   }
 
-  /** Shadow: one `inbox.would_move` per version of a file while this worker runs. */
-  private reportWouldMove(
+  /**
+   * Shadow: one `inbox.would_move` per version of a file, recorded in the
+   * shadow memo so no later worker classifies that version again. A failed
+   * write is logged; the version may then be classified once more after a
+   * restart.
+   */
+  private async reportWouldMove(
     tick: Tick,
     ids: RowIds,
     candidate: InboxCandidate,
     decision: AcceptanceDecision,
     extra: Record<string, unknown> = {},
-  ): void {
+  ): Promise<void> {
     const key = versionKey(candidate);
     if (this.reportedMoves.has(key)) return;
     remember(this.reportedMoves, key);
@@ -752,6 +784,55 @@ export class ChannelInbox {
         ...extra,
       },
       'inbox.would_move',
+    );
+    const memo = this.deps.shadowMemo;
+    if (!memo) return;
+    try {
+      await memo.add(memoKey(ids, candidate));
+    } catch (err) {
+      this.reportMemoFailureOnce(tick, ids, 'write', err);
+    }
+  }
+
+  /**
+   * Shadow: whether an earlier worker reported this version (`true`), not
+   * (`false`), or the memo could not say (`'unknown'`: the file waits).
+   */
+  private async reportedEarlier(
+    tick: Tick,
+    ids: RowIds,
+    candidate: InboxCandidate,
+  ): Promise<boolean | 'unknown'> {
+    const memo = this.deps.shadowMemo;
+    if (!memo) return false;
+    try {
+      if (!(await memo.has(memoKey(ids, candidate)))) return false;
+    } catch (err) {
+      this.reportMemoFailureOnce(tick, ids, 'read', err);
+      return 'unknown';
+    }
+    remember(this.reportedMoves, versionKey(candidate));
+    return true;
+  }
+
+  /** One `inbox.shadow_memo_failed` per operation and tick: the error's name and status. */
+  private reportMemoFailureOnce(
+    tick: Tick,
+    ids: RowIds,
+    operation: 'read' | 'write',
+    err: unknown,
+  ): void {
+    if (tick.memoFailures.has(operation)) return;
+    tick.memoFailures.add(operation);
+    const status = statusOf(err);
+    tick.log.warn(
+      {
+        event: 'inbox.shadow_memo_failed',
+        listItemId: ids.listItemId,
+        operation,
+        err: { ...describeError(err), ...(status !== undefined ? { status } : {}) },
+      },
+      'inbox.shadow_memo_failed',
     );
   }
 
@@ -907,7 +988,7 @@ export class ChannelInbox {
     const decision = opts.decision ?? processingFailedDecision(this.now());
     const extra = { unclassified: true, ...opts.extra };
     if (this.deps.mode === 'shadow') {
-      this.reportWouldMove(tick, ids, candidate, decision, extra);
+      await this.reportWouldMove(tick, ids, candidate, decision, extra);
       return;
     }
     try {
@@ -1077,6 +1158,11 @@ function userIdOf(identity: { readonly user?: { readonly id?: string } } | undef
 /** One version of one file: the key of what shadow has already reported. */
 function versionKey(candidate: InboxCandidate): string {
   return `${candidate.item.id}|${candidate.eTag}`;
+}
+
+/** The same version, in this row, for the shadow memo. */
+function memoKey(ids: RowIds, candidate: InboxCandidate): ShadowMemoKey {
+  return { listItemId: ids.listItemId, driveItemId: candidate.item.id, eTag: candidate.eTag };
 }
 
 /** The tick has too little time left for the next stage: the file waits, not a failure. */

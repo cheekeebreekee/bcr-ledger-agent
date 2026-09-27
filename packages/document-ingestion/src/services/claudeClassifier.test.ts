@@ -4,12 +4,14 @@ import { PDFDocument } from 'pdf-lib';
 import {
   apiErrorDetail,
   CLASSIFICATION_OUTPUT_SCHEMA,
+  CLAUDE_ACCOUNT_PAUSE_MS,
   CLAUDE_EFFORT,
   CLAUDE_MAX_RETRIES,
   CLAUDE_MAX_TOKENS,
   CLAUDE_REQUEST_TIMEOUT_MS,
   ClaudeClassifier,
   buildExtraction,
+  classifierFingerprint,
   classifyApiError,
   systemPrompt,
   type ClaudeUsage,
@@ -837,5 +839,113 @@ describe('classifyApiError: an exhausted credit balance', () => {
       outcome: 'no_result',
       reason: 'invalid_request',
     });
+  });
+});
+
+// 27 September 2026: with the credit used up, every waiting file was
+// downloaded and sent again on every two-minute tick, all refused.
+describe('ClaudeClassifier: a refusal of the account pauses the calls', () => {
+  const billing = () =>
+    new Anthropic.BadRequestError(
+      400,
+      {
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: 'Your credit balance is too low to access the Anthropic API.',
+        },
+      },
+      'bad',
+      new Headers(),
+    );
+
+  it('sends no request and reads no document for 15 minutes after a credit refusal', async () => {
+    let now = 1_000_000;
+    const create = jest.fn().mockRejectedValue(billing());
+    const { c, lines } = classifier(create, { now: () => now });
+    const readContent = jest.fn(async () => Buffer.from('%PDF-1.7 fake'));
+
+    const first = await c.classify(ctx({ readContent }));
+    now += CLAUDE_ACCOUNT_PAUSE_MS - 1;
+    const during = await Promise.all([c.classify(ctx({ readContent })), c.classify(ctx())]);
+
+    expect(first).toEqual({ outcome: 'retry_later', reason: 'billing', status: 400 });
+    expect(during).toEqual([first, first]);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(readContent).toHaveBeenCalledTimes(1);
+    expect(lines.filter((l) => l['event'] === 'claude.paused')).toEqual([
+      expect.objectContaining({ reason: 'billing', status: 400, pauseMs: CLAUDE_ACCOUNT_PAUSE_MS }),
+    ]);
+  });
+
+  it('tries again when the pause is over, and classifies once the account is back', async () => {
+    let now = 1_000_000;
+    const create = jest
+      .fn()
+      .mockRejectedValueOnce(billing())
+      .mockResolvedValue(answer({ category: 'umowy', confidence: 0.9 }));
+    const { c } = classifier(create, { now: () => now });
+
+    await c.classify(ctx());
+    now += CLAUDE_ACCOUNT_PAUSE_MS;
+    const after = await c.classify(ctx());
+    const next = await c.classify(ctx());
+
+    expect(create).toHaveBeenCalledTimes(3);
+    expect(after).toMatchObject({ fields: { category: 'umowy' } });
+    expect(next).not.toHaveProperty('outcome');
+  });
+
+  it('pauses on a key or workspace the API will not serve (401-404) too', async () => {
+    const create = jest
+      .fn()
+      .mockRejectedValue(
+        Anthropic.APIError.generate(401, { type: 'error' }, 'Unauthorized', new Headers()),
+      );
+    const { c } = classifier(create, { now: () => 5 });
+
+    await c.classify(ctx());
+    const second = await c.classify(ctx());
+
+    expect(second).toEqual({ outcome: 'retry_later', reason: 'unavailable', status: 401 });
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['rate limited (429)', 429, 'rate_limited'],
+    ['overloaded (529)', 529, 'overloaded'],
+  ])(
+    'does not pause when %s: that is capacity, not the account',
+    async (_label, status, reason) => {
+      const create = jest
+        .fn()
+        .mockRejectedValue(
+          Anthropic.APIError.generate(status, { type: 'error' }, 'x', new Headers()),
+        );
+      const { c, lines } = classifier(create, { now: () => 5 });
+
+      await c.classify(ctx());
+      const second = await c.classify(ctx());
+
+      expect(second).toMatchObject({ outcome: 'retry_later', reason });
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(lines.filter((l) => l['event'] === 'claude.paused')).toEqual([]);
+    },
+  );
+});
+
+describe('classifierFingerprint', () => {
+  it('is a short hex digest, the same for the same release', () => {
+    expect(classifierFingerprint('claude-opus-5')).toMatch(/^[0-9a-f]{16}$/);
+    expect(classifierFingerprint('claude-opus-5')).toBe(classifierFingerprint('claude-opus-5'));
+    expect(classifierFingerprint('claude-opus-5')).toBe(
+      classifierFingerprint('claude-opus-5', CLAUDE_EFFORT),
+    );
+  });
+
+  it('changes with the model or the effort', () => {
+    const base = classifierFingerprint('claude-opus-5');
+    expect(classifierFingerprint('claude-opus-5-5')).not.toBe(base);
+    expect(classifierFingerprint('claude-opus-5', 'medium')).not.toBe(base);
   });
 });

@@ -490,7 +490,11 @@ first.
   connection string is the smaller first step. **[verify]** how the zip deploy works without
   the key: on Linux Consumption `config-zip` uploads the package with the storage connection
   string and points `WEBSITE_RUN_FROM_PACKAGE` at it with a SAS. `tools/check-app-settings.mjs`
-  changes with it: `AzureWebJobsStorage__accountName` joins its `PLATFORM_SETTINGS`.
+  changes with it: `AzureWebJobsStorage__accountName` joins its `PLATFORM_SETTINGS`. The
+  ingestion code reads the connection string too, since 27 September 2026: the channel inbox's
+  shadow memo (`services/shadowMemo.ts`, table `inboxshadow`). With identity-based storage it
+  moves to `new TableClient(<table endpoint>, 'inboxshadow', <managed identity credential>)`,
+  and the ingestion identity needs *Storage Table Data Contributor* on the account.
 - **F2. Key Vault access per secret (T11).** Replace the two resource-group-scope *Key Vault
   Secrets User* assignments in `main.bicep` with one per secret, scoped to it: the bot's
   identity on `bot-app-password`, the ingestion identity on `anthropic-api-key`. A secret must

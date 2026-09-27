@@ -36,6 +36,7 @@ const envMap = {
   ledgerDbHost: 'LEDGER_DB_HOST',
   ledgerDbName: 'LEDGER_DB_NAME',
   ledgerDbUser: 'LEDGER_DB_USER',
+  webJobsStorage: 'AzureWebJobsStorage',
   applicationInsightsConnectionString: 'APPLICATIONINSIGHTS_CONNECTION_STRING',
   logLevel: 'LOG_LEVEL',
 } as const satisfies Record<keyof IngestionConfig, string>;

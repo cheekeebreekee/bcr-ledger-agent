@@ -235,6 +235,13 @@ SHA-256 of the bytes, for 24 hours: the third counted answer files the document 
 `RETRY_EXHAUSTED` instead of a third "send it again". Both are in memory per worker, like the
 inbox's failure count; a worker restart only means a few more attempts.
 
+**A refusal of the account pauses the classifier.** A credit refusal (`billing`) or a 401–404
+(`unavailable`) is about the account, and neither passes in minutes. After one,
+`ClaudeClassifier` sends nothing for 15 minutes (`claude.paused`, per worker): every call in
+between returns the same `retry_later` without reading the document. Before this, with the
+credit used up on 27 September 2026, each of 43 waiting files was downloaded and sent again on
+every two-minute tick, all refused.
+
 **The acceptance policy is the only place a threshold or review reason is applied.** A
 suggestion is filed under its category only when the category exists and is not the review
 bucket, a dated category has a usable year and month, an invoice's direction is settled, and the
@@ -627,9 +634,17 @@ inbox**, and ingestion sweeps it.
 - **Classification cache and repeated failures.** A placement is reused per
   (`driveItemId`, `eTag`) for an hour, so a file whose move keeps failing is not sent to Claude
   every tick. In `shadow`, where nothing moves and every file is listed again each tick,
-  `inbox.would_move` is logged once per (`driveItemId`, `eTag`) per worker, and a version already
-  reported is skipped before the budget (`alreadyReported`): otherwise the same cached files took
-  the whole budget every tick and the rest of a channel was never classified. A file whose processing fails three times (counted per worker) is moved to
+  `inbox.would_move` is logged once per (row, `driveItemId`, `eTag`, classifier release), and a
+  version already reported is skipped before the budget (`alreadyReported`): otherwise the same
+  cached files took the whole budget every tick and the rest of a channel was never classified.
+  "Already reported" survives worker restarts: the **shadow memo** records each report in a
+  table (`inboxshadow`) in the Function App's own storage account, keyed by the row's list item
+  id and a SHA-256 of the item id, its `eTag` and the classifier release (a fingerprint of the
+  model, effort, output schema and prompts, plus the threshold), so it holds no name or content.
+  A new release classifies each file once more; a memo that cannot answer leaves the file for a
+  later tick (`deferred`, `inbox.shadow_memo_failed`) instead of paying to classify it. Without
+  it, a Consumption worker restart (several an hour) re-classified the whole shadowed inbox:
+  about 2,700 paid calls for 43 test files on 26 September 2026. A file whose processing fails three times (counted per worker) is moved to
   `98_Nieposortowane/YYYY/MM` unclassified, so the inbox drains; if even that fails, it stays and
   is logged each tick.
 - **Budget and time limit.** At most `INBOX_MAX_FILES_PER_TICK` files (default 20) per tick
