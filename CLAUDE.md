@@ -209,9 +209,20 @@ Two intakes share the classifier, the taxonomy, the client SharePoint factory an
 4. **Classify** — `services/classificationService.ts` takes the first classifier with an answer
    from `ClaudeClassifier → FallbackClassifier` (Claude only if `ANTHROPIC_ENABLED` + key) and
    passes it through `services/acceptancePolicy.ts`, which decides the folder. `ClaudeClassifier`
-   sends the content to `ANTHROPIC_MODEL` (default `claude-opus-5`) with structured output
-   (`output_config.format`, the category enum from the taxonomy) at effort `low`; a PDF over 100
-   pages is sent as a copy of its first 20 (`services/pdfPreview.ts`; the original is filed).
+   sends the content to `ANTHROPIC_MODEL` (default `claude-opus-5`; `claude-sonnet-5` takes the
+   same request at 2/5 of the price) with structured output (`output_config.format`, the
+   category enum from the taxonomy) at `ANTHROPIC_EFFORT` (default `low`), with adaptive
+   thinking unless `ANTHROPIC_THINKING=disabled` (refused at cold start for a model that rejects
+   it). A PDF over 5 pages is sent as a copy of its first 4 and its last
+   (`services/pdfPreview.ts`; the original is filed; an encrypted one up to 100 pages is sent
+   whole). **The system prompt (`SYSTEM_PROMPT`) is one cached block, the same bytes for every
+   client and document**: the client's identity (`clientIdentity`) and the file name go in the
+   user turn, after the document. Never put anything that varies — a client, a date, a flag — into
+   `SYSTEM_PROMPT`: every call would then pay full price for it, and a client's data would sit in
+   a shared cache entry. The schema asks for nothing the pipeline does not read (no free-text
+   `reasoning`): output costs 5× input. Every billed response logs `claude.usage` (model, effort,
+   thinking, input/output/cache-read/cache-write tokens, pages sent; counts only), and filing lines
+   carry the same four counts for their document.
    For the `01_Faktury` categories (`invoiceFields` in the taxonomy) the same answer carries an
    `invoice` block (number, dates, currency, net/VAT/gross as strings, KSeF number; seller and
    buyer come from the parties), validated field by field after the call with the
@@ -584,7 +595,7 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
 | `docs/client-directory-admin-guide.md` | The Client Directory list — columns and admin workflow |
 | `docs/admin-sharepoint-grant.md` | `Sites.Selected` via Graph Explorer |
 | `docs/security.md` | Threat model + secrets inventory |
-| `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback; "Lifting gate G1"; the *Classification release* runbook (evaluate, deploy, switch the model, go/no-go); the *Document index release* runbook (cost, db.bicep, the login, migrations, settings, canary, rollback) |
+| `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback; "Lifting gate G1"; the *Classification release* runbook (evaluate, deploy, switch the model, go/no-go); the *Document index release* runbook (cost, db.bicep, the login, migrations, settings, canary, rollback); the *Classifier cost release* (caching, excerpts, `ANTHROPIC_EFFORT`/`ANTHROPIC_THINKING`, the Sonnet 5 test on the canary) |
 | `docs/operations/incident-2026-09.md` | The cross-client routing incident: causes, IR-0..IR-3, status |
 | `docs/operations/tenant-hardening.md` | Tenant settings that keep clients apart (BCR GROUP stays Private, read-only check) |
 | `docs/diagrams/` | Mermaid: as-is, Phase-0 routing, target business logic/architecture/data flow, sequences, data model |

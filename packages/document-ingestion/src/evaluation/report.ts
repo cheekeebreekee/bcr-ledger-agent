@@ -4,16 +4,25 @@ export interface ReportMeta {
   readonly date: Date;
   readonly model: string;
   readonly effort: string;
+  readonly thinking: string;
   readonly threshold: number;
   /** Whether a client identity was primed (its values are not printed). */
   readonly identityGiven: boolean;
 }
 
-/** USD per million tokens (input, output), for the cost estimate only. */
-const PRICES: readonly [string, number, number][] = [
-  ['claude-opus-5', 5, 25],
-  ['claude-opus-4-5', 5, 25],
-];
+/**
+ * USD per million tokens, for the cost estimate only: input, output and
+ * prompt-cache reads (0.1× input on these models, 0.05× on Opus 5.5).
+ * 5-minute cache writes are 1.25× input on every model. The most specific
+ * id wins, so `claude-opus-5-5` is not priced as `claude-opus-5`.
+ */
+const PRICES: readonly (readonly [id: string, input: number, output: number, cacheRead: number])[] =
+  [
+    ['claude-opus-5-5', 4, 20, 0.2],
+    ['claude-opus-5', 5, 25, 0.5],
+    ['claude-sonnet-5', 2, 10, 0.2],
+    ['claude-opus-4-5', 5, 25, 0.5],
+  ];
 
 /** The go/no-go bar of the classification release (docs/operations/human-steps.md). */
 export const CATEGORY_BAR = 0.95;
@@ -54,7 +63,7 @@ export function renderReport(
   const lines: string[] = [
     `# Classification evaluation — ${meta.date.toISOString().slice(0, 16).replace('T', ' ')} UTC`,
     '',
-    `Model \`${meta.model}\`, effort \`${meta.effort}\`, accept threshold ${meta.threshold.toFixed(2)}, ` +
+    `Model \`${meta.model}\`, effort \`${meta.effort}\`, thinking \`${meta.thinking}\`, accept threshold ${meta.threshold.toFixed(2)}, ` +
       `client identity ${meta.identityGiven ? 'given' : 'not given (direction not measured)'}.`,
     '',
     '## Go / no-go',
@@ -81,7 +90,8 @@ export function renderReport(
         .map(([r, n]) => `${r} ${n}`)
         .join(', ') || 'none'
     }.`,
-    `- Tokens: ${summary.inputTokens} in, ${summary.outputTokens} out${cost(summary, results)}.`,
+    `- Tokens: ${summary.inputTokens} in, ${summary.cacheReadInputTokens} cache read, ` +
+      `${summary.cacheCreationInputTokens} cache write, ${summary.outputTokens} out${cost(summary, results)}.`,
     '',
     '## Per category (truth)',
     '',
@@ -187,9 +197,16 @@ function directionDetail(summary: EvaluationSummary): string {
 
 function cost(summary: EvaluationSummary, results: readonly DocumentResult[]): string {
   const model = results.find((r) => r.model)?.model ?? '';
-  const price = PRICES.find(([prefix]) => model.startsWith(prefix));
+  const price = PRICES.filter(([id]) => model === id || model.startsWith(`${id}-`)).sort(
+    (a, b) => b[0].length - a[0].length,
+  )[0];
   if (!price) return '';
-  const usd = (summary.inputTokens * price[1] + summary.outputTokens * price[2]) / 1_000_000;
+  const [, input, output, cacheRead] = price;
+  const usd =
+    ((summary.inputTokens + summary.cacheCreationInputTokens * 1.25) * input +
+      summary.cacheReadInputTokens * cacheRead +
+      summary.outputTokens * output) /
+    1_000_000;
   return ` (about $${usd.toFixed(2)} at list price for \`${model}\`)`;
 }
 

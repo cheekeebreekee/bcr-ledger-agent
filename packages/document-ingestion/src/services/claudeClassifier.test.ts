@@ -9,11 +9,14 @@ import {
   CLAUDE_MAX_RETRIES,
   CLAUDE_MAX_TOKENS,
   CLAUDE_REQUEST_TIMEOUT_MS,
+  CLAUDE_THINKING,
   ClaudeClassifier,
+  SYSTEM_PROMPT,
   buildExtraction,
   classifierFingerprint,
   classifyApiError,
-  systemPrompt,
+  clientIdentity,
+  userInstruction,
   type ClaudeUsage,
 } from './claudeClassifier';
 import { DIRECTION_UNRESOLVED } from './invoiceDirection';
@@ -37,7 +40,6 @@ function answer(output: Record<string, unknown>, over: Record<string, unknown> =
           year: null,
           month: null,
           client_role: 'unknown',
-          reasoning: 'Uzasadnienie.',
           parties: [],
           ...output,
         }),
@@ -117,11 +119,65 @@ describe('ClaudeClassifier: the request', () => {
     expect(CLAUDE_EFFORT).toBe('low');
   });
 
+  // Output tokens cost five times input: nothing is asked for that nothing reads.
+  it('asks for no free-text reasoning, and keeps none a model sends anyway', async () => {
+    const props = Object.keys(
+      (CLASSIFICATION_OUTPUT_SCHEMA as { properties: Record<string, unknown> }).properties,
+    );
+    expect(props).not.toContain('reasoning');
+    const create = jest.fn().mockResolvedValue({
+      model: 'claude-opus-5',
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ category: 'inne', confidence: 0.9, reasoning: 'free text' }),
+        },
+      ],
+    });
+    const result = (await classifier(create).c.classify(ctx())) as Classification;
+    expect(JSON.stringify(result)).not.toContain('free text');
+  });
+
   it('runs at another effort when told to', async () => {
     const create = jest.fn().mockResolvedValue(answer({ category: 'umowy', confidence: 0.9 }));
     const { c } = classifier(create, { effort: 'medium' });
     await c.classify(ctx());
     expect(create.mock.calls[0][0].output_config.effort).toBe('medium');
+  });
+
+  it('turns thinking off only when told to', async () => {
+    const create = jest.fn().mockResolvedValue(answer({ category: 'umowy', confidence: 0.9 }));
+    await classifier(create, { thinking: 'disabled' }).c.classify(ctx());
+    await classifier(create, { thinking: 'adaptive' }).c.classify(ctx());
+    expect(create.mock.calls[0][0].thinking).toEqual({ type: 'disabled' });
+    expect('thinking' in create.mock.calls[1][0]).toBe(false);
+    expect(CLAUDE_THINKING).toBe('adaptive');
+  });
+
+  // Prompt caching: the prefix must be byte-identical for every client and
+  // document, or every call pays full price for it (and a client's data
+  // would sit in a shared cache entry).
+  it('sends one cached system block, the same bytes for every client and document', async () => {
+    const create = jest.fn().mockResolvedValue(answer({ category: 'umowy', confidence: 0.9 }));
+    const { c } = classifier(create);
+    await c.classify(ctx({ client: CLIENT, filename: 'a.pdf' }));
+    await c.classify(
+      ctx({ client: { nip: '2222222222', companyName: 'Inny Klient S.A.' }, filename: 'b.pdf' }),
+    );
+    await c.classify(ctx({ filename: 'c.pdf' }));
+
+    const systems = create.mock.calls.map((call) => call[0].system);
+    expect(systems[0]).toEqual([
+      { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
+    ]);
+    expect(systems[1]).toEqual(systems[0]);
+    expect(systems[2]).toEqual(systems[0]);
+    const leaked = ['1111111111', '2222222222', 'Klient Testowy', 'Inny Klient', '.pdf'].filter(
+      (s) => SYSTEM_PROMPT.includes(s),
+    );
+    expect(leaked).toEqual([]);
   });
 
   it('declares a schema structured outputs accept: closed objects, every property required, no numeric bounds', () => {
@@ -174,13 +230,16 @@ describe('ClaudeClassifier: the request', () => {
     expect(blocks[2]).toEqual({ type: 'text', text: 'Szanowni Państwo' });
   });
 
-  it('primes only the bound client’s own identity, with the rules from the evaluation', async () => {
+  it('primes only the bound client’s own identity, in the user turn, with the rules from the evaluation', async () => {
     const create = jest.fn().mockResolvedValue(answer({ category: 'umowy', confidence: 0.9 }));
     const { c } = classifier(create);
     await c.classify(ctx({ client: { nip: '111-111-11-11', companyName: CLIENT.companyName } }));
-    const system = create.mock.calls[0][0].system as string;
-    expect(system).toContain('Klient Testowy Sp. z o.o., NIP 1111111111');
-    expect(system).toContain('client_role');
+    const content = create.mock.calls[0][0].messages[0].content;
+    // The document first, then the text that names the client and the file.
+    expect(content.map((b: { type: string }) => b.type)).toEqual(['document', 'text']);
+    const turn = content[1].text as string;
+    expect(turn).toContain('Klient Testowy Sp. z o.o., NIP 1111111111');
+    expect(turn).toContain('client_role');
     for (const rule of [
       'klantenbon',
       'BEZ danych nabywcy',
@@ -189,16 +248,17 @@ describe('ClaudeClassifier: the request', () => {
       '450 zł',
       'rachunek hotelowy',
     ]) {
-      expect(system).toContain(rule);
+      expect(SYSTEM_PROMPT).toContain(rule);
     }
+    expect(SYSTEM_PROMPT).toContain('Tożsamość klienta (nazwa i NIP)');
   });
 
   it('tells the model when no identity is given, and that direction is not its call', () => {
-    const system = systemPrompt(undefined);
-    expect(system).toMatch(/Tożsamość klienta nie jest podana/);
-    expect(system).toMatch(/client_role na unknown/);
-    expect(systemPrompt({ nip: '', companyName: 'Tylko Nazwa' })).toContain('Tylko Nazwa');
-    expect(systemPrompt({ nip: '1111111111', companyName: '' })).toContain(
+    const turn = userInstruction('x.pdf', undefined, undefined);
+    expect(turn).toMatch(/Tożsamość klienta nie jest podana/);
+    expect(turn).toMatch(/client_role na unknown/);
+    expect(clientIdentity({ nip: '', companyName: 'Tylko Nazwa' })).toContain('Tylko Nazwa');
+    expect(clientIdentity({ nip: '1111111111', companyName: '' })).toContain(
       '(nazwa nieznana), NIP 1111111111',
     );
   });
@@ -346,34 +406,101 @@ describe('ClaudeClassifier: results', () => {
     expect(result.model).toBe('claude-opus-5');
   });
 
-  it('reports each response’s token usage', async () => {
+  it('reports each response’s token usage, cache reads and writes included', async () => {
     const usage: ClaudeUsage[] = [];
+    const create = jest.fn().mockResolvedValue(
+      answer(
+        { category: 'umowy', confidence: 0.9 },
+        {
+          usage: {
+            input_tokens: 1200,
+            output_tokens: 180,
+            cache_read_input_tokens: 1800,
+            cache_creation_input_tokens: 0,
+          },
+        },
+      ),
+    );
+    const { c, lines } = classifier(create, { onUsage: (u) => usage.push(u) });
+    const result = (await c.classify(ctx())) as Classification;
+    const expected = {
+      inputTokens: 1200,
+      outputTokens: 180,
+      cacheReadInputTokens: 1800,
+      cacheCreationInputTokens: 0,
+    };
+    expect(usage).toEqual([{ model: 'claude-opus-5', ...expected }]);
+    expect(result.usage).toEqual(expected);
+    expect(lines.filter((l) => l['event'] === 'claude.usage')).toEqual([
+      expect.objectContaining({
+        model: 'claude-opus-5',
+        effort: 'low',
+        thinking: 'adaptive',
+        stopReason: 'end_turn',
+        ...expected,
+      }),
+    ]);
+  });
+
+  // A refused or truncated answer is billed too: the bill must count it.
+  it('logs the usage of a response it cannot use', async () => {
+    const create = jest
+      .fn()
+      .mockResolvedValue(
+        answer({ category: 'umowy', confidence: 0.9 }, { stop_reason: 'refusal' }),
+      );
+    const { c, lines } = classifier(create);
+    expect(await c.classify(ctx())).toEqual({
+      outcome: 'no_result',
+      reason: 'refusal',
+      usage: {
+        inputTokens: 1200,
+        outputTokens: 180,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      },
+    });
+    expect(lines.filter((l) => l['event'] === 'claude.usage')).toEqual([
+      expect.objectContaining({ inputTokens: 1200, outputTokens: 180, stopReason: 'refusal' }),
+    ]);
+  });
+
+  it('logs usage as ids and counts only, never the file or the client', async () => {
     const create = jest.fn().mockResolvedValue(answer({ category: 'umowy', confidence: 0.9 }));
-    const { c } = classifier(create, { onUsage: (u) => usage.push(u) });
-    await c.classify(ctx());
-    expect(usage).toEqual([{ model: 'claude-opus-5', inputTokens: 1200, outputTokens: 180 }]);
+    const { c, lines } = classifier(create);
+    await c.classify(ctx({ client: CLIENT }));
+    const line = JSON.stringify(lines.filter((l) => l['event'] === 'claude.usage'));
+    const leaked = [CLIENT.nip, CLIENT.companyName, '20260917', '.pdf'].filter((s) =>
+      line.includes(s),
+    );
+    expect(leaked).toEqual([]);
   });
 });
 
 describe('ClaudeClassifier: long PDFs', () => {
-  it('classifies a PDF over 100 pages from its first 20, and never changes the original', async () => {
-    const original = await syntheticPdf(101);
+  it('classifies a PDF over 5 pages from its first 4 and its last, and never changes the original', async () => {
+    const original = await syntheticPdf(33);
     const before = Buffer.from(original);
     const create = jest.fn().mockResolvedValue(answer({ category: 'umowy', confidence: 0.9 }));
-    const { c } = classifier(create);
+    const { c, lines } = classifier(create);
 
     const result = (await c.classify(ctx({ readContent: async () => original }))) as Classification;
 
     const [block, instruction] = create.mock.calls[0][0].messages[0].content;
     const sent = await PDFDocument.load(Buffer.from(block.source.data, 'base64'));
-    expect(sent.getPageCount()).toBe(20);
-    expect(instruction.text).toContain('Dokument ma 101 stron; załączono tylko pierwsze 20.');
-    expect(result.fields).toMatchObject({ pagesRead: 20, pageCount: 101 });
+    expect(sent.getPageCount()).toBe(5);
+    expect(instruction.text).toContain(
+      'Dokument ma 33 stron; załączono tylko strony 1–4 i ostatnią (33).',
+    );
+    expect(result.fields).toMatchObject({ pagesRead: 5, pageCount: 33 });
+    expect(lines.filter((l) => l['event'] === 'claude.usage')).toEqual([
+      expect.objectContaining({ pagesSent: 5, pageCount: 33 }),
+    ]);
     expect(original.equals(before)).toBe(true);
   });
 
-  it('sends a PDF of 100 pages whole', async () => {
-    const pdf = await syntheticPdf(100);
+  it('sends a PDF of 5 pages whole', async () => {
+    const pdf = await syntheticPdf(5);
     const create = jest.fn().mockResolvedValue(answer({ category: 'umowy', confidence: 0.9 }));
     const { c } = classifier(create);
     await c.classify(ctx({ readContent: async () => pdf }));
@@ -469,7 +596,10 @@ describe('ClaudeClassifier: failures never throw', () => {
   ])('gives no result for %s', async (_label, response, reason) => {
     const create = jest.fn().mockResolvedValue(response);
     const { c } = classifier(create);
-    expect(await c.classify(ctx())).toEqual({ outcome: 'no_result', reason });
+    const result = await c.classify(ctx());
+    expect(result).toMatchObject({ outcome: 'no_result', reason });
+    // A response the API billed carries its cost; an internal error has none to carry.
+    expect('usage' in (result as object)).toBe(reason !== 'internal_error');
   });
 
   // 529 "Overloaded" parked two classifiable documents in review in the
@@ -666,7 +796,7 @@ describe('ClaudeClassifier: invoice fields for the document index', () => {
   });
 
   it('tells the model which categories carry the fields, and not to guess', () => {
-    const prompt = systemPrompt(OWN);
+    const prompt = SYSTEM_PROMPT;
     expect(prompt).toContain(
       'invoice: dla kategorii faktury_sprzedazy, faktury_zakupu, faktury_korekty, faktury_noty',
     );
@@ -943,9 +1073,11 @@ describe('classifierFingerprint', () => {
     );
   });
 
-  it('changes with the model or the effort', () => {
+  it('changes with the model, the effort or the thinking', () => {
     const base = classifierFingerprint('claude-opus-5');
-    expect(classifierFingerprint('claude-opus-5-5')).not.toBe(base);
+    expect(classifierFingerprint('claude-sonnet-5')).not.toBe(base);
     expect(classifierFingerprint('claude-opus-5', 'medium')).not.toBe(base);
+    expect(classifierFingerprint('claude-opus-5', 'low', 'disabled')).not.toBe(base);
+    expect(classifierFingerprint('claude-opus-5', CLAUDE_EFFORT, CLAUDE_THINKING)).toBe(base);
   });
 });

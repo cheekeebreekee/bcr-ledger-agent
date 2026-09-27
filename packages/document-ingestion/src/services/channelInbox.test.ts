@@ -641,7 +641,12 @@ describe('ChannelInbox: filing a client upload', () => {
     const create = jest.fn().mockResolvedValue({
       model: 'claude-opus-5',
       stop_reason: 'end_turn',
-      usage: { input_tokens: 1, output_tokens: 1 },
+      usage: {
+        input_tokens: 700,
+        output_tokens: 250,
+        cache_read_input_tokens: 1900,
+        cache_creation_input_tokens: 0,
+      },
       content: [
         {
           type: 'text',
@@ -651,7 +656,6 @@ describe('ChannelInbox: filing a client upload', () => {
             month: 8,
             confidence: 0.95,
             client_role: 'buyer',
-            reasoning: 'x',
             parties: [
               { role: 'seller', nip: NIP_A, company_name: null, person_name: null },
               { role: 'buyer', nip: '2222222222', company_name: null, person_name: null },
@@ -667,7 +671,7 @@ describe('ChannelInbox: filing a client upload', () => {
       client: { messages: { create } } as never,
       log: silent,
     });
-    const { tenant, inbox } = setup({
+    const { tenant, inbox, events } = setup({
       classification: serviceOf(claude, new FallbackClassifier()),
     });
     const id = tenant.addFile('inbox-a', { name: 'fv.pdf' });
@@ -675,7 +679,19 @@ describe('ChannelInbox: filing a client upload', () => {
     await inbox.sweep();
 
     expect(tenant.pathOf(id)).toBe(`${CHANNEL}/01_Faktury/01_Faktury_sprzedaży/2026/08/fv.pdf`);
-    expect(create.mock.calls[0][0].system).toContain(`NIP ${NIP_A}`);
+    // The filing line carries what this document's classification cost.
+    expect(events('inbox.filed')).toEqual([
+      expect.objectContaining({
+        driveItemId: id,
+        inputTokens: 700,
+        outputTokens: 250,
+        cacheReadInputTokens: 1900,
+        cacheCreationInputTokens: 0,
+      }),
+    ]);
+    // The row's identity is in the user turn; the cached system prompt has none.
+    expect(create.mock.calls[0][0].messages[0].content[1].text).toContain(`NIP ${NIP_A}`);
+    expect(JSON.stringify(create.mock.calls[0][0].system)).not.toContain(NIP_A);
   });
 
   it('sends an invoice of a row without NIP or name match to review, suggestion logged', async () => {

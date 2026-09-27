@@ -1,10 +1,16 @@
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import type Anthropic from '@anthropic-ai/sdk';
-import { ingestionConfigSchema, type Logger } from '@bcr/shared';
+import { ingestionConfigSchema, thinkingDisabledProblem, type Logger } from '@bcr/shared';
 import { AcceptancePolicy } from '../services/acceptancePolicy';
 import { ClassificationService, FallbackClassifier } from '../services/classificationService';
-import { CLAUDE_EFFORT, ClaudeClassifier, type ClaudeEffort } from '../services/claudeClassifier';
+import {
+  CLAUDE_EFFORT,
+  CLAUDE_THINKING,
+  ClaudeClassifier,
+  type ClaudeEffort,
+  type ClaudeThinking,
+} from '../services/claudeClassifier';
 import { runEvaluation, summarize, type ServiceFactory } from './evaluate';
 import { goNoGo, renderReport } from './report';
 import { arbiterToTruth, parseTruth, type ArbiterRow } from './truth';
@@ -24,7 +30,8 @@ export interface CliDeps {
 
 export const USAGE = `Usage:
   eval run --dir <folder> --truth <truth.json> [--client-name <name>] [--client-nip <nip>]
-           [--out <report.md>] [--model <id>] [--effort low|medium|high] [--threshold <0.70-0.95>]
+           [--out <report.md>] [--model <id>] [--effort low|medium|high] [--thinking adaptive|disabled]
+           [--threshold <0.70-0.95>]
            [--concurrency <1-4>] [--retry-passes <n>] [--retry-delay-ms <ms>]
   eval truth --arbiter <arbiter.json> [--out <truth.json>] [--client-name <name>] [--client-nip <nip>]
 
@@ -67,6 +74,7 @@ async function runCommand(argv: readonly string[], deps: CliDeps): Promise<numbe
       truth: { type: 'string' },
       model: { type: 'string' },
       effort: { type: 'string' },
+      thinking: { type: 'string' },
       threshold: { type: 'string' },
       concurrency: { type: 'string' },
       'retry-passes': { type: 'string' },
@@ -92,6 +100,13 @@ async function runCommand(argv: readonly string[], deps: CliDeps): Promise<numbe
   if (!thresholdResult.success) throw new Error('--threshold must be a number from 0.70 to 0.95');
   const threshold = thresholdResult.data;
   const effort = effortOf(values.effort);
+  const thinking = thinkingOf(values.thinking);
+  // As at cold start: a model that refuses it would turn every call into a 400.
+  const thinkingProblem = thinkingDisabledProblem({
+    anthropicThinking: thinking,
+    anthropicModel: model,
+  });
+  if (thinkingProblem) throw new Error(thinkingProblem);
   const client = identityOf(values['client-name'], values['client-nip']);
 
   const entries = parseTruth(JSON.parse((await deps.readFile(values.truth)).toString('utf8')));
@@ -105,6 +120,7 @@ async function runCommand(argv: readonly string[], deps: CliDeps): Promise<numbe
           model,
           maxContentBytes,
           effort,
+          thinking,
           onUsage,
           log: quiet,
           ...(deps.anthropicClient ? { client: deps.anthropicClient } : {}),
@@ -131,6 +147,7 @@ async function runCommand(argv: readonly string[], deps: CliDeps): Promise<numbe
     date: (deps.now ?? (() => new Date()))(),
     model,
     effort,
+    thinking,
     threshold,
     identityGiven: client !== undefined,
   });
@@ -143,7 +160,9 @@ async function runCommand(argv: readonly string[], deps: CliDeps): Promise<numbe
       `direction ${verdict.direction}, retry later ${summary.retryLater}, ` +
       `retry exhausted ${summary.retryExhausted}, ` +
       `review ${summary.review.hit}/${summary.review.of}, ` +
-      `tokens ${summary.inputTokens}/${summary.outputTokens}: ${verdict.go ? 'GO' : 'NO-GO'}` +
+      `tokens in ${summary.inputTokens} (cache read ${summary.cacheReadInputTokens}, ` +
+      `write ${summary.cacheCreationInputTokens}) / out ${summary.outputTokens}: ` +
+      `${verdict.go ? 'GO' : 'NO-GO'}` +
       `${values.out ? `; report written to ${values.out}` : ''}\n`,
   );
   return 0;
@@ -186,6 +205,12 @@ function effortOf(value: string | undefined): ClaudeEffort {
   if (value === undefined) return CLAUDE_EFFORT;
   if (value === 'low' || value === 'medium' || value === 'high') return value;
   throw new Error('--effort must be low, medium or high');
+}
+
+function thinkingOf(value: string | undefined): ClaudeThinking {
+  if (value === undefined) return CLAUDE_THINKING;
+  if (value === 'adaptive' || value === 'disabled') return value;
+  throw new Error('--thinking must be adaptive or disabled');
 }
 
 function identityOf(

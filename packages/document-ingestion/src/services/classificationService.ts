@@ -7,6 +7,7 @@ import {
   isNoResult,
   isRetryLater,
   type Classification,
+  type ClassificationUsage,
   type Classifier,
   type ClassifierContext,
   type ClassifierResult,
@@ -95,6 +96,8 @@ export class ClassificationService {
   /** `now` sets the review folder's month; callers with their own clock pass it. */
   async classify(ctx: ClassifierContext, now: Date = this.now()): Promise<ClassificationOutcome> {
     let unclassifiedReason: string | undefined;
+    // A billed response the classifier could not use: its cost stays on the decision.
+    let noResultUsage: ClassificationUsage | undefined;
     for (const c of this.classifiers) {
       let result: ClassifierResult;
       try {
@@ -117,13 +120,16 @@ export class ClassificationService {
       if (result === null) continue;
       if (isNoResult(result)) {
         unclassifiedReason ??= result.reason;
+        noResultUsage ??= result.usage;
         continue;
       }
       const withReason =
         unclassifiedReason && result.reviewReasons?.includes('NOT_CLASSIFIED')
           ? { ...result, fields: { ...result.fields, unclassifiedReason } }
           : result;
-      return { kind: 'decided', decision: this.opts.policy.decide(withReason, now) };
+      const withUsage =
+        noResultUsage && !withReason.usage ? { ...withReason, usage: noResultUsage } : withReason;
+      return { kind: 'decided', decision: this.opts.policy.decide(withUsage, now) };
     }
     throw new ClassificationError(`No classifier produced a result for ${ctx.filename}`);
   }

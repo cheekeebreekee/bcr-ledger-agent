@@ -16,7 +16,8 @@ reason every comment in the blocks below sits on its own line.
 
 Phase 0 is here, then the releases that followed it: [Lifting gate G1](#lifting-gate-g1), the
 [Classification release](#classification-release) and the
-[Document index release](#document-index-release). Later phases add their own sections.
+[Document index release](#document-index-release), then the
+[Classifier cost release](#classifier-cost-release). Later phases add their own sections.
 
 ---
 
@@ -2623,3 +2624,89 @@ again. The rows already written stay; nothing is deleted. To go back to the prev
 deploy the `document-ingestion-p0-$STAMP.zip` saved in step 7, the same way: it ignores the
 `LEDGER_*` settings (and still files as before). The database stays until Roman decides
 otherwise; it costs the same whether or not anything writes to it.
+
+---
+
+## Classifier cost release
+
+**Owner:** Yahor. **When:** any working day outside the change freeze, not in the same window
+as another change. It changes only the ingestion app, and it spends BCR's Anthropic credit only in
+the model test (step 4, about $1).
+
+**What it changes.**
+- **The build** (no behaviour change for routing or filing):
+  - **Prompt caching.** The system prompt is one cached block, the same bytes for every client and
+    document; the client's identity moved to the user turn.
+  - **Shorter long PDFs.** A PDF over 5 pages is sent as its first 4 pages and its last (an
+    encrypted one up to 100 pages is still sent whole).
+  - **No unused output.** The unused free-text `reasoning` field is gone from the output.
+  - **Token logging.** Every billed response logs `claude.usage`, and filing lines carry their
+    document's token counts.
+- **Two new settings**, recorded in `main.bicep` and both parameter files: `ANTHROPIC_EFFORT`
+  (`low`) and `ANTHROPIC_THINKING` (`adaptive`). Absent, the build uses exactly these values, so
+  setting them changes nothing. **From the merge until step 3**, `check-app-settings --live`
+  against dev reports exactly these two names as "in Bicep, not running: a deploy would add it",
+  and no Bicep deploy to dev and no G1-b may run in between.
+- **The classifier release fingerprint changes.** The shadow memo classifies each file in a
+  shadowed row once more, once (PESKOVOI has none after its cutoff).
+
+1. **Deploy the build**, as the channel-inbox step of H-12, sub-step 1 (`save_running` under a new
+   name, build, the marker checks, `config-zip`, trigger sync), with this check added, which must
+   print `1` or more:
+
+   ```bash
+   unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js | grep -c anthropicThinking
+   ```
+
+2. **Verify.** `/api/health` is unchanged. The cold-start `classification.config` line shows
+   `effort` `low`, `thinking` `adaptive` and a new `release`.
+
+3. **Set the two settings** (one restart), and compare:
+
+   ```bash
+   node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json \
+     --expect ANTHROPIC_EFFORT,ANTHROPIC_THINKING
+   az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
+     ANTHROPIC_EFFORT=low ANTHROPIC_THINKING=adaptive
+   node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json
+   ```
+
+   Exactly two `note` lines before, and `✔ no errors, no drift` after.
+
+4. **Model test (optional): Sonnet 5 on the canary's test documents**, with the production key,
+   which never leaves Key Vault. It re-classifies the 43 test documents in the canary Team's
+   channel once, in `shadow`, so nothing moves.
+   1. Record both changes in `main.dev.parameters.json`, in a commit of its own:
+      - `anthropicModel`: `claude-sonnet-5`;
+      - `inboxSweepRows`: `10,2` (the canary row back in).
+   2. Set them, then run `--live --expect ANTHROPIC_MODEL,INBOX_SWEEP_ROWS` before and plain
+      `--live` after, as in step 3:
+
+      ```bash
+      az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
+        ANTHROPIC_MODEL=claude-sonnet-5 INBOX_SWEEP_ROWS=10,2
+      ```
+
+   3. The model setting applies to the whole app. PESKOVOI's row is also classified by Sonnet,
+      and it has no files after its cutoff. Staff uploads through the bot are quarantined
+      without being classified.
+   4. Within a few ticks, 43 `inbox.would_move` lines with `model` `claude-sonnet-5…` and
+      `listItemId` `10`. Score them against the 26 September truth file with the same bar as the
+      [Classification release](#classification-release):
+      - category ≥ 95% of the answered;
+      - direction 100%;
+      - nothing filed under a wrong category;
+      - the month right.
+   5. The cost is the sum of the `claude.usage` lines since the switch. Price them per million
+      tokens:
+      - Sonnet 5: $2 input, $10 output;
+      - cache reads: 0.1× the input price;
+      - 5-minute cache writes: 1.25× the input price.
+   6. Then take the canary row out again (`INBOX_SWEEP_ROWS=2`, recorded the same way).
+   7. **GO:** keep `claude-sonnet-5`.
+   8. **NO-GO:** set `ANTHROPIC_MODEL=claude-opus-5` back (recorded the same way). The Opus
+      rows of the shadow memo never expire, so going back costs nothing.
+   9. Record the verdict, the scores and the cost in the incident's status table.
+
+**Rollback.** Deploy the saved package. It ignores `ANTHROPIC_EFFORT` and `ANTHROPIC_THINKING`,
+which can stay set.

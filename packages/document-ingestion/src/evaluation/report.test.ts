@@ -23,6 +23,8 @@ function summary(over: Partial<EvaluationSummary> = {}): EvaluationSummary {
     reasons: { LOW_CONFIDENCE: 3 },
     inputTokens: 2_000_000,
     outputTokens: 40_000,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
     ...over,
   };
 }
@@ -31,6 +33,7 @@ const meta = {
   date: new Date('2026-09-26T10:00:00Z'),
   model: 'claude-opus-5',
   effort: 'low',
+  thinking: 'adaptive',
   threshold: 0.7,
   identityGiven: true,
 };
@@ -41,6 +44,8 @@ const base: Omit<DocumentResult, 'truth' | 'outcome'> = {
   filedWrongly: false,
   inputTokens: 0,
   outputTokens: 0,
+  cacheReadInputTokens: 0,
+  cacheCreationInputTokens: 0,
   model: 'claude-opus-5',
 };
 
@@ -187,7 +192,7 @@ describe('renderReport', () => {
 
     expect(text).toContain('# Classification evaluation — 2026-09-26 10:00 UTC');
     expect(text).toContain(
-      'Model `claude-opus-5`, effort `low`, accept threshold 0.70, client identity given.',
+      'Model `claude-opus-5`, effort `low`, thinking `adaptive`, accept threshold 0.70, client identity given.',
     );
     expect(text).toContain('| Category ≥ 95% of answered | PASS | 38/40 (95%) |');
     expect(text).toContain(
@@ -213,6 +218,50 @@ describe('renderReport', () => {
     expect(text).toContain('| unreadable |');
     expect(text).toContain('`faktury_zakupu` (zakup)');
     expect(text).toContain('- Review reasons: LOW_CONFIDENCE 3.');
+  });
+
+  // Cache reads cost 0.1x and 5-minute writes 1.25x the input price.
+  // (1,000,000 + 1.25 x 100,000) x $4 + 2,000,000 x $0.20 + 100,000 x $20, per million.
+  it('prices Opus 5.5 at its own list price, not as Opus 5, with its own cache-read rate', () => {
+    const tokens = {
+      inputTokens: 1_000_000,
+      outputTokens: 100_000,
+      cacheReadInputTokens: 2_000_000,
+      cacheCreationInputTokens: 100_000,
+    };
+    const opus55 = [
+      {
+        ...base,
+        model: 'claude-opus-5-5',
+        truth: { file: 'a.pdf', category: 'umowy', month: '' },
+        outcome: 'answered' as const,
+      },
+    ];
+    const text = renderReport(summary(tokens), opus55, { ...meta, model: 'claude-opus-5-5' });
+    expect(text).toContain('about $6.90 at list price for `claude-opus-5-5`');
+  });
+
+  it('prices cache reads and writes, and Sonnet 5 at its own list price', () => {
+    const tokens = {
+      inputTokens: 1_000_000,
+      outputTokens: 100_000,
+      cacheReadInputTokens: 2_000_000,
+      cacheCreationInputTokens: 100_000,
+    };
+    const sonnet = [
+      {
+        ...base,
+        model: 'claude-sonnet-5',
+        truth: { file: 'a.pdf', category: 'umowy', month: '' },
+        outcome: 'answered' as const,
+      },
+    ];
+    const text = renderReport(summary(tokens), sonnet, { ...meta, model: 'claude-sonnet-5' });
+    // (1,000,000 + 200,000 + 125,000) x $2 + 100,000 x $10, per million.
+    expect(text).toContain('about $3.65 at list price for `claude-sonnet-5`');
+    expect(text).toContain(
+      '- Tokens: 1000000 in, 2000000 cache read, 100000 cache write, 100000 out',
+    );
   });
 
   it('reports invoice-field accuracy and each miss by field name, never by value', () => {

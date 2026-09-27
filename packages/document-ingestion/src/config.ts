@@ -3,6 +3,7 @@ import {
   ingestionConfigSchema,
   loadConfig,
   missingLedgerIndexSettings,
+  thinkingDisabledProblem,
   ValidationError,
 } from '@bcr/shared';
 
@@ -30,6 +31,8 @@ const envMap = {
   anthropicEnabled: 'ANTHROPIC_ENABLED',
   anthropicApiKey: 'ANTHROPIC_API_KEY',
   anthropicModel: 'ANTHROPIC_MODEL',
+  anthropicEffort: 'ANTHROPIC_EFFORT',
+  anthropicThinking: 'ANTHROPIC_THINKING',
   anthropicMaxContentBytes: 'ANTHROPIC_MAX_CONTENT_BYTES',
   classificationAcceptThreshold: 'CLASSIFICATION_ACCEPT_THRESHOLD',
   ledgerIndexMode: 'LEDGER_INDEX_MODE',
@@ -72,6 +75,10 @@ export function loadIngestionConfig(env: NodeJS.ProcessEnv = process.env): Inges
           .join('; ')}`,
       );
     }
+    // A model that refuses disabled thinking would answer every call with a
+    // 400, and every document would go to review unclassified.
+    const thinking = thinkingDisabledProblem(config);
+    if (thinking) throw new ValidationError(`Invalid configuration: ${thinking}`);
     cached = config;
   }
   return cached;

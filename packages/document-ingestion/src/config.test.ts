@@ -90,6 +90,34 @@ describe('loadIngestionConfig', () => {
     expect(set.classificationAcceptThreshold).toBe(0.8);
   });
 
+  it('reads the effort and thinking settings, low and adaptive by default', () => {
+    const defaults = loadIngestionConfig(env);
+    expect([defaults.anthropicEffort, defaults.anthropicThinking]).toEqual(['low', 'adaptive']);
+    _resetConfigCache();
+    const set = loadIngestionConfig({
+      ...env,
+      ANTHROPIC_MODEL: 'claude-sonnet-5',
+      ANTHROPIC_EFFORT: 'medium',
+      ANTHROPIC_THINKING: 'disabled',
+    });
+    expect([set.anthropicModel, set.anthropicEffort, set.anthropicThinking]).toEqual([
+      'claude-sonnet-5',
+      'medium',
+      'disabled',
+    ]);
+  });
+
+  // Every call would be a 400, and every document would go to review unclassified.
+  it('refuses to start with disabled thinking on a model that rejects it', () => {
+    expect(() =>
+      loadIngestionConfig({
+        ...env,
+        ANTHROPIC_MODEL: 'claude-opus-5-5',
+        ANTHROPIC_THINKING: 'disabled',
+      }),
+    ).toThrow(/ANTHROPIC_THINKING: 'disabled' is not accepted by ANTHROPIC_MODEL claude-opus-5-5/);
+  });
+
   it('refuses to start on a threshold of 0.69', () => {
     expect(() => loadIngestionConfig({ ...env, CLASSIFICATION_ACCEPT_THRESHOLD: '0.69' })).toThrow(
       /CLASSIFICATION_ACCEPT_THRESHOLD/,

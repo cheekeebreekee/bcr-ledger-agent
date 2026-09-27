@@ -22,6 +22,8 @@
     "inboxMaxFilesPerTick": { "value": "" },
     "enableAnthropic": { "value": true },
     "anthropicModel": { "value": "claude-opus-5" },
+    "anthropicEffort": { "value": "low" },
+    "anthropicThinking": { "value": "adaptive" },
     "classificationAcceptThreshold": { "value": "0.70" },
     "ledgerIndexMode": { "value": "off" },
     "ledgerDbHost": { "value": "" },

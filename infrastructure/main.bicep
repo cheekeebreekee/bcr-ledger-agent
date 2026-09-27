@@ -99,6 +99,14 @@ param enableAnthropic bool = true
 @description('ANTHROPIC_MODEL: Anthropic model id used for document classification.')
 param anthropicModel string = 'claude-opus-5'
 
+@description('ANTHROPIC_EFFORT: output_config.effort of every classification call. low is the cheapest.')
+@allowed(['low', 'medium', 'high'])
+param anthropicEffort string = 'low'
+
+@description('ANTHROPIC_THINKING: adaptive (the model decides at the given effort) or disabled (no thinking tokens; only claude-opus-5 and claude-sonnet-5 accept it).')
+@allowed(['adaptive', 'disabled'])
+param anthropicThinking string = 'adaptive'
+
 @description('CLASSIFICATION_ACCEPT_THRESHOLD: the one acceptance threshold, 0.70-0.95; below it a document goes to 98_Nieposortowane for review. Ingestion refuses to start outside that range.')
 param classificationAcceptThreshold string = '0.70'
 
@@ -246,6 +254,8 @@ var ingestionAppSettings = union(
   enableAnthropic
     ? {
         ANTHROPIC_MODEL: anthropicModel
+        ANTHROPIC_EFFORT: anthropicEffort
+        ANTHROPIC_THINKING: anthropicThinking
         ANTHROPIC_API_KEY: '@Microsoft.KeyVault(SecretUri=${keyVault.outputs.uri}secrets/anthropic-api-key/)'
       }
     : {}

@@ -7,6 +7,7 @@ import {
   getCategory,
   isDocumentCategory,
   type Classification,
+  type ClassificationUsage,
   type DocumentCategory,
   type DocumentExtraction,
 } from '@bcr/shared';
@@ -88,6 +89,8 @@ export interface AcceptanceDecision {
    * Client data: {@link decisionLogFields} leaves them out.
    */
   readonly extraction?: DocumentExtraction;
+  /** The tokens the model call was billed for, when a model answered. Counts only. */
+  readonly usage?: ClassificationUsage;
 }
 
 /**
@@ -148,6 +151,7 @@ export class AcceptancePolicy {
       model: classification.model ?? '',
       month: date ? `${date.year}-${String(date.month).padStart(2, '0')}` : '',
       ...(classification.extraction ? { extraction: classification.extraction } : {}),
+      ...(classification.usage ? { usage: classification.usage } : {}),
     };
     if (reasons.size === 0 && category) {
       const folderPath = getCategory(category).dated
@@ -228,6 +232,15 @@ export function decisionLogFields(decision: AcceptanceDecision): Record<string, 
     reviewReasons: decision.reviewReasons,
     ...(decision.unclassifiedReason ? { unclassifiedReason: decision.unclassifiedReason } : {}),
     folder: decision.folderPath,
+    // What this document's classification cost, for the per-document bill.
+    ...(decision.usage
+      ? {
+          inputTokens: decision.usage.inputTokens,
+          outputTokens: decision.usage.outputTokens,
+          cacheReadInputTokens: decision.usage.cacheReadInputTokens,
+          cacheCreationInputTokens: decision.usage.cacheCreationInputTokens,
+        }
+      : {}),
   };
 }
 

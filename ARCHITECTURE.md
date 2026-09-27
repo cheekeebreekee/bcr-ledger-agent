@@ -178,20 +178,41 @@ the folder. Classifiers only suggest; the policy files.
 
 1. **`ClaudeClassifier`** ([`claudeClassifier.ts`](./packages/document-ingestion/src/services/claudeClassifier.ts)).
    It sends the document **content** to the Messages API (`ANTHROPIC_MODEL`, default
-   `claude-opus-5`): PDF as a `document` block, images as `image`, text as `text`. The answer is
-   **structured output** (`output_config.format`, `json_schema`) at `output_config.effort: low`:
-   `category` (an enum generated from the folder taxonomy,
+   `claude-opus-5`; `claude-sonnet-5` takes the same request): PDF as a `document` block, images
+   as `image`, text as `text`. The answer is **structured output** (`output_config.format`,
+   `json_schema`) at `output_config.effort` = `ANTHROPIC_EFFORT` (default `low`): `category` (an
+   enum generated from the folder taxonomy,
    [`folderTaxonomy.ts`](./packages/shared/src/parsers/folderTaxonomy.ts)), `year`/`month`,
-   `confidence`, `client_role` (seller, buyer, none, unknown), a one-line `reasoning`, and
-   `parties[]` (role, NIP, name). The request has no `thinking`, sampling or tool fields: on
-   `claude-opus-5` it thinks adaptively (so `max_tokens` is 8192, which caps thinking and answer
-   together), and the same request is valid on `claude-opus-4-5-20251101`. Each call has a 45 s
+   `confidence`, `client_role` (seller, buyer, none, unknown), `parties[]` (role, NIP, name) and
+   the `invoice` block. The request has no sampling or tool fields, and no `thinking` field
+   unless `ANTHROPIC_THINKING=disabled`: `claude-opus-5` and `claude-sonnet-5` think adaptively
+   (so `max_tokens` is 8192, which caps thinking and answer together). Each call has a 45 s
    timeout and one SDK retry.
 
-   - **Long PDFs.** A PDF over 100 pages is classified from an in-memory copy of its first 20
-     ([`pdfPreview.ts`](./packages/document-ingestion/src/services/pdfPreview.ts), pdf-lib), and
-     the model is told so. The original is what gets filed. If no copy can be made (encrypted, or
-     the copy fails), there is no result, reason `pdf_trim_failed`.
+   - **Cost.** Four levers, measured by the `claude.usage` line every billed response logs
+     (model, effort, thinking, input, output, cache-read and cache-write tokens, pages sent) and
+     by the same counts on every filing line:
+     - **Prompt caching.** The system prompt ([`SYSTEM_PROMPT`](./packages/document-ingestion/src/services/claudeClassifier.ts):
+       the rules and the category catalogue) is one block with `cache_control`, byte-identical
+       for every client and document, so any call within 5 minutes of another reads it at 0.1×
+       the input price (a write costs 1.25×). The bound client's identity and the file name are
+       in the user turn, after the document, so the cached prefix holds no client data.
+     - **Excerpts of long PDFs** (below).
+     - **Nothing asked for that nothing reads.** No free-text `reasoning` in the output: output
+       tokens cost 5× input, and neither the policy, the logs, the card nor the index read it.
+     - **Settings, not code:** `ANTHROPIC_MODEL` (Sonnet 5 is 2/5 of Opus 5's price per token),
+       `ANTHROPIC_EFFORT` (`low` | `medium` | `high`) and `ANTHROPIC_THINKING` (`adaptive` |
+       `disabled`; refused at cold start for a model that rejects it). The classifier release
+       fingerprint covers all three, so the shadow memo classifies each file once more after a
+       change, never repeatedly.
+     Message Batches (50% off) are not used: they would make a client's file wait up to 24 hours
+     in the inbox and change how the sweep tracks a file between ticks.
+   - **Long PDFs.** A PDF over 5 pages is classified from an in-memory copy of its first 4 pages
+     and its last ([`pdfPreview.ts`](./packages/document-ingestion/src/services/pdfPreview.ts),
+     pdf-lib), and the model is told which pages it has: the header, the period and the parties
+     are on the first pages, an invoice's totals on the last. The original is what gets filed.
+     If no copy can be made (encrypted, or the copy fails), a PDF of up to 100 pages is sent
+     whole; above 100 (the API's limit) there is no result, reason `pdf_trim_failed`.
    - **Direction.** [`invoiceDirection.ts`](./packages/document-ingestion/src/services/invoiceDirection.ts)
      settles sales (`faktury_sprzedazy`) vs purchase (`faktury_zakupu`) from the bound client's
      **own** identity, passed per call in `ClassifierContext.client`: its NIP on exactly one side

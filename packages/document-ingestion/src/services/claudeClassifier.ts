@@ -15,7 +15,10 @@ import {
   normalizeKsefNumber,
   normalizeNip,
   normalizeText,
+  type AnthropicEffort,
+  type AnthropicThinking,
   type Classification,
+  type ClassificationUsage,
   type Classifier,
   type ClassifierContext,
   type ClassifierNoResult,
@@ -30,13 +33,17 @@ import { settleInvoiceDirection, type ClientRole } from './invoiceDirection';
 import { pdfForModel, type PdfForModel } from './pdfPreview';
 
 /** The effort levels this classifier may run at (`output_config.effort`). */
-export type ClaudeEffort = 'low' | 'medium' | 'high';
+export type ClaudeEffort = AnthropicEffort;
+
+/**
+ * `adaptive`: no `thinking` field, so `claude-opus-5` and `claude-sonnet-5`
+ * think as much as the effort allows. `disabled`: no thinking tokens at all.
+ */
+export type ClaudeThinking = AnthropicThinking;
 
 /** Token usage of one API response, for cost reporting. */
-export interface ClaudeUsage {
+export interface ClaudeUsage extends ClassificationUsage {
   readonly model: string;
-  readonly inputTokens: number;
-  readonly outputTokens: number;
 }
 
 export interface ClaudeClassifierOptions {
@@ -47,6 +54,8 @@ export interface ClaudeClassifierOptions {
   readonly maxContentBytes: number;
   /** Defaults to {@link CLAUDE_EFFORT}. */
   readonly effort?: ClaudeEffort;
+  /** Defaults to {@link CLAUDE_THINKING}. */
+  readonly thinking?: ClaudeThinking;
   /** Called with every response's token usage (the evaluation harness sums them). */
   readonly onUsage?: (usage: ClaudeUsage) => void;
   /** Injectable for tests. */
@@ -80,17 +89,22 @@ export const CLAUDE_REQUEST_TIMEOUT_MS = 45_000;
 export const CLAUDE_MAX_RETRIES = 1;
 
 /**
- * Thinking plus the JSON answer. On `claude-opus-5` a request without a
- * `thinking` field thinks (adaptively), and `max_tokens` caps thinking and
- * answer together, so this is far above the ~300 tokens the answer takes.
+ * Thinking plus the JSON answer. On `claude-opus-5` and `claude-sonnet-5` a
+ * request without a `thinking` field thinks (adaptively), and `max_tokens`
+ * caps thinking and answer together, so this is far above the ~250 tokens the
+ * answer takes. It is a backstop, not a cost lever: lower, it only truncates.
  */
 export const CLAUDE_MAX_TOKENS = 8192;
 
 /**
  * A short classification call: `low` effort keeps the adaptive thinking
- * brief. `effort` is valid on `claude-opus-5` and on `claude-opus-4-5`.
+ * brief. `effort` is valid on `claude-opus-5`, `claude-sonnet-5` and
+ * `claude-opus-4-5`. `ANTHROPIC_EFFORT` overrides it.
  */
 export const CLAUDE_EFFORT: ClaudeEffort = 'low';
+
+/** Adaptive thinking at {@link CLAUDE_EFFORT}, as Anthropic recommends; `ANTHROPIC_THINKING` overrides it. */
+export const CLAUDE_THINKING: ClaudeThinking = 'adaptive';
 
 const PARTY_ROLES: readonly PartyRole[] = ['seller', 'buyer', 'issuer', 'recipient', 'unknown'];
 const CLIENT_ROLES: readonly ClientRole[] = ['seller', 'buyer', 'none', 'unknown'];
@@ -150,6 +164,11 @@ const INVOICE_OUTPUT_SCHEMA: Record<string, unknown> = {
  * they are checked here, after parsing. Every property is required, and
  * optional values are nullable (`anyOf` with `null`): 13 union-typed
  * properties in all, well inside the API's limit on them.
+ *
+ * Only what the pipeline uses is asked for: output tokens cost five times
+ * input tokens. There is no free-text `reasoning` (nothing read it: not the
+ * policy, the logs, the card or the index), and the model's own thinking is
+ * where it reasons.
  */
 export const CLASSIFICATION_OUTPUT_SCHEMA: Record<string, unknown> = {
   type: 'object',
@@ -169,7 +188,6 @@ export const CLASSIFICATION_OUTPUT_SCHEMA: Record<string, unknown> = {
         'Rola klienta na fakturze: seller (sprzedawca/wystawca), buyer (nabywca), ' +
         'none (klient nie jest stroną), unknown (nie da się ustalić lub brak tożsamości klienta).',
     },
-    reasoning: { type: 'string', description: 'Jedno krótkie zdanie uzasadnienia po polsku.' },
     parties: {
       type: 'array',
       description: 'Strony dokumentu: sprzedawca i nabywca faktury, strony umowy, wystawca.',
@@ -187,16 +205,7 @@ export const CLASSIFICATION_OUTPUT_SCHEMA: Record<string, unknown> = {
     },
     invoice: INVOICE_OUTPUT_SCHEMA,
   },
-  required: [
-    'category',
-    'year',
-    'month',
-    'confidence',
-    'client_role',
-    'reasoning',
-    'parties',
-    'invoice',
-  ],
+  required: ['category', 'year', 'month', 'confidence', 'client_role', 'parties', 'invoice'],
   additionalProperties: false,
 };
 
@@ -209,7 +218,6 @@ const modelOutput = z.object({
   month: z.number().int().nullable().optional(),
   confidence: z.number(),
   client_role: z.enum(['seller', 'buyer', 'none', 'unknown']).optional(),
-  reasoning: z.string().optional(),
   parties: z
     .array(
       z.object({
@@ -265,6 +273,7 @@ export class ClaudeClassifier implements Classifier {
   private readonly model: string;
   private readonly maxContentBytes: number;
   private readonly effort: ClaudeEffort;
+  private readonly thinking: ClaudeThinking;
   private readonly onUsage: ((usage: ClaudeUsage) => void) | undefined;
   private readonly now: () => number;
   /** The account refusal every call answers with until `until` (epoch ms). */
@@ -281,6 +290,7 @@ export class ClaudeClassifier implements Classifier {
     this.model = opts.model;
     this.maxContentBytes = opts.maxContentBytes;
     this.effort = opts.effort ?? CLAUDE_EFFORT;
+    this.thinking = opts.thinking ?? CLAUDE_THINKING;
     this.onUsage = opts.onUsage;
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? createLogger('ingestion/claude');
@@ -307,7 +317,12 @@ export class ClaudeClassifier implements Classifier {
         message = await this.client.messages.create({
           model: this.model,
           max_tokens: CLAUDE_MAX_TOKENS,
-          system: systemPrompt(ctx.client),
+          // The same bytes for every client and document, so every call
+          // after the first within 5 minutes reads it from the prompt cache
+          // (about 0.1× the input price). It holds no client data: the
+          // client's identity is in the user turn, after the breakpoint.
+          system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+          ...(this.thinking === 'disabled' ? { thinking: { type: 'disabled' as const } } : {}),
           output_config: {
             effort: this.effort,
             format: { type: 'json_schema', schema: CLASSIFICATION_OUTPUT_SCHEMA },
@@ -317,7 +332,10 @@ export class ClaudeClassifier implements Classifier {
               role: 'user',
               content: [
                 input.block,
-                { type: 'text', text: userInstruction(ctx.filename, input.preview) },
+                {
+                  type: 'text',
+                  text: userInstruction(ctx.filename, input.preview, ctx.client),
+                },
               ],
             },
           ],
@@ -325,15 +343,18 @@ export class ClaudeClassifier implements Classifier {
       } catch (err) {
         return this.apiFailure(err);
       }
-      this.reportUsage(message);
+      const usage = this.reportUsage(message, input.preview);
 
-      if (message.stop_reason === 'refusal') return this.noResult('refusal');
-      if (message.stop_reason === 'max_tokens') return this.noResult('max_tokens');
+      // Billed but unusable: the usage goes with the no-result to the fallback's decision.
+      if (message.stop_reason === 'refusal') return this.noResult('refusal', undefined, {}, usage);
+      if (message.stop_reason === 'max_tokens') {
+        return this.noResult('max_tokens', undefined, {}, usage);
+      }
       const output = parseOutput(message);
-      if (!output) return this.noResult('malformed_output');
+      if (!output) return this.noResult('malformed_output', undefined, {}, usage);
 
       return settleInvoiceDirection(
-        toClassification(output, message.model || this.model, input.preview),
+        { ...toClassification(output, message.model || this.model, input.preview), usage },
         ctx.client,
       );
     } catch (err) {
@@ -361,13 +382,13 @@ export class ClaudeClassifier implements Classifier {
       if (pdf.kind === 'trim_failed') {
         return this.noResult('pdf_trim_failed', undefined, { pageCount: pdf.pageCount });
       }
-      const bytes = pdf.kind === 'first_pages' ? pdf.content : content;
+      const bytes = pdf.kind === 'excerpt' ? pdf.content : content;
       return {
         block: {
           type: 'document',
           source: { type: 'base64', media_type: 'application/pdf', data: bytes.toString('base64') },
         },
-        ...(pdf.kind === 'first_pages'
+        ...(pdf.kind === 'excerpt'
           ? { preview: { pages: pdf.pages, pageCount: pdf.pageCount } }
           : {}),
       };
@@ -421,6 +442,7 @@ export class ClaudeClassifier implements Classifier {
     reason: string,
     status?: number,
     extra: Record<string, unknown> = {},
+    usage?: ClassificationUsage,
   ): ClassifierNoResult {
     this.log.info(
       {
@@ -432,16 +454,45 @@ export class ClaudeClassifier implements Classifier {
       },
       'claude.no_result',
     );
-    return { outcome: 'no_result', reason, ...(status !== undefined ? { status } : {}) };
+    return {
+      outcome: 'no_result',
+      reason,
+      ...(status !== undefined ? { status } : {}),
+      ...(usage ? { usage } : {}),
+    };
   }
 
-  private reportUsage(message: Anthropic.Message): void {
-    if (!this.onUsage || !message.usage) return;
-    this.onUsage({
-      model: message.model || this.model,
-      inputTokens: message.usage.input_tokens ?? 0,
-      outputTokens: message.usage.output_tokens ?? 0,
-    });
+  /**
+   * One `claude.usage` line per response the API billed, answered or not
+   * (a refusal or a truncated answer is billed too): the model, the counts and
+   * the pages sent, nothing about the document. Summed, these lines are the
+   * classifier's bill.
+   */
+  private reportUsage(
+    message: Anthropic.Message,
+    preview: PdfPreview | undefined,
+  ): ClassificationUsage {
+    const usage: ClassificationUsage = {
+      inputTokens: message.usage?.input_tokens ?? 0,
+      outputTokens: message.usage?.output_tokens ?? 0,
+      cacheReadInputTokens: message.usage?.cache_read_input_tokens ?? 0,
+      cacheCreationInputTokens: message.usage?.cache_creation_input_tokens ?? 0,
+    };
+    const model = message.model || this.model;
+    this.log.info(
+      {
+        event: 'claude.usage',
+        model,
+        effort: this.effort,
+        thinking: this.thinking,
+        stopReason: message.stop_reason ?? '',
+        ...usage,
+        ...(preview ? { pagesSent: preview.pages, pageCount: preview.pageCount } : {}),
+      },
+      'claude.usage',
+    );
+    this.onUsage?.({ model, ...usage });
+    return usage;
   }
 }
 
@@ -488,92 +539,121 @@ export function classifyApiError(err: unknown): ClassifierNoResult | ClassifierR
 }
 
 /**
- * The rules, in Polish like the documents. The client's identity is the only
- * client data in it, and only the bound client's own.
+ * The rules, in Polish like the documents. The same bytes for every client
+ * and every document, so the API serves them from the prompt cache: there is
+ * no client data in it, and nothing that varies. The bound client's identity
+ * goes in the user turn ({@link clientIdentity}), after the cache breakpoint.
  */
-export function systemPrompt(client: ClassifierContext['client']): string {
+export const SYSTEM_PROMPT: string = [
+  'Jesteś asystentem księgowym polskiego biura rachunkowego. Klasyfikujesz jeden dokument ' +
+    'klienta do kategorii w strukturze folderów SharePoint tego klienta. Tożsamość klienta ' +
+    '(nazwa i NIP), gdy jest znana, jest podana w wiadomości z dokumentem.',
+  '',
+  'Zasady:',
+  '- Kategorię wybierasz na podstawie TREŚCI dokumentu, nie nazwy pliku.',
+  '- Faktura to także faktura uproszczona, zaliczkowa, rozliczeniowa, faktura KSeF oraz ' +
+    'faktura zagraniczna (invoice, factuur, Rechnung). Faktura trafia do faktury_sprzedazy ' +
+    'albo faktury_zakupu, zależnie od roli klienta.',
+  '- Paragon fiskalny z NIP-em nabywcy (do 450 zł brutto) to faktura uproszczona, czyli faktura.',
+  '- Paragon, potwierdzenie płatności kartą, wydruk z terminala i zagraniczny paragon ' +
+    '(klantenbon, receipt, Kassenbon) BEZ danych nabywcy to faktury_noty: dowód księgowy ' +
+    'niebędący fakturą VAT.',
+  '- Zagraniczna faktura, bilet lub rachunek hotelowy, który wskazuje nabywcę (firmę lub ' +
+    'osobę), to faktura.',
+  '- Faktura pro forma to inne. Polisa, ogólne warunki ubezpieczenia (OWU) i warunki ' +
+    'polisy to umowy.',
+  '- Faktura korygująca i anulowanie faktury to faktury_korekty; nota księgowa, ' +
+    'obciążeniowa lub uznaniowa to faktury_noty.',
+  '- year i month to data dokumentu: data wystawienia faktury, data transakcji paragonu, ' +
+    'okres wyciągu. Podaj je zawsze, gdy da się je odczytać; w przeciwnym razie null.',
+  '- confidence (0-1) ustaw rzetelnie: niska, gdy nie masz pewności kategorii.',
+  '- parties: sprzedawca i nabywca faktury (lub strony umowy, wystawca pisma) z NIP-em ' +
+    'i nazwą, jeśli są na dokumencie.',
+  '- nieposortowane wybierz tylko wtedy, gdy dokument jest nieczytelny albo nie pasuje ' +
+    'do żadnej kategorii.',
+  `- invoice: dla kategorii ${INVOICE_FIELD_CATEGORIES.join(', ')} przepisz z dokumentu ` +
+    'numer, datę wystawienia, datę sprzedaży, walutę, sumy netto, VAT i brutto oraz numer ' +
+    'KSeF. Kwoty zapisuj cyframi z kropką dziesiętną, bez spacji i symbolu waluty (np. ' +
+    '1234.50; ujemne na korekcie in minus). Pole, którego nie ma na dokumencie albo którego ' +
+    'nie da się odczytać, ustaw na null: nie zgaduj i nie licz. Dla pozostałych kategorii ' +
+    'wszystkie pola invoice ustaw na null.',
+  '',
+  'Kategorie:',
+  categoryCatalog.map((c) => `- ${c.id} (${c.polishLabel}): ${c.description}`).join('\n'),
+].join('\n');
+
+/**
+ * The bound client's identity and what to do with it — the only client data
+ * in the prompt, and only this client's. It settles `client_role` (invoice
+ * direction), never the client.
+ */
+export function clientIdentity(client: ClassifierContext['client']): string {
   const nip = client?.nip.replace(/\D+/g, '') ?? '';
   const name = client?.companyName.trim() ?? '';
-  const identity =
-    nip || name
-      ? `Dokument należy do klienta: ${name || '(nazwa nieznana)'}${nip ? `, NIP ${nip}` : ''}. ` +
+  return nip || name
+    ? `Dokument należy do klienta: ${name || '(nazwa nieznana)'}${nip ? `, NIP ${nip}` : ''}. ` +
         'W polu client_role wskaż rolę klienta na fakturze, porównując jego NIP (same cyfry) ' +
         'i nazwę z danymi sprzedawcy i nabywcy: seller, gdy klient jest sprzedawcą lub ' +
         'wystawcą; buyer, gdy jest nabywcą; none, gdy nie jest żadną ze stron; unknown, gdy ' +
         'nie da się tego ustalić. Nie zgaduj: rola musi wynikać z danych na dokumencie.'
-      : 'Tożsamość klienta nie jest podana. Nie ustalaj, czy faktura jest sprzedażowa, czy ' +
+    : 'Tożsamość klienta nie jest podana. Nie ustalaj, czy faktura jest sprzedażowa, czy ' +
         'zakupowa: ustaw client_role na unknown. Kierunek faktury ustali księgowy.';
-
-  return [
-    'Jesteś asystentem księgowym polskiego biura rachunkowego. Klasyfikujesz jeden dokument ' +
-      'klienta do kategorii w strukturze folderów SharePoint tego klienta.',
-    identity,
-    '',
-    'Zasady:',
-    '- Kategorię wybierasz na podstawie TREŚCI dokumentu, nie nazwy pliku.',
-    '- Faktura to także faktura uproszczona, zaliczkowa, rozliczeniowa, faktura KSeF oraz ' +
-      'faktura zagraniczna (invoice, factuur, Rechnung). Faktura trafia do faktury_sprzedazy ' +
-      'albo faktury_zakupu, zależnie od roli klienta.',
-    '- Paragon fiskalny z NIP-em nabywcy (do 450 zł brutto) to faktura uproszczona, czyli faktura.',
-    '- Paragon, potwierdzenie płatności kartą, wydruk z terminala i zagraniczny paragon ' +
-      '(klantenbon, receipt, Kassenbon) BEZ danych nabywcy to faktury_noty: dowód księgowy ' +
-      'niebędący fakturą VAT.',
-    '- Zagraniczna faktura, bilet lub rachunek hotelowy, który wskazuje nabywcę (firmę lub ' +
-      'osobę), to faktura.',
-    '- Faktura pro forma to inne. Polisa, ogólne warunki ubezpieczenia (OWU) i warunki ' +
-      'polisy to umowy.',
-    '- Faktura korygująca i anulowanie faktury to faktury_korekty; nota księgowa, ' +
-      'obciążeniowa lub uznaniowa to faktury_noty.',
-    '- year i month to data dokumentu: data wystawienia faktury, data transakcji paragonu, ' +
-      'okres wyciągu. Podaj je zawsze, gdy da się je odczytać; w przeciwnym razie null.',
-    '- confidence (0-1) ustaw rzetelnie: niska, gdy nie masz pewności kategorii.',
-    '- parties: sprzedawca i nabywca faktury (lub strony umowy, wystawca pisma) z NIP-em ' +
-      'i nazwą, jeśli są na dokumencie.',
-    '- nieposortowane wybierz tylko wtedy, gdy dokument jest nieczytelny albo nie pasuje ' +
-      'do żadnej kategorii.',
-    `- invoice: dla kategorii ${INVOICE_FIELD_CATEGORIES.join(', ')} przepisz z dokumentu ` +
-      'numer, datę wystawienia, datę sprzedaży, walutę, sumy netto, VAT i brutto oraz numer ' +
-      'KSeF. Kwoty zapisuj cyframi z kropką dziesiętną, bez spacji i symbolu waluty (np. ' +
-      '1234.50; ujemne na korekcie in minus). Pole, którego nie ma na dokumencie albo którego ' +
-      'nie da się odczytać, ustaw na null: nie zgaduj i nie licz. Dla pozostałych kategorii ' +
-      'wszystkie pola invoice ustaw na null.',
-    '',
-    'Kategorie:',
-    categoryCatalog.map((c) => `- ${c.id} (${c.polishLabel}): ${c.description}`).join('\n'),
-  ].join('\n');
 }
 
-function userInstruction(filename: string, preview: PdfPreview | undefined): string {
+/**
+ * The user turn's text, after the document: the client's identity, then the
+ * file name as a hint and, for an excerpt of a long PDF, which pages were
+ * sent (the first `pages - 1` and the last).
+ */
+export function userInstruction(
+  filename: string,
+  preview: PdfPreview | undefined,
+  client: ClassifierContext['client'],
+): string {
   return [
-    `Nazwa pliku (jedynie wskazówka, może być myląca): "${filename}".`,
-    ...(preview
-      ? [
-          `Dokument ma ${preview.pageCount} stron; załączono tylko pierwsze ${preview.pages}. ` +
-            'Sklasyfikuj cały dokument na ich podstawie.',
-        ]
-      : []),
-    'Sklasyfikuj dokument na podstawie jego TREŚCI, nie nazwy pliku.',
-  ].join(' ');
+    clientIdentity(client),
+    '',
+    [
+      `Nazwa pliku (jedynie wskazówka, może być myląca): "${filename}".`,
+      ...(preview
+        ? [
+            `Dokument ma ${preview.pageCount} stron; załączono tylko strony 1–${preview.pages - 1} ` +
+              `i ostatnią (${preview.pageCount}). Sklasyfikuj cały dokument na ich podstawie.`,
+          ]
+        : []),
+      'Sklasyfikuj dokument na podstawie jego TREŚCI, nie nazwy pliku.',
+    ].join(' '),
+  ].join('\n');
 }
 
 /**
  * A short digest of everything that decides this classifier's answer other
- * than the document and the client: the model, effort and token cap, the
- * output schema, and the prompts (with and without a client identity, the
- * identity itself replaced by a fixed stand-in). A new release changes it;
- * the shadow memo keys on it, so a new release classifies each file once.
+ * than the document and the client: the model, effort, thinking and token
+ * cap, the output schema, and the prompts (the user turn with and without a
+ * client identity, the identity itself replaced by a fixed stand-in). A new
+ * release changes it; the shadow memo keys on it, so a new release
+ * classifies each file once.
  */
-export function classifierFingerprint(model: string, effort: ClaudeEffort = CLAUDE_EFFORT): string {
+export function classifierFingerprint(
+  model: string,
+  effort: ClaudeEffort = CLAUDE_EFFORT,
+  thinking: ClaudeThinking = CLAUDE_THINKING,
+): string {
   return createHash('sha256')
     .update(
       JSON.stringify({
         model,
         effort,
+        thinking,
         maxTokens: CLAUDE_MAX_TOKENS,
         schema: CLASSIFICATION_OUTPUT_SCHEMA,
-        withClient: systemPrompt({ nip: '0000000000', companyName: 'X' }),
-        withoutClient: systemPrompt(undefined),
-        instruction: userInstruction('x', { pages: 1, pageCount: 2 }),
+        system: SYSTEM_PROMPT,
+        withClient: userInstruction(
+          'x',
+          { pages: 5, pageCount: 9 },
+          { nip: '0000000000', companyName: 'X' },
+        ),
+        withoutClient: userInstruction('x', undefined, undefined),
       }),
     )
     .digest('hex')
@@ -617,7 +697,6 @@ function toClassification(
       category,
       ...(date ? { year: date.year, month: date.month } : {}),
       clientRole: output.client_role ?? 'unknown',
-      ...(output.reasoning ? { reasoning: output.reasoning } : {}),
       ...(preview ? { pagesRead: preview.pages, pageCount: preview.pageCount } : {}),
     },
     ...(parties.length > 0 ? { parties } : {}),

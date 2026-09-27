@@ -235,6 +235,33 @@ describe('retryExhaustedDecision', () => {
   });
 });
 
+describe('decisionLogFields: tokens', () => {
+  it('adds the four token counts when the decision has usage, and none otherwise', () => {
+    const usage = {
+      inputTokens: 900,
+      outputTokens: 8192,
+      cacheReadInputTokens: 1800,
+      cacheCreationInputTokens: 0,
+    };
+    const withUsage = policy.decide(result({ category: 'umowy' }, { usage }), NOW);
+    expect(decisionLogFields(withUsage)).toMatchObject(usage);
+    const without = decisionLogFields(policy.decide(result({ category: 'umowy' }), NOW));
+    expect(Object.keys(without).filter((k) => k.endsWith('Tokens'))).toEqual([]);
+  });
+
+  it('keeps the usage when the decision goes to review', () => {
+    const usage = {
+      inputTokens: 900,
+      outputTokens: 8192,
+      cacheReadInputTokens: 1800,
+      cacheCreationInputTokens: 0,
+    };
+    const review = policy.decide(result({ category: 'umowy' }, { usage, confidence: 0.4 }), NOW);
+    expect(review.review).toBe(true);
+    expect(decisionLogFields(review)).toMatchObject({ inputTokens: 900, outputTokens: 8192 });
+  });
+});
+
 describe('reviewFolderPath', () => {
   it('uses the UTC month of now', () => {
     expect(reviewFolderPath(new Date('2026-12-31T23:30:00.000Z'))).toBe(

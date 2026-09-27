@@ -337,12 +337,46 @@ export const ingestionConfigSchema = z.object({
   anthropicEnabled: boolish(false),
   anthropicApiKey: optionalStr(),
   /**
-   * The model id. The request (structured output, `effort`, no sampling
-   * parameters, no `thinking` field) is valid on `claude-opus-5` and on the
-   * `claude-opus-4-5-20251101` it replaces, so the setting can change at the
-   * deploy without an outage in between.
+   * The model id. The request (structured output, `effort`, a cached system
+   * prompt, no sampling parameters, no `thinking` field unless
+   * `ANTHROPIC_THINKING=disabled`) is valid unchanged on `claude-opus-5` and
+   * `claude-sonnet-5` (2/5 of Opus 5's price per token), and on the
+   * `claude-opus-4-5-20251101` Opus 5 replaced.
    */
   anthropicModel: optionalStr('claude-opus-5'),
+  /**
+   * `ANTHROPIC_EFFORT`: `output_config.effort` of every classification call.
+   * `low` (the default) is the cheapest, and enough for one short
+   * classification; raise it only when an evaluation shows shallow answers at
+   * `low`. Anything else fails at cold start.
+   */
+  anthropicEffort: z
+    .preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z
+        .enum(['low', 'medium', 'high'], {
+          errorMap: () => ({ message: "must be 'low', 'medium' or 'high'" }),
+        })
+        .optional(),
+    )
+    .transform((v) => v ?? 'low'),
+  /**
+   * `ANTHROPIC_THINKING`: `adaptive` (the default: no `thinking` field, so
+   * the model decides how much to think at the given effort) or `disabled`
+   * (no thinking tokens at all). Anthropic recommends adaptive at `low` first.
+   * `disabled` is accepted only with a model that takes it at this effort
+   * (see {@link thinkingDisabledProblem}); anything else fails at cold start.
+   */
+  anthropicThinking: z
+    .preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z
+        .enum(['adaptive', 'disabled'], {
+          errorMap: () => ({ message: "must be 'adaptive' or 'disabled'" }),
+        })
+        .optional(),
+    )
+    .transform((v) => v ?? 'adaptive'),
   /** Hard cap on document bytes sent to the model. Default 10 MiB. */
   anthropicMaxContentBytes: numeric(10 * 1024 * 1024),
   /**
@@ -427,6 +461,33 @@ export function missingLedgerIndexSettings(
     ...(config.ledgerDbHost === '' ? ['LEDGER_DB_HOST'] : []),
     ...(config.ledgerDbUser === '' ? ['LEDGER_DB_USER'] : []),
   ];
+}
+
+/** `ANTHROPIC_EFFORT`: see {@link ingestionConfigSchema}. */
+export type AnthropicEffort = IngestionConfig['anthropicEffort'];
+
+/** `ANTHROPIC_THINKING`: see {@link ingestionConfigSchema}. */
+export type AnthropicThinking = IngestionConfig['anthropicThinking'];
+
+/**
+ * The models that accept `thinking: {type: 'disabled'}` at efforts up to
+ * `high`. Opus 5.5 and Fable 5.1 reject it outright: every call would be a
+ * 400, and every document would go to review unclassified.
+ */
+const THINKING_DISABLED_MODELS: ReadonlySet<string> = new Set(['claude-opus-5', 'claude-sonnet-5']);
+
+/**
+ * Why `ANTHROPIC_THINKING=disabled` cannot run with this model, or `undefined`
+ * when it can (or thinking is adaptive). Checked at cold start.
+ */
+export function thinkingDisabledProblem(
+  config: Pick<IngestionConfig, 'anthropicThinking' | 'anthropicModel'>,
+): string | undefined {
+  if (config.anthropicThinking !== 'disabled') return undefined;
+  return THINKING_DISABLED_MODELS.has(config.anthropicModel)
+    ? undefined
+    : `ANTHROPIC_THINKING: 'disabled' is not accepted by ANTHROPIC_MODEL ${config.anthropicModel}; ` +
+        `use 'adaptive', or one of ${[...THINKING_DISABLED_MODELS].join(', ')}`;
 }
 
 /** `MEMBERSHIP_CHECK_MODE`: see {@link ingestionConfigSchema}. */

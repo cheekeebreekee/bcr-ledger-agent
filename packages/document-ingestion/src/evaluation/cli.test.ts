@@ -22,7 +22,6 @@ function answer(
           year: null,
           month: null,
           client_role: 'unknown',
-          reasoning: 'x',
           parties: [],
           ...output,
         }),
@@ -148,8 +147,8 @@ describe('eval run', () => {
     expect(report).not.toContain(CLIENT_NIP);
 
     // The primed identity is the one given, digits only.
-    const system = api.messages.create.mock.calls[0]?.[0].system as string;
-    expect(system).toContain(`Biuro Testowe Sp. z o.o., NIP ${CLIENT_NIP}`);
+    const turn = api.messages.create.mock.calls[0]?.[0].messages[0].content[1].text as string;
+    expect(turn).toContain(`Biuro Testowe Sp. z o.o., NIP ${CLIENT_NIP}`);
     expect(api.messages.create.mock.calls[0]?.[0].model).toBe('claude-opus-5');
     expect(err.join('')).toMatch(/category 4\/4 \(PASS\), direction PASS, retry later 0/);
     expect(err.join('')).toContain('report written to /report.md');
@@ -168,13 +167,34 @@ describe('eval run', () => {
     expect(written).toEqual({});
     const report = out.join('');
     expect(report).toContain(
-      'Model `claude-opus-4-5-20251101`, effort `medium`, accept threshold 0.80',
+      'Model `claude-opus-4-5-20251101`, effort `medium`, thinking `adaptive`, accept threshold 0.80',
     );
     expect(report).toContain('client identity not given');
     // Without an identity the sale is not guessed: it goes to review.
     expect(report).toMatch(
       /\| sale\.txt \|.*DIRECTION_UNRESOLVED.*\| review \(category right\) \|/,
     );
+  });
+
+  it('runs with thinking disabled on a model that takes it, and says so', async () => {
+    const { deps, out, api } = harness(files);
+    const code = await runCli(
+      [
+        'run',
+        '--dir',
+        DIR,
+        '--truth',
+        '/truth.json',
+        '--model',
+        'claude-sonnet-5',
+        '--thinking',
+        'disabled',
+      ],
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(api.messages.create.mock.calls[0]?.[0].thinking).toEqual({ type: 'disabled' });
+    expect(out.join('')).toContain('Model `claude-sonnet-5`, effort `low`, thinking `disabled`');
   });
 
   it('needs ANTHROPIC_API_KEY from the environment when no client is injected', async () => {
@@ -189,6 +209,21 @@ describe('eval run', () => {
     [['run', '--truth', '/truth.json'], /--dir and --truth are required/],
     [['run', '--dir', DIR, '--truth', '/truth.json', '--threshold', '0.69'], /0.70 to 0.95/],
     [['run', '--dir', DIR, '--truth', '/truth.json', '--effort', 'max'], /--effort/],
+    [['run', '--dir', DIR, '--truth', '/truth.json', '--thinking', 'off'], /--thinking must be/],
+    [
+      [
+        'run',
+        '--dir',
+        DIR,
+        '--truth',
+        '/truth.json',
+        '--model',
+        'claude-opus-5-5',
+        '--thinking',
+        'disabled',
+      ],
+      /'disabled' is not accepted by ANTHROPIC_MODEL claude-opus-5-5/,
+    ],
     [['run', '--dir', DIR, '--truth', '/truth.json', '--client-nip', '123'], /10 digits/],
     [['run', '--dir', DIR, '--truth', '/truth.json', '--concurrency', '9'], /--concurrency/],
     [['run', '--dir', DIR, '--truth', '/missing.json'], /ENOENT/],

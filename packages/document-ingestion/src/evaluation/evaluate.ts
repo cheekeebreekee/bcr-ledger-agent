@@ -73,6 +73,9 @@ export interface DocumentResult {
   readonly fields?: Readonly<Partial<Record<DocumentExtractionField, boolean>>>;
   readonly inputTokens: number;
   readonly outputTokens: number;
+  /** Prompt-cache reads and writes, billed apart from `inputTokens`. */
+  readonly cacheReadInputTokens: number;
+  readonly cacheCreationInputTokens: number;
   readonly model: string;
 }
 
@@ -115,10 +118,18 @@ async function classifyOne(
   } catch {
     return blank(truth, 'unreadable');
   }
-  const usage = { inputTokens: 0, outputTokens: 0, model: '' };
+  const usage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    model: '',
+  };
   const service = opts.makeService((u) => {
     usage.inputTokens += u.inputTokens;
     usage.outputTokens += u.outputTokens;
+    usage.cacheReadInputTokens += u.cacheReadInputTokens;
+    usage.cacheCreationInputTokens += u.cacheCreationInputTokens;
     usage.model = u.model;
   });
   const now = (opts.now ?? (() => new Date()))();
@@ -151,6 +162,8 @@ function blank(truth: TruthEntry, outcome: DocumentResult['outcome']): DocumentR
     filedWrongly: false,
     inputTokens: 0,
     outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
     model: '',
   };
 }
@@ -166,6 +179,8 @@ export function score(
     decision,
     inputTokens: 0,
     outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
     model: decision.model,
   };
   const unanswered = decision.reviewReasons.includes('NOT_CLASSIFIED')
@@ -322,6 +337,8 @@ export interface EvaluationSummary {
   readonly reasons: Readonly<Record<string, number>>;
   readonly inputTokens: number;
   readonly outputTokens: number;
+  readonly cacheReadInputTokens: number;
+  readonly cacheCreationInputTokens: number;
 }
 
 const BUCKETS: readonly [string, number, number][] = [
@@ -392,5 +409,7 @@ export function summarize(
     reasons,
     inputTokens: results.reduce((n, r) => n + r.inputTokens, 0),
     outputTokens: results.reduce((n, r) => n + r.outputTokens, 0),
+    cacheReadInputTokens: results.reduce((n, r) => n + r.cacheReadInputTokens, 0),
+    cacheCreationInputTokens: results.reduce((n, r) => n + r.cacheCreationInputTokens, 0),
   };
 }

@@ -199,8 +199,20 @@ describe('runEvaluation', () => {
           if (ctx.filename === 'b.txt' && bFails-- > 0) {
             return { kind: 'retry_later', classifier: 'claude', reason: 'overloaded', status: 529 };
           }
-          onUsage({ model: 'claude-opus-5', inputTokens: 100, outputTokens: 10 });
-          onUsage({ model: 'claude-opus-5', inputTokens: 1, outputTokens: 1 });
+          onUsage({
+            model: 'claude-opus-5',
+            inputTokens: 100,
+            outputTokens: 10,
+            cacheReadInputTokens: 50,
+            cacheCreationInputTokens: 7,
+          });
+          onUsage({
+            model: 'claude-opus-5',
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 2,
+            cacheCreationInputTokens: 1,
+          });
           return { kind: 'decided', decision: decide({ category: 'umowy' }) };
         },
       }),
@@ -223,6 +235,8 @@ describe('runEvaluation', () => {
     expect(results[0]).toMatchObject({
       inputTokens: 101,
       outputTokens: 11,
+      cacheReadInputTokens: 52,
+      cacheCreationInputTokens: 8,
       model: 'claude-opus-5',
     });
     expect(calls).toEqual(['a.txt', 'b.txt', 'b.txt']);
@@ -391,6 +405,8 @@ describe('summarize', () => {
     filedWrongly: false,
     inputTokens: 10,
     outputTokens: 1,
+    cacheReadInputTokens: 100,
+    cacheCreationInputTokens: 3,
     model: 'claude-opus-5',
     ...over,
   });
@@ -450,6 +466,8 @@ describe('summarize', () => {
       reasons: { DIRECTION_UNRESOLVED: 1, LOW_CONFIDENCE: 1 },
       inputTokens: 40,
       outputTokens: 4,
+      cacheReadInputTokens: 400,
+      cacheCreationInputTokens: 12,
     });
     expect(s.perCategory).toEqual([
       {

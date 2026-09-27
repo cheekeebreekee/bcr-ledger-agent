@@ -97,6 +97,8 @@ export const classification = new ClassificationService(
           new ClaudeClassifier({
             apiKey: config.anthropicApiKey,
             model: config.anthropicModel,
+            effort: config.anthropicEffort,
+            thinking: config.anthropicThinking,
             maxContentBytes: config.anthropicMaxContentBytes,
           }),
         ]
@@ -107,7 +109,9 @@ export const classification = new ClassificationService(
 );
 /** What decides a classification besides the document: see `classifierFingerprint`. */
 const classifierRelease = `${
-  claudeOn ? classifierFingerprint(config.anthropicModel) : 'fallback'
+  claudeOn
+    ? classifierFingerprint(config.anthropicModel, config.anthropicEffort, config.anthropicThinking)
+    : 'fallback'
 }|${config.classificationAcceptThreshold}`;
 createLogger('ingestion/runtime').info(
   {
@@ -115,6 +119,7 @@ createLogger('ingestion/runtime').info(
     release: classifierRelease,
     claude: claudeOn ? 'on' : 'off',
     model: claudeOn ? config.anthropicModel : '',
+    ...(claudeOn ? { effort: config.anthropicEffort, thinking: config.anthropicThinking } : {}),
     acceptThreshold: config.classificationAcceptThreshold,
   },
   'classification.config',

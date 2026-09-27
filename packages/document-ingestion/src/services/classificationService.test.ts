@@ -92,6 +92,36 @@ describe('ClassificationService', () => {
     });
   });
 
+  // A truncated answer bills its whole max_tokens: its cost must stay on the
+  // filing line of the document it was for.
+  it('keeps the cost of a billed but unusable answer on the fallback’s decision', async () => {
+    const usage = {
+      inputTokens: 900,
+      outputTokens: 8192,
+      cacheReadInputTokens: 1800,
+      cacheCreationInputTokens: 0,
+    };
+    const outcome = await service([
+      answering({ outcome: 'no_result', reason: 'max_tokens', usage }),
+      new FallbackClassifier(),
+    ]).classify(ctx());
+    expect(outcome).toMatchObject({
+      kind: 'decided',
+      decision: { reviewReasons: ['NOT_CLASSIFIED'], unclassifiedReason: 'max_tokens', usage },
+    });
+  });
+
+  it('carries the usage of an answer through the policy', async () => {
+    const usage = {
+      inputTokens: 900,
+      outputTokens: 8192,
+      cacheReadInputTokens: 1800,
+      cacheCreationInputTokens: 0,
+    };
+    const outcome = await service([answering({ ...contract, usage })]).classify(ctx());
+    expect(outcome).toMatchObject({ kind: 'decided', decision: { review: false, usage } });
+  });
+
   it('never falls through to the fallback on "retry later"', async () => {
     const fallback = answering(contract, 'fallback');
     const outcome = await service([

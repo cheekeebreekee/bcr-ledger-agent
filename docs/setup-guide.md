@@ -551,8 +551,10 @@ Skip (set `ANTHROPIC_ENABLED=false`) if you want fallback-only routing
 |---|---|
 | `ANTHROPIC_ENABLED` | `true` to wire the Claude classifier in; `false` to disable (fallback only). |
 | `ANTHROPIC_API_KEY` | [Anthropic Console](https://console.anthropic.com/) → **API Keys**. After deployment, store as Key Vault secret `anthropic-api-key` *(§4)*. |
-| `ANTHROPIC_MODEL` | Model id. Default `claude-opus-5`. |
-| `ANTHROPIC_MAX_CONTENT_BYTES` | Max document size sent to the API. Default `10485760` (10 MiB); larger files skip AI and go to manual review. A PDF over 100 pages is classified from its first 20. |
+| `ANTHROPIC_MODEL` | Model id. Default `claude-opus-5`; `claude-sonnet-5` takes the same request at 2/5 of the price per token. |
+| `ANTHROPIC_EFFORT` | `output_config.effort`: `low` (default, the cheapest), `medium` or `high`. Anything else stops ingestion at cold start. |
+| `ANTHROPIC_THINKING` | `adaptive` (default: the model thinks as much as the effort allows) or `disabled` (no thinking tokens). `disabled` with a model that rejects it (anything but `claude-opus-5` and `claude-sonnet-5`) stops ingestion at cold start. |
+| `ANTHROPIC_MAX_CONTENT_BYTES` | Max document size sent to the API. Default `10485760` (10 MiB); larger files skip AI and go to manual review. A PDF over 5 pages is classified from its first 4 pages and its last. |
 | `CLASSIFICATION_ACCEPT_THRESHOLD` | Minimum confidence to file a document under its category. Default `0.70`; must be from `0.70` to `0.95` or ingestion does not start. Below it the document goes to manual review. Replaces `ANTHROPIC_CONFIDENCE_THRESHOLD`, which is no longer read. |
 
 > **Note:** the previous `CLIENT_COMPANY_NAME` / `CLIENT_NIP` env vars
@@ -695,6 +697,7 @@ union requests, exceptions, traces
 | `ANTHROPIC_ENABLED` | feature flag | Ingestion Function App setting |
 | `ANTHROPIC_API_KEY` | Anthropic Console | **Key Vault** secret `anthropic-api-key` |
 | `ANTHROPIC_MODEL` | constant (model id) | Ingestion Function App setting |
+| `ANTHROPIC_EFFORT`, `ANTHROPIC_THINKING` | constants (`low`, `adaptive`) | Ingestion Function App settings |
 | `ANTHROPIC_MAX_CONTENT_BYTES` | constant | Ingestion Function App setting |
 | `CLASSIFICATION_ACCEPT_THRESHOLD` | constant, `0.70`–`0.95` | Ingestion Function App setting |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | App Insights Overview | Both Function Apps |

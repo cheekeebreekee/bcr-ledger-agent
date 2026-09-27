@@ -381,7 +381,7 @@ describe('BatchIngestor — classification outcomes', () => {
       return Buffer.from(await doc.save());
     }
 
-    it('files the original of a 101-page PDF, although the model read only its first 20 pages', async () => {
+    it('files the original of a 101-page PDF, although the model read only 5 of its pages', async () => {
       const original = await longPdf(101);
       const create = jest.fn().mockResolvedValue({
         model: 'claude-opus-5',
@@ -419,7 +419,7 @@ describe('BatchIngestor — classification outcomes', () => {
       expect(sp.uploads[0]?.args.folderPath).toBe('04_Umowy');
       expect(sp.uploads[0]?.args.content.equals(original)).toBe(true);
       const sent = create.mock.calls[0][0].messages[0].content[0].source.data as string;
-      expect((await PDFDocument.load(Buffer.from(sent, 'base64'))).getPageCount()).toBe(20);
+      expect((await PDFDocument.load(Buffer.from(sent, 'base64'))).getPageCount()).toBe(5);
     });
 
     it('never files a document to 98_ because Claude was overloaded', async () => {

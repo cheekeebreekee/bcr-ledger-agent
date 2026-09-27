@@ -5,6 +5,7 @@ import {
   ingestionConfigSchema,
   loadConfig,
   missingLedgerIndexSettings,
+  thinkingDisabledProblem,
 } from './config';
 
 const botEnvMap = {
@@ -43,6 +44,8 @@ const ingestionEnvMap = {
   anthropicEnabled: 'ANTHROPIC_ENABLED',
   anthropicApiKey: 'ANTHROPIC_API_KEY',
   anthropicModel: 'ANTHROPIC_MODEL',
+  anthropicEffort: 'ANTHROPIC_EFFORT',
+  anthropicThinking: 'ANTHROPIC_THINKING',
   anthropicMaxContentBytes: 'ANTHROPIC_MAX_CONTENT_BYTES',
   classificationAcceptThreshold: 'CLASSIFICATION_ACCEPT_THRESHOLD',
   ledgerIndexMode: 'LEDGER_INDEX_MODE',
@@ -138,6 +141,8 @@ describe('ingestionConfigSchema', () => {
     expect(cfg.expectedRoles).toEqual(['Documents.Ingest']);
     expect(cfg.anthropicEnabled).toBe(false);
     expect(cfg.anthropicModel).toBe('claude-opus-5');
+    expect(cfg.anthropicEffort).toBe('low');
+    expect(cfg.anthropicThinking).toBe('adaptive');
     expect(cfg.anthropicMaxContentBytes).toBe(10 * 1024 * 1024);
     expect(cfg.classificationAcceptThreshold).toBe(0.7);
     expect(cfg.membershipCheckMode).toBe('enforce');
@@ -150,6 +155,47 @@ describe('ingestionConfigSchema', () => {
     expect(cfg.ledgerDbHost).toBe('');
     expect(cfg.ledgerDbName).toBe('ledger');
     expect(cfg.ledgerDbUser).toBe('');
+  });
+
+  describe('effort and thinking', () => {
+    it('reads ANTHROPIC_EFFORT and ANTHROPIC_THINKING, empty as the defaults', () => {
+      const set = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+        ...baseEnv,
+        ANTHROPIC_EFFORT: 'medium',
+        ANTHROPIC_THINKING: 'disabled',
+      });
+      expect([set.anthropicEffort, set.anthropicThinking]).toEqual(['medium', 'disabled']);
+      const empty = loadConfig(ingestionConfigSchema, ingestionEnvMap, {
+        ...baseEnv,
+        ANTHROPIC_EFFORT: ' ',
+        ANTHROPIC_THINKING: '',
+      });
+      expect([empty.anthropicEffort, empty.anthropicThinking]).toEqual(['low', 'adaptive']);
+    });
+
+    // xhigh and max cost more and, with disabled thinking, are a 400 on Opus 5.
+    it.each([
+      ['ANTHROPIC_EFFORT', 'xhigh'],
+      ['ANTHROPIC_EFFORT', 'max'],
+      ['ANTHROPIC_EFFORT', 'LOW'],
+      ['ANTHROPIC_THINKING', 'off'],
+      ['ANTHROPIC_THINKING', 'enabled'],
+    ])('fails at cold start on %s=%j', (name, value) => {
+      expect(() =>
+        loadConfig(ingestionConfigSchema, ingestionEnvMap, { ...baseEnv, [name]: value }),
+      ).toThrow(new RegExp(name));
+    });
+
+    it('accepts disabled thinking only with a model that takes it', () => {
+      const problem = (anthropicThinking: 'adaptive' | 'disabled', anthropicModel: string) =>
+        thinkingDisabledProblem({ anthropicThinking, anthropicModel });
+      expect(problem('disabled', 'claude-sonnet-5')).toBeUndefined();
+      expect(problem('disabled', 'claude-opus-5')).toBeUndefined();
+      expect(problem('adaptive', 'claude-opus-5-5')).toBeUndefined();
+      expect(problem('disabled', 'claude-opus-5-5')).toMatch(
+        /ANTHROPIC_THINKING: 'disabled' is not accepted by ANTHROPIC_MODEL claude-opus-5-5/,
+      );
+    });
   });
 
   describe('the document index settings', () => {

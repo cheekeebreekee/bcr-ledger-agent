@@ -39,6 +39,23 @@ export interface Classification {
    * data: written to the document index, never logged.
    */
   readonly extraction?: DocumentExtraction;
+  /** What the model call cost, in tokens: model-backed classifiers only. */
+  readonly usage?: ClassificationUsage;
+}
+
+/**
+ * The tokens one model call was billed for. The prompt's total is the sum of
+ * the three input counts: `inputTokens` is the uncached remainder only.
+ */
+export interface ClassificationUsage {
+  /** Input billed at the full price. */
+  readonly inputTokens: number;
+  /** Output, thinking included. */
+  readonly outputTokens: number;
+  /** Input served from the prompt cache (about 0.1× the input price). */
+  readonly cacheReadInputTokens: number;
+  /** Input written to the prompt cache (1.25× the input price, 5-minute entry). */
+  readonly cacheCreationInputTokens: number;
 }
 
 /**
@@ -130,6 +147,12 @@ export interface ClassifierNoResult {
   readonly reason: string;
   /** The model API's HTTP status, when there was one. */
   readonly status?: number;
+  /**
+   * What the call cost when the API billed a response it could not use (a
+   * refusal, a truncated or malformed answer): carried to the fallback's
+   * decision, so the document's filing line still shows its bill.
+   */
+  readonly usage?: ClassificationUsage;
 }
 
 /**
