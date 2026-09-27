@@ -380,7 +380,7 @@ export class ClaudeClassifier implements Classifier {
       );
       return failure;
     }
-    return this.noResult(failure.reason, failure.status);
+    return this.noResult(failure.reason, failure.status, apiErrorDetail(err));
   }
 
   private noResult(
@@ -662,6 +662,23 @@ function clamp(n: number): number {
 }
 
 /** The error's class name only: an SDK message can quote the request. */
+/**
+ * For a request the API refused (4xx), its error type and message: they
+ * describe the request (a schema rule, a page limit), never the document, and
+ * without them a 400 cannot be diagnosed. Capped, and empty when absent.
+ */
+export function apiErrorDetail(err: unknown): Record<string, unknown> {
+  if (!(err instanceof Anthropic.APIError)) return {};
+  const body = err.error as { error?: { type?: unknown; message?: unknown } } | undefined;
+  const type = typeof body?.error?.type === 'string' ? body.error.type : undefined;
+  const message =
+    typeof body?.error?.message === 'string' ? body.error.message.slice(0, 300) : undefined;
+  return {
+    ...(type ? { apiErrorType: type } : {}),
+    ...(message ? { apiErrorMessage: message } : {}),
+  };
+}
+
 function describeError(err: unknown): Record<string, unknown> {
   return err instanceof Error ? { name: err.name } : { type: typeof err };
 }

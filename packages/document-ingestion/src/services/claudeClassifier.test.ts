@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { Classification, ClassifierContext, Logger } from '@bcr/shared';
 import { PDFDocument } from 'pdf-lib';
 import {
+  apiErrorDetail,
   CLASSIFICATION_OUTPUT_SCHEMA,
   CLAUDE_EFFORT,
   CLAUDE_MAX_RETRIES,
@@ -776,5 +777,23 @@ describe('ClaudeClassifier: invoice fields for the document index', () => {
     await c.classify(ctx({ client: OWN }));
     const serialized = JSON.stringify(lines);
     expect(['FV 12', '1230', '5260250274'].filter((v) => serialized.includes(v))).toEqual([]);
+  });
+});
+
+describe('apiErrorDetail', () => {
+  it('reads the API error type and message of a refused request, capped', () => {
+    const err = new Anthropic.BadRequestError(
+      400,
+      { type: 'error', error: { type: 'invalid_request_error', message: 'x'.repeat(400) } },
+      'bad',
+      new Headers(),
+    );
+    const d = apiErrorDetail(err);
+    expect(d.apiErrorType).toBe('invalid_request_error');
+    expect(String(d.apiErrorMessage)).toHaveLength(300);
+  });
+
+  it('returns nothing for a non-API error', () => {
+    expect(apiErrorDetail(new Error('boom'))).toEqual({});
   });
 });
