@@ -15,6 +15,7 @@ import {
   type ClaudeUsage,
 } from './claudeClassifier';
 import { DIRECTION_UNRESOLVED } from './invoiceDirection';
+import { countsAgainstDocument } from './retryLaterBound';
 
 type CreateFn = jest.Mock;
 
@@ -795,5 +796,46 @@ describe('apiErrorDetail', () => {
 
   it('returns nothing for a non-API error', () => {
     expect(apiErrorDetail(new Error('boom'))).toEqual({});
+  });
+});
+
+describe('classifyApiError: an exhausted credit balance', () => {
+  const billing = new Anthropic.BadRequestError(
+    400,
+    {
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message:
+          'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.',
+      },
+    },
+    'bad',
+    new Headers(),
+  );
+
+  it('is "retry later", not a result, so the document is never sent to review for it', () => {
+    expect(classifyApiError(billing)).toEqual({
+      outcome: 'retry_later',
+      reason: 'billing',
+      status: 400,
+    });
+  });
+
+  it('does not count against the document', () => {
+    expect(countsAgainstDocument('billing')).toBe(false);
+  });
+
+  it('leaves an ordinary invalid request as no result', () => {
+    const other = new Anthropic.BadRequestError(
+      400,
+      { type: 'error', error: { type: 'invalid_request_error', message: 'messages.0: bad block' } },
+      'bad',
+      new Headers(),
+    );
+    expect(classifyApiError(other)).toMatchObject({
+      outcome: 'no_result',
+      reason: 'invalid_request',
+    });
   });
 });

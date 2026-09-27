@@ -440,6 +440,10 @@ export function classifyApiError(err: unknown): ClassifierNoResult | ClassifierR
     if (status === 401 || status === 402 || status === 403 || status === 404) {
       return retryLater('unavailable', status);
     }
+    // An exhausted credit balance arrives as a 400 invalid_request_error. It is
+    // the account's state, not the document's: treated like an outage, so a
+    // document waits instead of being sent to review for good.
+    if (isBillingRefusal(err)) return retryLater('billing', status);
     return {
       outcome: 'no_result',
       reason: 'invalid_request',
@@ -662,6 +666,13 @@ function clamp(n: number): number {
 }
 
 /** The error's class name only: an SDK message can quote the request. */
+/** The API's refusal because the account has no credit left. */
+function isBillingRefusal(err: InstanceType<typeof Anthropic.APIError>): boolean {
+  const body = err.error as { error?: { message?: unknown } } | undefined;
+  const message = typeof body?.error?.message === 'string' ? body.error.message : err.message;
+  return /credit balance|purchase credits|plans\s*&\s*billing/i.test(message);
+}
+
 /**
  * For a request the API refused (4xx), its error type and message: they
  * describe the request (a schema rule, a page limit), never the document, and
