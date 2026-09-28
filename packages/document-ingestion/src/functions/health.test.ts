@@ -7,12 +7,21 @@ let mockMode: 'enforce' | 'off' = 'enforce';
 let mockInbox: 'off' | 'shadow' | 'enforce' = 'off';
 let mockRows: string[] = [];
 let mockIndex: 'off' | 'write' = 'off';
+let mockSearch: Record<string, unknown> = {};
 jest.mock('../config', () => ({
+  ...jest.requireActual('../config'),
   loadIngestionConfig: () => ({
     membershipCheckMode: mockMode,
     inboxSweepMode: mockInbox,
     inboxSweepRows: mockRows,
     ledgerIndexMode: mockIndex,
+    searchMode: 'off',
+    searchRows: [],
+    searchCallerAppIds: [],
+    botCallerAppIds: ['00000000-0000-0000-0000-000000000001'],
+    anthropicEnabled: true,
+    anthropicApiKey: 'key',
+    ...mockSearch,
   }),
 }));
 
@@ -24,6 +33,7 @@ describe('health', () => {
     mockInbox = 'off';
     mockRows = [];
     mockIndex = 'off';
+    mockSearch = {};
   });
 
   it('registers GET /api/health anonymously, with handleHealth as the handler', () => {
@@ -52,6 +62,7 @@ describe('health', () => {
         inboxSweep: 'off',
         inboxSweepRows: 'all',
         ledgerIndex: 'off',
+        search: 'off',
       });
       expect(body.status).toBe('ok');
       expect(body.service).toBe('document-ingestion');
@@ -70,6 +81,7 @@ describe('health', () => {
         inboxSweep: m,
         inboxSweepRows: 'all',
         ledgerIndex: 'off',
+        search: 'off',
       });
     },
   );
@@ -92,6 +104,35 @@ describe('health', () => {
     expect(JSON.stringify(body)).not.toMatch(/"7"|"12"/);
   });
 
+  const searchOn = {
+    searchMode: 'on',
+    searchCallerAppIds: ['7d0c3f6a-5b1e-4c2d-9e8f-0a1b2c3d4e5f'],
+  };
+
+  it.each([
+    ['off while SEARCH_MODE is off', {}, 'write', 'off'],
+    ['off while the index does not write', searchOn, 'off', 'off'],
+    ['all when on for every row', searchOn, 'write', 'all'],
+    ['listed when SEARCH_ROWS names rows', { ...searchOn, searchRows: ['10'] }, 'write', 'listed'],
+  ] as const)(
+    'reports search %s, without touching phase or routing',
+    async (_l, over, index, want) => {
+      mockSearch = { ...over };
+      mockIndex = index;
+      const body = (await handleHealth()).jsonBody as ReturnType<typeof healthBody>;
+      expect(body.build).toMatchObject({ phase: 'p0', routing: 'identity-only', search: want });
+      expect(JSON.stringify(body)).not.toMatch(/"10"|7d0c3f6a/);
+    },
+  );
+
+  it('reports search off when the membership check is off (search has no bypass)', async () => {
+    mockSearch = searchOn;
+    mockIndex = 'write';
+    mockMode = 'off';
+    const body = (await handleHealth()).jsonBody as ReturnType<typeof healthBody>;
+    expect(body.build.search).toBe('off');
+  });
+
   it('stamps the time it was asked', () => {
     const now = new Date('2026-09-26T10:00:00.000Z');
     const build = {
@@ -99,6 +140,7 @@ describe('health', () => {
       inboxSweep: 'off',
       inboxSweepRows: 'all',
       ledgerIndex: 'off',
+      search: 'off',
     } as const;
     expect(healthBody(build, now).timestamp).toBe('2026-09-26T10:00:00.000Z');
   });

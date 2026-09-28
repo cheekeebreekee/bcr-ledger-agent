@@ -24,7 +24,9 @@ site — all via Azure Functions + Microsoft Graph. There are **two intakes**:
 
 Every document filed into a client's space also gets a row in the **document index**, a
 PostgreSQL database whose row-level security keeps each client's rows to that client
-(`packages/ledger-db`; search and billing read it later).
+(`packages/ledger-db`; billing reads it later). A client's guest can **search** their own
+client's rows by asking in the bot's 1:1 chat ([Client search](#client-search-post-apisearch);
+off until its release).
 
 UI strings are **Polish**; code, comments and logs are English.
 
@@ -97,11 +99,11 @@ yarn start:bot            # http://localhost:3978/api/messages
 yarn start:ingestion      # http://localhost:7071/api/ingest/batch
 ```
 
-The Bot Framework Emulator no longer gets a file through: the gate accepts only a Teams 1:1 chat
-from the BCR tenant with a GUID `aadObjectId`, which Emulator activities lack (silence in
-`enforce`; in a local `BOT_GATE_MODE=log`, ingestion's source check still answers 400). Test bot
-turns with `TestAdapter` (`ledgerBot.test.ts`) and ingestion with a direct call, as in
-`docs/local-development.md`.
+The Bot Framework Emulator no longer reaches the bot: the adapter accepts only Bot Framework
+channel tokens (`bot/channelAuth.ts`; an Emulator token is what the bot secret alone can mint),
+and behind it the gate accepts only a Teams 1:1 chat from the BCR tenant with a GUID
+`aadObjectId`. Test bot turns with `TestAdapter` (`ledgerBot.test.ts`) and ingestion with a
+direct call, as in `docs/local-development.md`.
 
 The index database's operator tool, as the server's Entra administrator after `az login`
 (`LEDGER_DB_HOST`, `LEDGER_DB_ADMIN_USER`; the release runbook is *Document index release* in
@@ -154,9 +156,10 @@ versions with install scripts disabled (checking each top-level version against 
 `@bcr/ledger-db` for ingestion). `artifacts/*.zip` are git-ignored build
 output: never commit one, and deploy only a zip built for that deploy. Before deploying, still
 check the vendored copy: `unzip -p artifacts/<pkg>.zip node_modules/@bcr/shared/dist/config.js |
-grep -c botGateMode` (ingestion: `forbiddenTargetSitePaths`, `membershipCheckMode`,
-`inboxSweepMode`, `inboxSweepRows`, `classificationAcceptThreshold` and `ledgerIndexMode`) must be
-greater than 0.
+grep -c botGateMode` (both apps also `searchMode`; ingestion also `forbiddenTargetSitePaths`,
+`membershipCheckMode`, `inboxSweepMode`, `inboxSweepRows`, `classificationAcceptThreshold` and
+`ledgerIndexMode`) must be greater than 0. The script itself refuses a `@bcr/shared` without
+`botGateMode`, `forbiddenTargetSitePaths` or `searchMode` (`SHARED_MARKERS`).
 
 CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test (and `test:tools`), the
 `db-integration` job (`test:db` against a `postgres:16` service container), plus `bicep build`,
@@ -175,10 +178,11 @@ on `shared` and `ledger-db`, never on each other.
 ```
 Teams ──▶ Azure Bot Service ──▶ @bcr/teams-bot (Func App)
                                       │ POST /api/ingest/batch  (AAD client-credentials JWT)
+                                      │ POST /api/search  (the bot app's managed identity)
                                       ▼
 Teams channel post / „Udostępnione”   @bcr/document-ingestion (Func App)
   └─▶ channel folder ◀── timer: inboxSweep (every 2 min)
-                                      ├─▶ Claude (classify content)
+                                      ├─▶ Claude (classify content; a search question → filter)
                                       ├─▶ Microsoft Graph (managed identity) ──▶ SharePoint
                                       └─▶ PostgreSQL (managed identity, RLS) — the document index
 ```
@@ -188,7 +192,8 @@ Teams channel post / „Udostępnione”   @bcr/document-ingestion (Func App)
 Two intakes share the classifier, the taxonomy, the client SharePoint factory and its guards: the
 **bot DM** (below) and the **channel inbox** (after it).
 
-`functions/ingestDocument.ts` is thin wiring (the only route is `POST /api/ingest/batch`);
+`functions/ingestDocument.ts` is thin wiring (its one route is `POST /api/ingest/batch`; the
+others are `POST /api/search`, below, and `GET /api/health`);
 `services/batchIngestor.ts` runs the pipeline; every collaborator is a cold-start singleton from
 `runtime.ts`:
 
@@ -321,15 +326,18 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
 
 PostgreSQL 16 on Azure Database for PostgreSQL Flexible Server (`infrastructure/db.bicep`), one
 database `ledger`, schema `ledger`: `clients` (keyed by `client_id`, upserted by the Directory
-row's list item id) and `documents` (one row per filed document, unique per client and drive
-item; the invoice fields the classifier read in the same call). Migrations are numbered SQL in
+row's list item id), `documents` (one row per filed document, unique per client and drive
+item; the invoice fields the classifier read in the same call) and `search_queries` (one row per
+client search: kind, outcome, the filter's hash and field names, counts, tokens; never the
+question; the durable search limits). Migrations are numbered SQL in
 `packages/ledger-db/migrations`, applied by the Entra admin with `migrate`, checksummed;
 `sql/verify.sql` is the isolation check (no rows = pass). The pool fetches an Entra token per
 connection (`ManagedIdentityCredential` in Azure, `DefaultAzureCredential` locally), TLS
 verified, every wait bounded. The ingestion's `client_id` for a row is a UUIDv5 of
 `CLIENT_DIRECTORY_LIST_ID` and the row's list item id (`clientIdForDirectoryRow`), so the scope
-is known before any read. Search (`documentsRepo.search`, keyset paging) exists as a repository
-only; its API is point 5. Rows carry the file's `web_url` (migration 0002) for staff.
+is known before any read. Client search reads it through `documentsRepo.searchClientView` and
+`countMatching` (below), which share `documentsRepo.search`'s one condition builder. Rows carry
+the file's `web_url` (migration 0002) for staff.
 
 **Review notices** (`services/reviewNotifier.ts`, timer `reviewNotify`, every 10 min): per bound
 row and in that client's scope, the `NEEDS_REVIEW` rows with no `review_notified_at` are posted
@@ -341,6 +349,48 @@ text carries the row's title, the suggestion's Polish label, reasons in Polish a
 its link "Otwórz plik" targets the file's SharePoint `webUrl`, which contains the file name —
 hence a staff-only chat. Off unless the index writes and the URL resolved
 (`review_notice.config`). **A migration goes in before the build that uses it** (0002 first).
+
+### Client search (`POST /api/search`)
+
+A client's guest asks in the bot's 1:1 chat ("faktury od X z września") and gets their own
+client's filed documents from the index, 10 to a card. Off until the *Client search release*
+(`docs/operations/human-steps.md`): `SEARCH_MODE` on both apps; on ingestion also `SEARCH_ROWS`
+(list item ids, canary first; `/api/health` `build.search`: `off`|`listed`|`all`) and
+`SEARCH_CALLER_APP_IDS`. The contract is `@bcr/shared` `types/search.ts`: strict zod, so a body
+naming a client, row, scope or limit is a 400.
+
+- **Bot.** Attachments take the upload path unchanged. With `SEARCH_MODE=on`, text (normalised,
+  1–300 characters; `pomoc`/`help`/`?`/`menu` get `buildHelpCard({ search: true })`; 20 a minute per
+  guest per worker, `services/userLimiter.ts`) and the card's own `activity.value`
+  (`bcr.search.page`, `bcr.search.filter`: a filter and a cursor, nothing else) go to
+  `services/searchClient.ts`. It POSTs `{ source, query }` with a token of the bot Function App's
+  **managed identity** (`ManagedIdentityCredential`, `INGESTION_SCOPE`), never the bot secret,
+  never logs a body, and turns every failure into `unavailable`. `bot/searchCard.ts` and
+  `bot/searchText.ts` render fixed Polish sentences from `cardText.ts`, every value escaped.
+- **Ingestion** (`functions/clientSearch.ts` is wiring; `services/clientSearch.ts`
+  `ClientSearchService` takes only injected collaborators). The token is checked first
+  (`Documents.Search`, app id in `SEARCH_CALLER_APP_IDS`), then the body. Search answers
+  `disabled` while it cannot run safely (mode off, index or Claude off, no caller, a caller also
+  in `BOT_CALLER_APP_IDS`, `MEMBERSHIP_CHECK_MODE` not `enforce`), with a `search.config` reason
+  at cold start; it never stops ingestion. Then the uploads' `ClientResolver` singleton, then
+  `userTypeOf` must be `Guest`: anything else is `no_access`, with no DB read and no model call.
+  A resolved row not in `SEARCH_ROWS` is `disabled`. Scope = `clientIdForDirectoryRow`. tx1:
+  `clientsRepo.upsertFromDirectory` + `searchQueriesRepo.reserve` (the durable limits). For a
+  question only: `services/searchInterpreter.ts` (`SEARCH_MODEL = 'claude-sonnet-5'`, a static
+  cached prompt built from `categoryCatalog[].searchTerms`, a closed output schema; never throws;
+  retry-later is `unavailable`), then `toSearchFilter` (`searchPeriod.ts` resolves periods in
+  Europe/Warsaw). tx2 is `withClientTx(scope, fn, { readOnly: true })`:
+  `documentsRepo.searchClientView` + `countMatching` (capped at 500). tx3,
+  `searchQueriesRepo.finish`, is best effort. `services/searchResult.ts` maps rows to
+  `SearchResultItem`; a link survives only if it is https on the row's own site.
+- **Limits**: per guest, questions 10 per 5 minutes and 60 per 24 hours, typed and page requests
+  30 per 5 minutes; per client, 300 questions per 24 hours (all in `search_queries`, under a
+  per-client advisory lock); per worker, 2 concurrent searches and 300 model calls an hour.
+- **Records**: `search.*` logs and `search_queries` carry ids, codes, the filter's SHA-256 and
+  field names, counts and tokens; never the question, never a filter value. `search_queries` is
+  kept 13 months, deleted by the operator (the runbook); `ledger_app` cannot delete.
+- **Evaluation**: `eval:search` in `@bcr/document-ingestion`, by hand, synthetic questions only
+  (an injection set included), with the key from your shell; reports under `tools/out/`.
 
 ### Invariants — break these and documents mis-file
 
@@ -470,19 +520,52 @@ hence a staff-only chat. Off unless the index writes and the URL resolved
   matrix fail otherwise. Never grant a role `BYPASSRLS`, never add a policy with another
   predicate, never put a non-client table in schema `ledger`.
 - **`app.client_id` is set in one place: `LedgerDb.withClientTx` in `packages/ledger-db/src/tx.ts`**
-  (`BEGIN; SET LOCAL ROLE ledger_app; SELECT set_config('app.client_id', $1, true); fn; COMMIT`),
-  transaction-local, so a pooled connection goes back holding no role and no scope.
+  (`BEGIN; SET LOCAL ROLE ledger_app; SELECT set_config('app.client_id', $1, true); fn; COMMIT`;
+  `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` with `{ readOnly: true }`), transaction-local,
+  so a pooled connection goes back holding no role and no scope.
   `tx.test.ts` scans every package's `src` and `tools/` and fails if anything else names it or
   calls `set_config`; repositories take only a `ClientTx` that `withClientTx` minted (a forged
   or ended one throws), and `ClientTx.query` runs only `sql`-tagged templates, whose values are
   always bind parameters. The scope comes from the bound Directory row the document was filed
-  for — never from the document, a request body or a model.
+  for, or the asker's resolved row for a search — never from the document, a request body or a
+  model.
+- **Search's client comes only from the asker's identity.** `ClientSearchService`'s one scope
+  source is `clientIdForDirectoryRow(CLIENT_DIRECTORY_LIST_ID, row.listItemId)` of the row the
+  uploads' `ClientResolver` resolved for the gate-checked user id, after `userTypeOf` said
+  `Guest`; any other outcome is `no_access` before any read or model call, and search does not
+  run while `MEMBERSHIP_CHECK_MODE` is off. The question, the model's output, a cursor or a card's
+  data never reach the resolver (it runs first) and never carry a scope: it is derived again for
+  every page. Reads are `readOnly` transactions of the client-view columns only. A property test
+  pins that `withClientTx` only ever receives that id; keep it.
+- **The search model sees no rows and no client data, never picks a client, and its text is
+  never rendered.** The system prompt is static and client-free (a fingerprint test locks it and
+  the output schema); the user turn is the nonce-wrapped question and nothing else. Its answer is
+  a closed schema that becomes a filter over the asker's own rows, and a free string (a name, an
+  invoice number, NIP digits) survives only if it occurs in the question. The card shows fixed
+  Polish sentences from `cardText.ts` and the filter in taxonomy labels. Logs and
+  `search_queries` never hold the question or a filter value.
+- **Only two routes take a user id from the body, each pinned to exactly one caller** (invariant
+  I6, interim). `/api/ingest/batch` (until the queue cutover): `Documents.Ingest` and
+  `BOT_CALLER_APP_IDS`, the bot's app registration. `/api/search` (until search moves into the
+  bot or behind user SSO): `Documents.Search` and `SEARCH_CALLER_APP_IDS`, the bot Function App's
+  **managed identity**, assigned only by `infrastructure/identity/grant-bot-search-caller.sh`.
+  The two lists never share an id (search stays off if they do), so the bot's secret (T15)
+  cannot search and the managed identity cannot file. The token is verified before the body is
+  read, and `routes.test.ts` pins the `app.http` list: a new route that takes a user id is a
+  design change, not a pull request.
 - **The bot processes only 1:1 chats.** Teams *channel* uploads never reach a bot (drag-drop
   bypasses Bot Framework; `@mention` activities carry only mention HTML) — they reach ingestion
   through the channel inbox instead — and group chats are refused. Every activity passes the bot
   gate (personal conversation, BCR tenant, GUID `aadObjectId`) before any logic runs, and the
   ingestion API re-checks it. `teamsChannelId` is telemetry only. The anonymous Personal Tab
   lookup (`/api/user-target`) is deleted: it mapped any user id to their client.
+- **The bot accepts only Bot Framework channel tokens.** The gate reads body fields a caller
+  writes, so it is only as good as the token behind the body. `createBotFrameworkAuth`
+  (`bot/channelAuth.ts`) refuses every issuer but `https://api.botframework.com`; the SDK's
+  default also took an "emulator" AAD token the bot secret alone can mint, and then replied to
+  any `serviceUrl`, which let the secret act as any guest. Never build the adapter's
+  authentication another way, and keep `channelAuth.test.ts` proving the SDK default still
+  accepts what ours refuses.
 
 ### Bot side
 
@@ -493,7 +576,9 @@ gets a single consolidated result card. A per-file download or ingest failure be
 row in that card rather than an aborted turn. The gate (`BOT_GATE_MODE=log|enforce`) runs for every
 activity type before the turn logic; the card escapes every inserted value and renders Polish text by
 error code, never raw error messages. The help card (`buildHelpCard`) sends clients to their Team's
-„Dokumenty księgowe” channel, because guests cannot attach files in the chat.
+„Dokumenty księgowe” channel, because guests cannot attach files in the chat; with `SEARCH_MODE=on`
+it adds a „Wyszukiwanie” section, and with it off it is byte for byte the card from before
+search (a test pins its hash). Text goes to client search only with `SEARCH_MODE=on`.
 
 ---
 
@@ -576,6 +661,13 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
   use a delegated `GRAPH_TOKEN`, since the CLI's token hits `AADSTS65002` here). A managed
   identity's token carries its roles and the platform caches it ~24 h with no forced refresh,
   so grant a day before the deploy; until then bound uploads are `membership_unverified`.
+- **Client search's caller is the bot Function App's own managed identity**, with the app role
+  `Documents.Search` on the Ingestion API registration, which
+  `infrastructure/identity/grant-bot-search-caller.sh` creates (Applications only, a fixed id)
+  and assigns (dry run by default; delegated `GRAPH_TOKEN`). `SEARCH_CALLER_APP_IDS` is that
+  identity's app id, never `MICROSOFT_APP_ID`. Its token is cached ~24 h per resource, so keep the
+  bot's `SEARCH_MODE` off until a day after the grant. Recreating the bot app changes the
+  identity: search then fails closed (403) until the grant and the setting follow.
 - `MICROSOFT_APP_TYPE` must be `SingleTenant` (the app registration is `AzureADMyOrg`); the wrong
   value is a 401 at Bot Framework auth.
 - `@anthropic-ai/sdk` 0.104.2 (the locked version) has what the classifier sends: typed PDF
@@ -604,14 +696,14 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
 
 | File | What's in it |
 |---|---|
-| `ARCHITECTURE.md` | Component/sequence detail; §4.2 multi-tenant routing, §5 auth model |
+| `ARCHITECTURE.md` | Component/sequence detail; §4.2 multi-tenant routing, §4.6 client search, §5 auth model |
 | `PROJECT_OVERVIEW.md` | Current deployed state, tooling versions, lessons learned |
 | `docs/setup-guide.md` | First-time setup: app registrations, every env var and where to find it |
 | `docs/deployment.md` | A new environment end to end; §3a how to change an app setting through a deploy (`--expect`) |
 | `docs/client-directory-admin-guide.md` | The Client Directory list — columns and admin workflow |
 | `docs/admin-sharepoint-grant.md` | `Sites.Selected` via Graph Explorer |
-| `docs/security.md` | Threat model + secrets inventory |
-| `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback; "Lifting gate G1"; the *Classification release* runbook (evaluate, deploy, switch the model, go/no-go); the *Document index release* runbook (cost, db.bicep, the login, migrations, settings, canary, rollback); the *Classifier cost release* (caching, excerpts, `ANTHROPIC_EFFORT`/`ANTHROPIC_THINKING`, the Sonnet 5 test on the canary) |
+| `docs/security.md` | Threat model + secrets inventory; T21 client search |
+| `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback; "Lifting gate G1"; the *Classification release* runbook (evaluate, deploy, switch the model, go/no-go); the *Document index release* runbook (cost, db.bicep, the login, migrations, settings, canary, rollback); the *Classifier cost release* (caching, excerpts, `ANTHROPIC_EFFORT`/`ANTHROPIC_THINKING`, the Sonnet 5 test on the canary); the *Client search release* (the grant a day ahead, migration 0003 before the ingestion build, both apps off then on, the canary on row 10, the owner's go per client, the 13-month `search_queries` retention) |
 | `docs/operations/incident-2026-09.md` | The cross-client routing incident: causes, IR-0..IR-3, status |
 | `docs/operations/tenant-hardening.md` | Tenant settings that keep clients apart (BCR GROUP stays Private, read-only check) |
 | `docs/diagrams/` | Mermaid: as-is, Phase-0 routing, target business logic/architecture/data flow, sequences, data model |

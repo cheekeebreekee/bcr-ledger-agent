@@ -32,6 +32,17 @@ describe('loadBotConfig', () => {
     expect(() => loadBotConfig({ ...env, BOT_GATE_MODE: 'off' })).toThrow(ValidationError);
   });
 
+  it('keeps search off unless SEARCH_MODE=on', () => {
+    expect(loadBotConfig(env).searchMode).toBe('off');
+    expect(loadBotConfig({ ...env, SEARCH_MODE: ' ' }).searchMode).toBe('off');
+    expect(loadBotConfig({ ...env, SEARCH_MODE: 'off' }).searchMode).toBe('off');
+    expect(loadBotConfig({ ...env, SEARCH_MODE: 'on' }).searchMode).toBe('on');
+  });
+
+  it('rejects an unknown search mode, naming SEARCH_MODE', () => {
+    expect(() => loadBotConfig({ ...env, SEARCH_MODE: 'true' })).toThrow(/SEARCH_MODE/);
+  });
+
   it('fails fast without MICROSOFT_APP_TYPE', () => {
     const withoutType: Record<string, string> = { ...env };
     delete withoutType.MICROSOFT_APP_TYPE;

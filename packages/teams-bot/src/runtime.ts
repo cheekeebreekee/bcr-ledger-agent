@@ -3,24 +3,25 @@
  * adding a new function is just "import from './runtime'". Wiring only —
  * the behaviour lives in `bot/**` and `services/**`, where it is tested.
  */
-import {
-  CloudAdapter,
-  ConfigurationBotFrameworkAuthentication,
-  type ConfigurationBotFrameworkAuthenticationOptions,
-} from 'botbuilder';
+import { CloudAdapter, type ConfigurationBotFrameworkAuthenticationOptions } from 'botbuilder';
 import { createLogger } from '@bcr/shared';
 import { loadBotConfig } from './config';
 import { LedgerBot } from './bot/ledgerBot';
+import { createBotFrameworkAuth } from './bot/channelAuth';
 import { GateMiddleware } from './bot/gateMiddleware';
 import { createTurnErrorHandler } from './bot/turnError';
 import { IngestionClient } from './services/ingestionClient';
 import { AttachmentDownloader } from './services/attachmentDownloader';
+import { SearchClient } from './services/searchClient';
+import { SEARCH_FLOOD_LIMIT, UserLimiter } from './services/userLimiter';
 
 const log = createLogger('bot/runtime');
 
 export const config = loadBotConfig();
 
-export const botFrameworkAuth = new ConfigurationBotFrameworkAuthentication({
+// Bot Framework channel tokens only: never the SDK's emulator/skill paths
+// (`bot/channelAuth.ts`), which the bot secret alone could satisfy.
+export const botFrameworkAuth = createBotFrameworkAuth({
   MicrosoftAppId: config.microsoftAppId,
   MicrosoftAppPassword: config.microsoftAppPassword,
   MicrosoftAppType: config.microsoftAppType,
@@ -48,4 +49,34 @@ export const ingestionClient = new IngestionClient({
 
 export const attachmentDownloader = new AttachmentDownloader();
 
-export const bot = new LedgerBot({ ingestionClient, attachmentDownloader });
+// Client search (`SEARCH_MODE=on`): ingestion's `POST /api/search`, called with
+// a token of this Function App's system-assigned managed identity (the only
+// holder of `Documents.Search`), never the bot registration's secret. Off,
+// nothing is built and text gets today's help card.
+const search =
+  config.searchMode === 'on'
+    ? {
+        client: new SearchClient({
+          baseUrl: config.ingestionBaseUrl,
+          scope: config.ingestionScope,
+        }),
+        limiter: new UserLimiter(SEARCH_FLOOD_LIMIT),
+        tenantId: config.microsoftAppTenantId,
+      }
+    : undefined;
+
+log.info(
+  {
+    searchMode: config.searchMode,
+    ...(search
+      ? { caller: 'managed_identity', floodLimitPerMinute: SEARCH_FLOOD_LIMIT.limit }
+      : {}),
+  },
+  'search.config',
+);
+
+export const bot = new LedgerBot({
+  ingestionClient,
+  attachmentDownloader,
+  ...(search ? { search } : {}),
+});

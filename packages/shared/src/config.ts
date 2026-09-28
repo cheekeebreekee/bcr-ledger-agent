@@ -158,6 +158,17 @@ export const botConfigSchema = z.object({
     .enum(['log', 'enforce'])
     .optional()
     .transform((v) => v ?? 'enforce'),
+  /**
+   * `SEARCH_MODE` (bot): `off` (the default) keeps today's help card for text;
+   * `on` sends a guest's text to ingestion's `POST /api/search` with a token
+   * of the bot Function App's managed identity. Anything else fails at cold start.
+   */
+  searchMode: z
+    .preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z.enum(['off', 'on'], { errorMap: () => ({ message: "must be 'off' or 'on'" }) }).optional(),
+    )
+    .transform((v) => v ?? 'off'),
   applicationInsightsConnectionString: optionalStr(),
   logLevel,
 });
@@ -448,6 +459,35 @@ export const ingestionConfigSchema = z.object({
    * with the reason said once at cold start; it never stops ingestion.
    */
   reviewWebhookUrl: optionalStr(),
+  // --- Client search (POST /api/search, called only by the bot's managed identity) ---
+  /**
+   * `SEARCH_MODE` (ingestion): `off` (the default) answers every search
+   * `disabled`; `on` serves it. A search that cannot run safely (no index, no
+   * Claude, no callers, callers overlapping `BOT_CALLER_APP_IDS`, membership
+   * check off) is off with a reason said once at cold start; it never stops
+   * ingestion. Anything else fails at cold start.
+   */
+  searchMode: z
+    .preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z.enum(['off', 'on'], { errorMap: () => ({ message: "must be 'off' or 'on'" }) }).optional(),
+    )
+    .transform((v) => v ?? 'off'),
+  /**
+   * `SEARCH_ROWS`: Client Directory list item ids (not `ClientId`) search is
+   * open to, for a canary-first rollout; empty: every bound row. Read as
+   * written: an entry that is not a list item id keeps search off
+   * (`bad_rows`, `searchOffReason`), never stops ingestion, and is never
+   * dropped (dropping it could leave the list empty, open to every row).
+   */
+  searchRows: csvList([]),
+  /**
+   * `SEARCH_CALLER_APP_IDS`: the app ids (`appid ?? azp`) that may call
+   * `/api/search` with role `Documents.Search`: the bot Function App's managed
+   * identity only. Empty: search off. Must share no id with `BOT_CALLER_APP_IDS`.
+   * An entry that is not a GUID keeps search off (`bad_callers`).
+   */
+  searchCallerAppIds: csvList([]),
   applicationInsightsConnectionString: optionalStr(),
   logLevel,
 });

@@ -14,9 +14,11 @@
 import type { Logger } from '@bcr/shared';
 import { clientIdForDirectoryRow } from '../src/clientScope';
 import * as clientsRepo from '../src/repos/clientsRepo';
+import * as documentsRepo from '../src/repos/documentsRepo';
+import * as searchQueriesRepo from '../src/repos/searchQueriesRepo';
 import { sql } from '../src/sql';
 import { LedgerDb } from '../src/tx';
-import { createTestDatabase, type TestDatabase } from './harness';
+import { createTestDatabase, sqlState, type TestDatabase } from './harness';
 
 const LIST_ID = '0f0e0d0c-0b0a-4988-8776-655443322110';
 const A = clientIdForDirectoryRow(LIST_ID, '201');
@@ -136,6 +138,79 @@ describe('a connection that dies inside a client transaction', () => {
       { event: 'index.connection_error', err: { name: 'error', code: '25P03' } },
     ]);
     expect(await committedClientRows()).toBe(0);
+    await poolServesTheNextTransaction();
+  });
+});
+
+describe('a read-only client transaction (search reads)', () => {
+  const readOnly = { readOnly: true } as const;
+
+  it('reads, scoped as usual, on one snapshot', async () => {
+    const rows = await db.withClientTx(
+      A,
+      (tx) =>
+        tx.query<{ who: string; scope: string; ro: string; iso: string }>(
+          sql`SELECT current_user::text AS who, current_setting('app.client_id', true) AS scope,
+                current_setting('transaction_read_only') AS ro,
+                current_setting('transaction_isolation') AS iso`,
+        ),
+      readOnly,
+    );
+    expect(rows).toEqual([{ who: 'ledger_app', scope: A, ro: 'on', iso: 'repeatable read' }]);
+    const page = await db.withClientTx(A, (tx) => documentsRepo.searchClientView(tx, {}), readOnly);
+    expect(page).toEqual({ items: [], nextCursor: null });
+  });
+
+  it('does not see a row committed between two of its statements (a page and its count agree)', async () => {
+    const count = (tx: Parameters<Parameters<LedgerDb['withClientTx']>[1]>[0]) =>
+      tx.query<{ n: number }>(sql`SELECT count(*)::int AS n FROM ledger.clients`);
+    const seen = await db.withClientTx(
+      A,
+      async (tx) => {
+        const before = await count(tx);
+        // A filing commits for the same client, on another connection, mid-read.
+        await t.admin.query(
+          `INSERT INTO ledger.clients (client_id, directory_list_item_id) VALUES ($1, '201')`,
+          [A],
+        );
+        const after = await count(tx);
+        return [before[0]?.n, after[0]?.n];
+      },
+      readOnly,
+    );
+    await t.admin.query('DELETE FROM ledger.clients WHERE client_id = $1', [A]);
+    expect(seen).toEqual([0, 0]);
+    expect(await committedClientRows()).toBe(0);
+  });
+
+  it('fails any write with SQLSTATE 25006, commits nothing, and leaves the pool read-write', async () => {
+    expect(
+      await sqlState(
+        db.withClientTx(A, (tx) => clientsRepo.upsertFromDirectory(tx, row), readOnly),
+      ),
+    ).toBe('25006');
+    expect(
+      await sqlState(
+        db.withClientTx(
+          A,
+          (tx) =>
+            searchQueriesRepo.reserve(tx, {
+              queryId: '5e000000-0000-4000-8000-0000000000ff',
+              userOid: '11111111-2222-4333-8444-555555555555',
+              kind: 'question',
+            }),
+          readOnly,
+        ),
+      ),
+    ).toBe('25006');
+    expect(await committedClientRows()).toBe(0);
+    expect(uncaught).toEqual([]);
+    expect(warnings).toEqual([]);
+    // The same pooled connection, next: an ordinary transaction, which may write.
+    const ro = await db.withClientTx(A, (tx) =>
+      tx.query<{ ro: string }>(sql`SELECT current_setting('transaction_read_only') AS ro`),
+    );
+    expect(ro).toEqual([{ ro: 'off' }]);
     await poolServesTheNextTransaction();
   });
 });

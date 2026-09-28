@@ -126,7 +126,7 @@ regression test from the workstream that builds it.
 | I2 | Content never changes the client. | P0 (no promotion), D2 (BIND), D5 |
 | I3 | Ambiguity goes to quarantine, never to a guess. | P0, D2, D5 |
 | I4 | Row-level security fails closed: no scope set means zero rows. | D3, D8 |
-| I6 | Nothing identifies the user from a request body. Callers are pinned by app id. | P0, D3, D5 |
+| I6 | Nothing identifies the user from a request body. Callers are pinned by app id. **Amended, interim:** only `/api/ingest/batch` (until the queue cutover) and `/api/search` (until search moves into the bot or behind user SSO) take a user id from the body. Each is pinned to exactly one caller; the search caller is a managed identity ([`security.md` T21](../security.md#t21-client-search)). | P0, D3, D5 |
 | I7 | Cards and logs never carry another client's URL, name or filename. Model free text is never shown to clients. | P0 (card rows), D5, D6 |
 | I8 | Uploads never overwrite (`conflictBehavior=fail`). | P0, D5, D6, D7 |
 | I9 | Staff are never client users. | D8 |

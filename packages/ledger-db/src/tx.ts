@@ -94,6 +94,23 @@ export interface LedgerDbOptions {
   readonly log?: Logger;
 }
 
+/** How a read-only client transaction opens: one snapshot, no writes. */
+export const BEGIN_READ_ONLY = 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY';
+
+/** How {@link LedgerDb.withClientTx} opens its transaction. */
+export interface ClientTxOptions {
+  /**
+   * `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`: any write in the
+   * transaction fails (SQLSTATE 25006), whatever `fn` runs, and every
+   * statement reads the one snapshot the first took, so a page and its count
+   * agree even while a filing commits. A read-only transaction never fails
+   * serialization (only writes do). For reads a client's request drives, such
+   * as search. Writes keep READ COMMITTED: the quota reservation counts after
+   * its lock with a fresh snapshot.
+   */
+  readonly readOnly?: boolean;
+}
+
 /**
  * The document index's database handle. Its one way in is
  * {@link withClientTx}: every statement the app runs is inside a transaction
@@ -112,7 +129,8 @@ export class LedgerDb {
   /**
    * Runs `fn` in a transaction scoped to `clientId`:
    *
-   *     BEGIN;
+   *     BEGIN;           -- BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY
+   *                      --   with { readOnly: true }
    *     SET LOCAL ROLE ledger_app;
    *     SELECT set_config('app.client_id', $1, true);
    *     … fn …
@@ -139,7 +157,11 @@ export class LedgerDb {
    * name and SQLSTATE only, the pending statement rejects as usual, and the
    * connection is destroyed, never pooled.
    */
-  async withClientTx<T>(clientId: string, fn: (tx: ClientTx) => Promise<T>): Promise<T> {
+  async withClientTx<T>(
+    clientId: string,
+    fn: (tx: ClientTx) => Promise<T>,
+    opts: ClientTxOptions = {},
+  ): Promise<T> {
     if (!isCanonicalUuid(clientId)) {
       throw new LedgerDbError('invalid_scope', 'the client id is not a canonical UUID');
     }
@@ -162,7 +184,7 @@ export class LedgerDb {
     };
     conn.on('error', onConnectionError);
     try {
-      await conn.query('BEGIN');
+      await conn.query(opts.readOnly === true ? BEGIN_READ_ONLY : 'BEGIN');
       await conn.query(`SET LOCAL ROLE ${LEDGER_APP_ROLE}`);
       await conn.query("SELECT set_config('app.client_id', $1, true)", [clientId]);
       openTxs.add(tx);

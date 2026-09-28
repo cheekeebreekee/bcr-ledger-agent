@@ -1,6 +1,6 @@
 import { app, type HttpResponseInit } from '@azure/functions';
 import type { InboxSweepMode, LedgerIndexMode, MembershipCheckMode } from '@bcr/shared';
-import { loadIngestionConfig } from '../config';
+import { loadIngestionConfig, searchOffReason } from '../config';
 
 /**
  * Trivial liveness probe — no auth, no calls out. Used by Bicep's
@@ -30,6 +30,11 @@ import { loadIngestionConfig } from '../config';
  * `build.ledgerIndex` is `LEDGER_INDEX_MODE`: `off`, or `write` when filed
  * documents are recorded in the document index. The server and the login are
  * in the cold-start `index.config` line, not here.
+ *
+ * `build.search` is client search (`POST /api/search`): `off` while
+ * `SEARCH_MODE` is off or anything it needs is missing (the reason is in the
+ * cold-start `search.config` line), `listed` while `SEARCH_ROWS` opens it to
+ * named rows only, `all` otherwise.
  */
 app.http('health', {
   route: 'health',
@@ -48,6 +53,7 @@ export async function handleHealth(): Promise<HttpResponseInit> {
         inboxSweep: config.inboxSweepMode,
         inboxSweepRows: config.inboxSweepRows.length > 0 ? 'listed' : 'all',
         ledgerIndex: config.ledgerIndexMode,
+        search: searchOffReason(config) ? 'off' : config.searchRows.length > 0 ? 'listed' : 'all',
       },
       new Date(),
     ),
@@ -59,6 +65,7 @@ export interface HealthBuild {
   readonly inboxSweep: InboxSweepMode;
   readonly inboxSweepRows: 'all' | 'listed';
   readonly ledgerIndex: LedgerIndexMode;
+  readonly search: 'off' | 'listed' | 'all';
 }
 
 export function healthBody(build: HealthBuild, now: Date) {
@@ -72,6 +79,7 @@ export function healthBody(build: HealthBuild, now: Date) {
       inboxSweep: build.inboxSweep,
       inboxSweepRows: build.inboxSweepRows,
       ledgerIndex: build.ledgerIndex,
+      search: build.search,
     },
     timestamp: now.toISOString(),
   } as const;

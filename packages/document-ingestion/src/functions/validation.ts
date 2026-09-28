@@ -1,5 +1,10 @@
 import { z } from 'zod';
-import { ValidationError, type IngestionBatchRequestPayload } from '@bcr/shared';
+import {
+  searchRequestSchema,
+  ValidationError,
+  type IngestionBatchRequestPayload,
+  type SearchRequestPayload,
+} from '@bcr/shared';
 
 const documentSchema = z.object({
   filename: z
@@ -99,5 +104,50 @@ export function validateBatchIngestionPayload(
       userAadObjectId: source.userAadObjectId.toLowerCase(),
       userDisplayName: source.userDisplayName,
     },
+  };
+}
+
+/** A paging cursor as the index issues it: base64url, nothing else. */
+const CURSOR = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * `POST /api/search`'s body: the shared `searchRequestSchema` (strict at every
+ * level, so a `clientId`, `listItemId`, `scope` or `limit` is a 400, never
+ * ignored), then the same checks as uploads: a 1:1 chat of the BCR tenant,
+ * and the asker's id lower-cased. A cursor must be one the index could have
+ * issued in shape (its content is checked again by the index). Messages name
+ * fields, never the question.
+ */
+export function validateSearchPayload(
+  raw: unknown,
+  opts: BatchValidationOptions,
+): SearchRequestPayload {
+  const parsed = searchRequestSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new ValidationError(`Invalid search payload: ${formatIssues(parsed.error)}`);
+  }
+  const { source, query } = parsed.data;
+  if (source.tenantId.toLowerCase() !== opts.expectedTenantId.toLowerCase()) {
+    throw new ValidationError('Invalid search payload: source.tenantId is not the BCR tenant');
+  }
+  if (query.kind === 'typed' && query.after !== undefined && !CURSOR.test(query.after)) {
+    throw new ValidationError('Invalid search payload: query.after: not a search cursor');
+  }
+  return {
+    source: {
+      tenantId: source.tenantId,
+      conversationId: source.conversationId,
+      activityId: source.activityId,
+      conversationType: source.conversationType,
+      userAadObjectId: source.userAadObjectId.toLowerCase(),
+    },
+    query:
+      query.kind === 'question'
+        ? { kind: 'question', text: query.text }
+        : {
+            kind: 'typed',
+            filter: query.filter,
+            ...(query.after !== undefined ? { after: query.after } : {}),
+          },
   };
 }

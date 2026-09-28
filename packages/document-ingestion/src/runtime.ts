@@ -6,7 +6,13 @@
  */
 import { createLedgerPool, LedgerDb } from '@bcr/ledger-db';
 import { createLogger } from '@bcr/shared';
-import { loadIngestionConfig, RETIRED_SETTINGS, retiredSettingsIn } from './config';
+import {
+  claudeConfigured,
+  loadIngestionConfig,
+  RETIRED_SETTINGS,
+  retiredSettingsIn,
+  searchOffReason,
+} from './config';
 import { AuthMiddleware } from './auth/authMiddleware';
 import { createGraphClient } from './services/graphClient';
 import { forbiddenSiteKeys } from './services/sharePointService';
@@ -23,6 +29,12 @@ import { ChannelInbox, MAX_INBOX_FILE_BYTES } from './services/channelInbox';
 import { INDEX_OFF, LedgerDocumentIndex, type DocumentIndex } from './services/documentIndex';
 import { TablePaidClassifications, TableShadowMemo } from './services/shadowMemo';
 import { LedgerReviewNotices, ReviewNotifier, WorkflowsWebhook } from './services/reviewNotifier';
+import { ClientSearchService } from './services/clientSearch';
+import {
+  SEARCH_MODEL,
+  SearchInterpreter,
+  searchInterpreterFingerprint,
+} from './services/searchInterpreter';
 
 export const config = loadIngestionConfig();
 
@@ -90,7 +102,7 @@ export const clientResolver = new ClientResolver(clientDirectory, {
  * and the review reasons are applied. Said once per cold start: the model and
  * the threshold, never the key.
  */
-const claudeOn = config.anthropicEnabled && config.anthropicApiKey !== '';
+const claudeOn = claudeConfigured(config);
 export const classification = new ClassificationService(
   [
     ...(claudeOn
@@ -260,4 +272,45 @@ createLogger('ingestion/runtime').info(
     ...(reviewNoticesOff ? { reason: reviewNoticesOff } : {}),
   },
   'review_notice.config',
+);
+
+/**
+ * Client search (functions/clientSearch.ts, `POST /api/search`), for the bot
+ * Function App's managed identity only. On only when `SEARCH_MODE=on`, the
+ * index writes, Claude is configured, `SEARCH_CALLER_APP_IDS` is set and
+ * shares no id with `BOT_CALLER_APP_IDS`, and the membership check enforces;
+ * otherwise every search answers `disabled`, and nothing here stops
+ * ingestion. The client is resolved by the uploads' own `clientResolver`.
+ * Said once per cold start: on or off with the reason, the rows, the model
+ * and the prompt's fingerprint; never a key.
+ *
+ * Its user-type reader is its own, with the Graph SDK's retries off (bounded
+ * retries of ours): the guest waits in the chat, and the bot gives up after 20 s.
+ */
+const searchOff = searchOffReason(config);
+export const clientSearch = new ClientSearchService({
+  ...(searchOff ? { offReason: searchOff } : {}),
+  resolver: clientResolver,
+  userTypes: new UserTypeReader(graph, { sdkRetries: false }),
+  ...(ledgerDb && !searchOff ? { db: ledgerDb } : {}),
+  ...(claudeOn && !searchOff
+    ? { interpreter: new SearchInterpreter({ apiKey: config.anthropicApiKey }) }
+    : {}),
+  directoryListId: config.clientDirectoryListId,
+  searchRows: config.searchRows,
+});
+createLogger('ingestion/runtime').info(
+  {
+    event: 'search.config',
+    mode: clientSearch.enabled ? 'on' : 'off',
+    ...(searchOff ? { reason: searchOff } : {}),
+    ...(clientSearch.enabled
+      ? {
+          rows: config.searchRows.length ? config.searchRows : 'all',
+          model: SEARCH_MODEL,
+          prompt: searchInterpreterFingerprint(),
+        }
+      : {}),
+  },
+  'search.config',
 );

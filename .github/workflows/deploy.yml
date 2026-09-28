@@ -99,6 +99,9 @@ jobs:
           }
           check teams-bot botGateMode
           check document-ingestion forbiddenTargetSitePaths
+          # Client search: an older @bcr/shared would ignore SEARCH_MODE.
+          check teams-bot searchMode
+          check document-ingestion searchMode
           listing="$(unzip -Z1 artifacts/document-ingestion.zip)"
           if [[ "$listing" == *userTarget* ]]; then
             echo "::error::artifacts/document-ingestion.zip carries the deleted /api/user-target handler"; exit 1

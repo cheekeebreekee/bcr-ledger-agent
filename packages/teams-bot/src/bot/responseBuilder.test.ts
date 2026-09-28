@@ -1,5 +1,12 @@
+import { createHash } from 'node:crypto';
 import type { IngestionBatchItemResult, IngestionUploadResult } from '@bcr/shared';
-import { QUARANTINED_TEXT, rejectionText } from './cardText';
+import {
+  QUARANTINED_TEXT,
+  rejectionText,
+  SEARCH_COVERAGE_TEXT,
+  SEARCH_HELP_HEADING,
+  SEARCH_HELP_TEXT,
+} from './cardText';
 import { buildBatchResultCard, buildHelpCard } from './responseBuilder';
 
 const result: IngestionUploadResult = {
@@ -267,5 +274,31 @@ describe('buildHelpCard', () => {
     const blocks = (buildHelpCard() as Card).body.map((b) => b.text ?? '');
     const offenders = blocks.filter((t) => /\]\(|<|\{/.test(t));
     expect(offenders).toEqual([]);
+  });
+});
+
+describe('buildHelpCard with search', () => {
+  /** SHA-256 of the help card's JSON before search existed (HEAD b9d0182). */
+  const HELP_CARD_SHA256 = '85be6ea3de384bffdfd9ddc6d4bfe971b849c0ff8039f270f0647a8ad2ec154a';
+  const sha256 = (card: unknown) =>
+    createHash('sha256').update(JSON.stringify(card), 'utf8').digest('hex');
+
+  it('is, with search off, byte for byte the card from before search', () => {
+    expect(sha256(buildHelpCard())).toBe(HELP_CARD_SHA256);
+    expect(sha256(buildHelpCard({}))).toBe(HELP_CARD_SHA256);
+    expect(sha256(buildHelpCard({ search: false }))).toBe(HELP_CARD_SHA256);
+  });
+
+  it('adds only a fixed „Wyszukiwanie” section at the end with search on', () => {
+    const before = (buildHelpCard() as Card).body;
+    const after = (buildHelpCard({ search: true }) as Card).body;
+    expect(after.slice(0, before.length)).toEqual(before);
+    expect(after.slice(before.length).map((b) => b.text)).toEqual([
+      SEARCH_HELP_HEADING,
+      SEARCH_HELP_TEXT,
+      SEARCH_COVERAGE_TEXT,
+    ]);
+    expect(SEARCH_HELP_TEXT).toContain('„faktury zakupu z marca 2026”');
+    expect(JSON.stringify(after)).not.toMatch(/\]\(/);
   });
 });

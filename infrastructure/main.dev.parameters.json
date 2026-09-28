@@ -32,7 +32,11 @@
     "ledgerIndexMode": { "value": "write" },
     "ledgerDbHost": { "value": "psql-bcr-dev-vyyintffz6ehq.postgres.database.azure.com" },
     "ledgerDbUser": { "value": "func-bcr-ingest-dev-vyyintffz6ehq" },
+    "searchMode": { "value": "off" },
+    "searchRows": { "value": "" },
+    "searchCallerAppIds": { "value": "" },
     "botGateMode": { "value": "enforce" },
+    "botSearchMode": { "value": "off" },
     "logLevel": { "value": "debug" }
   }
 }

@@ -10,6 +10,7 @@
     "MICROSOFT_APP_TENANT_ID": "",
     "MICROSOFT_APP_TYPE": "SingleTenant",
     "BOT_GATE_MODE": "enforce",
+    "SEARCH_MODE": "off",
     "INGESTION_BASE_URL": "http://localhost:7071",
     "INGESTION_SCOPE": "api://00000000-0000-0000-0000-000000000000/.default",
     "APPLICATIONINSIGHTS_CONNECTION_STRING": "",

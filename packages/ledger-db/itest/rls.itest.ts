@@ -18,6 +18,7 @@ import { clientIdForDirectoryRow } from '../src/clientScope';
 import { verifySchema } from '../src/migrate';
 import * as clientsRepo from '../src/repos/clientsRepo';
 import * as documentsRepo from '../src/repos/documentsRepo';
+import * as searchQueriesRepo from '../src/repos/searchQueriesRepo';
 import { sql, type Sql } from '../src/sql';
 import { createTestDatabase, sqlState, type TestDatabase } from './harness';
 
@@ -25,20 +26,30 @@ const LIST_ID = '0f0e0d0c-0b0a-4988-8776-655443322110';
 const A = clientIdForDirectoryRow(LIST_ID, '101');
 const B = clientIdForDirectoryRow(LIST_ID, '102');
 
-/** How to write a row of each table, for a client, in the current scope. */
+/** How to read and write the rows of each table, for a client, in the current scope. */
 interface TableCase {
   insertFor(clientId: string, n: number): Sql;
+  /** Every row's client_id, as text. */
+  select: Sql;
   touch: Sql;
+  /** The nullable column `touch` sets. */
+  touchedColumn: string;
   moveTo(clientId: string): Sql;
+  deleteAll: Sql;
 }
+
+const USER = '11111111-2222-4333-8444-555555555555';
 
 const TABLES: Readonly<Record<string, TableCase>> = {
   clients: {
     insertFor: (clientId, n) =>
       sql`INSERT INTO ledger.clients (client_id, directory_list_item_id)
           VALUES (${clientId}::uuid, ${String(900 + n)})`,
+    select: sql`SELECT client_id::text FROM ledger.clients`,
     touch: sql`UPDATE ledger.clients SET legal_name = 'touched'`,
+    touchedColumn: 'legal_name',
     moveTo: (clientId) => sql`UPDATE ledger.clients SET client_id = ${clientId}::uuid`,
+    deleteAll: sql`DELETE FROM ledger.clients`,
   },
   documents: {
     insertFor: (clientId, n) =>
@@ -46,8 +57,21 @@ const TABLES: Readonly<Record<string, TableCase>> = {
             (document_id, client_id, source, drive_id, drive_item_id, status, category)
           VALUES (gen_random_uuid(), ${clientId}::uuid, 'bot', 'drive-x', ${`item-x-${n}`},
                   'FILED', 'umowy')`,
+    select: sql`SELECT client_id::text FROM ledger.documents`,
     touch: sql`UPDATE ledger.documents SET model = 'touched'`,
+    touchedColumn: 'model',
     moveTo: (clientId) => sql`UPDATE ledger.documents SET client_id = ${clientId}::uuid`,
+    deleteAll: sql`DELETE FROM ledger.documents`,
+  },
+  search_queries: {
+    insertFor: (clientId) =>
+      sql`INSERT INTO ledger.search_queries (query_id, client_id, user_oid, kind)
+          VALUES (gen_random_uuid(), ${clientId}::uuid, ${USER}::uuid, 'question')`,
+    select: sql`SELECT client_id::text FROM ledger.search_queries`,
+    touch: sql`UPDATE ledger.search_queries SET model = 'touched'`,
+    touchedColumn: 'model',
+    moveTo: (clientId) => sql`UPDATE ledger.search_queries SET client_id = ${clientId}::uuid`,
+    deleteAll: sql`DELETE FROM ledger.search_queries`,
   },
 };
 
@@ -95,10 +119,20 @@ beforeAll(async () => {
     await clientsRepo.upsertFromDirectory(tx, directoryRow('101', '1234567819'));
     await documentsRepo.recordFiled(tx, doc('a0000000-0000-4000-8000-000000000001', 'a-item-1'));
     await documentsRepo.recordReview(tx, doc('a0000000-0000-4000-8000-000000000002', 'a-item-2'));
+    await searchQueriesRepo.reserve(tx, {
+      queryId: 'a0000000-0000-4000-8000-0000000000a1',
+      userOid: USER,
+      kind: 'question',
+    });
   });
   await t.db.withClientTx(B, async (tx) => {
     await clientsRepo.upsertFromDirectory(tx, directoryRow('102', '5260250274'));
     await documentsRepo.recordFiled(tx, doc('b0000000-0000-4000-8000-000000000001', 'b-item-1'));
+    await searchQueriesRepo.reserve(tx, {
+      queryId: 'b0000000-0000-4000-8000-0000000000b1',
+      userOid: USER,
+      kind: 'typed',
+    });
   });
 });
 
@@ -153,14 +187,8 @@ describe.each(Object.entries(TABLES))('ledger.%s', (table, cases) => {
   });
 
   it("scope A: reads A's rows only", async () => {
-    const rows = await t.db.withClientTx(A, (tx) =>
-      tx.query<{ client_id: string }>(
-        // A fixed table name per case; the scope comes from the transaction only.
-        table === 'clients'
-          ? sql`SELECT client_id::text FROM ledger.clients`
-          : sql`SELECT client_id::text FROM ledger.documents`,
-      ),
-    );
+    // A fixed table name per case; the scope comes from the transaction only.
+    const rows = await t.db.withClientTx(A, (tx) => tx.query<{ client_id: string }>(cases.select));
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.filter((r) => r.client_id !== A)).toEqual([]);
   });
@@ -175,8 +203,7 @@ describe.each(Object.entries(TABLES))('ledger.%s', (table, cases) => {
     const after = await t.admin.query(`SELECT * FROM ledger.${table} WHERE client_id = $1`, [B]);
     expect(after.rows).toEqual(before.rows);
     await t.admin.query(
-      `UPDATE ledger.${table} SET ${table === 'clients' ? 'legal_name' : 'model'} = NULL
-       WHERE client_id = $1`,
+      `UPDATE ledger.${table} SET ${cases.touchedColumn} = NULL WHERE client_id = $1`,
       [A],
     );
   });
@@ -187,9 +214,7 @@ describe.each(Object.entries(TABLES))('ledger.%s', (table, cases) => {
   });
 
   it('scope A: nothing can be deleted', async () => {
-    const statement =
-      table === 'clients' ? sql`DELETE FROM ledger.clients` : sql`DELETE FROM ledger.documents`;
-    expect(await failsInScope(A, statement)).toBe('42501');
+    expect(await failsInScope(A, cases.deleteAll)).toBe('42501');
   });
 
   it('client_id is immutable, even for a superuser that bypasses RLS', async () => {
@@ -300,10 +325,29 @@ describe('verify.sql', () => {
   it('sees a new table with no RLS, no policy, no client_id and the wrong owner', async () => {
     expect(await brokenBy('CREATE TABLE ledger.notes (id int)')).toEqual([
       'client_id_missing notes',
+      'guard_trigger_missing notes',
       'owner_not_ledger_owner notes',
       'policy_missing notes',
       'rls_not_enabled notes',
       'rls_not_forced notes',
+    ]);
+  });
+
+  it('sees a table whose client_id guard is gone or disabled', async () => {
+    expect(
+      await brokenBy('DROP TRIGGER search_queries_guard_row_update ON ledger.search_queries'),
+    ).toEqual(['guard_trigger_missing search_queries']);
+    expect(
+      await brokenBy('ALTER TABLE ledger.documents DISABLE TRIGGER documents_guard_row_update'),
+    ).toEqual(['guard_trigger_missing documents']);
+  });
+
+  it('sees the app role granted DELETE or TRUNCATE', async () => {
+    expect(await brokenBy('GRANT DELETE ON ledger.search_queries TO ledger_app')).toEqual([
+      'app_role_can_delete search_queries',
+    ]);
+    expect(await brokenBy('GRANT TRUNCATE ON ledger.clients TO ledger_app')).toEqual([
+      'app_role_can_delete clients',
     ]);
   });
 
@@ -324,7 +368,9 @@ describe('verify.sql', () => {
     expect(await brokenBy('ALTER ROLE ledger_app BYPASSRLS')).toEqual([
       'role_privileged ledger_app',
     ]);
+    // An owner holds every privilege on its table, DELETE and TRUNCATE included.
     expect(await brokenBy('ALTER TABLE ledger.clients OWNER TO ledger_app')).toEqual([
+      'app_role_can_delete clients',
       'app_role_owns ledger_app',
       'owner_not_ledger_owner clients',
     ]);

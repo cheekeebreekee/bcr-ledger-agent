@@ -128,11 +128,31 @@ param ledgerDbHost string = ''
 @description('LEDGER_DB_USER: the PostgreSQL login of the ingestion managed identity, which pgaadauth_create_principal names after the Function App. Empty while LEDGER_INDEX_MODE is off.')
 param ledgerDbUser string = ''
 
+// ---- Ingestion: client search (POST /api/search) ----------------------------
+// Called only by the bot Function App's managed identity, with the app role
+// Documents.Search that infrastructure/identity/grant-bot-search-caller.sh
+// assigns. Search that cannot run safely is off with a reason at cold start;
+// only a SEARCH_MODE outside off|on stops ingestion.
+
+@description('SEARCH_MODE (ingestion): off answers every search disabled; on serves it.')
+@allowed(['off', 'on'])
+param searchMode string = 'off'
+
+@description('SEARCH_ROWS: Client Directory list item ids (not ClientId) search is open to, comma-separated. Empty: every bound row. An entry that is not a list item id keeps search off (bad_rows); it never stops ingestion.')
+param searchRows string = ''
+
+@description('SEARCH_CALLER_APP_IDS: the app id of the bot Function App\'s managed identity (grant-bot-search-caller.sh prints it). Empty: search off. Never an id of BOT_CALLER_APP_IDS.')
+param searchCallerAppIds string = ''
+
 // ---- Bot --------------------------------------------------------------------
 
 @description('BOT_GATE_MODE: what the bot does with an activity that fails the gate. enforce refuses it; log only records it.')
 @allowed(['log', 'enforce'])
 param botGateMode string = 'enforce'
+
+@description('SEARCH_MODE (bot): off keeps the help card for text; on sends a guest\'s text to ingestion\'s /api/search with the bot\'s managed identity.')
+@allowed(['off', 'on'])
+param botSearchMode string = 'off'
 
 // ---- Both apps --------------------------------------------------------------
 
@@ -221,6 +241,7 @@ var botAppSettings = {
   INGESTION_BASE_URL: 'https://${ingestionFunction.outputs.defaultHostname}'
   INGESTION_SCOPE: 'api://${ingestionAppId}/.default'
   BOT_GATE_MODE: botGateMode
+  SEARCH_MODE: botSearchMode
   LOG_LEVEL: logLevel
 }
 
@@ -252,6 +273,9 @@ var ingestionAppSettings = union(
     LEDGER_DB_HOST: ledgerDbHost
     LEDGER_DB_NAME: 'ledger'
     LEDGER_DB_USER: ledgerDbUser
+    SEARCH_MODE: searchMode
+    SEARCH_ROWS: searchRows
+    SEARCH_CALLER_APP_IDS: searchCallerAppIds
     LOG_LEVEL: logLevel
   },
   enableReviewNotices

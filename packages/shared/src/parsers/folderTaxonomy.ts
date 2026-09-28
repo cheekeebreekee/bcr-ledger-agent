@@ -52,6 +52,12 @@ export interface CategoryDefinition {
   /** Representative example documents. */
   readonly examples: readonly string[];
   /**
+   * Words a client may use for this category when searching (Polish): they
+   * teach the search interpreter which category a question means. Not used by
+   * the classifier's prompt, so changing them never re-classifies anything.
+   */
+  readonly searchTerms: readonly string[];
+  /**
    * An invoice, receipt or note: the classifier also reads its number, dates,
    * currency, amounts, parties and KSeF number for the document index.
    */
@@ -69,6 +75,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     dated: true,
     invoiceFields: true,
     polishLabel: 'Faktura sprzedaży',
+    searchTerms: ['faktury sprzedażowe', 'sprzedaż', 'faktury wystawione', 'przychody'],
     description:
       'Faktura, na której KLIENT jest sprzedawcą/wystawcą (sprzedaje towar lub usługę): ' +
       'dane sprzedawcy zgadzają się z nazwą lub NIP klienta. Dowolna postać faktury: ' +
@@ -85,6 +92,13 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     dated: true,
     invoiceFields: true,
     polishLabel: 'Faktura zakupu',
+    searchTerms: [
+      'faktury zakupowe',
+      'zakupy',
+      'koszty',
+      'faktury kosztowe',
+      'faktury od dostawców',
+    ],
     description:
       'Faktura, na której KLIENT jest nabywcą/kupującym: dane nabywcy zgadzają się z nazwą ' +
       'lub NIP klienta, a sprzedawcą jest inny podmiot. Dowolna postać faktury: VAT, KSeF, ' +
@@ -103,6 +117,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     dated: true,
     invoiceFields: true,
     polishLabel: 'Korekta / anulowanie',
+    searchTerms: ['korekty', 'faktury korygujące', 'anulowane faktury'],
     description:
       'Faktura korygująca, nota korygująca lub dokument anulowania faktury — ' +
       'niezależnie od kierunku (sprzedaż czy zakup).',
@@ -114,6 +129,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     dated: true,
     invoiceFields: true,
     polishLabel: 'Nota / dowód księgowy',
+    searchTerms: ['noty', 'noty księgowe', 'paragony', 'dowody księgowe'],
     description:
       'Nota księgowa, nota obciążeniowa/uznaniowa, polecenie księgowania lub inny ' +
       'dowód księgowy niebędący fakturą VAT. Także paragon, potwierdzenie płatności kartą ' +
@@ -130,6 +146,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['02_Wyciągi_bankowe'],
     dated: true,
     polishLabel: 'Wyciąg bankowy',
+    searchTerms: ['wyciągi', 'wyciągi bankowe', 'historia rachunku'],
     description: 'Wyciąg bankowy lub potwierdzenie operacji/przelewu z banku.',
     examples: ['Wyciąg bankowy mBank', 'Historia rachunku', 'Potwierdzenie przelewu'],
   },
@@ -138,6 +155,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['03_Raporty_marketplace'],
     dated: true,
     polishLabel: 'Raport marketplace',
+    searchTerms: ['raporty marketplace', 'Allegro', 'Amazon', 'raporty sprzedaży platform'],
     description:
       'Raport rozliczeniowy lub sprzedażowy z platformy marketplace ' +
       '(Allegro, Amazon, eBay, Erli itp.).',
@@ -148,6 +166,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['04_Umowy'],
     dated: false,
     polishLabel: 'Umowa',
+    searchTerms: ['umowy', 'aneksy', 'polisy', 'ubezpieczenia', 'OWU'],
     description:
       'Umowa handlowa, umowa z kontrahentem, aneks do umowy, polisa ubezpieczeniowa ' +
       'oraz ogólne warunki ubezpieczenia (OWU) i warunki polisy (z wyłączeniem umów ' +
@@ -160,6 +179,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['05_Dokumenty_firmowe_ustawowe'],
     dated: false,
     polishLabel: 'Dokument firmowy / ustawowy',
+    searchTerms: ['dokumenty firmowe', 'KRS', 'CEIDG', 'uchwały', 'dokumenty rejestrowe'],
     description:
       'Dokumenty rejestrowe i ustawowe firmy: odpis KRS, umowa spółki, ' +
       'zaświadczenia NIP/REGON, uchwały.',
@@ -170,6 +190,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['06_Kadry_i_płace'],
     dated: false,
     polishLabel: 'Kadry i płace',
+    searchTerms: ['kadry', 'płace', 'listy płac', 'wynagrodzenia'],
     description:
       'Dokumenty kadrowo-płacowe: umowy o pracę/zlecenie, listy płac, ' +
       'dokumenty ZUS dotyczące pracowników, świadectwa pracy.',
@@ -180,6 +201,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['07_Deklaracje_i_JPK'],
     dated: false,
     polishLabel: 'Deklaracja / JPK',
+    searchTerms: ['deklaracje', 'JPK', 'VAT-7', 'PIT', 'CIT'],
     description:
       'Deklaracje podatkowe i pliki JPK: VAT-7, JPK_V7, PIT, CIT, ' +
       'deklaracje ZUS DRA, potwierdzenia UPO.',
@@ -190,6 +212,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['08_Korespondencja'],
     dated: false,
     polishLabel: 'Korespondencja',
+    searchTerms: ['pisma', 'korespondencja', 'urząd skarbowy', 'ZUS', 'wezwania'],
     description:
       'Pisma i korespondencja: pisma z urzędu skarbowego lub ZUS, wezwania, ' +
       'pisma od kontrahentów, e-maile zapisane jako dokument.',
@@ -200,6 +223,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['09_Raporty'],
     dated: false,
     polishLabel: 'Raport',
+    searchTerms: ['raporty', 'sprawozdania', 'bilans'],
     description:
       'Raporty wewnętrzne i sprawozdania niebędące raportami marketplace ' +
       '(np. raporty zarządcze, sprawozdania finansowe).',
@@ -210,6 +234,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['10_Środki_trwałe'],
     dated: false,
     polishLabel: 'Środki trwałe',
+    searchTerms: ['środki trwałe', 'amortyzacja', 'leasing'],
     description:
       'Dokumenty środków trwałych: ewidencja, tabele amortyzacji, ' +
       'dokumenty OT/LT przyjęcia i likwidacji.',
@@ -220,6 +245,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['11_Ewidencja_VAT'],
     dated: false,
     polishLabel: 'Ewidencja VAT',
+    searchTerms: ['ewidencja VAT', 'rejestr VAT'],
     description: 'Rejestry i ewidencje VAT (rejestr sprzedaży/zakupu VAT).',
     examples: ['Rejestr VAT sprzedaży', 'Rejestr VAT zakupu'],
   },
@@ -228,6 +254,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['12_Onboarding_i_reguły'],
     dated: false,
     polishLabel: 'Onboarding i reguły',
+    searchTerms: ['umowa z biurem rachunkowym', 'onboarding', 'reguły księgowania'],
     description:
       'Dokumenty onboardingowe klienta, w tym umowa klienta z biurem rachunkowym ' +
       '(o usługi księgowe, kadrowe lub płacowe) z aneksami, oraz ustalone reguły ' +
@@ -244,6 +271,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['13_Inne'],
     dated: false,
     polishLabel: 'Inne',
+    searchTerms: ['inne', 'pro forma'],
     description:
       'Dokument rozpoznany jako księgowy/firmowy, ale niepasujący do żadnej ' +
       'z powyższych kategorii. Także faktura pro forma, która nie jest dowodem księgowym.',
@@ -254,6 +282,7 @@ export const categoryCatalog: readonly CategoryDefinition[] = [
     segments: ['98_Nieposortowane'],
     dated: true,
     polishLabel: 'Nieposortowane',
+    searchTerms: ['do weryfikacji', 'nieposortowane'],
     description:
       'Dokument, którego nie udało się pewnie zaklasyfikować — wymaga ręcznej ' +
       'weryfikacji przez księgowego.',

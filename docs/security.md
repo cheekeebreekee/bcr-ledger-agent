@@ -20,11 +20,12 @@ one SharePoint site. Each threat now has a status:
 | Trust boundary | Principal | Credential | Checked by |
 |---|---|---|---|
 | Teams client → bot | Bot Framework | JWT signed by `login.botframework.com` | `CloudAdapter`, then the bot's gate on **every** activity type: a 1:1 chat, from the BCR tenant, with a GUID user object id (P0) |
-| Bot → ingestion | The bot's app registration | Client secret (Key Vault, and laptop copies: see T15) → token for `api://<ingestion-app-id>` | `AuthMiddleware`: issuer, audience, the `Documents.Ingest` role, and **the caller's app id** (`appid`, else `azp`) in `BOT_CALLER_APP_IDS` (P0). Then the request body: `conversationType` must be `personal`, the user id must be a UUID, and the tenant must be BCR's (P0). |
+| Bot → ingestion (`/api/ingest/batch`) | The bot's app registration | Client secret (Key Vault, and laptop copies: see T15) → token for `api://<ingestion-app-id>` | `AuthMiddleware`: issuer, audience, the `Documents.Ingest` role, and **the caller's app id** (`appid`, else `azp`) in `BOT_CALLER_APP_IDS` (P0). Then the request body: `conversationType` must be `personal`, the user id must be a UUID, and the tenant must be BCR's (P0). |
+| Bot → ingestion (`/api/search`) | The bot Function App's system-assigned managed identity | Managed identity token for `api://<ingestion-app-id>`; no secret exists | `AuthMiddleware`, before the body is read: issuer, audience, the `Documents.Search` role, and the caller's app id in `SEARCH_CALLER_APP_IDS` (that identity only; never an id of `BOT_CALLER_APP_IDS`). Then a strict body, and the asker resolved like an uploader and required to be a `Guest` (see T21). |
 | Ingestion → Microsoft Graph | The ingestion Function App's system-assigned managed identity | Managed identity token | Graph. `Sites.Selected`, plus a per-site grant on every site it files into (see T3). `Directory.Read.All` (read-only), to read the uploader's Team memberships at upload time (see T10), and, for the channel inbox, a file creator's `userType` and Teams (see T18). |
 | Channel inbox timer → ingestion logic | None: a timer trigger | None | Not a route. It takes no input, so nothing outside can name a user, a row or a target to it (T18). |
 | Bot, ingestion → Key Vault | Each app's managed identity | *Key Vault Secrets User*, assigned at **resource-group** scope | Key Vault (see T11) |
-| Ingestion → Claude | Anthropic API key (Key Vault) | TLS and bearer key | `api.anthropic.com` (see T16) |
+| Ingestion → Claude | Anthropic API key (Key Vault) | TLS and bearer key | `api.anthropic.com`: document content (see T16), and client search's questions (see T21) |
 | Ingestion → document index (PostgreSQL) | The ingestion Function App's managed identity, as a login named after the app (`pgaadauth_create_principal`) | An Entra token per connection; the server has password authentication disabled | The server (Entra only, TLS 1.2+); then `SET LOCAL ROLE ledger_app` and row-level security per client transaction (see T19) |
 | Operator → document index | The server's Entra administrator (a person) | A token from `az login` | The server; a firewall rule for the operator's IP, for one session (see T19) |
 
@@ -277,6 +278,21 @@ developers' `.env` files. Whoever holds it can get a token as the bot.
 - **After Phase 0,** ingestion accepts only the bot's app id. But a holder of the secret *is* the
   bot. They can still call ingestion with any guest's id and have the upload filed as that guest,
   and they can message users as "Asystent BCR".
+- **The bot's own endpoint accepts only Bot Framework channel tokens** (`bot/channelAuth.ts`),
+  from the Client search release's bot build (its step 5). The Phase 0 bot still running before
+  that build takes the SDK default, which allows no more than the bullet above: uploading as a
+  guest.
+  The SDK's default also accepted an "emulator" token: any AAD token for the bot's app id, which
+  the secret alone can mint, with no audience check, and the bot then replied to whatever
+  `serviceUrl` the activity named. Since the gate reads only body fields, such an activity could
+  name any guest's `aadObjectId` and act as them: upload as them, and, once search is on, read
+  their client's search results. `validateClaims` now refuses every token whose issuer is not
+  `https://api.botframework.com`, on every path (channel, emulator, skill, ASE), and the SDK binds
+  a channel token to the activity's `serviceUrl`. So an activity that reaches the bot comes from
+  the Bot Framework channel, with the sender Teams set.
+- **Client search does not widen it.** `/api/search` accepts only the bot Function App's managed
+  identity, with its own role (T21); the bot's app registration holds neither, and the secret
+  cannot pose as a guest in the chat, so the secret still cannot read a document.
 
 **Status: Accepted** until Roman provides new credentials; rotation is deferred. **Phase 3**
 fixes it for good:
@@ -414,16 +430,17 @@ application code:
   row whose channel folder holds the file. Content never picks the scope, as it never picks the
   client;
 - the app's role `ledger_app` owns nothing, cannot create anything, has no `BYPASSRLS`, and has
-  only `SELECT`, `INSERT`, `UPDATE` (no `DELETE`) on the two tables. The app's login (the
+  only `SELECT`, `INSERT`, `UPDATE` (no `DELETE`) on its tables (`clients`, `documents`, and
+  `search_queries` for client search, T21). The app's login (the
   ingestion managed identity) is granted it `WITH INHERIT FALSE, SET TRUE`: outside a client
   transaction it can read nothing at all;
 - `client_id` is immutable (a trigger, even for a superuser); a document row is unique per
   client and drive item;
 - every statement is an `sql`-tagged template whose values are bind parameters, and a client
   transaction runs nothing else (checked at run time, not only by the compiler);
-- `packages/ledger-db/sql/verify.sql` reports any table without forced RLS or with another
-  policy, a privileged or owning app role, and any login that could use the app role while
-  privileged or inheriting it. It runs after every migration, in CI (`test:db`, with the RLS
+- `packages/ledger-db/sql/verify.sql` reports any table without forced RLS, with another policy
+  or without the `client_id` guard trigger, a privileged or owning app role or one that can
+  delete, and any login that could use the app role while privileged or inheriting it. It runs after every migration, in CI (`test:db`, with the RLS
   matrix for every table read from the catalog), and daily by hand.
 
 **Credentials.** None stored. Password authentication is disabled on the server: the only
@@ -475,6 +492,77 @@ opens only for someone with access to that client's Team. Rows are read and
 marked in each client's own RLS scope, one client per transaction; the card is built from the
 bound Directory rows, never from a document.
 
+### T21. Client search
+
+A client's guest can search their own client's documents from the bot's 1:1 chat
+([`ARCHITECTURE.md` §4.6](../ARCHITECTURE.md#46-client-search)). Search reads the document index
+(T19): invoice numbers, amounts, counterparties. So the questions are which client's rows a
+search can read, and who can make ingestion believe that a given guest is asking.
+
+- **Who asks** is the Bot-Framework-authenticated `from.aadObjectId` that passed the bot's gate
+  (T1), as for uploads. The bot accepts only Bot Framework channel tokens (T15), so that sender
+  is the one Teams set, never one a caller with the bot's secret wrote.
+- **Who may name that guest to ingestion.** `POST /api/search`, like `/api/ingest/batch`, takes
+  the guest's id from its body, so it is pinned to one caller: a token with the role
+  `Documents.Search` whose app id is in `SEARCH_CALLER_APP_IDS`, the bot Function App's
+  system-assigned managed identity. That identity's credential cannot be exported; only code
+  running in the bot app gets its token. The role is assigned by
+  `infrastructure/identity/grant-bot-search-caller.sh` and nothing else, which refuses any other
+  principal. The bot's app registration holds neither the role nor a place in
+  `SEARCH_CALLER_APP_IDS`, and ingestion keeps search off if that list shares an id with
+  `BOT_CALLER_APP_IDS`. So **T15's rationale is unchanged**: the secret can file as a guest, but it
+  cannot search, neither directly nor through the bot's chat (channel tokens only), and it still
+  cannot read a document. The other way round, the managed
+  identity's token is refused (403) on `/api/ingest/batch`. The token is checked before the body
+  is read.
+- **Which client.** Ingestion runs the same `ClientResolver` as for uploads: exactly one bound
+  row, and the asker's Teams, read at request time, exactly the row's `TeamId` (R46); every
+  quarantine reason is refused. Then the asker must be `userType` `Guest`, so a staff id on a
+  client row can never search. Search does not run at all while `MEMBERSHIP_CHECK_MODE` is off.
+  Every refusal is one fixed no-access answer, with no index read and no model call.
+  `SEARCH_ROWS` narrows it further, for a rollout.
+- **What can be read.** The scope is `clientIdForDirectoryRow` of the resolved row, computed
+  before any read and again for every page: no cursor or card carries it, and the request body
+  can name no client, row, scope or limit (every schema is strict; an unknown key is a 400). The
+  read runs in `withClientTx(scope, …, { readOnly: true })` (`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`), under forced RLS
+  with an explicit `client_id = <scope>` on top, and selects only the client-view columns: never
+  who uploaded, the hash, drive ids, the confidence, the model or its suggestion. A link is kept
+  only if it is https on the row's own site.
+- **The model** turns the question into a typed filter. It sees a static system prompt with no
+  client data (the same bytes for every client) and the question wrapped in a random tag; never
+  a row. Its answer is a closed schema, and a free string (a name, an invoice number, NIP digits)
+  is kept only if it occurs in the question. No field can name a client, a column, SQL or a limit,
+  so an injected instruction can at worst produce another filter over the asker's own rows. Its
+  text is never shown: the card is fixed Polish sentences and the filter spelled with taxonomy
+  labels. The question goes to Anthropic, as document content does (T16).
+- **Abuse and cost.** Auth, strict validation and resolution run before anything is paid for.
+  Durable limits in `ledger.search_queries`, counted under a per-client advisory lock across every
+  worker: questions 10 per 5 minutes and 60 per 24 hours per guest, typed and page requests 30 per
+  5 minutes per guest, questions 300 per 24 hours per client. Per worker: 20 messages a minute per
+  guest in the bot; at most 2 concurrent searches and 300 model calls an hour in ingestion.
+  `SEARCH_MODE=off` on either app switches it off.
+- **Records.** Logs carry ids, codes and counts, never the question. `ledger.search_queries` keeps
+  the kind, the outcome, the SHA-256 of the filter and the names of its fields, the result count,
+  the model, token counts and latency, in the client's own scope under forced RLS: never the
+  question and never a filter value. The hash is not keyed: for a filter with little in it (a NIP
+  alone) it can be reversed by trying every NIP, but only by someone who can already read that
+  client's scope. The rows are kept 13 months and then deleted by the operator
+  ([the runbook](operations/human-steps.md#client-search-release)); `ledger_app` cannot delete.
+
+**Residual risk.** The trust boundary is the bot app. Anyone who can deploy code to it or change
+its configuration can get the identity's token and search as any guest who currently resolves,
+within the limits and recorded per search. That is the same person who could already change
+what the bot sends, and it is narrower than the bot's secret, which works from anywhere. It
+amends invariant I6 (no user id from a request body) with a second route, until search moves
+into the bot or behind user sign-in (Phase 3). If the bot app is recreated its identity changes,
+and search fails closed (403) until the grant and `SEARCH_CALLER_APP_IDS` follow. A link can go
+stale after staff move a file: it then opens nothing, and never another client's site. The index
+holds only documents filed since 28 September 2026.
+
+**Status: Mitigated by design; off until the
+[Client search release](operations/human-steps.md#client-search-release)** turns it on for the
+canary row, then client by client. The I6 amendment is an [accepted risk](#accepted-risks).
+
 ### Also fixed in Phase 0
 
 - **Model text on cards.** The classifier's free-text reasoning was rendered as Markdown on the
@@ -524,10 +612,11 @@ first.
 
 | Risk | Why it is accepted | Owner | Until | What limits it meanwhile |
 |---|---|---|---|---|
-| **Secret rotation deferred** (T15, and the Anthropic key). Plaintext copies of both secrets are on developer laptops. | New credentials come from Roman, who will provide them soon. Rotating twice gains nothing. | Roman | New credentials arrive. Then rotate and delete the laptop copies the same day. | Caller pinning: only the bot's app id is accepted. A forged upload needs a real guest's id, lands only in that guest's own client, and is logged under that id. The secret cannot read documents, because the bot holds no SharePoint permission. |
+| **Secret rotation deferred** (T15, and the Anthropic key). Plaintext copies of both secrets are on developer laptops. | New credentials come from Roman, who will provide them soon. Rotating twice gains nothing. | Roman | New credentials arrive. Then rotate and delete the laptop copies the same day. | Caller pinning: only the bot's app id is accepted. A forged upload needs a real guest's id, lands only in that guest's own client, and is logged under that id. The secret cannot read documents, because the bot holds no SharePoint permission; it cannot call `/api/search` (T21), and, from the Client search release's bot build, the bot's endpoint accepts only Bot Framework channel tokens, so it cannot pose as a guest in the chat (T15). |
 | **Yahor's dual role.** He is the developer, the operator who deploys, and a Global Administrator. One person can change the code, ship it and change tenant permissions. That is also a bus factor of one. | BCR has one technical person today. | Roman | A second admin or a formal approval path exists. | Roman reviews every binding plan before it is applied. IR-2 moves need two people. Every tenant and Azure change is a recorded command with its before and after state. The IR evidence is immutable and readable by Roman and the IOD. Yahor does not upload through the bot. Planned: Roman approves production deploys through GitHub environment protection, and a `HANDOVER.md`. |
 | **One identity writes every client site** (T3). | Inherent to the current design. | Yahor | Phase 2 (upload by id, attestation, nightly audit). | Identity-only routing, only bound rows route, the uploader's Teams checked at upload time against the row's Team, one client per site, drive and Team, canonical site paths, forbidden targets checked by path and by resolved site id, `DriveId` check, `conflictBehavior=fail`. The channel inbox moves only within the channel folder it is sweeping, by id, and checks where each move ended (T18). |
 | **The index database has a public endpoint** (T19): the Azure-services rule admits every Azure address, other tenants' too. | A Y1 Consumption app has no VNet integration and no fixed outbound IP; a VNet, NAT gateway and private endpoint cost more than the whole index. | Yahor | The move to Flex Consumption with VNet integration (T12, Phase 1–2): then a private endpoint, and public access off. | Entra-only authentication (no password exists), TLS 1.2+, the login's token issued by BCR's tenant for a principal created on the server, row-level security with the scope set in one place, `verify.sql` daily. An outage of the index never stops filing. |
+| **A managed identity names the asking guest to `/api/search`** (T21): invariant I6 amended, a second route that takes a user id from its body. | Only the bot knows who is asking; search inside the bot, or behind user sign-in (on-behalf-of), waits for Phase 3. | Yahor | Search moves into the bot or behind user sign-in (Phase 3). | One caller, a managed identity whose credential cannot leave the bot app, with a role of its own that the bot's secret lacks; every request resolved like an upload and limited to a `Guest`; read-only, RLS-scoped reads of client-view columns; durable limits; every search recorded. |
 | **No P1: 7-day Entra sign-in log, no Conditional Access** (T14). | Needs a licence purchase. | Roman | Decision 5. | Purview audit log: file operations and sign-in events, about 180 days. `{NIP}@` accounts blocked (T-1). |
 
 ## 4. Data residency and retention
@@ -549,6 +638,10 @@ first.
   restore), geo-redundant to the paired region (North Europe), both in the EU. Rows stay as long
   as the documents they describe; deleting a client's rows at offboarding is part of the
   offboarding runbook (v2 plan, Operations), not yet built. The index holds no file content.
+- **Search records** (`ledger.search_queries`, T21): one row per search, with no question and no
+  filter value; kept **13 months**, then deleted monthly by the operator as the database's
+  administrator, client scope by client scope
+  ([Client search release](operations/human-steps.md#client-search-release), *Retention*).
 
 ## 5. Compliance checklist
 
@@ -559,8 +652,9 @@ first.
       is in an app setting (follow-up F1).
 - [x] Key Vault soft-delete and purge protection
 - [ ] Key Vault access per secret (T11, Phase 1; follow-up F2)
-- [x] App role `Documents.Ingest` required on every call
-- [x] Caller app id pinned to the bot (P0)
+- [x] App role `Documents.Ingest` required on every batch call, `Documents.Search` on every
+      search call
+- [x] Caller app id pinned to the bot (P0); the search caller to the bot's managed identity (T21)
 - [x] Uploads never overwrite (`conflictBehavior=fail`, P0)
 - [x] Routing by uploader identity only; content never picks the client (P0)
 - [x] Channel inbox: the file's location picks the client; only files this Team's guests created
@@ -571,5 +665,8 @@ first.
 - [x] Document index: Entra-only authentication, TLS required, `FORCE ROW LEVEL SECURITY` on
       every table with the scope set in one place, an app role that owns nothing and cannot
       bypass RLS, `verify.sql` in CI and daily (T19)
+- [x] Client search: the client from the verified asker only (`ClientResolver`, then `Guest`),
+      read-only RLS-scoped reads of client-view columns, a model that sees no rows and whose text
+      is never shown, durable limits, no question stored or logged (T21)
 - [x] No secrets in source: `.env` and `local.settings.json` are git-ignored, and the `*.example`
       files are the templates. The laptop copies are an accepted risk.

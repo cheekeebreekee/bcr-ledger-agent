@@ -18,7 +18,6 @@ exact UI path (and CLI equivalent) where you can find or generate it.
 | **Yarn 4 via Corepack** | 4.3.1 | `corepack enable && corepack prepare yarn@4.3.1 --activate` |
 | **Azure CLI** | ≥ 2.65 | <https://learn.microsoft.com/cli/azure/install-azure-cli> |
 | **Azure Functions Core Tools** | bundled per workspace | installed by `yarn install` |
-| **Bot Framework Emulator** *(optional)* | latest | <https://github.com/microsoft/BotFramework-Emulator/releases>. It cannot get a file through the bot's gate; see [`local-development.md`](./local-development.md). |
 | **`jq`** | any | `brew install jq` |
 
 You will also need:
@@ -472,6 +471,14 @@ apply.
    at least a day before ingestion first takes traffic: the platform caches a managed identity's
    token for about 24 hours, and the role reaches the app only in a new token.
 
+**Client search** adds one grant, and it is to the **bot's** managed identity, not ingestion's:
+the app role `Documents.Search` on the Ingestion API registration, which
+`infrastructure/identity/grant-bot-search-caller.sh` creates if it is missing and assigns (dry
+run by default, then `--apply` by a Global Administrator or a Cloud Application Administrator).
+It prints the identity's app id, the value of `SEARCH_CALLER_APP_IDS`. Grant it a day before the
+bot's `SEARCH_MODE` goes on
+([Client search release](operations/human-steps.md#client-search-release)).
+
 ---
 
 ## 6. Reference: every `.env` / `local.settings.json` variable
@@ -506,6 +513,7 @@ references for secrets).
 | `BOT_GATE_MODE` | teams-bot | `enforce` (default) or `log`. The gate refuses anything but a 1:1 chat from the BCR tenant with a valid user id. Use `log` only for the first 24 hours of a rollout, to prove real guests pass. |
 | `INGESTION_BASE_URL` | teams-bot | `http://localhost:7071` locally, `https://func-bcr-ingest-<env>-XXXX.azurewebsites.net` in Azure. |
 | `INGESTION_SCOPE` | teams-bot | `api://<INGESTION_APP_ID>/.default` — see §2b |
+| `SEARCH_MODE` | teams-bot | *(optional)* `off` (the default, also when empty) or `on`. Client search ([`ARCHITECTURE.md` §4.6](../ARCHITECTURE.md#46-client-search)): `on` sends a guest's text to ingestion's `/api/search` with the bot Function App's managed identity (§5). Anything else fails at cold start. |
 
 ### 6c. Ingestion API auth & multi-tenant routing (`packages/document-ingestion/local.settings.json`)
 
@@ -538,6 +546,9 @@ for the design.
 | `INBOX_MAX_FILES_PER_TICK` | *(optional)* Default `20`. Most files the sweep processes per tick, across all clients. A whole number ≥ 1. |
 | `INBOX_SWEEP_ROWS` | *(optional)* Empty (the default): the sweep takes every bound row the Directory routes to. Otherwise comma-separated Client Directory **list item ids** (the `listItemId` in the logs, not the `ClientId`), and only those rows are swept: how the first `shadow` and `enforce` are limited to a canary Team's row before a real client's channel ([human-steps H-12](operations/human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries), the channel-inbox step). It only narrows: a listed row the Directory does not route to is still not swept. While it is set, a newly bound client is **not** swept until its id is added. Shows in `/api/health` as `build.inboxSweepRows` (`all` or `listed`). Anything but whole numbers fails at cold start. |
 | `INBOX_CREATED_AFTER` | *(optional)* Empty (the default): no cutoff. Otherwise a UTC time such as `2026-10-01T00:00:00Z`: files created at or before it stay where they are, counted as `skippedBeforeCutoff`. For a channel whose earlier post attachments the owner decided to leave in place when the sweep went on. Only a time ending in `Z` is accepted. |
+| `SEARCH_MODE` | *(optional)* `off` (the default, also when empty) or `on`: client search, `POST /api/search` ([`ARCHITECTURE.md` §4.6](../ARCHITECTURE.md#46-client-search)). In `on`, search that cannot run safely (index or Claude off, no caller, a caller also in `BOT_CALLER_APP_IDS`, `MEMBERSHIP_CHECK_MODE` off) stays off with a `search.config` reason; it never stops ingestion. Shows in `/api/health` as `build.search`. Any other value fails at cold start. |
+| `SEARCH_ROWS` | *(optional)* Empty (the default): every bound row. Otherwise comma-separated Client Directory list item ids (not `ClientId`), like `INBOX_SWEEP_ROWS`: the canary row first, then client by client. An entry that is not a list item id keeps search off (`bad_rows` in `search.config`); unlike `INBOX_SWEEP_ROWS`, it never stops ingestion. Never empty it to take the last client out: that opens every row. |
+| `SEARCH_CALLER_APP_IDS` | *(optional)* The app id of the bot Function App's **managed identity**, which `grant-bot-search-caller.sh` prints (§5); never the bot's app registration. Empty: search off. Each entry must be a GUID (else search stays off, `bad_callers`; ingestion still starts), and none may be in `BOT_CALLER_APP_IDS`. |
 
 The `FALLBACK_*` settings were removed in Phase 0. The fallback bucket they described (the BCR
 GROUP library root, readable by the whole team) is replaced by the quarantine.
@@ -694,6 +705,8 @@ union requests, exceptions, traces
 | `INBOX_MIN_AGE_MS` / `INBOX_MAX_FILES_PER_TICK` | *(optional)* `120000` / `20` | Ingestion Function App setting |
 | `INBOX_SWEEP_ROWS` / `INBOX_CREATED_AFTER` | *(optional)* empty (every routed row) / empty (no cutoff) | Ingestion Function App setting |
 | `BOT_GATE_MODE` | `enforce` (or `log` for the first 24 h) | Bot Function App setting |
+| `SEARCH_MODE` | *(optional)* `off` (default) or `on` | Bot and Ingestion Function App settings, one each |
+| `SEARCH_ROWS` / `SEARCH_CALLER_APP_IDS` | *(optional)* empty (every bound row) / the bot managed identity's app id | Ingestion Function App setting |
 | `ANTHROPIC_ENABLED` | feature flag | Ingestion Function App setting |
 | `ANTHROPIC_API_KEY` | Anthropic Console | **Key Vault** secret `anthropic-api-key` |
 | `ANTHROPIC_MODEL` | constant (model id) | Ingestion Function App setting |

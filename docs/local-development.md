@@ -18,21 +18,22 @@ The bot needs `MICROSOFT_APP_ID`, `MICROSOFT_APP_PASSWORD` and `MICROSOFT_APP_TE
 start, so it runs as a real app registration: use a test registration's values, in your local
 file only.
 
-## What the Bot Framework Emulator can and cannot do
+## Why the Bot Framework Emulator cannot reach the bot
 
-**The Emulator cannot get a file filed.** Every activity passes the bot's gate first, and the
-gate lets through only a Teams 1:1 chat (`conversation.conversationType` = `personal`) from the
-BCR tenant (`channelData.tenant.id`), sent by a user with a GUID `from.aadObjectId`. Emulator
-activities carry none of these by default.
+**No Emulator request reaches the bot, in any `BOT_GATE_MODE`.** The bot accepts only tokens the
+Bot Framework channel service issued (`bot/channelAuth.ts`). Authentication runs before any
+middleware, so the gate never sees an Emulator activity, and `BOT_GATE_MODE=log` changes nothing
+for it. The Emulator gets HTTP 500, and the log shows `adapter.processActivityDirect threw` with:
 
-- With `BOT_GATE_MODE=enforce`, the value in the example settings and the default, the gate
-  refuses every Emulator activity. The bot answers a refused message only in a personal
-  conversation, so the Emulator sees **no reply at all**. That is the gate working, not a
-  broken bot: the log shows `bot.gate.rejected` with the reason.
-- With `BOT_GATE_MODE=log` in your **local** settings, the gate logs the refusal and lets the turn
-  through. That is enough for the help card and card layout. A file sent this way still comes
-  back as a rejected row: the bot forwards the activity's conversation type, tenant and user id
-  as they are, and ingestion's source check refuses the batch with 400.
+- `Only Bot Framework channel tokens are accepted.` when the Emulator signs in with the app id
+  and password: that is exactly the token a stolen bot secret could mint
+  ([`security.md`](security.md) T15);
+- `Unauthorized Access. Request is not authorized` when it sends no credentials. The bot cannot
+  run without authentication: `MICROSOFT_APP_ID` and `MICROSOFT_APP_PASSWORD` are required.
+
+Behind authentication, the gate lets through only a Teams 1:1 chat
+(`conversation.conversationType` = `personal`) from the BCR tenant (`channelData.tenant.id`), sent
+by a user with a GUID `from.aadObjectId`; ingestion checks the same again.
 
 Never set `log` on a deployed bot outside the rollout window in
 [`operations/human-steps.md`](operations/human-steps.md#phase-0).

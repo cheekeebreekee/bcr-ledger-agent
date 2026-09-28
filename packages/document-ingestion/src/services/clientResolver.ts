@@ -27,6 +27,15 @@ export interface ClientResolverOptions {
 }
 
 /**
+ * Who is asking: the authenticated user id, and nothing that could name a
+ * client. `purpose` goes into the log lines only (`upload` when absent); it
+ * changes nothing about the decision.
+ */
+export type ResolveRequest = Pick<IngestionSource, 'userAadObjectId'> & {
+  readonly purpose?: 'upload' | 'search';
+};
+
+/**
  * Decides **which client** an upload belongs to — from the authenticated
  * uploader's identity and nothing else.
  *
@@ -57,7 +66,7 @@ export class ClientResolver {
     this.log = opts.log ?? createLogger('ingestion/clientResolver');
   }
 
-  async resolve(source: IngestionSource): Promise<ResolvedClient> {
+  async resolve(source: ResolveRequest): Promise<ResolvedClient> {
     const snapshot = await this.directory.getSnapshot();
     if (snapshot.health === 'unavailable') {
       return this.quarantine('stale_directory');
@@ -80,11 +89,16 @@ export class ClientResolver {
     if (!teamId || !isBoundRow(row)) return this.quarantine('unbound_target');
 
     const ids = { clientId: row.clientId, listItemId: row.listItemId, teamId };
-    const refused = await this.checkMembership(oid, ids);
+    const purpose = source.purpose ? { purpose: source.purpose } : {};
+    const refused = await this.checkMembership(oid, ids, purpose);
     if (refused) return refused;
 
     this.log.info(
-      { ...ids, membership: this.opts.membership.mode === 'off' ? 'unchecked' : 'verified' },
+      {
+        ...ids,
+        ...purpose,
+        membership: this.opts.membership.mode === 'off' ? 'unchecked' : 'verified',
+      },
       'routed to client via userAadObjectId',
     );
     return {
@@ -108,6 +122,7 @@ export class ClientResolver {
   private async checkMembership(
     oid: string,
     ids: { readonly clientId: string; readonly listItemId: string; readonly teamId: string },
+    purpose: { readonly purpose?: string },
   ): Promise<ResolvedClient | null> {
     const check = this.opts.membership;
     if (check.mode === 'off') return null;
@@ -118,7 +133,12 @@ export class ClientResolver {
     } catch (err) {
       const status = err instanceof TeamMembershipReadError ? err.status : undefined;
       this.log.warn(
-        { event: 'membership.unverified', ...ids, ...(status !== undefined ? { status } : {}) },
+        {
+          event: 'membership.unverified',
+          ...ids,
+          ...purpose,
+          ...(status !== undefined ? { status } : {}),
+        },
         'membership.unverified',
       );
       return this.quarantine('membership_unverified');
@@ -129,7 +149,14 @@ export class ClientResolver {
     if (inRowTeam && otherTeamCount === 0) return null;
 
     this.log.warn(
-      { event: 'membership.mismatch', ...ids, teamCount: teams.size, inRowTeam, otherTeamCount },
+      {
+        event: 'membership.mismatch',
+        ...ids,
+        ...purpose,
+        teamCount: teams.size,
+        inRowTeam,
+        otherTeamCount,
+      },
       'membership.mismatch',
     );
     return this.quarantine('membership_mismatch');

@@ -117,7 +117,11 @@ only, deployed alone in incremental mode by `infrastructure/db-deploy.sh <env>` 
 then `--apply`), with a `db.<env>.parameters.json` of its own. The ingestion app runs with the
 index off (`LEDGER_INDEX_MODE=off`, the template's default) until the steps of the
 [Document index release](operations/human-steps.md#document-index-release) are done: the
-login, the migrations and the settings.
+login, the migrations and the settings. Client search stays off too (`SEARCH_MODE=off` on both
+apps, the template's default) until the
+[Client search release](operations/human-steps.md#client-search-release): the bot identity's
+`Documents.Search` grant (`infrastructure/identity/grant-bot-search-caller.sh`, which also adds
+the role to the Ingestion API registration), migration 0003, then the settings.
 
 ### 3a. App settings
 

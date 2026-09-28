@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
-import type Anthropic from '@anthropic-ai/sdk';
+import Anthropic from '@anthropic-ai/sdk';
 import { ingestionConfigSchema, thinkingDisabledProblem, type Logger } from '@bcr/shared';
 import { AcceptancePolicy } from '../services/acceptancePolicy';
 import { ClassificationService, FallbackClassifier } from '../services/classificationService';
@@ -13,6 +13,13 @@ import {
 } from '../services/claudeClassifier';
 import { runEvaluation, summarize, type ServiceFactory } from './evaluate';
 import { goNoGo, renderReport } from './report';
+import {
+  parseSearchCases,
+  promptTokens,
+  renderSearchReport,
+  runSearchEvaluation,
+  summarizeSearch,
+} from './searchEval';
 import { arbiterToTruth, parseTruth, type ArbiterRow } from './truth';
 
 /** Everything the CLI touches outside itself, so tests can run it offline. */
@@ -28,12 +35,19 @@ export interface CliDeps {
   readonly now?: () => Date;
 }
 
+/**
+ * The synthetic search cases, relative to the package (where `yarn workspace … eval:search` runs).
+ * Outside `src/`: the packager ships only compiled TypeScript and refuses any other file there.
+ */
+export const DEFAULT_SEARCH_CASES = 'fixtures/search-questions.json';
+
 export const USAGE = `Usage:
   eval run --dir <folder> --truth <truth.json> [--client-name <name>] [--client-nip <nip>]
            [--out <report.md>] [--model <id>] [--effort low|medium|high] [--thinking adaptive|disabled]
            [--threshold <0.70-0.95>]
            [--concurrency <1-4>] [--retry-passes <n>] [--retry-delay-ms <ms>]
   eval truth --arbiter <arbiter.json> [--out <truth.json>] [--client-name <name>] [--client-nip <nip>]
+  eval search [--cases <cases.json>] [--out <report.md>] [--now <ISO time>]
 
 run classifies every document of truth.json from <folder> with the real Claude
 classifier and acceptance policy, and reports accuracy, direction, month, review
@@ -41,7 +55,13 @@ rate, confidence and tokens. It reads ANTHROPIC_API_KEY from this shell's
 environment (never from Key Vault) and sends each document to the Anthropic API
 only. ANTHROPIC_MODEL and CLASSIFICATION_ACCEPT_THRESHOLD are used when set.
 
-truth converts the independent reviewers' arbiter report into truth.json.`;
+truth converts the independent reviewers' arbiter report into truth.json.
+
+search turns every synthetic question of <cases.json> (default ${DEFAULT_SEARCH_CASES})
+into a filter with the real search interpreter, and reports exact answers,
+invented values, keys outside the schema, the system prompt's tokens and GO /
+NO-GO. Periods are read at the file's "now" unless --now is given. It reads
+ANTHROPIC_API_KEY from this shell only, and sends only the questions.`;
 
 /** Exit codes: 0 done (whatever the verdict), 2 bad arguments or input. */
 export async function runCli(argv: readonly string[], deps: CliDeps): Promise<number> {
@@ -49,6 +69,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
   try {
     if (command === 'run') return await runCommand(rest, deps);
     if (command === 'truth') return await truthCommand(rest, deps);
+    if (command === 'search') return await searchCommand(rest, deps);
     deps.stderr(`${USAGE}\n`);
     return command === '--help' || command === 'help' ? 0 : 2;
   } catch (err) {
@@ -192,6 +213,49 @@ async function truthCommand(argv: readonly string[], deps: CliDeps): Promise<num
   deps.stderr(
     `${entries.length} entries (${entries.filter((e) => e.direction).length} with a direction): ` +
       `${[...counts].map(([c, n]) => `${c} ${n}`).join(', ')}\n`,
+  );
+  return 0;
+}
+
+async function searchCommand(argv: readonly string[], deps: CliDeps): Promise<number> {
+  const { values } = parseArgs({
+    args: [...argv],
+    strict: true,
+    options: {
+      cases: { type: 'string' },
+      out: { type: 'string' },
+      now: { type: 'string' },
+      help: { type: 'boolean', short: 'h' },
+    },
+  });
+  if (values.help) return usage(deps);
+  const apiKey = (deps.env['ANTHROPIC_API_KEY'] ?? '').trim();
+  if (!apiKey && !deps.anthropicClient) {
+    throw new Error('ANTHROPIC_API_KEY is not set in this shell; export it for this run only');
+  }
+  const file = parseSearchCases(
+    JSON.parse((await deps.readFile(values.cases ?? DEFAULT_SEARCH_CASES)).toString('utf8')),
+  );
+  const now = new Date(values.now ?? file.now);
+  if (Number.isNaN(now.getTime())) throw new Error('--now must be an ISO 8601 time');
+  const client = deps.anthropicClient ?? new Anthropic({ apiKey });
+
+  const tokens = await promptTokens(client);
+  const results = await runSearchEvaluation({
+    cases: file.cases,
+    now,
+    client,
+    onProgress: (done, total) => deps.stderr(`\r${done}/${total}`),
+  });
+  const summary = summarizeSearch(results, tokens);
+  const report = renderSearchReport(summary, results, (deps.now ?? (() => new Date()))());
+  if (values.out) await deps.writeFile(values.out, report);
+  else deps.stdout(report);
+  deps.stderr(
+    `\nexact ${summary.exact}/${summary.expected}, invented (injection) ` +
+      `${summary.injectionInvented}, outside schema ${summary.schemaViolations}, ` +
+      `prompt ${summary.promptTokens} tokens, unavailable ${summary.unavailable}: ` +
+      `${summary.go ? 'GO' : 'NO-GO'}${values.out ? `; report written to ${values.out}` : ''}\n`,
   );
   return 0;
 }

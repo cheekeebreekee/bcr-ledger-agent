@@ -41,6 +41,9 @@ const envMap = {
   ledgerDbUser: 'LEDGER_DB_USER',
   webJobsStorage: 'AzureWebJobsStorage',
   reviewWebhookUrl: 'REVIEW_WEBHOOK_URL',
+  searchMode: 'SEARCH_MODE',
+  searchRows: 'SEARCH_ROWS',
+  searchCallerAppIds: 'SEARCH_CALLER_APP_IDS',
   applicationInsightsConnectionString: 'APPLICATIONINSIGHTS_CONNECTION_STRING',
   logLevel: 'LOG_LEVEL',
 } as const satisfies Record<keyof IngestionConfig, string>;
@@ -59,6 +62,73 @@ export const RETIRED_SETTINGS: Readonly<Record<string, string>> = {
 /** The retired settings that are still set (non-empty) in `env`, by name only. */
 export function retiredSettingsIn(env: NodeJS.ProcessEnv = process.env): string[] {
   return Object.keys(RETIRED_SETTINGS).filter((name) => (env[name] ?? '').trim() !== '');
+}
+
+/** Whether classification may call Claude: enabled, and a key to call it with. */
+export function claudeConfigured(
+  config: Pick<IngestionConfig, 'anthropicEnabled' | 'anthropicApiKey'>,
+): boolean {
+  return config.anthropicEnabled && config.anthropicApiKey !== '';
+}
+
+/**
+ * Why client search (`POST /api/search`) is off, or `undefined` when it may
+ * run. Said once at cold start (`search.config`), shown in `/api/health`
+ * (`build.search`), and every search answers `disabled` while it holds:
+ *
+ *  - `mode_off`: `SEARCH_MODE=off` (the default);
+ *  - `bad_rows`: a `SEARCH_ROWS` entry is not a list item id (a whole number):
+ *    a typo keeps search off, never opens it wider;
+ *  - `bad_callers`: a `SEARCH_CALLER_APP_IDS` entry is not an app id (a GUID);
+ *  - `index_off`: `LEDGER_INDEX_MODE` is not `write`, so there is nothing to search;
+ *  - `claude_off`: no model to read a question with (`ANTHROPIC_ENABLED`, the key);
+ *  - `no_callers`: `SEARCH_CALLER_APP_IDS` is empty, so nobody may call the route;
+ *  - `caller_overlap`: an app id is on both `SEARCH_CALLER_APP_IDS` and
+ *    `BOT_CALLER_APP_IDS`: the bot registration's secret, which files documents,
+ *    must never also read them;
+ *  - `membership_off`: `MEMBERSHIP_CHECK_MODE` is not `enforce`: search has no
+ *    way round the check that keeps a guest of two clients' Teams out.
+ *
+ * None of these stops ingestion's cold start: filing does not depend on search.
+ */
+const LIST_ITEM_ID = /^[1-9][0-9]*$/;
+const APP_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export type SearchOffReason =
+  | 'mode_off'
+  | 'bad_rows'
+  | 'bad_callers'
+  | 'index_off'
+  | 'claude_off'
+  | 'no_callers'
+  | 'caller_overlap'
+  | 'membership_off';
+
+export function searchOffReason(
+  config: Pick<
+    IngestionConfig,
+    | 'searchMode'
+    | 'searchRows'
+    | 'ledgerIndexMode'
+    | 'anthropicEnabled'
+    | 'anthropicApiKey'
+    | 'searchCallerAppIds'
+    | 'botCallerAppIds'
+    | 'membershipCheckMode'
+  >,
+): SearchOffReason | undefined {
+  if (config.searchMode !== 'on') return 'mode_off';
+  if (!config.searchRows.every((id) => LIST_ITEM_ID.test(id))) return 'bad_rows';
+  if (!config.searchCallerAppIds.every((id) => APP_ID.test(id))) return 'bad_callers';
+  if (config.ledgerIndexMode !== 'write') return 'index_off';
+  if (!claudeConfigured(config)) return 'claude_off';
+  if (config.searchCallerAppIds.length === 0) return 'no_callers';
+  const botCallers = new Set(config.botCallerAppIds.map((id) => id.trim().toLowerCase()));
+  if (config.searchCallerAppIds.some((id) => botCallers.has(id.trim().toLowerCase()))) {
+    return 'caller_overlap';
+  }
+  if (config.membershipCheckMode !== 'enforce') return 'membership_off';
+  return undefined;
 }
 
 let cached: IngestionConfig | undefined;

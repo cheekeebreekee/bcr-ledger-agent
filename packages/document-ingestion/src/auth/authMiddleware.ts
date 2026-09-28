@@ -19,6 +19,14 @@ export interface CallerPolicy {
   readonly appIds: readonly string[];
 }
 
+/**
+ * The app role `POST /api/search` requires. It is assigned to the bot Function
+ * App's managed identity only (`SEARCH_CALLER_APP_IDS`), never to the bot's
+ * app registration: the registration's secret, which the bot holds to talk to
+ * Bot Framework, can file documents but cannot read them.
+ */
+export const SEARCH_ROLE = 'Documents.Search';
+
 export interface VerifiedCaller {
   readonly subject: string;
   readonly appId: string;

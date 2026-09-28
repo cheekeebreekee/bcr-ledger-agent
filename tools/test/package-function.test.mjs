@@ -62,7 +62,7 @@ function fakeRepo(extra = {}) {
     'packages/shared/package.json': '{"name":"@bcr/shared"}',
     'packages/shared/src/config.ts': '',
     'packages/shared/src/index.ts': '',
-    'packages/shared/dist/config.js': 'botGateMode forbiddenTargetSitePaths',
+    'packages/shared/dist/config.js': 'botGateMode forbiddenTargetSitePaths searchMode',
     'packages/shared/dist/index.js': '',
     ...extra,
   });
@@ -119,6 +119,16 @@ describe('dist ↔ src', () => {
         const src = join(REPO, 'packages', name, 'src', file.replace(/\.js$/, '.ts'));
         assert.equal(existsSync(src), true, `${name}: ${src}`);
       }
+    }
+  });
+
+  test("this repo's shipped packages hold only TypeScript in src", () => {
+    // A package run refuses anything else there (it would not ship); catch it
+    // here, not at deploy time. Data a tool reads, such as the search
+    // evaluation's cases, lives beside src/.
+    for (const dir of ['teams-bot', 'document-ingestion', 'shared', 'ledger-db']) {
+      const pkg = join(REPO, 'packages', dir);
+      assert.deepEqual(compareDistToSrc(join(pkg, 'dist'), join(pkg, 'src')).unshipped, [], dir);
     }
   });
 });
@@ -317,6 +327,29 @@ describe('packageFunction', () => {
       (err) => err instanceof PackageError && /not the Phase-0 build/.test(err.message),
     );
     assert.equal(existsSync(join(root, 'artifacts/document-ingestion.zip')), false);
+  });
+
+  test('a @bcr/shared from before the client search release fails, for either app', () => {
+    for (const name of ['document-ingestion', 'teams-bot']) {
+      const root = fakeRepo({
+        'artifacts/teams-bot.zip': 'an older build',
+        'packages/teams-bot/host.json': '{}',
+        'packages/teams-bot/package.json': '{"name":"@bcr/teams-bot"}',
+        'packages/teams-bot/src/index.ts': '',
+        'packages/teams-bot/src/bot/gateMiddleware.ts': '',
+        'packages/teams-bot/dist/index.js': '',
+        'packages/teams-bot/dist/bot/gateMiddleware.js': "'bot.gate.rejected'",
+        'packages/shared/dist/config.js': 'botGateMode forbiddenTargetSitePaths',
+      });
+      assert.throws(
+        () => packageFunction({ root, name, log: quiet }),
+        (err) =>
+          err instanceof PackageError &&
+          /@bcr\/shared: .*config\.js does not contain "searchMode"/.test(err.message),
+        name,
+      );
+      assert.equal(existsSync(join(root, `artifacts/${name}.zip`)), false, name);
+    }
   });
 
   test('an orphan in the dist of another workspace package the app ships fails too', () => {

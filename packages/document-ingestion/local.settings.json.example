@@ -34,6 +34,9 @@
     "LEDGER_DB_HOST": "",
     "LEDGER_DB_NAME": "ledger",
     "LEDGER_DB_USER": "",
+    "SEARCH_MODE": "off",
+    "SEARCH_ROWS": "",
+    "SEARCH_CALLER_APP_IDS": "",
     "APPLICATIONINSIGHTS_CONNECTION_STRING": "",
     "LOG_LEVEL": "debug"
   },

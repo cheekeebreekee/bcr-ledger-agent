@@ -20,9 +20,15 @@
 # Tokens:
 #   - `az` (signed in with `az login`) is used only to read the Function App's
 #     managed identity from Azure Resource Manager.
-#   - Every Microsoft Graph call uses GRAPH_TOKEN, a delegated token, as the
-#     operator tools do. The Azure CLI's own Graph token cannot write app role
-#     assignments in this tenant (AADSTS65002, PROJECT_OVERVIEW.md lessons).
+#   - Every Microsoft Graph call uses GRAPH_TOKEN, a delegated token. The
+#     operator's own Azure CLI Graph token works and is the short route:
+#       export GRAPH_TOKEN=$(az account get-access-token \
+#         --resource https://graph.microsoft.com --query accessToken -o tsv)
+#     In this tenant its scopes carry AppRoleAssignment.ReadWrite.All and
+#     Directory.AccessAsUser.All (H-8b's grant was made with it). AADSTS65002
+#     applies only to SharePoint scopes and to adding new scopes to the CLI's
+#     app, never to this grant. The graph-login.mjs token (H-4a's
+#     registration) is the other route.
 #     The token is sent from a private temporary file, never on a command line,
 #     and never printed.
 #   - The dry run needs to read service principals: Directory.Read.All or
@@ -157,7 +163,7 @@ echo "   tenant:               $AZ_TENANT"
 echo "   GRAPH_TOKEN signed in as: $(claim upn 2>/dev/null || echo '?')"
 if [[ " $TOKEN_SCOPES " != *" AppRoleAssignment.ReadWrite.All "* ]]; then
   if [[ $APPLY == 1 ]]; then
-    die "GRAPH_TOKEN has no delegated AppRoleAssignment.ReadWrite.All: add it to the app registration GRAPH_TOKEN comes from, grant admin consent, and sign in again"
+    die "GRAPH_TOKEN has no delegated AppRoleAssignment.ReadWrite.All: run again with the Azure CLI's Graph token (see --help), or send the dry run's request from Graph Explorer. Consent on H-4a's registration only as a last resort, and remove it again afterwards (H-4a Rollback)"
   fi
   echo "   note: GRAPH_TOKEN has no AppRoleAssignment.ReadWrite.All; --apply will need it"
 fi

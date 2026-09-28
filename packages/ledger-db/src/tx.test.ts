@@ -76,6 +76,21 @@ describe('LedgerDb.withClientTx', () => {
     expect(f.released).toEqual([undefined]);
   });
 
+  it('opens read-only on one snapshot when asked, and scopes it the same way', async () => {
+    const f = fakePool();
+    await f.db.withClientTx(A, (tx) => tx.query(sql`SELECT ${1}`), { readOnly: true });
+    expect(f.texts()).toEqual([
+      'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY',
+      'SET LOCAL ROLE ledger_app',
+      "SELECT set_config('app.client_id', $1, true)",
+      'SELECT $1',
+      'COMMIT',
+    ]);
+    const plain = fakePool();
+    await plain.db.withClientTx(A, async () => 1, { readOnly: false });
+    expect(plain.texts()[0]).toBe('BEGIN');
+  });
+
   it('rolls back and rethrows when fn throws, and returns the connection', async () => {
     const f = fakePool();
     await expect(

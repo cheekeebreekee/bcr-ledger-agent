@@ -29,7 +29,11 @@
     "ledgerIndexMode": { "value": "off" },
     "ledgerDbHost": { "value": "" },
     "ledgerDbUser": { "value": "" },
+    "searchMode": { "value": "off" },
+    "searchRows": { "value": "" },
+    "searchCallerAppIds": { "value": "" },
     "botGateMode": { "value": "enforce" },
+    "botSearchMode": { "value": "off" },
     "logLevel": { "value": "info" }
   }
 }

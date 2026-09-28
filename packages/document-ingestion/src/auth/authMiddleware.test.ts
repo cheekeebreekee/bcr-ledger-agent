@@ -1,6 +1,6 @@
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
 import { ForbiddenError, UnauthorizedError } from '@bcr/shared';
-import { AuthMiddleware, type CallerPolicy } from './authMiddleware';
+import { AuthMiddleware, SEARCH_ROLE, type CallerPolicy } from './authMiddleware';
 
 const TENANT = '379013e4-0000-4000-8000-000000000001';
 const AUDIENCE = 'api://ingestion-app';
@@ -101,6 +101,53 @@ describe('AuthMiddleware.verify', () => {
   it('rejects a token with no app id at all', async () => {
     const t = await token({ appid: undefined });
     await expect(auth.verify(`Bearer ${t}`, policy)).rejects.toBeInstanceOf(ForbiddenError);
+  });
+});
+
+// Search is pinned to the bot Function App's managed identity with its own
+// role; the bot registration's secret (Documents.Ingest, the bot's app id)
+// files documents and must never read them.
+describe('AuthMiddleware.verify: the search route and the batch route', () => {
+  const BOT_MI = '7d0c3f6a-5b1e-4c2d-9e8f-0a1b2c3d4e5f';
+  const searchPolicy: CallerPolicy = { roles: [SEARCH_ROLE], appIds: [BOT_MI] };
+  const miToken = () => token({ appid: BOT_MI, roles: [SEARCH_ROLE] });
+
+  it('names the role Documents.Search', () => {
+    expect(SEARCH_ROLE).toBe('Documents.Search');
+  });
+
+  it("accepts the bot managed identity's token with Documents.Search on the search route", async () => {
+    await expect(auth.verify(`Bearer ${await miToken()}`, searchPolicy)).resolves.toMatchObject({
+      appId: BOT_MI,
+      roles: [SEARCH_ROLE],
+    });
+  });
+
+  it("refuses the bot secret's token (Documents.Ingest, the bot app id) on the search route", async () => {
+    const t = await token({});
+    await expect(auth.verify(`Bearer ${t}`, searchPolicy)).rejects.toBeInstanceOf(ForbiddenError);
+  });
+
+  it('refuses the bot app id even if it held Documents.Search', async () => {
+    const t = await token({ roles: [SEARCH_ROLE] });
+    await expect(auth.verify(`Bearer ${t}`, searchPolicy)).rejects.toBeInstanceOf(ForbiddenError);
+  });
+
+  it("refuses the managed identity's token on the batch route", async () => {
+    await expect(auth.verify(`Bearer ${await miToken()}`, policy)).rejects.toBeInstanceOf(
+      ForbiddenError,
+    );
+  });
+
+  it('refuses the managed identity with the ingest role on the batch route (app id not listed)', async () => {
+    const t = await token({ appid: BOT_MI, roles: ['Documents.Ingest'] });
+    await expect(auth.verify(`Bearer ${t}`, policy)).rejects.toBeInstanceOf(ForbiddenError);
+  });
+
+  it('refuses every caller while SEARCH_CALLER_APP_IDS is empty', async () => {
+    await expect(
+      auth.verify(`Bearer ${await miToken()}`, { roles: [SEARCH_ROLE], appIds: [] }),
+    ).rejects.toBeInstanceOf(ForbiddenError);
   });
 });
 

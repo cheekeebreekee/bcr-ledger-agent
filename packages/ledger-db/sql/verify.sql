@@ -71,6 +71,25 @@ problems AS (
       AND a.atttypid = 'uuid'::regtype AND NOT a.attisdropped
   )
   UNION ALL
+  SELECT 'guard_trigger_missing', t.relname::text,
+         'no enabled BEFORE UPDATE row trigger running ledger.guard_row_update(): client_id could change'
+  FROM ledger_tables t
+  WHERE NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger tg
+    JOIN pg_catalog.pg_proc p ON p.oid = tg.tgfoid
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+    WHERE tg.tgrelid = t.oid AND NOT tg.tgisinternal AND tg.tgenabled IN ('O', 'A')
+      AND n.nspname = 'ledger' AND p.proname = 'guard_row_update'
+      -- tgtype bits: 1 FOR EACH ROW, 2 BEFORE, 16 UPDATE.
+      AND (tg.tgtype & 19) = 19
+  )
+  UNION ALL
+  SELECT 'app_role_can_delete', t.relname::text, 'ledger_app holds ' || acl.privilege_type
+  FROM ledger_tables t,
+       LATERAL pg_catalog.aclexplode(coalesce(t.relacl, pg_catalog.acldefault('r', t.relowner))) acl
+  WHERE acl.grantee = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'ledger_app')
+    AND acl.privilege_type IN ('DELETE', 'TRUNCATE')
+  UNION ALL
   SELECT 'owner_not_ledger_owner', relname::text,
          'owned by ' || pg_catalog.pg_get_userbyid(relowner)
   FROM ledger_tables

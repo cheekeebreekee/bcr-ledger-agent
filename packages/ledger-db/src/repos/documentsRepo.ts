@@ -1,4 +1,6 @@
 import {
+  SEARCH_PAGE_SIZE,
+  SEARCH_TOTAL_CAP,
   normalizeAmount,
   normalizeCurrency,
   normalizeIsoDate,
@@ -9,6 +11,7 @@ import { z } from 'zod';
 import { LedgerDbError } from '../errors';
 import { joinSql, sql, type Sql } from '../sql';
 import { assertClientTx, type ClientTx } from '../tx';
+import { filterConditions, parseSearchFilter, type DocumentSearchFilter } from './searchFilter';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MONTH = /^[0-9]{4}-(0[1-9]|1[0-2])$/;
@@ -354,32 +357,17 @@ export async function monthlyCounts(tx: ClientTx): Promise<MonthlyCount[]> {
     ORDER BY document_month DESC NULLS LAST, status`);
 }
 
-/**
- * A search of one client's documents. No field names a client or a limit: the
- * client is the transaction's, the page size is {@link SearchPage}'s.
- */
-export interface DocumentSearchFilter {
-  /** The category filed under (`nieposortowane` finds the review pile). */
-  readonly category?: string;
-  /** `YYYY-MM`, inclusive. */
-  readonly monthFrom?: string;
-  readonly monthTo?: string;
-  /** Gross amount bounds, inclusive: a number or a decimal string. */
-  readonly grossMin?: string | number;
-  readonly grossMax?: string | number;
-  /** A NIP on either side of the invoice. */
-  readonly counterpartyNip?: string;
-}
+export type { DocumentSearchFilter } from './searchFilter';
 
 export interface SearchPage {
-  /** 1–100. Default 25. */
-  readonly limit?: number;
+  /** 1–100. Default 25 ({@link search}), 10 ({@link searchClientView}). */
+  readonly limit?: number | undefined;
   /** The `nextCursor` of the previous page. */
-  readonly after?: string;
+  readonly after?: string | undefined;
 }
 
-export interface SearchResult {
-  readonly items: readonly DocumentRow[];
+export interface SearchResult<R = DocumentRow> {
+  readonly items: readonly R[];
   /** Pass as `after` for the next page; `null` on the last page. */
   readonly nextCursor: string | null;
 }
@@ -387,25 +375,21 @@ export interface SearchResult {
 export const SEARCH_DEFAULT_LIMIT = 25;
 export const SEARCH_MAX_LIMIT = 100;
 
-const amountFilter = z
-  .union([z.string(), z.number()])
-  .transform((v, ctx) => normalizeAmount(v) ?? (ctx.addIssue({ code: 'custom' }), z.NEVER));
-
-const filterSchema = z
-  .object({
-    category: z.string().regex(CATEGORY).optional(),
-    monthFrom: z.string().regex(MONTH).optional(),
-    monthTo: z.string().regex(MONTH).optional(),
-    grossMin: amountFilter.optional(),
-    grossMax: amountFilter.optional(),
-    counterpartyNip: z
-      .string()
-      .transform((v, ctx) => normalizeNip(v) ?? (ctx.addIssue({ code: 'custom' }), z.NEVER))
-      .optional(),
-  })
-  .strict();
-
 const CURSOR_TIME = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$/;
+
+/**
+ * A cursor's time that PostgreSQL will take: the shape above AND a real
+ * instant (no 30 February, month 13, hour 24 or second 60; not year 0000,
+ * which JavaScript round-trips and PostgreSQL refuses). Checked before any
+ * SQL, so a tampered cursor is `invalid_cursor`, never a database error
+ * (22008) that reads as an outage.
+ */
+function isCursorTime(value: string): boolean {
+  if (!CURSOR_TIME.test(value) || value.startsWith('0000')) return false;
+  const millis = `${value.slice(0, 23)}Z`;
+  const time = Date.parse(millis);
+  return !Number.isNaN(time) && new Date(time).toISOString() === millis;
+}
 
 /** The keyset of a row: newest first, ties broken by id. */
 export function encodeCursor(row: Pick<DocumentRow, 'createdAt' | 'documentId'>): string {
@@ -423,7 +407,7 @@ function decodeCursor(cursor: string): { readonly createdAt: string; readonly do
     !Array.isArray(parsed) ||
     parsed.length !== 2 ||
     typeof parsed[0] !== 'string' ||
-    !CURSOR_TIME.test(parsed[0]) ||
+    !isCursorTime(parsed[0]) ||
     typeof parsed[1] !== 'string' ||
     !UUID.test(parsed[1])
   ) {
@@ -432,36 +416,19 @@ function decodeCursor(cursor: string): { readonly createdAt: string; readonly do
   return { createdAt: parsed[0], documentId: parsed[1] };
 }
 
-/**
- * The transaction's client's documents matching `filter`, newest first, one
- * page at a time (keyset paging on `created_at`, `document_id`: stable while
- * rows are added, and no OFFSET scans). Every value reaches SQL as a
- * parameter; the conditions are fixed fragments.
- */
-export async function search(
+/** One page of `columns` from the documents matching `filter`: the pager of every search read. */
+async function searchPage<R extends Pick<DocumentRow, 'createdAt' | 'documentId'>>(
   tx: ClientTx,
   filter: DocumentSearchFilter,
-  page: SearchPage = {},
-): Promise<SearchResult> {
+  page: SearchPage,
+  columns: Sql,
+  defaultLimit: number,
+): Promise<SearchResult<R>> {
   assertClientTx(tx);
-  const parsed = filterSchema.safeParse(filter);
-  if (!parsed.success) {
-    const fields = [...new Set(parsed.error.issues.map((i) => i.path.join('.')))].join(', ');
-    throw new LedgerDbError('invalid_filter', `the search filter is invalid: ${fields}`);
-  }
-  const limit = page.limit ?? SEARCH_DEFAULT_LIMIT;
+  const conditions = filterConditions(tx, parseSearchFilter(filter));
+  const limit = page.limit ?? defaultLimit;
   if (!Number.isInteger(limit) || limit < 1 || limit > SEARCH_MAX_LIMIT) {
     throw new LedgerDbError('invalid_filter', 'the search filter is invalid: limit');
-  }
-  const f = parsed.data;
-  const conditions: Sql[] = [sql`client_id = ${tx.clientId}`];
-  if (f.category) conditions.push(sql`category = ${f.category}`);
-  if (f.monthFrom) conditions.push(sql`document_month >= ${`${f.monthFrom}-01`}::date`);
-  if (f.monthTo) conditions.push(sql`document_month <= ${`${f.monthTo}-01`}::date`);
-  if (f.grossMin !== undefined) conditions.push(sql`gross_amount >= ${f.grossMin}::numeric`);
-  if (f.grossMax !== undefined) conditions.push(sql`gross_amount <= ${f.grossMax}::numeric`);
-  if (f.counterpartyNip) {
-    conditions.push(sql`(seller_nip = ${f.counterpartyNip} OR buyer_nip = ${f.counterpartyNip})`);
   }
   if (page.after !== undefined) {
     const after = decodeCursor(page.after);
@@ -469,12 +436,132 @@ export async function search(
       sql`(created_at, document_id) < (${after.createdAt}::timestamptz, ${after.documentId}::uuid)`,
     );
   }
-  const rows = await tx.query<DocumentRow>(sql`
-    SELECT ${COLUMNS} FROM ledger.documents
+  const rows = await tx.query<R>(sql`
+    SELECT ${columns} FROM ledger.documents
     WHERE ${joinSql(conditions, sql` AND `)}
     ORDER BY created_at DESC, document_id DESC
     LIMIT ${limit + 1}`);
   const items = rows.slice(0, limit);
   const last = items[items.length - 1];
   return { items, nextCursor: rows.length > limit && last ? encodeCursor(last) : null };
+}
+
+/**
+ * The transaction's client's documents matching `filter`, newest first, one
+ * page at a time (keyset paging on `created_at`, `document_id`: stable while
+ * rows are added, and no OFFSET scans), every column: for staff and the
+ * index's own tools, never for a client (that is {@link searchClientView}).
+ * Every value reaches SQL as a parameter; the conditions are fixed fragments.
+ */
+export function search(
+  tx: ClientTx,
+  filter: DocumentSearchFilter,
+  page: SearchPage = {},
+): Promise<SearchResult> {
+  return searchPage<DocumentRow>(tx, filter, page, COLUMNS, SEARCH_DEFAULT_LIMIT);
+}
+
+/**
+ * A document as its client may see it: the client-view columns only. Never
+ * who uploaded it, the bytes' hash, drive ids, the folder, the classifier, its
+ * model, confidence, suggestion or review reasons. `status` is the index's
+ * (`FILED` | `NEEDS_REVIEW`); `webUrl` is the stored link, unchecked here (the
+ * caller keeps it only on the client's own site).
+ */
+export interface ClientViewRow {
+  readonly documentId: string;
+  readonly status: DocumentStatus;
+  readonly category: string;
+  /** `YYYY-MM`. */
+  readonly documentMonth: string | null;
+  readonly invoiceNumber: string | null;
+  /** `YYYY-MM-DD`. */
+  readonly issueDate: string | null;
+  readonly currency: string | null;
+  /** A decimal string. */
+  readonly grossAmount: string | null;
+  readonly sellerNip: string | null;
+  readonly sellerName: string | null;
+  readonly buyerNip: string | null;
+  readonly buyerName: string | null;
+  readonly webUrl: string | null;
+  /** ISO 8601 UTC with microseconds: the keyset of the paging. */
+  readonly createdAt: string;
+}
+
+/** The fields of {@link ClientViewRow}, in the order selected: all a client's search reads. */
+export const CLIENT_VIEW_FIELDS = [
+  'documentId',
+  'status',
+  'category',
+  'documentMonth',
+  'invoiceNumber',
+  'issueDate',
+  'currency',
+  'grossAmount',
+  'sellerNip',
+  'sellerName',
+  'buyerNip',
+  'buyerName',
+  'webUrl',
+  'createdAt',
+] as const satisfies readonly (keyof ClientViewRow)[];
+
+/** Exactly {@link CLIENT_VIEW_FIELDS}, selected in SQL: nothing else leaves the database. */
+const CLIENT_VIEW_COLUMNS = sql`
+  document_id::text AS "documentId", status, category,
+  to_char(document_month, 'YYYY-MM') AS "documentMonth", invoice_number AS "invoiceNumber",
+  issue_date::text AS "issueDate", currency::text AS currency,
+  gross_amount::text AS "grossAmount", seller_nip AS "sellerNip", seller_name AS "sellerName",
+  buyer_nip AS "buyerNip", buyer_name AS "buyerName", web_url AS "webUrl",
+  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "createdAt"`;
+
+/**
+ * A client's search: {@link search}'s filter and paging, but only the
+ * client-view columns ({@link ClientViewRow}), selected in SQL. A page is 10
+ * by default (`SEARCH_PAGE_SIZE`). Run it in a read-only transaction
+ * (`withClientTx(…, { readOnly: true })`).
+ */
+export function searchClientView(
+  tx: ClientTx,
+  filter: DocumentSearchFilter,
+  page: SearchPage = {},
+): Promise<SearchResult<ClientViewRow>> {
+  return searchPage<ClientViewRow>(tx, filter, page, CLIENT_VIEW_COLUMNS, SEARCH_PAGE_SIZE);
+}
+
+/** How many documents match, counted up to a cap. */
+export interface MatchCount {
+  /** The matches, at most the cap. */
+  readonly total: number;
+  /** More than the cap match ("ponad 500"). */
+  readonly capped: boolean;
+}
+
+/** The highest cap {@link countMatching} takes. */
+export const COUNT_MAX_CAP = 10_000;
+
+/**
+ * How many of the transaction's client's documents match `filter` (the same
+ * conditions as {@link searchClientView}), counting no further than `cap` + 1
+ * rows, so a broad filter costs no more than `cap` does.
+ */
+export async function countMatching(
+  tx: ClientTx,
+  filter: DocumentSearchFilter,
+  cap: number = SEARCH_TOTAL_CAP,
+): Promise<MatchCount> {
+  assertClientTx(tx);
+  const conditions = filterConditions(tx, parseSearchFilter(filter));
+  if (!Number.isInteger(cap) || cap < 1 || cap > COUNT_MAX_CAP) {
+    throw new LedgerDbError('invalid_filter', 'the search filter is invalid: cap');
+  }
+  const rows = await tx.query<{ n: number }>(sql`
+    SELECT count(*)::int AS n FROM (
+      SELECT 1 FROM ledger.documents
+      WHERE ${joinSql(conditions, sql` AND `)}
+      LIMIT ${cap + 1}
+    ) AS matching`);
+  const n = rows[0]?.n ?? 0;
+  return { total: Math.min(n, cap), capped: n > cap };
 }

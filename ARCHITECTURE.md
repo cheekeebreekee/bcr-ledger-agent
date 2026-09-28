@@ -35,7 +35,9 @@
 
 **Non-goals**
 
-- A generic chatbot framework. This agent has exactly one skill: *"take this file and file it"*.
+- A generic chatbot framework. This agent has two skills: *"take this file and file it"*, and,
+  for a client's guest, *"find my client's filed documents"* (§4.6). The second only narrows a
+  search over the asker's own client; it answers nothing else.
 - Long-running workflows. Moving uploads to a queue is planned (v2 Phase 3).
 
 ---
@@ -49,7 +51,7 @@
 | Shared library | TypeScript | Yarn workspace |
 | Channel registration | Azure Bot Service | Microsoft.BotService |
 | Secrets | Azure Key Vault | Microsoft.KeyVault |
-| Document classification | Claude (Anthropic Messages API) | api.anthropic.com (external) |
+| Document classification; client search's question → filter (§4.6) | Claude (Anthropic Messages API) | api.anthropic.com (external) |
 | Routing directory | "Client Directory" SharePoint list on the BCR GROUP site | Microsoft 365 tenant |
 | Document index | PostgreSQL 16 (`packages/ledger-db`): row-level security per client, Entra-only login (§4.5) | Azure Database for PostgreSQL Flexible Server, Burstable B1ms |
 | File store | Each client's Team site, channel "Dokumenty księgowe" (Microsoft Graph) | Microsoft 365 tenant |
@@ -747,12 +749,13 @@ are never indexed; `shadow` writes nothing, so it indexes nothing.
 **The isolation boundary is the database's row-level security**, not the application code
 ([`packages/ledger-db`](./packages/ledger-db/README.md)):
 
-- every table in schema `ledger` (`clients`, `documents`) has `ENABLE` + `FORCE ROW LEVEL
-  SECURITY` and one policy, `client_id = ledger.current_client_id()`, for reading and writing.
-  `current_client_id()` is `NULL` unless the transaction set its scope: no scope, no rows, no
-  writes;
-- the scope is set in one place only, `LedgerDb.withClientTx(clientId, fn)`:
-  `BEGIN; SET LOCAL ROLE ledger_app; SELECT set_config('app.client_id', $1, true); fn; COMMIT`.
+- every table in schema `ledger` (`clients`, `documents`, `search_queries`) has `ENABLE` +
+  `FORCE ROW LEVEL SECURITY` and one policy, `client_id = ledger.current_client_id()`, for
+  reading and writing. `current_client_id()` is `NULL` unless the transaction set its scope: no
+  scope, no rows, no writes;
+- the scope is set in one place only, `LedgerDb.withClientTx(clientId, fn, opts?)`:
+  `BEGIN; SET LOCAL ROLE ledger_app; SELECT set_config('app.client_id', $1, true); fn; COMMIT`
+  (`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` with `{ readOnly: true }`, which client search's reads use: no write, and one snapshot, so a page and its count agree).
   Both the role and the setting end with the transaction, so a pooled connection goes back
   holding neither. A source scan fails the build if anything else names the setting;
 - `ledger_app` owns nothing, cannot create, has no `BYPASSRLS` and no `DELETE`; the app's login
@@ -800,7 +803,59 @@ Node worker), logs `index.connection_error` and destroys the connection.
 
 **Reads.** `documentsRepo.monthlyCounts(tx)` and `documentsRepo.search(tx, filter, page)`
 (category, month range, gross range, counterparty NIP; keyset paging, newest first) run inside
-a client transaction like everything else. The search API and its UX are point 5.
+a client transaction like everything else. Client search (§4.6) reads through
+`documentsRepo.searchClientView` and `countMatching`, which share `search`'s one condition
+builder.
+
+### 4.6 Client search
+
+A client's guest asks, in Polish, in the bot's 1:1 chat ("faktury od X z września"), and gets
+their own client's filed documents, 10 to a card. It is point 5 of the v2 plan, and it is off
+until the [Client search release](docs/operations/human-steps.md#client-search-release)
+(`SEARCH_MODE` on both apps).
+
+```
+guest ─▶ bot: gate (§5.1), text not a file, SEARCH_MODE=on, 20 a minute per guest
+          │ POST /api/search {source: the gate-checked user id, query: question | typed filter}
+          │ token of the bot Function App's managed identity, role Documents.Search
+          ▼
+ingestion: token (SEARCH_CALLER_APP_IDS) ─▶ strict body ─▶ ClientResolver.resolve(user id)
+           ─▶ Guest? ─▶ row in SEARCH_ROWS? ─▶ scope = clientIdForDirectoryRow(list, row)
+           ─▶ tx1: limits (search_queries) ─▶ question only: Claude ─▶ typed filter
+           ─▶ tx2, READ ONLY: client-view rows + count ─▶ tx3: record (best effort)
+           ─▶ { status: ok, scopeLabel, filter, total, items ≤ 10, nextCursor } ─▶ bot card
+```
+
+- **The client** comes from the asker only, never from the question: the same `ClientResolver`
+  singleton as uploads (§4.2: exactly one bound row, the asker's Teams exactly its `TeamId`),
+  then `userType` must be `Guest`, so staff never search. Any other outcome is one fixed
+  `no_access` answer, with no index read and no model call. Search does not run while
+  `MEMBERSHIP_CHECK_MODE` is off. The scope is a pure function of the resolved row, re-derived
+  for every page; the body can name no client, row, scope or limit (strict schemas, 400).
+- **The question** becomes a typed filter (`ClientSearchFilter` in `@bcr/shared`: categories,
+  months, gross range, currency, counterparty NIP or name, invoice number, status). Claude
+  (`claude-sonnet-5`, a constant in the code) gets a static system prompt built from the
+  taxonomy (`categoryCatalog[].searchTerms`), the same bytes for every client, and the question
+  in a random tag. It sees no row and no client data, and it cannot name a client. Periods are
+  resolved in code (Europe/Warsaw); a name or number is kept only if it is in the question. Paging
+  and the card's „Zmień filtr” form send a typed filter: no model call, and they work when
+  Anthropic does not.
+- **The read** is `withClientTx(scope, …, { readOnly: true })`: RLS plus an explicit
+  `client_id = <scope>`, the client-view columns only (never who uploaded, the hash, drive ids,
+  the confidence, the model or its suggestion), a keyset cursor, and a count capped at 500.
+- **The answer** is rendered by the bot from fixed Polish sentences; model text is never shown.
+  A document in review is labelled „(w weryfikacji)”, and a link is shown only if it is https on
+  the row's own site.
+- **Limits and records.** `ledger.search_queries` (migration 0003) holds one row per search,
+  never the question or a filter value, and carries the durable limits (per guest: questions 10
+  per 5 minutes and 60 per 24 hours, typed and page requests 30 per 5 minutes; per client: 300
+  questions per 24 hours). Per worker: at most 2 concurrent searches (the pool of 2 is shared
+  with filing) and 300 model calls an hour.
+- **Settings.** Ingestion `SEARCH_MODE`, `SEARCH_ROWS` (list item ids, for a canary-first
+  rollout; `/api/health` `build.search`: `off`, `listed` or `all`) and `SEARCH_CALLER_APP_IDS`;
+  the bot's `SEARCH_MODE`. Search that cannot run safely (index or Claude off, no caller, a
+  caller also in `BOT_CALLER_APP_IDS`, membership check off) stays off, with a `search.config`
+  reason at cold start; it never stops ingestion.
 
 ---
 
@@ -808,9 +863,15 @@ a client transaction like everything else. The search API and its UX are point 5
 
 ### 5.1 Teams → bot
 
-Standard Bot Framework JWT, validated by `CloudAdapter` with the bot's `MicrosoftAppId`,
-`MicrosoftAppPassword` and `MicrosoftAppTenantId`. `MICROSOFT_APP_TYPE` is required and is
-`SingleTenant`.
+Bot Framework **channel tokens only**. `CloudAdapter` authenticates with `createBotFrameworkAuth`
+(`bot/channelAuth.ts`): the SDK's `ConfigurationBotFrameworkAuthentication` with the bot's
+`MicrosoftAppId`, `MicrosoftAppPassword` and `MicrosoftAppTenantId`, plus a `validateClaims` that
+refuses every issuer but `https://api.botframework.com` on every token path (channel, emulator,
+skill, ASE). The SDK also checks a channel token's `serviceurl` claim against the activity's
+`serviceUrl`. The SDK default alone also accepted an "emulator" AAD token, which the bot secret
+can mint, and then replied to any `serviceUrl`: the secret could have acted as any guest in the
+chat ([`security.md` T15](./docs/security.md#t15-the-bots-client-secret)). The Emulator therefore
+no longer authenticates. `MICROSOFT_APP_TYPE` is required and is `SingleTenant`.
 
 After authentication, a **gate middleware** runs on every activity type: messages, invokes
 (Adaptive Card actions, file consent), conversation and installation updates, edits and
@@ -850,15 +911,32 @@ tenant's JWKS, and checks:
   not enough, because any app granted `Documents.Ingest` could have called with any user id.
   Refusals are logged as `ingestion.caller.rejected {appId}`.
 
-Ingestion's only routes are `POST /api/ingest/batch` and `GET /api/health`. The channel-inbox
-timer (§4.4) is not a route and takes no input: a manual run through the host's admin endpoint
-needs the master key, and even then carries no identity or target, so it sweeps exactly what a
-scheduled tick would.
+**Client search** (§4.6) has a caller of its own. The bot gets that token from its Function App's
+**system-assigned managed identity** (`ManagedIdentityCredential`, scope
+`api://<ingestion-app-id>/.default`), never with its secret, and `POST /api/search` checks, before
+reading the body:
 
-**What pinning does not cover.** The user id still travels in the request body. Anyone holding
-the bot's secret *is* the bot, and can name any guest. That is threat T15 in
-[`docs/security.md`](./docs/security.md). Phase 3 removes it, with a federated credential and a
-queue transport that carries no user identity across the network.
+- `roles` contains `Documents.Search`, an app role for applications only, assigned to that
+  identity by `infrastructure/identity/grant-bot-search-caller.sh` and to nothing else;
+- the caller's app id is in `SEARCH_CALLER_APP_IDS`, that identity's app id. The two caller
+  lists must not share an id: if they do, search stays off (`search.config`
+  `reason=caller_overlap`). So the bot's secret cannot search, and the managed identity's token
+  gets 403 on `/api/ingest/batch`.
+
+Ingestion's only routes are `POST /api/ingest/batch`, `POST /api/search` and `GET /api/health`;
+a test pins that list. The channel-inbox timer (§4.4) is not a route and takes no input: a manual
+run through the host's admin endpoint needs the master key, and even then carries no identity or
+target, so it sweeps exactly what a scheduled tick would.
+
+**What pinning does not cover.** The user id still travels in the request body, on both routes
+that take one. Anyone holding the bot's secret *is* the bot, and can file as any guest. That is
+threat T15 in [`docs/security.md`](./docs/security.md). Phase 3 removes it, with a federated
+credential and a queue transport that carries no user identity across the network. Search's
+caller is a managed identity, whose credential cannot leave the bot app: who can deploy to or
+configure the bot app can search as any guest who resolves, within the limits and recorded
+(T21). Until search moves into the bot or behind user sign-in, invariant I6 reads: only
+`/api/ingest/batch` (until the queue cutover) and `/api/search` take a user id from the body,
+each pinned to exactly one caller.
 
 ### 5.3 Ingestion → Microsoft Graph
 
@@ -943,6 +1021,9 @@ and site grants through the onboarding repo's `Grant-TeamSiteAccess.ps1` runbook
 | Channel inbox: more files than the budget, or the 150 s deadline | The rest wait for the next tick (`deferred`); rows take turns. |
 | Document index unreachable (timeout, refused connection, no token, the server restarting) | The document is filed as ever; `index.write_failed` with `reason` `unavailable`, and writes are skipped for a minute. The missing rows can be backfilled. |
 | Document index refuses a row (two bound rows sharing a NIP: `23505`; anything RLS refuses: `42501`) | Filed as ever; `index.write_failed` with the reason and SQLSTATE, never the database's message (it quotes values). `row_security` or `scope` is an incident. |
+| Client search: the asker is not a guest bound to exactly one client, or their Teams cannot be read | One fixed `no_access` answer (`search.no_access` with the reason); no index read, no model call. |
+| Client search: Claude answers retry-later, or the index is down, or the worker's caps are reached, or too little of the 15 s budget is left | `unavailable`: for a question, a card with the fixed text and an empty „Zmień filtr” form; for a typed or page request, the fixed line. Paging and „Zmień filtr” need no model; a search refused for time is not charged to the quotas. Filing is unaffected. |
+| Client search: a guest's limits are reached | `rate_limited` with the time to try again; no model call. |
 
 Every request is logged with the Teams `activityId` and `conversationId`, and from Phase 0 with a
 server-minted `documentId` per document. Routing outcomes are the events `document.filed` and

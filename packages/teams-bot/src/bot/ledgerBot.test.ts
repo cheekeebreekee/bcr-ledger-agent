@@ -3,10 +3,28 @@ import type {
   IngestionBatchItemResult,
   IngestionBatchRequestPayload,
   IngestionBatchResponsePayload,
+  SearchRequestPayload,
+  SearchResponsePayload,
 } from '@bcr/shared';
 import { filterFileAttachments, LedgerBot, type LedgerBotDeps } from './ledgerBot';
-import { GATE_REFUSAL_TEXT, QUARANTINED_TEXT, rejectionText } from './cardText';
+import {
+  GATE_REFUSAL_TEXT,
+  QUARANTINED_TEXT,
+  rejectionText,
+  SEARCH_FILTER_INVALID_TEXT,
+  SEARCH_HELP_HEADING,
+  SEARCH_NO_ACCESS_TEXT,
+  SEARCH_NOT_UNDERSTOOD_TEXT,
+  SEARCH_TOO_LONG_TEXT,
+  SEARCH_UNAVAILABLE_TEXT,
+  searchFloodText,
+  searchRateLimitedText,
+} from './cardText';
 import { GateMiddleware } from './gateMiddleware';
+import { buildHelpCard } from './responseBuilder';
+import { buildUnavailableCard } from './searchCard';
+import { SEARCH_FORM_INPUTS } from './searchText';
+import { SEARCH_FLOOD_LIMIT, UserLimiter } from '../services/userLimiter';
 
 // Placeholder GUIDs — not real tenants or users.
 const BCR_TENANT = '11111111-1111-4111-8111-111111111111';
@@ -298,6 +316,333 @@ describe('LedgerBot behind the enforce-mode gate', () => {
     const f = fakes(() => [uploadedResult('a.pdf')]);
     await run(f.deps, message([teamsFile('a.pdf')]), gate());
     expect(f.ingestBatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('LedgerBot search', () => {
+  const NOW = new Date('2026-09-28T10:00:00Z'); // 12:00 in Warsaw
+  const TODAYS_HELP = JSON.stringify(buildHelpCard());
+
+  const okAnswer: SearchResponsePayload = {
+    status: 'ok',
+    scopeLabel: 'Firma Testowa',
+    filter: { categories: ['faktury_zakupu'] },
+    total: 1,
+    totalCapped: false,
+    items: [
+      {
+        documentId: 'doc-1',
+        status: 'filed',
+        category: 'faktury_zakupu',
+        documentMonth: '2026-03',
+        invoiceNumber: 'FV/1/2026',
+        issueDate: '2026-03-02',
+        grossAmount: '123.45',
+        currency: 'PLN',
+        counterpartyName: 'Dostawca',
+        counterpartyNip: '1234563218',
+        webUrl: 'https://bcr.sharepoint.test/sites/Klient/a.pdf',
+      },
+    ],
+    nextCursor: null,
+    notes: [],
+  };
+
+  interface SearchFakes {
+    readonly deps: LedgerBotDeps;
+    readonly search: jest.Mock<Promise<SearchResponsePayload>, [SearchRequestPayload]>;
+    readonly take: jest.Mock;
+    readonly ingestBatch: jest.Mock;
+    readonly download: jest.Mock;
+  }
+
+  function searchFakes(
+    answer: SearchResponsePayload | Error = okAnswer,
+    limiter: Pick<UserLimiter, 'take'> = { take: () => ({ ok: true }) },
+  ): SearchFakes {
+    const base = fakes(() => [uploadedResult('a.pdf')]);
+    const search = jest.fn(async (_payload: SearchRequestPayload) => {
+      if (answer instanceof Error) throw answer;
+      return answer;
+    });
+    const take = jest.fn((key: string) => limiter.take(key));
+    return {
+      deps: {
+        ...base.deps,
+        search: { client: { search }, limiter: { take }, tenantId: BCR_TENANT, now: () => NOW },
+      },
+      search,
+      take,
+      ingestBatch: base.ingestBatch,
+      download: base.download,
+    };
+  }
+
+  const text = (t: string, overrides: Partial<Activity> = {}) =>
+    message([], { text: t, ...overrides });
+  const submit = (value: unknown) => message([], { value });
+  const cardJson = (a: Partial<Activity> | undefined) =>
+    JSON.stringify(a?.attachments?.[0]?.content);
+
+  it('sends the question with the sender’s AAD object id, and nothing that names a client', async () => {
+    const f = searchFakes();
+    const sent = await run(f.deps, text('faktury zakupu z marca'));
+
+    expect(f.search).toHaveBeenCalledTimes(1);
+    const payload = f.search.mock.calls[0]?.[0];
+    expect(payload).toEqual({
+      source: {
+        tenantId: BCR_TENANT,
+        conversationId: 'conv-personal',
+        activityId: 'activity-1',
+        conversationType: 'personal',
+        userAadObjectId: USER_OID,
+      },
+      query: { kind: 'question', text: 'faktury zakupu z marca' },
+    });
+    expect(JSON.stringify(payload)).not.toMatch(/client|listItem|scope|limit|Anna|DisplayName/i);
+    expect(f.take).toHaveBeenCalledWith(USER_OID);
+
+    expect(sent.map((a) => a.type)).toEqual(['typing', 'message']);
+    expect(cardJson(sent[1])).toContain('Wyniki wyszukiwania');
+    expect(f.download).not.toHaveBeenCalled();
+    expect(f.ingestBatch).not.toHaveBeenCalled();
+  });
+
+  it('normalises the question before sending it', async () => {
+    const f = searchFakes();
+    const zwsp = String.fromCodePoint(0x200b);
+    await run(f.deps, text(`<at>Asystent BCR</at>  faktury${zwsp}   <b>zakupu</b>\n`));
+    expect(f.search.mock.calls[0]?.[0].query).toEqual({ kind: 'question', text: 'faktury zakupu' });
+  });
+
+  it('refuses a question over 300 characters without a call, and takes one of exactly 300', async () => {
+    const f = searchFakes();
+    const sent = await run(f.deps, text('a'.repeat(301)));
+    expect(sent.map((a) => a.text)).toEqual([SEARCH_TOO_LONG_TEXT]);
+    expect(f.search).not.toHaveBeenCalled();
+    expect(f.take).not.toHaveBeenCalled();
+
+    await run(f.deps, text('a'.repeat(300)));
+    expect(f.search).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['pomoc', 'Help', '?', 'menu', ''])(
+    'answers %p with the help card and its search section, without a call',
+    async (t) => {
+      const f = searchFakes();
+      const sent = await run(f.deps, text(t));
+      expect(f.search).not.toHaveBeenCalled();
+      expect(f.take).not.toHaveBeenCalled();
+      expect(sent).toHaveLength(1);
+      expect(cardJson(sent[0])).toBe(JSON.stringify(buildHelpCard({ search: true })));
+      expect(cardJson(sent[0])).toContain(SEARCH_HELP_HEADING);
+    },
+  );
+
+  it('with search off answers text and card submits with today’s help card, byte for byte', async () => {
+    const f = fakes(() => []);
+    for (const activity of [
+      text('faktury zakupu z marca'),
+      submit({ v: 1, action: 'bcr.search.page', filter: {}, after: 'c' }),
+    ]) {
+      const sent = await run(f.deps, activity);
+      expect(sent).toHaveLength(1);
+      expect(cardJson(sent[0])).toBe(TODAYS_HELP);
+    }
+  });
+
+  it('greets a new member with the search section only when search is on', async () => {
+    const added = {
+      ...message([]),
+      type: 'conversationUpdate',
+      recipient: { id: 'bot', name: 'Asystent BCR' },
+      membersAdded: [{ id: 'user-1', name: 'Anna Kowalska' }],
+    };
+    const on = await run(searchFakes().deps, added);
+    const off = await run(fakes(() => []).deps, added);
+    expect(cardJson(on[0])).toContain(SEARCH_HELP_HEADING);
+    expect(cardJson(off[0])).toBe(TODAYS_HELP);
+  });
+
+  it('keeps uploads on today’s path with search on', async () => {
+    const f = searchFakes();
+    const sent = await run(f.deps, message([teamsFile('a.pdf')], { text: 'faktura' }));
+    expect(f.ingestBatch).toHaveBeenCalledTimes(1);
+    expect(f.search).not.toHaveBeenCalled();
+    expect(resultCard(sent).rows[0]?.[0]).toBe('✅ a.pdf');
+  });
+
+  it('forwards only the filter and the cursor of a page button', async () => {
+    const f = searchFakes({ ...okAnswer, total: 11, nextCursor: null });
+    const filter = { categories: ['faktury_sprzedazy'], monthFrom: '2026-01' };
+    const sent = await run(
+      f.deps,
+      submit({
+        v: 1,
+        action: 'bcr.search.page',
+        filter,
+        after: 'cursor-2',
+        start: 11,
+        clientId: '55555555-5555-4555-8555-555555555555',
+        listItemId: 2,
+        scope: 'other-client',
+        limit: 1000,
+      }),
+    );
+    const payload = f.search.mock.calls[0]?.[0];
+    expect(payload?.query).toEqual({ kind: 'typed', filter, after: 'cursor-2' });
+    expect(payload?.source.userAadObjectId).toBe(USER_OID);
+    expect(JSON.stringify(payload)).not.toMatch(/55555555|listItem|other-client|limit|start/);
+    expect(cardJson(sent[1])).toContain('pokazuję dokument nr 11');
+  });
+
+  it('forwards only the filter of a submitted form: no cursor, nothing else', async () => {
+    const f = searchFakes();
+    await run(
+      f.deps,
+      submit({
+        v: 1,
+        action: 'bcr.search.filter',
+        [SEARCH_FORM_INPUTS.monthFrom]: '2026-01',
+        [SEARCH_FORM_INPUTS.grossMin]: '100',
+        [SEARCH_FORM_INPUTS.status]: 'all',
+        after: 'smuggled-cursor',
+        clientId: '55555555-5555-4555-8555-555555555555',
+      }),
+    );
+    expect(f.search.mock.calls[0]?.[0].query).toEqual({
+      kind: 'typed',
+      filter: { monthFrom: '2026-01', grossMin: '100.00' },
+    });
+  });
+
+  it('answers an unusable form or page button with the fixed text, without a call', async () => {
+    const f = searchFakes();
+    for (const value of [
+      { v: 1, action: 'bcr.search.filter', [SEARCH_FORM_INPUTS.monthFrom]: 'marzec' },
+      { v: 1, action: 'bcr.search.page', filter: { clientId: 'x' }, after: 'c' },
+    ]) {
+      const sent = await run(f.deps, submit(value));
+      expect(sent.map((a) => a.text)).toEqual([SEARCH_FILTER_INVALID_TEXT]);
+    }
+    expect(f.search).not.toHaveBeenCalled();
+  });
+
+  it('stops a flood per user before any call and says when to try again', async () => {
+    const f = searchFakes(okAnswer, { take: () => ({ ok: false, retryAfterMs: 30_000 }) });
+    const sent = await run(f.deps, text('faktury'));
+    expect(f.search).not.toHaveBeenCalled();
+    expect(sent.map((a) => a.text)).toEqual([searchFloodText('12:01')]);
+  });
+
+  it('lets 20 searches a minute through per user and refuses the 21st', async () => {
+    const limiter = new UserLimiter({ ...SEARCH_FLOOD_LIMIT, now: () => NOW.getTime() });
+    const f = searchFakes(okAnswer, limiter);
+    const bot = new LedgerBot(f.deps);
+    const adapter = new TestAdapter(async (context) => bot.run(context));
+    for (let i = 0; i < 21; i += 1) await adapter.processActivity(text(`faktury ${i}`));
+    expect(f.search).toHaveBeenCalledTimes(20);
+  });
+
+  it.each<[string, SearchResponsePayload | Error, string]>([
+    ['no_access', { status: 'no_access' }, SEARCH_NO_ACCESS_TEXT],
+    ['not_understood', { status: 'not_understood', reason: 'unclear' }, SEARCH_NOT_UNDERSTOOD_TEXT],
+    [
+      'rate_limited',
+      { status: 'rate_limited', retryAfterSeconds: 240 },
+      searchRateLimitedText('12:04'),
+    ],
+  ])('answers %s with its one fixed text', async (_label, answer, expected) => {
+    const f = searchFakes(answer);
+    const sent = await run(f.deps, text('faktury'));
+    expect(sent.map((a) => a.type)).toEqual(['typing', 'message']);
+    expect(sent[1]?.text).toBe(expected);
+    expect(sent[1]?.attachments ?? []).toEqual([]);
+  });
+
+  it.each<[string, SearchResponsePayload | Error]>([
+    ['unavailable', { status: 'unavailable' }],
+    ['a client that threw', new Error('boom /api/search')],
+  ])('answers a question %s with its fixed text and a „Zmień filtr” form', async (_l, answer) => {
+    const sent = await run(searchFakes(answer).deps, text('faktury'));
+    expect(sent.map((a) => a.type)).toEqual(['typing', 'message']);
+    expect(cardJson(sent[1])).toBe(JSON.stringify(buildUnavailableCard()));
+  });
+
+  it('answers the form (typed) unavailable with the text: its card is already there', async () => {
+    const f = searchFakes({ status: 'unavailable' });
+    const sent = await run(f.deps, submit({ v: 1, action: 'bcr.search.filter' }));
+    expect(f.search).toHaveBeenCalledTimes(1);
+    expect(sent[1]?.text).toBe(SEARCH_UNAVAILABLE_TEXT);
+    expect(sent[1]?.attachments ?? []).toEqual([]);
+  });
+
+  it('still logs attachments the filter dropped before searching, and not a plain text message', async () => {
+    const f = searchFakes();
+    const bot = new LedgerBot(f.deps);
+    const info = jest.spyOn((bot as unknown as { log: { info: () => void } }).log, 'info');
+    const adapter = new TestAdapter(async (context) => bot.run(context));
+    const dropped: Attachment = { contentType: 'application/vnd.microsoft.card.hero', content: {} };
+    await adapter.processActivity(message([dropped], { text: 'proszę zarchiwizować' }));
+    const html: Attachment = { contentType: 'text/html', content: '<p>faktury</p>' };
+    await adapter.processActivity(message([html], { text: 'faktury' }));
+    const lines = info.mock.calls.filter(([, msg]) =>
+      String(msg).startsWith('no file attachments'),
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.[0]).toMatchObject({
+      rawAttachmentCount: 1,
+      rawAttachmentContentTypes: ['application/vnd.microsoft.card.hero'],
+    });
+    expect(f.search).toHaveBeenCalledTimes(2);
+  });
+
+  it('answers disabled with today’s help card and help with the search section', async () => {
+    const disabled = await run(searchFakes({ status: 'disabled' }).deps, text('faktury'));
+    expect(cardJson(disabled[1])).toBe(TODAYS_HELP);
+    const help = await run(searchFakes({ status: 'help' }).deps, text('dzień dobry'));
+    expect(cardJson(help[1])).toBe(JSON.stringify(buildHelpCard({ search: true })));
+  });
+
+  describe('behind the gate', () => {
+    const groupChat: Partial<Activity> = {
+      conversation: { id: 'g', name: '', isGroup: true, conversationType: 'groupChat' },
+    };
+
+    it('in enforce mode, a group chat reaches no search and gets no answer', async () => {
+      const f = searchFakes();
+      const gate = new GateMiddleware({
+        tenantId: BCR_TENANT,
+        mode: 'enforce',
+        logger: { warn: jest.fn() },
+      });
+      const sent = await run(f.deps, text('faktury', groupChat), gate);
+      expect(f.search).not.toHaveBeenCalled();
+      expect(sent).toEqual([]);
+    });
+
+    it.each<[string, Partial<Activity>]>([
+      ['a group chat', groupChat],
+      ['a foreign tenant', { channelData: { tenant: { id: FOREIGN_TENANT } } }],
+      ['a sender without an AAD object id', { from: { id: 'user-1', name: 'Anna' } }],
+      ['a conversation without an id', { conversation: { ...personalConversation(), id: '' } }],
+    ])(
+      'in log mode, %s is never searched for and gets today’s help card',
+      async (_label, overrides) => {
+        const f = searchFakes();
+        const gate = new GateMiddleware({
+          tenantId: BCR_TENANT,
+          mode: 'log',
+          logger: { warn: jest.fn() },
+        });
+        const sent = await run(f.deps, text('faktury', overrides), gate);
+        expect(f.search).not.toHaveBeenCalled();
+        expect(f.take).not.toHaveBeenCalled();
+        expect(sent).toHaveLength(1);
+        expect(cardJson(sent[0])).toBe(TODAYS_HELP);
+      },
+    );
   });
 });
 

@@ -125,9 +125,16 @@ export function workspaceDir(name) {
   return name.replace(/^@bcr\//, '');
 }
 
+/**
+ * What the vendored `@bcr/shared` must contain, for both apps: the Phase-0
+ * config, and `searchMode` (the client search release), without which a bot
+ * or an ingestion built against an older `@bcr/shared` would ignore
+ * `SEARCH_MODE`.
+ */
 export const SHARED_MARKERS = [
   ['config.js', 'botGateMode'],
   ['config.js', 'forbiddenTargetSitePaths'],
+  ['config.js', 'searchMode'],
 ];
 
 /** Below this the archive cannot hold the dependencies. */

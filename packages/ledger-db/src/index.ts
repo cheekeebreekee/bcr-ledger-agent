@@ -29,6 +29,7 @@ export {
   LedgerDb,
   assertClientTx,
   type ClientTx,
+  type ClientTxOptions,
   type ConnectionLike,
   type LedgerDbOptions,
   type PoolLike,
@@ -36,20 +37,35 @@ export {
 } from './tx';
 export * as clientsRepo from './repos/clientsRepo';
 export * as documentsRepo from './repos/documentsRepo';
+export * as searchQueriesRepo from './repos/searchQueriesRepo';
 export type { DirectoryClientRow } from './repos/clientsRepo';
 export type {
+  ClientViewRow,
   DocumentInvoiceFields,
   DocumentRecord,
   DocumentRow,
   DocumentSearchFilter,
   DocumentSource,
   DocumentStatus,
+  MatchCount,
   MonthlyCount,
   PendingReviewNotice,
   RecordOutcome,
   SearchPage,
   SearchResult,
 } from './repos/documentsRepo';
+export { SEARCH_FILTER_FIELDS, type SearchFilterField } from './repos/searchFilter';
+export type {
+  FilterDigest,
+  ReserveResult,
+  SearchQueryFinish,
+  SearchQueryKind,
+  SearchQueryOutcome,
+  SearchQuota,
+  SearchQuotaName,
+  SearchReservation,
+  SearchTokenUsage,
+} from './repos/searchQueriesRepo';
 export {
   MIGRATIONS_DIR,
   VERIFY_SQL_FILE,

@@ -12,6 +12,7 @@ const envMap = {
   ingestionBaseUrl: 'INGESTION_BASE_URL',
   ingestionScope: 'INGESTION_SCOPE',
   botGateMode: 'BOT_GATE_MODE',
+  searchMode: 'SEARCH_MODE',
   applicationInsightsConnectionString: 'APPLICATIONINSIGHTS_CONNECTION_STRING',
   logLevel: 'LOG_LEVEL',
 } as const satisfies Record<keyof BotConfig, string>;

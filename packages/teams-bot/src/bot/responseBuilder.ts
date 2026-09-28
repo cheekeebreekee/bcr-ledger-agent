@@ -1,5 +1,12 @@
 import type { IngestionBatchItemResult, IngestionUploadResult } from '@bcr/shared';
-import { QUARANTINED_TEXT, escapeMarkdown, rejectionText } from './cardText';
+import {
+  QUARANTINED_TEXT,
+  SEARCH_COVERAGE_TEXT,
+  SEARCH_HELP_HEADING,
+  SEARCH_HELP_TEXT,
+  escapeMarkdown,
+  rejectionText,
+} from './cardText';
 
 /**
  * Adaptive Card payloads. We hand-author the JSON (rather than using a
@@ -14,8 +21,13 @@ import { QUARANTINED_TEXT, escapeMarkdown, rejectionText } from './cardText';
  * Schema reference: https://adaptivecards.io/explorer/
  */
 
-const ADAPTIVE_CARD_VERSION = '1.5';
-const SCHEMA = 'http://adaptivecards.io/schemas/adaptive-card.json';
+export const ADAPTIVE_CARD_VERSION = '1.5';
+export const SCHEMA = 'http://adaptivecards.io/schemas/adaptive-card.json';
+
+export interface HelpCardOptions {
+  /** Search is on (`SEARCH_MODE=on`): add the „Wyszukiwanie” section. */
+  readonly search?: boolean;
+}
 
 /**
  * The help card. Clients are Teams guests, and Teams lets a guest attach a
@@ -23,8 +35,11 @@ const SCHEMA = 'http://adaptivecards.io/schemas/adaptive-card.json';
  * their Team's „Dokumenty księgowe” channel (the channel inbox), and keeps
  * the chat for whoever can attach here. Every string is fixed; nothing is
  * inserted.
+ *
+ * With search on, a „Wyszukiwanie” section follows; with it off the card is
+ * byte for byte the one from before search existed (a test pins its hash).
  */
-export function buildHelpCard(): unknown {
+export function buildHelpCard(opts: HelpCardOptions = {}): unknown {
   return {
     type: 'AdaptiveCard',
     $schema: SCHEMA,
@@ -82,8 +97,23 @@ export function buildHelpCard(): unknown {
         isSubtle: true,
         spacing: 'Small',
       },
+      ...(opts.search ? searchHelpSection() : []),
     ],
   };
+}
+
+function searchHelpSection(): unknown[] {
+  return [
+    {
+      type: 'TextBlock',
+      text: SEARCH_HELP_HEADING,
+      weight: 'Bolder',
+      spacing: 'Large',
+      wrap: true,
+    },
+    { type: 'TextBlock', text: SEARCH_HELP_TEXT, wrap: true, spacing: 'Small' },
+    { type: 'TextBlock', text: SEARCH_COVERAGE_TEXT, wrap: true, isSubtle: true, spacing: 'Small' },
+  ];
 }
 
 /**
@@ -197,7 +227,7 @@ function dash() {
 }
 
 /** Only an absolute https URL becomes a button; anything else is dropped. */
-function safeHttpsUrl(raw: string): string | undefined {
+export function safeHttpsUrl(raw: string): string | undefined {
   try {
     const url = new URL(raw);
     return url.protocol === 'https:' ? url.toString() : undefined;

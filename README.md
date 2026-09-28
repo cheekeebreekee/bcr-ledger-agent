@@ -105,10 +105,10 @@ yarn start:bot           # http://localhost:3978/api/messages
 yarn start:ingestion     # http://localhost:7071/api/ingest/batch
 ```
 
-The Bot Framework Emulator cannot get a file filed any more: the bot's gate accepts only a
-Teams 1:1 chat from the BCR tenant with a user object id, and Emulator activities carry none of
-that. [`docs/local-development.md`](./docs/local-development.md) shows what works locally: the
-bot's `TestAdapter` tests for card work, and a direct call to the ingestion API.
+The Bot Framework Emulator cannot reach the bot: the bot accepts only Bot Framework channel
+tokens (`bot/channelAuth.ts`), and the Emulator's token is refused before any turn runs.
+[`docs/local-development.md`](./docs/local-development.md) shows what works locally: the bot's
+`TestAdapter` tests for card work, and a direct call to the ingestion API.
 
 ---
 

@@ -67,6 +67,8 @@ Microsoft Teams (1:1 chat only)
            │  POST /api/ingest/batch (Bearer JWT)
            │  client_credentials → audience api://b8b90018-…
            │  role Documents.Ingest + caller app id pinned (BOT_CALLER_APP_IDS)
+           │  POST /api/search: the bot Function App's managed identity,
+           │  role Documents.Search + app id pinned (SEARCH_CALLER_APP_IDS)
            ▼
 ┌────────────────────────────┐
 │  func-bcr-ingest-dev-…     │      Identity-only routing:
@@ -74,6 +76,7 @@ Microsoft Teams (1:1 chat only)
 │  @bcr/document-ingestion   │      2. classify() primed with the bound client
 │  ┝ /api/health             │      3. bound client only: flip invoice direction
 │  ┝ /api/ingest/batch       │      4. upload: client's channel folder, or quarantine
+│  ┝ /api/search             │      client search: the asker's own client, read only
 │  ┕ system-assigned MI      │
 │    d5226274-… / 7984e56c-… │
 │    role: Sites.Selected    │
@@ -105,8 +108,9 @@ Microsoft Teams (1:1 chat only)
 | Principal | App ID | Object ID | Role / scope |
 |---|---|---|---|
 | Bot app reg | `3ee1ba6c-2501-4e2d-9971-ab156a9a6f9a` | (SP-side) | Holds the bot client secret; requests the `Documents.Ingest` app role on the ingestion API. The only app id in `BOT_CALLER_APP_IDS`. |
-| Ingestion API app reg | `b8b90018-9af0-4d7a-ada2-71559952ebbe` | — | Audience identity (`api://b8b90018-…`); defines the `Documents.Ingest` app role |
+| Ingestion API app reg | `b8b90018-9af0-4d7a-ada2-71559952ebbe` | — | Audience identity (`api://b8b90018-…`); defines the `Documents.Ingest` app role, and `Documents.Search` (Applications only) from the client search release |
 | Ingestion func **managed identity** | `d5226274-a2c0-4ae9-9c3b-34158c43f2fc` | `7984e56c-e264-427d-8e90-ff57dea6b0fa` | Calls Microsoft Graph with `Sites.Selected` and a per-site grant on each site it files into (see `docs/security.md` T3) |
+| Bot func **managed identity** | printed by `grant-bot-search-caller.sh` | `az functionapp identity show` on the bot app | *Key Vault Secrets User* (resource group). From the client search release: `Documents.Search` on the ingestion API, the only app id in `SEARCH_CALLER_APP_IDS`; it calls `/api/search` and nothing else. Never in `BOT_CALLER_APP_IDS`. |
 
 Two-step SharePoint grant (see lessons 1–5):
 
@@ -116,6 +120,11 @@ Two-step SharePoint grant (see lessons 1–5):
 The Phase-0 membership check needs one more app role on the same MI: `Directory.Read.All`, to
 read each bound uploader's `memberOf` (`docs/operations/human-steps.md` H-8b,
 `infrastructure/identity/grant-ingestion-membership-read.sh`). **Not granted yet**: pending H-8b.
+
+Client search adds one grant, to the **bot's** managed identity: the app role `Documents.Search`
+on the ingestion API, which `infrastructure/identity/grant-bot-search-caller.sh` also creates on
+the registration if it is missing ([Client search release](docs/operations/human-steps.md#client-search-release)
+step 1). No Graph, SharePoint, Key Vault or database permission changes.
 
 ---
 
@@ -146,6 +155,9 @@ Endpoints:
 - Ingestion health: `GET https://func-bcr-ingest-dev-vyyintffz6ehq.azurewebsites.net/api/health`
 - Ingestion (batch): `POST https://func-bcr-ingest-dev-vyyintffz6ehq.azurewebsites.net/api/ingest/batch`
   (Bearer JWT from the bot's app only)
+- Ingestion (client search): `POST https://func-bcr-ingest-dev-vyyintffz6ehq.azurewebsites.net/api/search`
+  (Bearer JWT from the bot Function App's managed identity only; answers `disabled` until the
+  client search release)
 - *Removed in Phase 0:* `POST /api/ingest` (single document) and `GET /api/user-target`, the
   Personal Tab's lookup and an IDOR.
 
@@ -172,6 +184,7 @@ difference, and CI checks that Bicep sets every setting the code needs.
 | `MICROSOFT_APP_TYPE` | **Required** since Phase 0. `SingleTenant` (lesson 12). |
 | `BOT_GATE_MODE` | **New.** `log` or `enforce` (default). `log` only for the first 24 h of the Phase-0 rollout. |
 | `INGESTION_BASE_URL`, `INGESTION_SCOPE` | Where ingestion is, and `api://<ingestion-app-id>/.default` |
+| `SEARCH_MODE` | **New.** Client search: `off` (default; text gets the help card) or `on` (a guest's text goes to ingestion's `/api/search` with the bot's managed identity). Anything else stops the bot at cold start. `off` in the template and both parameter files until the [Client search release](docs/operations/human-steps.md#client-search-release). |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING`, `LOG_LEVEL` | |
 
 **Ingestion (`func-bcr-ingest-…`)**
@@ -192,6 +205,9 @@ difference, and CI checks that Bicep sets every setting the code needs.
 | `CLASSIFICATION_ACCEPT_THRESHOLD` | **New.** The one acceptance threshold: default `0.70`, and anything outside 0.70–0.95 stops ingestion at cold start. Bicep sets it from `classificationAcceptThreshold` (`0.70`). It replaces `ANTHROPIC_CONFIDENCE_THRESHOLD`, which is no longer read (a set value only logs `config.retired_setting`; the classification release deletes it, and the template no longer sets it). |
 | `LEDGER_INDEX_MODE` | **New.** The document index: `off` (default; no connection) or `write` (every filed document gets a client-scoped row). Anything else stops ingestion at cold start, and so does `write` without `LEDGER_DB_HOST` or `LEDGER_DB_USER`. The template and both parameter files record `off` until the [Document index release](docs/operations/human-steps.md#document-index-release). |
 | `LEDGER_DB_HOST`, `LEDGER_DB_NAME`, `LEDGER_DB_USER` | **New.** The index server (`<server>.postgres.database.azure.com`), the database (default `ledger`) and the managed identity's PostgreSQL login, named after the Function App. No password: an Entra token per connection. |
+| `SEARCH_MODE` | **New.** Client search: `off` (default; every search answers `disabled`) or `on`. Anything else stops ingestion at cold start. In `on`, search that cannot run safely (index or Claude off, no caller, a caller also in `BOT_CALLER_APP_IDS`, `MEMBERSHIP_CHECK_MODE` off) stays off with a `search.config` reason; it never stops ingestion. `/api/health` shows it as `build.search`. |
+| `SEARCH_ROWS` | **New.** Empty (default): every bound row. Otherwise Client Directory list item ids (not `ClientId`), comma-separated, like `INBOX_SWEEP_ROWS`: the canary row first, then client by client. A malformed entry keeps search off (`bad_rows`) and never stops ingestion. |
+| `SEARCH_CALLER_APP_IDS` | **New.** The app id of the bot Function App's managed identity (`grant-bot-search-caller.sh` prints it), the only caller of `/api/search`. Empty: search off. Never an id of `BOT_CALLER_APP_IDS`. |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING`, `LOG_LEVEL` | |
 
 **Removed in Phase 0:** `FALLBACK_CLIENT_ID`, `FALLBACK_SITE_HOSTNAME`, `FALLBACK_SITE_PATH`,
@@ -395,12 +411,14 @@ corepack yarn workspace @bcr/teams-bot package            # → artifacts/teams-
 corepack yarn workspace @bcr/document-ingestion package   # → artifacts/document-ingestion.zip
 ```
 
-**3. Check the vendored `@bcr/shared` before deploying** (lesson 10). Both counts must be
+**3. Check the vendored `@bcr/shared` before deploying** (lesson 10). Every count must be
 greater than 0:
 
 ```bash
 unzip -p artifacts/teams-bot.zip          node_modules/@bcr/shared/dist/config.js | grep -c botGateMode
 unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js | grep -c forbiddenTargetSitePaths
+unzip -p artifacts/teams-bot.zip          node_modules/@bcr/shared/dist/config.js | grep -c searchMode
+unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js | grep -c searchMode
 ```
 
 **4. Deploy,** one app at a time. `$RG`, `$BOT` and `$INGEST` are set as in
