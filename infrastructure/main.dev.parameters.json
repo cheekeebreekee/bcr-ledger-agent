@@ -23,7 +23,7 @@
     "inboxSweepRows": { "value": "10,2" },
     "inboxCreatedAfter": { "value": "2026-09-28T11:10:29Z" },
     "inboxMaxFilesPerTick": { "value": "50" },
-    "enableReviewNotices": { "value": false },
+    "enableReviewNotices": { "value": true },
     "enableAnthropic": { "value": true },
     "anthropicModel": { "value": "claude-sonnet-5" },
     "anthropicEffort": { "value": "low" },
