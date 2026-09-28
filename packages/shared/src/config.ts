@@ -440,6 +440,14 @@ export const ingestionConfigSchema = z.object({
    * memory only. A secret (an account key): never logged.
    */
   webJobsStorage: optionalStr(),
+  /**
+   * `REVIEW_WEBHOOK_URL`: the Teams Workflows webhook that posts review notices
+   * into the staff chat, as a Key Vault reference to `review-webhook-url`. The
+   * whole URL is the credential: never logged. Anything but an `https://` URL
+   * (empty, or a reference Key Vault could not resolve) turns the notices off,
+   * with the reason said once at cold start; it never stops ingestion.
+   */
+  reviewWebhookUrl: optionalStr(),
   applicationInsightsConnectionString: optionalStr(),
   logLevel,
 });

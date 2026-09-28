@@ -42,6 +42,7 @@ entries are recorded for deletion.
 |---|---|---|---|
 | `bot-app-password` | Key Vault; **also plaintext in developers' `.env` files** | The bot, as `MICROSOFT_APP_PASSWORD` | Rotation deferred ([accepted](#accepted-risks)). Phase 3 replaces it with a federated credential. |
 | `anthropic-api-key` | Key Vault; **also plaintext in developers' `.env` files** | Ingestion, as `ANTHROPIC_API_KEY` | Rotation deferred ([accepted](#accepted-risks)). |
+| Review chat webhook URL (`review-webhook-url`) | Key Vault, read by the ingestion identity as `REVIEW_WEBHOOK_URL` (a Key Vault reference) | The review notifier | The whole URL is the credential: anyone holding it can post into the staff chat. Entered by `tools/ops/set-review-webhook.sh` without echo; never logged. Rotate by deleting the flow, creating a new one, storing its URL, then refreshing the app's Key Vault references and restarting ingestion (the versionless reference is cached). |
 | Storage account key | **In plain text in the `AzureWebJobsStorage` app setting** of both apps (`functionApp.bicep` reads it with `listKeys()`) | The Functions runtime | `az functionapp config appsettings set` prints it unless you pass `-o none`. The fix is identity-based storage access, or at least a Key Vault reference: [follow-up F1](#follow-ups-from-the-g1-review). The Bicep drift fix (G1) only records what runs, so it is a change of its own. |
 | Function keys | Azure platform | Not used | Functions are `authLevel: 'anonymous'`; each handler checks the JWT itself. |
 | Document index database | — | — | **No secret exists.** Password authentication is disabled; the ingestion and the operator log in with Entra tokens (T19). `LEDGER_DB_*` settings are configuration. |
@@ -458,6 +459,20 @@ idle in a transaction.
 **Status: Mitigated by design; off until the
 [Document index release](operations/human-steps.md#document-index-release)** sets
 `LEDGER_INDEX_MODE=write`. The public endpoint is an [accepted risk](#accepted-risks).
+
+### T20. Review notices in a staff chat
+
+The notifier posts which documents wait for review into a Teams group chat of staff (Roman, later
+the accountants), through a Workflows webhook. Membership of the chat decides who sees a notice,
+and it is managed by hand in Teams: a guest or a client must never be added to it. A notice's
+text carries the Directory row's title, the suggested category's Polish label, the review reasons
+in Polish and the month; never an amount, a NIP or model output. Its link, "Otwórz plik",
+targets the file's SharePoint `webUrl`, which contains the site, the channel folder and the file
+name: whatever the file name says (a counterparty, an invoice or KSeF number) is visible on hover
+to the chat's members, and to the flow's owners in its run history (about 28 days). The link
+opens only for someone with access to that client's Team. Rows are read and
+marked in each client's own RLS scope, one client per transaction; the card is built from the
+bound Directory rows, never from a document.
 
 ### Also fixed in Phase 0
 

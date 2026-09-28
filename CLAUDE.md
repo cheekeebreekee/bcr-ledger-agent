@@ -300,7 +300,11 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
    reported is skipped before the budget (`alreadyReported`). A memo that cannot answer means
    the file waits (`deferred`, `inbox.shadow_memo_failed`), never a paid classification. Before
    the memo, every worker restart re-classified a shadowed inbox, and that used up BCR's
-   Anthropic credit on 26 September 2026 — never make shadow memory per-worker again.
+   Anthropic credit on 26 September 2026 — never make shadow memory per-worker again. In
+   `enforce` the same table counts paid classifications per file version
+   (`TablePaidClassifications`, `MAX_PAID_CLASSIFICATIONS` = 3 across restarts): a version
+   that is never moved is sorted to `98_` unclassified at the bound, not paid for again; a
+   count that cannot be read makes the file wait (`inbox.paid_memo_failed`).
 6. **Move** — only with 60 s left: `ensureInboxFolder()` under the channel folder, then
    `moveWithinInbox()`: re-check, PATCH by id with `If-Match: <listed eTag>` and
    `conflictBehavior=fail`, `_1`…`_10` on 409, then assert same item, same drive, new parent. A
@@ -325,7 +329,18 @@ connection (`ManagedIdentityCredential` in Azure, `DefaultAzureCredential` local
 verified, every wait bounded. The ingestion's `client_id` for a row is a UUIDv5 of
 `CLIENT_DIRECTORY_LIST_ID` and the row's list item id (`clientIdForDirectoryRow`), so the scope
 is known before any read. Search (`documentsRepo.search`, keyset paging) exists as a repository
-only; its API is point 5.
+only; its API is point 5. Rows carry the file's `web_url` (migration 0002) for staff.
+
+**Review notices** (`services/reviewNotifier.ts`, timer `reviewNotify`, every 10 min): per bound
+row and in that client's scope, the `NEEDS_REVIEW` rows with no `review_notified_at` are posted
+as one Adaptive Card per client (under `REVIEW_NOTICE_MAX_BYTES`, well inside Teams' ~28 KB) to a
+staff chat through a Teams Workflows webhook (`REVIEW_WEBHOOK_URL`, a Key Vault reference to
+`review-webhook-url`; the URL is the credential and is never logged), and only the rows a card
+named are marked, after the webhook accepted it; a new move into `98_` clears the mark. The card
+text carries the row's title, the suggestion's Polish label, reasons in Polish and the month;
+its link "Otwórz plik" targets the file's SharePoint `webUrl`, which contains the file name —
+hence a staff-only chat. Off unless the index writes and the URL resolved
+(`review_notice.config`). **A migration goes in before the build that uses it** (0002 first).
 
 ### Invariants — break these and documents mis-file
 

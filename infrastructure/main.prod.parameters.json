@@ -20,6 +20,7 @@
     "inboxSweepRows": { "value": "" },
     "inboxCreatedAfter": { "value": "" },
     "inboxMaxFilesPerTick": { "value": "" },
+    "enableReviewNotices": { "value": false },
     "enableAnthropic": { "value": true },
     "anthropicModel": { "value": "claude-opus-5" },
     "anthropicEffort": { "value": "low" },

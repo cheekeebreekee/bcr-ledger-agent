@@ -59,6 +59,8 @@ export interface DocumentRecord {
   /** Hex SHA-256 of the bytes, when the filer had them. */
   readonly contentSha256?: string;
   readonly sizeBytes?: number;
+  /** The file's SharePoint link (`https://…`), for staff; client data like the rest of the row. */
+  readonly webUrl?: string;
   readonly invoice?: DocumentInvoiceFields;
 }
 
@@ -88,6 +90,11 @@ const recordSchema = z
       .regex(/^[0-9a-f]{64}$/)
       .optional(),
     sizeBytes: z.number().int().min(0).optional(),
+    webUrl: z
+      .string()
+      .max(2000)
+      .regex(/^https:\/\/\S+$/)
+      .optional(),
     invoice: z
       .object({
         invoiceNumber: z.string().max(100).nullable(),
@@ -186,7 +193,7 @@ async function record_(
       suggested_category, confidence, classifier, model, review_reasons, document_month,
       folder_path, uploaded_by_oid, content_sha256, size_bytes, invoice_number, issue_date,
       sale_date, currency, net_amount, vat_amount, gross_amount, seller_nip, seller_name,
-      buyer_nip, buyer_name, ksef_number
+      buyer_nip, buyer_name, ksef_number, web_url
     ) VALUES (
       ${r.documentId}, ${tx.clientId}, ${r.source}, ${r.driveId}, ${r.driveItemId}, ${status},
       ${r.category}, ${r.suggestedCategory ?? null},
@@ -197,7 +204,8 @@ async function record_(
       ${inv?.invoiceNumber ?? null}, ${inv?.issueDate ?? null}, ${inv?.saleDate ?? null},
       ${inv?.currency ?? null}, ${inv?.netAmount ?? null}, ${inv?.vatAmount ?? null},
       ${inv?.grossAmount ?? null}, ${inv?.sellerNip ?? null}, ${inv?.sellerName ?? null},
-      ${inv?.buyerNip ?? null}, ${inv?.buyerName ?? null}, ${inv?.ksefNumber ?? null}
+      ${inv?.buyerNip ?? null}, ${inv?.buyerName ?? null}, ${inv?.ksefNumber ?? null},
+      ${r.webUrl ?? null}
     )
     ON CONFLICT (client_id, drive_item_id) DO UPDATE SET
       source = EXCLUDED.source,
@@ -225,7 +233,12 @@ async function record_(
       seller_name = EXCLUDED.seller_name,
       buyer_nip = EXCLUDED.buyer_nip,
       buyer_name = EXCLUDED.buyer_name,
-      ksef_number = EXCLUDED.ksef_number
+      ksef_number = EXCLUDED.ksef_number,
+      web_url = COALESCE(EXCLUDED.web_url, ledger.documents.web_url),
+      -- Each write for review is one real move into 98_ (a file staff sent
+      -- back to the inbox and sorted again, too): announce it again.
+      review_notified_at = CASE WHEN EXCLUDED.status = 'NEEDS_REVIEW' THEN NULL
+        ELSE ledger.documents.review_notified_at END
     RETURNING document_id::text AS document_id, (xmax = 0) AS created`);
   const row = rows[0];
   if (!row) throw new LedgerDbError('invalid_record', 'the document row was not written');
@@ -258,6 +271,65 @@ export async function findByDriveItem(
     SELECT ${COLUMNS} FROM ledger.documents
     WHERE client_id = ${tx.clientId} AND drive_item_id = ${driveItemId}`);
   return rows[0] ?? null;
+}
+
+/** A document in review that no notice has named yet: what staff need to find it. */
+export interface PendingReviewNotice {
+  readonly documentId: string;
+  readonly driveItemId: string;
+  /** What the classifier suggested, when it named a real category. */
+  readonly suggestedCategory: string | null;
+  readonly reviewReasons: readonly string[];
+  /** `YYYY-MM`. */
+  readonly documentMonth: string | null;
+  readonly webUrl: string | null;
+  /** ISO 8601 UTC. */
+  readonly createdAt: string;
+}
+
+/** Most documents one call returns: a notice names at most this many per client. */
+export const REVIEW_NOTICE_MAX_LIMIT = 50;
+
+/**
+ * The client's documents in review (`NEEDS_REVIEW`) that no notice has named
+ * yet, oldest first, at most `limit`.
+ */
+export async function pendingReviewNotices(
+  tx: ClientTx,
+  limit: number,
+): Promise<PendingReviewNotice[]> {
+  assertClientTx(tx);
+  const n = Math.min(Math.max(Math.trunc(limit), 1), REVIEW_NOTICE_MAX_LIMIT);
+  return tx.query<PendingReviewNotice>(sql`
+    SELECT document_id::text AS "documentId", drive_item_id AS "driveItemId",
+      suggested_category AS "suggestedCategory", review_reasons AS "reviewReasons",
+      to_char(document_month, 'YYYY-MM') AS "documentMonth", web_url AS "webUrl",
+      to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "createdAt"
+    FROM ledger.documents
+    WHERE client_id = ${tx.clientId} AND status = 'NEEDS_REVIEW' AND review_notified_at IS NULL
+    ORDER BY created_at, document_id
+    LIMIT ${n}`);
+}
+
+/**
+ * Marks the client's documents as named in a notice, after the notice was
+ * posted. Only rows still pending are touched: returns how many.
+ */
+export async function markReviewNotified(
+  tx: ClientTx,
+  documentIds: readonly string[],
+): Promise<number> {
+  assertClientTx(tx);
+  if (documentIds.length === 0) return 0;
+  for (const id of documentIds) {
+    if (!UUID.test(id)) throw new LedgerDbError('invalid_record', 'a document id is not a UUID');
+  }
+  const rows = await tx.query<{ document_id: string }>(sql`
+    UPDATE ledger.documents SET review_notified_at = now()
+    WHERE client_id = ${tx.clientId} AND document_id = ANY(${[...documentIds]}::uuid[])
+      AND review_notified_at IS NULL
+    RETURNING document_id::text AS document_id`);
+  return rows.length;
 }
 
 /** Documents per month and status, newest month first; `month` null: no month read. */

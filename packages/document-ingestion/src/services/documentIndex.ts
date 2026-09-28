@@ -38,6 +38,8 @@ export interface IndexedDocument {
   /** Or their hex SHA-256, when the filer hashed them already. */
   readonly contentSha256?: string;
   readonly sizeBytes?: number;
+  /** The filed item's SharePoint link, for staff (review notices). */
+  readonly webUrl?: string;
 }
 
 /**
@@ -230,6 +232,7 @@ export function toRecord(doc: IndexedDocument): DocumentRecord {
         ? { contentSha256: createHash('sha256').update(doc.content).digest('hex') }
         : {}),
     ...(doc.sizeBytes !== undefined ? { sizeBytes: doc.sizeBytes } : {}),
+    ...(doc.webUrl?.startsWith('https://') ? { webUrl: doc.webUrl } : {}),
     ...(d.extraction ? { invoice: d.extraction } : {}),
   };
 }

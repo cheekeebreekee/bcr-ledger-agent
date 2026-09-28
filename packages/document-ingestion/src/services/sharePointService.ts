@@ -144,6 +144,8 @@ export interface InboxItem {
   readonly lastModifiedBy?: { readonly user?: { readonly id?: string } };
   readonly lastModifiedDateTime?: string;
   readonly parentReference?: { readonly driveId?: string; readonly id?: string };
+  /** Graph's link to open the item in SharePoint. */
+  readonly webUrl?: string;
 }
 
 /** The version of an inbox item the sweep listed: it acts on nothing else. */
@@ -157,6 +159,8 @@ export interface InboxItemVersion {
 export interface InboxMoveResult {
   readonly id: string;
   readonly nameSuffix: number;
+  /** The moved item's SharePoint link, when Graph returned one (for the index and staff). */
+  readonly webUrl?: string;
 }
 
 /** Resolves the Graph id of a site nothing may be filed to. May reject. */
@@ -536,7 +540,11 @@ export class SharePointService {
         );
       }
       this.log.info({ driveItemId: itemId, nameSuffix: n }, 'moved within the channel folder');
-      return { id: moved.id, nameSuffix: n };
+      return {
+        id: moved.id,
+        nameSuffix: n,
+        ...(typeof moved.webUrl === 'string' ? { webUrl: moved.webUrl } : {}),
+      };
     }
     throw new SharePointError('Too many filename collisions', 409);
   }

@@ -205,6 +205,10 @@ the folder. Classifiers only suggest; the policy files.
        `disabled`; refused at cold start for a model that rejects it). The classifier release
        fingerprint covers all three, so the shadow memo classifies each file once more after a
        change, never repeatedly.
+     - **A bound per file version in `enforce`.** A version the sweep does not move (a failing
+       move, a tick out of time) would be classified again by each new worker; the storage
+       table counts its paid classifications, and the third is the last: then it is sorted to
+       `98_` unclassified (`PROCESSING_FAILED`, `paidClassifications`).
      Message Batches (50% off) are not used: they would make a client's file wait up to 24 hours
      in the inbox and change how the sweep tracks a file between ticks.
    - **Long PDFs.** A PDF over 5 pages is classified from an in-memory copy of its first 4 pages

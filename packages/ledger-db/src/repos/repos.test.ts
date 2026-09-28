@@ -171,7 +171,20 @@ describe('documentsRepo.recordFiled / recordReview', () => {
       '1234567819',
       'Klient',
       null,
+      null,
     ]);
+  });
+
+  it('writes the web link when there is one, and keeps an earlier one on a rewrite without', async () => {
+    const url = 'https://tenant.sharepoint.com/sites/Klient/Dokumenty/f.pdf';
+    const { calls } = await inTx(
+      (tx) => documentsRepo.recordFiled(tx, { ...record, webUrl: url }),
+      () => [{ document_id: record.documentId, created: true }],
+    );
+    expect(calls[0]!.values.at(-1)).toBe(url);
+    expect(flat(calls[0]!.text)).toContain(
+      'web_url = COALESCE(EXCLUDED.web_url, ledger.documents.web_url)',
+    );
   });
 
   it('writes NULL for everything optional that is absent, with FILED', async () => {
@@ -205,6 +218,8 @@ describe('documentsRepo.recordFiled / recordReview', () => {
     [{ documentMonth: '2026-13' }, 'documentMonth'],
     [{ uploadedByOid: 'someone' }, 'uploadedByOid'],
     [{ contentSha256: 'abc' }, 'contentSha256'],
+    [{ webUrl: 'http://tenant.sharepoint.com/x' }, 'webUrl'],
+    [{ webUrl: 'https://tenant.sharepoint.com/a b' }, 'webUrl'],
     [{ invoice: { ...record.invoice!, grossAmount: '1 230,00' } }, 'invoice.grossAmount'],
     [{ invoice: { ...record.invoice!, buyerNip: '1234567810' } }, 'invoice.buyerNip'],
     [{ unexpected: true }, ''],
@@ -218,6 +233,46 @@ describe('documentsRepo.recordFiled / recordReview', () => {
     await expect(inTx((tx) => documentsRepo.recordFiled(tx, record))).rejects.toMatchObject({
       reason: 'invalid_record',
     });
+  });
+});
+
+describe('documentsRepo review notices', () => {
+  it('reads the scope’s documents in review not yet notified, oldest first, bounded', async () => {
+    const { result, calls } = await inTx(
+      (tx) => documentsRepo.pendingReviewNotices(tx, 500),
+      () => [{ documentId: record.documentId }],
+    );
+    expect(result).toEqual([{ documentId: record.documentId }]);
+    const text = flat(calls[0]!.text);
+    expect(text).toContain(
+      "WHERE client_id = $1 AND status = 'NEEDS_REVIEW' AND review_notified_at IS NULL",
+    );
+    expect(text).toContain('ORDER BY created_at, document_id LIMIT $2');
+    expect(calls[0]!.values).toEqual([A, documentsRepo.REVIEW_NOTICE_MAX_LIMIT]);
+    const one = await inTx((tx) => documentsRepo.pendingReviewNotices(tx, 0));
+    expect(one.calls[0]!.values).toEqual([A, 1]);
+  });
+
+  it('marks only the scope’s rows still pending, and says how many', async () => {
+    const ids = [record.documentId, '11111111-2222-4333-8444-555555555555'];
+    const { result, calls } = await inTx(
+      (tx) => documentsRepo.markReviewNotified(tx, ids),
+      () => [{ document_id: ids[0] }],
+    );
+    expect(result).toBe(1);
+    const text = flat(calls[0]!.text);
+    expect(text).toContain('UPDATE ledger.documents SET review_notified_at = now()');
+    expect(text).toContain('WHERE client_id = $1 AND document_id = ANY($2::uuid[])');
+    expect(text).toContain('AND review_notified_at IS NULL');
+    expect(calls[0]!.values).toEqual([A, ids]);
+  });
+
+  it('runs no statement for no ids, and refuses an id that is not a UUID', async () => {
+    const none = await inTx((tx) => documentsRepo.markReviewNotified(tx, []));
+    expect(none).toEqual({ result: 0, calls: [] });
+    await expect(
+      inTx((tx) => documentsRepo.markReviewNotified(tx, ["x' OR 1=1 --"])),
+    ).rejects.toMatchObject({ reason: 'invalid_record' });
   });
 });
 

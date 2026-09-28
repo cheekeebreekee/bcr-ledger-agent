@@ -18,7 +18,12 @@ import type { ClassificationOutcome } from './classificationService';
 import { boundClientRows, type ClientDirectorySnapshot } from './clientDirectoryReader';
 import { INDEX_OFF, recordFiling, type DocumentIndex, type IndexedClient } from './documentIndex';
 import { doublingBackoff, RetryLaterBound } from './retryLaterBound';
-import { statusOf, type ShadowMemo, type ShadowMemoKey } from './shadowMemo';
+import {
+  statusOf,
+  type PaidClassifications,
+  type ShadowMemo,
+  type ShadowMemoKey,
+} from './shadowMemo';
 import {
   ContentTooLargeError,
   graphStatus,
@@ -75,6 +80,14 @@ export const MAX_PROCESSING_ATTEMPTS = 3;
  * (`retryLaterBound.ts`). 429, 529 and 401–404 never count.
  */
 export const MAX_RETRY_LATER_ATTEMPTS = 5;
+
+/**
+ * Paid classifications one version of a file may cost in `enforce`, across
+ * worker restarts (`PaidClassifications`). A version is classified again only
+ * when it was not moved; at the bound it is sorted to review unclassified
+ * (`PROCESSING_FAILED`) instead of being paid for once more.
+ */
+export const MAX_PAID_CLASSIFICATIONS = 3;
 
 /**
  * The wait after a counted "retry later" before the file is read again:
@@ -156,6 +169,13 @@ export interface ChannelInboxDeps {
    * Absent: this worker's memory only.
    */
   readonly shadowMemo?: ShadowMemo;
+  /**
+   * Enforce: paid classifications per file version, kept across worker
+   * restarts, at most {@link MAX_PAID_CLASSIFICATIONS}. A count that cannot be
+   * read leaves the file for a later tick, never a paid classification.
+   * Absent: bounded by this worker's memory only.
+   */
+  readonly paidClassifications?: PaidClassifications;
   /** Defaults to {@link INBOX_TICK_DEADLINE_MS}. */
   readonly tickDeadlineMs?: number;
   /** Defaults to {@link INBOX_TICK_HARD_LIMIT_MS}. */
@@ -281,8 +301,8 @@ interface Tick {
   readonly log: Logger;
   readonly counts: Mutable<Omit<InboxTickSummary, 'mode' | 'durationMs'>>;
   processed: number;
-  /** Shadow-memo operations whose failure this tick has logged already. */
-  readonly memoFailures: Set<'read' | 'write'>;
+  /** Memo operations (`event|operation`) whose failure this tick has logged already. */
+  readonly memoFailures: Set<string>;
 }
 
 /**
@@ -657,10 +677,17 @@ export class ChannelInbox {
         },
         event,
       );
-      await this.recordInIndex(row, inbox, candidate, moved.id, decision, tick, placement);
+      await this.recordInIndex(row, inbox, candidate, moved, decision, tick, placement);
     } catch (err) {
       if (err instanceof ClassificationDeferred) {
         await this.deferClassification(err, row, ids, sharePoint, inbox, candidate, tick);
+        return;
+      }
+      if (err instanceof PaidBudgetExhausted) {
+        await this.sortUnclassified(row, ids, sharePoint, inbox, candidate, tick, {
+          counted: false,
+          extra: { paidClassifications: err.paid },
+        });
         return;
       }
       if (this.leftForLater(err, tick, ids, candidate)) return;
@@ -815,24 +842,29 @@ export class ChannelInbox {
     return true;
   }
 
-  /** One `inbox.shadow_memo_failed` per operation and tick: the error's name and status. */
+  /**
+   * One line per memo, operation and tick (`inbox.shadow_memo_failed`, or
+   * `inbox.paid_memo_failed` for the enforce count): the error's name and status.
+   */
   private reportMemoFailureOnce(
     tick: Tick,
     ids: RowIds,
     operation: 'read' | 'write',
     err: unknown,
+    event: 'inbox.shadow_memo_failed' | 'inbox.paid_memo_failed' = 'inbox.shadow_memo_failed',
   ): void {
-    if (tick.memoFailures.has(operation)) return;
-    tick.memoFailures.add(operation);
+    const key = `${event}|${operation}`;
+    if (tick.memoFailures.has(key)) return;
+    tick.memoFailures.add(key);
     const status = statusOf(err);
     tick.log.warn(
       {
-        event: 'inbox.shadow_memo_failed',
+        event,
         listItemId: ids.listItemId,
         operation,
         err: { ...describeError(err), ...(status !== undefined ? { status } : {}) },
       },
-      'inbox.shadow_memo_failed',
+      event,
     );
   }
 
@@ -863,6 +895,17 @@ export class ChannelInbox {
 
     if (!this.hasTimeFor(tick, CLASSIFY_RESERVE_MS)) throw new OutOfTime();
     await sharePoint.checkInboxItem(inbox, { id: candidate.item.id, eTag: candidate.eTag });
+    const paid = this.deps.mode === 'enforce' ? this.deps.paidClassifications : undefined;
+    if (paid) {
+      let count: number;
+      try {
+        count = await paid.count(memoKey(rowIdsOf(row), candidate));
+      } catch (err) {
+        this.reportMemoFailureOnce(tick, rowIdsOf(row), 'read', err, 'inbox.paid_memo_failed');
+        throw new OutOfTime();
+      }
+      if (count >= MAX_PAID_CLASSIFICATIONS) throw new PaidBudgetExhausted(count);
+    }
 
     // Read lazily: the fallback classifier never reads, so nothing is
     // downloaded when Claude is off. A failed read is a failed attempt, not a
@@ -903,6 +946,14 @@ export class ChannelInbox {
     if (outcome.kind === 'retry_later') throw new ClassificationDeferred(outcome);
     // Classified: earlier "retry later" answers no longer count.
     this.retryLaters.forget(versionKey(candidate));
+    // Billed (a model answered, usable or not): one more toward the bound.
+    if (paid && outcome.decision.usage) {
+      try {
+        await paid.add(memoKey(rowIdsOf(row), candidate));
+      } catch (err) {
+        this.reportMemoFailureOnce(tick, rowIdsOf(row), 'write', err, 'inbox.paid_memo_failed');
+      }
+    }
 
     const placement: CachedPlacement = {
       eTag: candidate.eTag,
@@ -923,7 +974,7 @@ export class ChannelInbox {
     row: ClientDirectoryEntry,
     inbox: InboxFolder,
     candidate: InboxCandidate,
-    movedId: string,
+    moved: { readonly id: string; readonly webUrl?: string },
     decision: AcceptanceDecision,
     tick: Tick,
     placement?: CachedPlacement,
@@ -935,9 +986,10 @@ export class ChannelInbox {
         source: 'inbox',
         client: indexedClient(row),
         driveId: inbox.driveId,
-        driveItemId: movedId,
+        driveItemId: moved.id,
         decision,
         uploadedByOid: candidate.creatorId,
+        ...(moved.webUrl ? { webUrl: moved.webUrl } : {}),
         ...(placement?.contentSha256 ? { contentSha256: placement.contentSha256 } : {}),
         ...(typeof candidate.item.size === 'number' ? { sizeBytes: candidate.item.size } : {}),
       },
@@ -1013,7 +1065,7 @@ export class ChannelInbox {
         },
         'inbox.sorted_to_review',
       );
-      await this.recordInIndex(row, inbox, candidate, moved.id, decision, tick);
+      await this.recordInIndex(row, inbox, candidate, moved, decision, tick);
     } catch (err) {
       // A file already counted as failed this tick is not also deferred.
       if (this.leftForLater(err, tick, ids, candidate, { countDeferred: !opts.counted })) return;
@@ -1160,15 +1212,26 @@ function versionKey(candidate: InboxCandidate): string {
   return `${candidate.item.id}|${candidate.eTag}`;
 }
 
-/** The same version, in this row, for the shadow memo. */
-function memoKey(ids: RowIds, candidate: InboxCandidate): ShadowMemoKey {
+/** The same version, in this row, for the shadow memo and the paid count. */
+function memoKey(ids: Pick<RowIds, 'listItemId'>, candidate: InboxCandidate): ShadowMemoKey {
   return { listItemId: ids.listItemId, driveItemId: candidate.item.id, eTag: candidate.eTag };
+}
+
+function rowIdsOf(row: ClientDirectoryEntry): RowIds {
+  return { clientId: row.clientId, listItemId: row.listItemId, teamId: row.teamId ?? '' };
 }
 
 /** The tick has too little time left for the next stage: the file waits, not a failure. */
 class OutOfTime extends Error {
   constructor() {
     super('Not enough time left in this tick');
+  }
+}
+
+/** The version has had its {@link MAX_PAID_CLASSIFICATIONS}: to review, unclassified. */
+class PaidBudgetExhausted extends Error {
+  constructor(readonly paid: number) {
+    super('Paid classifications exhausted');
   }
 }
 

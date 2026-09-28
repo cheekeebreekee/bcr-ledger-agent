@@ -99,6 +99,9 @@ param enableAnthropic bool = true
 @description('ANTHROPIC_MODEL: Anthropic model id used for document classification.')
 param anthropicModel string = 'claude-opus-5'
 
+@description('REVIEW_WEBHOOK_URL: review notices to the staff chat, from Key Vault secret review-webhook-url. true only once that secret exists (Classifier cost release / review notices runbook).')
+param enableReviewNotices bool = false
+
 @description('ANTHROPIC_EFFORT: output_config.effort of every classification call. low is the cheapest.')
 @allowed(['low', 'medium', 'high'])
 param anthropicEffort string = 'low'
@@ -251,6 +254,11 @@ var ingestionAppSettings = union(
     LEDGER_DB_USER: ledgerDbUser
     LOG_LEVEL: logLevel
   },
+  enableReviewNotices
+    ? {
+        REVIEW_WEBHOOK_URL: '@Microsoft.KeyVault(SecretUri=${keyVault.outputs.uri}secrets/review-webhook-url/)'
+      }
+    : {},
   enableAnthropic
     ? {
         ANTHROPIC_MODEL: anthropicModel

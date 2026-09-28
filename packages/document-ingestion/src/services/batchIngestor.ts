@@ -351,6 +351,7 @@ export class BatchIngestor {
         ...(batch.uploaderOid ? { uploadedByOid: batch.uploaderOid } : {}),
         content,
         sizeBytes: content.length,
+        ...(item.webUrl ? { webUrl: item.webUrl } : {}),
       },
       docLog,
     );

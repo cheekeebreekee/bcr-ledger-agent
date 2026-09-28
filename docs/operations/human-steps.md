@@ -17,7 +17,8 @@ reason every comment in the blocks below sits on its own line.
 Phase 0 is here, then the releases that followed it: [Lifting gate G1](#lifting-gate-g1), the
 [Classification release](#classification-release) and the
 [Document index release](#document-index-release), then the
-[Classifier cost release](#classifier-cost-release). Later phases add their own sections.
+[Classifier cost release](#classifier-cost-release) and [Review notices](#review-notices). Later phases add their
+own sections.
 
 ---
 
@@ -2710,3 +2711,77 @@ the model test (step 4, about $1).
 
 **Rollback.** Deploy the saved package. It ignores `ANTHROPIC_EFFORT` and `ANTHROPIC_THINKING`,
 which can stay set.
+
+---
+
+## Review notices
+
+**Owner:** Yahor (the chat and the webhook), Claude (the migration, the deploy, the setting).
+**What it does:** every 10 minutes the ingestion reads, per bound client and in that client's
+own scope of the document index, the documents sorted to `98_Nieposortowane` that no notice has
+named yet. It posts one card per client into a staff chat, kept well under Teams' message limit,
+and after the webhook accepted a card, marks the rows that card named (`review_notified_at`). A
+card the webhook refuses is retried on the next run. A 2xx only means the flow accepted it: a
+flow run that fails afterwards loses that card, so check the flow's run history now and then. A
+document sorted to review again (staff sent it back to the inbox) is announced again.
+
+The card's text carries, per client, the Directory row's title, and per document:
+- the suggested category's Polish label;
+- the review reasons in Polish;
+- the month;
+- a link, "Otwórz plik".
+
+The link targets the file's SharePoint address, which **contains the file name**. The chat is
+therefore staff only. Recipients: Roman now, and Katarzyna Pomian later. Who receives it is the
+chat's membership, managed in Teams.
+
+0. **Before this build is deployed** (Claude, once): apply migration `0002_review_notices` as the
+   server's Entra administrator, with a dated firewall rule as in the
+   [Document index release](#document-index-release) step 3. Run `migrate status` (0002
+   pending), `migrate` (`applying 0002_review_notices`, `verify.sql: no problems`), then
+   `migrate status` again, and delete the rule. The running build ignores the two new columns;
+   the new build writes `web_url` and fails every index write without it.
+1. **The chat.** In Teams, start a group chat named `Weryfikacja dokumentów (Ledger)` with
+   `roman.kachniuk@bcr-group.pl`. Add `katarzyna.pomian@bcr-group.pl` whenever she starts; nothing
+   else changes. A flow posts only into a chat its owner is in, so you stay in it.
+2. **The webhook.** In that chat: **⋯ → Workflows → "Send webhook alerts to a chat"**. Accept the
+   chat it proposes, and copy the URL it shows at the end.
+   - **The whole URL is the credential.** Never paste it into a chat, a ticket or a file.
+   - **A flow stops when its owner or its Teams connection goes.** In Power Automate, add Roman
+     as a co-owner.
+3. **Store it** (asks for the URL without showing it; pipes it straight to Key Vault):
+
+   ```bash
+   tools/ops/set-review-webhook.sh
+   ```
+
+4. **Switch it on** (Claude).
+   1. In a commit of its own, set `"enableReviewNotices": { "value": true }` in
+      `main.dev.parameters.json`.
+   2. Run `node tools/check-app-settings.mjs --live -g $RG -p infrastructure/main.dev.parameters.json --expect REVIEW_WEBHOOK_URL`.
+      It prints one note.
+   3. Set the reference:
+
+      ```bash
+      KV=$(az keyvault list -g $RG --query "[?starts_with(name,'kv-bcr-')].name | [0]" -o tsv)
+      az functionapp config appsettings set -g $RG -n $INGEST -o none --settings \
+        "REVIEW_WEBHOOK_URL=@Microsoft.KeyVault(SecretUri=https://$KV.vault.azure.net/secrets/review-webhook-url/)"
+      ```
+
+   4. Run `--live` again: it is clean.
+   5. The cold-start `review_notice.config` line says `mode` `on`. It says `off` with `reason`
+      `webhook_unresolved` while the reference does not resolve.
+5. **Verify.** The next document sorted to review appears in the chat within 10 minutes.
+   `review_notice.posted` logs its counts and document ids. The flow's run history shows
+   *Succeeded*.
+
+**Rotation.** Delete the flow, create a new one, and run step 3 again. Then make the app read the
+new version: the reference is versionless and cached for up to 24 hours.
+
+```bash
+az rest --method post --url "https://management.azure.com$(az functionapp show -g $RG -n $INGEST --query id -o tsv)/config/configreferences/appsettings/refresh?api-version=2022-03-01"
+az functionapp restart -g $RG -n $INGEST
+```
+
+**Rollback.** Set `enableReviewNotices` back to `false` and delete the setting. The two columns
+stay; the running build ignores them.

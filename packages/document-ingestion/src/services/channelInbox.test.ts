@@ -14,6 +14,7 @@ import {
   CLASSIFICATION_CACHE_TTL_MS,
   CLASSIFY_RESERVE_MS,
   INBOX_TICK_HARD_LIMIT_MS,
+  MAX_PAID_CLASSIFICATIONS,
   MAX_RETRY_LATER_ATTEMPTS,
   RETRY_LATER_BACKOFF_MS,
   WRITE_RESERVE_MS,
@@ -358,6 +359,7 @@ class FakeTenant {
           : { lastModifiedBy: { application: { id: 'app' } } };
       })(),
       createdDateTime: item.createdDateTime ?? OLD,
+      webUrl: `https://fake.sharepoint.com/${item.driveId}/${item.id}`,
       ...(item.parentId === null
         ? { root: {} }
         : { parentReference: { driveId: item.driveId, id: item.parentId } }),
@@ -1665,6 +1667,129 @@ describe('ChannelInbox: the shadow memo', () => {
 
 // 27 September 2026, after the credit ran out: 43 files, each downloaded and
 // sent again every two minutes, all refused.
+/** A paid-classification count in a Map, shared between "workers" like the table is. */
+function memoryPaid() {
+  const counts = new Map<string, number>();
+  const keyOf = (k: ShadowMemoKey) => `${k.listItemId}|${k.driveItemId}|${k.eTag}`;
+  const paid = {
+    count: jest.fn(async (k: ShadowMemoKey) => counts.get(keyOf(k)) ?? 0),
+    add: jest.fn(async (k: ShadowMemoKey) => {
+      const n = (counts.get(keyOf(k)) ?? 0) + 1;
+      counts.set(keyOf(k), n);
+      return n;
+    }),
+  };
+  return { paid, counts };
+}
+
+const billed = {
+  inputTokens: 700,
+  outputTokens: 250,
+  cacheReadInputTokens: 4700,
+  cacheCreationInputTokens: 0,
+};
+
+describe('ChannelInbox: paid classifications in enforce', () => {
+  /** Moves into 01_Faktury fail (its folder cannot be created); 98_ works. */
+  function failInvoiceFolder(tenant: FakeTenant): void {
+    tenant.overrides.push([
+      /^POST \/drives\/drive-a\/items\/inbox-a\/children$/,
+      (call, next) => {
+        if ((call.body as { name: string }).name === '01_Faktury') throw graphError(400);
+        return next();
+      },
+    ]);
+  }
+
+  // The shape of the 26 September incident in enforce: a file that is not
+  // moved is classified again by every new worker.
+  it('pays for a version at most 3 times across restarts, then sorts it to review unclassified', async () => {
+    const tenant = new FakeTenant();
+    const { paid } = memoryPaid();
+    failInvoiceFolder(tenant);
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    const classify = jest.fn(async () => ({ ...invoice, usage: billed }));
+
+    const workers = [1, 2, 3, 4].map(() =>
+      setup({ tenant, deps: { paidClassifications: paid }, classify }),
+    );
+    for (const w of workers) await w.inbox.sweep();
+
+    expect(classify).toHaveBeenCalledTimes(MAX_PAID_CLASSIFICATIONS);
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/98_Nieposortowane/2026/09/faktura.pdf`);
+    expect(workers[3]!.events('inbox.sorted_to_review')).toEqual([
+      expect.objectContaining({
+        driveItemId: id,
+        reviewReasons: ['PROCESSING_FAILED'],
+        unclassified: true,
+        paidClassifications: MAX_PAID_CLASSIFICATIONS,
+      }),
+    ]);
+  });
+
+  it('counts only billed answers: the free fallback never uses the budget', async () => {
+    const tenant = new FakeTenant();
+    const { paid } = memoryPaid();
+    failInvoiceFolder(tenant);
+    tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    const classify = jest.fn(async () => invoice);
+
+    for (let i = 0; i < 4; i += 1) {
+      await setup({ tenant, deps: { paidClassifications: paid }, classify }).inbox.sweep();
+    }
+
+    expect(classify).toHaveBeenCalledTimes(4);
+    expect(paid.add).not.toHaveBeenCalled();
+  });
+
+  it('never pays while the count cannot be read: the file waits, one warning per tick', async () => {
+    const paid = {
+      count: jest.fn(async () => {
+        throw Object.assign(new Error('storage down'), { statusCode: 503 });
+      }),
+      add: jest.fn(async () => 1),
+    };
+    const classify = jest.fn(async () => ({ ...invoice, usage: billed }));
+    const { tenant, inbox, events } = setup({ deps: { paidClassifications: paid }, classify });
+    const a = tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.addFile('inbox-a', { name: 'b.pdf' });
+
+    expect(await inbox.sweep()).toMatchObject({ filed: 0, deferred: 2 });
+    expect(classify).not.toHaveBeenCalled();
+    expect(tenant.pathOf(a)).toBe(`${CHANNEL}/a.pdf`);
+    expect(events('inbox.paid_memo_failed')).toEqual([
+      expect.objectContaining({ operation: 'read', err: { name: 'Error', status: 503 } }),
+    ]);
+  });
+
+  it('files the document when the count cannot be written, and says so once', async () => {
+    const paid = {
+      count: jest.fn(async () => 0),
+      add: jest.fn(async () => {
+        throw new Error('storage down');
+      }),
+    };
+    const classify = jest.fn(async () => ({ ...invoice, usage: billed }));
+    const { tenant, inbox, events } = setup({ deps: { paidClassifications: paid }, classify });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.addFile('inbox-a', { name: 'b.pdf' });
+
+    expect(await inbox.sweep()).toMatchObject({ filed: 2 });
+    expect(events('inbox.paid_memo_failed')).toEqual([
+      expect.objectContaining({ operation: 'write' }),
+    ]);
+  });
+
+  it('is never used in shadow', async () => {
+    const { paid } = memoryPaid();
+    const { tenant, inbox } = setup({ mode: 'shadow', deps: { paidClassifications: paid } });
+    tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+    expect(await inbox.sweep()).toMatchObject({ wouldMove: 1 });
+    expect(paid.count).not.toHaveBeenCalled();
+    expect(paid.add).not.toHaveBeenCalled();
+  });
+});
+
 describe('ChannelInbox: the account is refused', () => {
   it('sends one request per 15 minutes for the whole inbox, not one per file per tick', async () => {
     const create = jest.fn().mockRejectedValue(
@@ -2511,6 +2636,8 @@ describe('ChannelInbox: the document index', () => {
       uploadedByOid: GUEST_A,
       sizeBytes: content.length,
       contentSha256: createHash('sha256').update(content).digest('hex'),
+      // The moved item's link, as Graph's PATCH answered it: for staff notices.
+      webUrl: `https://fake.sharepoint.com/drive-a/${id}`,
     });
     expect(doc.documentId).toMatch(/^[0-9a-f-]{36}$/);
     expect(doc.decision).toMatchObject({ review: false, category: 'faktury_zakupu' });

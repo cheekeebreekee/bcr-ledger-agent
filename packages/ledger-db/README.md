@@ -43,3 +43,8 @@ administrator's UPN). Its sub-commands: `status`, `verify`, `grant-app <login>`,
   `ledger_app` needs. `sql/verify.sql` fails on anything less, and the RLS matrix in
   `itest/rls.itest.ts` fails until the table has its case there.
 - A table that is not per client (reference data) goes in another schema, never in `ledger`.
+- **Apply a migration before deploying the build that uses it**, and keep migrations additive
+  (new nullable columns, new tables) so the running build keeps working in between. The other
+  order fails every index write that names a missing column (`index.write_failed`, SQLSTATE
+  `42703`), and nothing writes those rows again. 0002 (`web_url`, `review_notified_at`) was
+  applied before the build that writes `web_url`.

@@ -8,6 +8,7 @@ import { LedgerDbError, sqlStateOf } from '../src/errors';
 import { applyMigrations, loadMigrations, verifySchema } from '../src/migrate';
 import * as clientsRepo from '../src/repos/clientsRepo';
 import * as documentsRepo from '../src/repos/documentsRepo';
+import { sql as sqlTag } from '../src/sql';
 import type { DocumentRecord } from '../src/repos/documentsRepo';
 import { createTestDatabase, sqlState, type TestDatabase } from './harness';
 
@@ -134,6 +135,86 @@ describe('clientsRepo.upsertFromDirectory', () => {
       ),
     );
     expect(state).toBe('42501');
+  });
+});
+
+describe('review notices (0002)', () => {
+  it("lists a client's documents in review not yet notified, marks them once, and never another client's", async () => {
+    const url = 'https://tenant.sharepoint.com/sites/Klient7/Dokumenty/98/a.pdf';
+    const inReview = record({
+      category: 'nieposortowane',
+      suggestedCategory: 'umowy',
+      reviewReasons: ['LOW_CONFIDENCE'],
+      webUrl: url,
+    });
+    const filed = record();
+    const bReview = record({ category: 'nieposortowane', reviewReasons: ['NOT_CLASSIFIED'] });
+    await t.db.withClientTx(A, (tx) => documentsRepo.recordReview(tx, inReview));
+    await t.db.withClientTx(A, (tx) => documentsRepo.recordFiled(tx, filed));
+    await t.db.withClientTx(B, (tx) => documentsRepo.recordReview(tx, bReview));
+
+    const pendingA = await t.db.withClientTx(A, (tx) => documentsRepo.pendingReviewNotices(tx, 50));
+    expect(pendingA.map((d) => d.documentId)).toContain(inReview.documentId);
+    expect(pendingA.map((d) => d.documentId)).not.toContain(filed.documentId);
+    expect(pendingA.map((d) => d.documentId)).not.toContain(bReview.documentId);
+    expect(pendingA.find((d) => d.documentId === inReview.documentId)).toMatchObject({
+      suggestedCategory: 'umowy',
+      reviewReasons: ['LOW_CONFIDENCE'],
+      webUrl: url,
+    });
+
+    // A cannot mark B's document: RLS hides it, so nothing is updated.
+    expect(
+      await t.db.withClientTx(A, (tx) =>
+        documentsRepo.markReviewNotified(tx, [bReview.documentId]),
+      ),
+    ).toBe(0);
+    expect(
+      await t.db.withClientTx(A, (tx) =>
+        documentsRepo.markReviewNotified(tx, [inReview.documentId]),
+      ),
+    ).toBe(1);
+    // Marked once: a second mark touches nothing, and it is no longer pending.
+    expect(
+      await t.db.withClientTx(A, (tx) =>
+        documentsRepo.markReviewNotified(tx, [inReview.documentId]),
+      ),
+    ).toBe(0);
+    const after = await t.db.withClientTx(A, (tx) => documentsRepo.pendingReviewNotices(tx, 50));
+    expect(after.map((d) => d.documentId)).not.toContain(inReview.documentId);
+    const pendingB = await t.db.withClientTx(B, (tx) => documentsRepo.pendingReviewNotices(tx, 50));
+    expect(pendingB.map((d) => d.documentId)).toContain(bReview.documentId);
+  });
+
+  it('announces a document sorted to review again after it was notified', async () => {
+    const again = record({ category: 'nieposortowane', reviewReasons: ['LOW_CONFIDENCE'] });
+    await t.db.withClientTx(A, (tx) => documentsRepo.recordReview(tx, again));
+    await t.db.withClientTx(A, (tx) => documentsRepo.markReviewNotified(tx, [again.documentId]));
+    const ids = async () =>
+      (await t.db.withClientTx(A, (tx) => documentsRepo.pendingReviewNotices(tx, 50))).map(
+        (d) => d.documentId,
+      );
+    expect(await ids()).not.toContain(again.documentId);
+    // Filed meanwhile: stays notified. Sorted to review again: pending again.
+    await t.db.withClientTx(A, (tx) =>
+      documentsRepo.recordFiled(tx, { ...again, category: 'umowy', reviewReasons: [] }),
+    );
+    expect(await ids()).not.toContain(again.documentId);
+    await t.db.withClientTx(A, (tx) => documentsRepo.recordReview(tx, again));
+    expect(await ids()).toContain(again.documentId);
+  });
+
+  it('refuses a web link that is not https at the database too', async () => {
+    const bad = record({ webUrl: 'https://ok.example/x' });
+    await t.db.withClientTx(A, (tx) => documentsRepo.recordFiled(tx, bad));
+    await expect(
+      t.db.withClientTx(A, (tx) =>
+        tx.query(
+          // A statement the repository would never send: the CHECK is the last line.
+          sqlTag`UPDATE ledger.documents SET web_url = 'http://x' WHERE document_id = ${bad.documentId}`,
+        ),
+      ),
+    ).rejects.toThrow();
   });
 });
 
@@ -307,7 +388,10 @@ describe('documentsRepo', () => {
 describe('the migration runner', () => {
   it('is a no-op the second time, and verify.sql still passes', async () => {
     const run = await applyMigrations(t.admin, loadMigrations());
-    expect(run).toEqual({ applied: [], alreadyApplied: ['0001_ledger_core'] });
+    expect(run).toEqual({
+      applied: [],
+      alreadyApplied: ['0001_ledger_core', '0002_review_notices'],
+    });
     expect(await verifySchema(t.admin)).toEqual([]);
   });
 
@@ -322,7 +406,10 @@ describe('the migration runner', () => {
     const { rows } = await t.admin.query(
       'SELECT version, name FROM ledger_meta.schema_migrations ORDER BY version',
     );
-    expect(rows).toEqual([{ version: '0001', name: 'ledger_core' }]);
+    expect(rows).toEqual([
+      { version: '0001', name: 'ledger_core' },
+      { version: '0002', name: 'review_notices' },
+    ]);
   });
 
   it("gives the app's login nothing on ledger_meta", async () => {

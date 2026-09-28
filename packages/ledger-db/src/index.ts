@@ -45,6 +45,7 @@ export type {
   DocumentSource,
   DocumentStatus,
   MonthlyCount,
+  PendingReviewNotice,
   RecordOutcome,
   SearchPage,
   SearchResult,

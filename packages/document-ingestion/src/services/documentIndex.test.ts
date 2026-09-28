@@ -279,6 +279,15 @@ describe('LedgerDocumentIndex', () => {
 });
 
 describe('toRecord', () => {
+  it('carries an https web link for staff, and never anything else', () => {
+    const url = 'https://tenant.sharepoint.com/sites/Klient/Dokumenty/f.pdf';
+    expect(toRecord(doc({ webUrl: url })).webUrl).toBe(url);
+    expect(toRecord(doc({ webUrl: 'http://tenant.sharepoint.com/f.pdf' }))).not.toHaveProperty(
+      'webUrl',
+    );
+    expect(toRecord(doc())).not.toHaveProperty('webUrl');
+  });
+
   it('maps the decision, hashes the bytes, lower-cases the uploader and carries the fields', () => {
     expect(toRecord(doc())).toEqual({
       documentId: '0b7f3c9e-1a2b-4c3d-8e4f-5a6b7c8d9e0f',

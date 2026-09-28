@@ -1,4 +1,9 @@
-import { TableShadowMemo, statusOf, type ShadowMemoTable } from './shadowMemo';
+import {
+  TablePaidClassifications,
+  TableShadowMemo,
+  statusOf,
+  type ShadowMemoTable,
+} from './shadowMemo';
 
 const KEY = {
   listItemId: '10',
@@ -91,6 +96,70 @@ describe('TableShadowMemo', () => {
     expect(table.createTable.mock.calls[0]).toEqual([{ abortSignal: expect.any(AbortSignal) }]);
     expect(table.getEntity.mock.calls[0]?.[2]).toEqual({ abortSignal: expect.any(AbortSignal) });
     expect(table.upsertEntity.mock.calls[0]?.[1]).toBe('Replace');
+  });
+});
+
+describe('TablePaidClassifications', () => {
+  it('counts from 0, one more per add, per version and release', async () => {
+    const { asTable } = fakeTable();
+    const paid = new TablePaidClassifications(asTable, 'r1');
+
+    expect(await paid.count(KEY)).toBe(0);
+    expect(await paid.add(KEY)).toBe(1);
+    expect(await paid.add(KEY)).toBe(2);
+    expect(await paid.count(KEY)).toBe(2);
+    expect(await paid.count({ ...KEY, eTag: '"v2"' })).toBe(0);
+    expect(await new TablePaidClassifications(asTable, 'r2').count(KEY)).toBe(0);
+  });
+
+  it('keeps its own rows: a shadow report is not a paid count, nor the other way round', async () => {
+    const { asTable } = fakeTable();
+    await new TableShadowMemo(asTable, 'r1').add(KEY);
+    expect(await new TablePaidClassifications(asTable, 'r1').count(KEY)).toBe(0);
+    await new TablePaidClassifications(asTable, 'r1').add(KEY);
+    const shadow = new TableShadowMemo(asTable, 'r1');
+    const paid = new TablePaidClassifications(asTable, 'r1');
+    expect(paid.rowKey(KEY)).not.toBe(shadow.rowKey(KEY));
+  });
+
+  it('stores ids, a digest and a number only', async () => {
+    const { asTable, entities } = fakeTable();
+    await new TablePaidClassifications(asTable, 'r1', () => new Date('2026-09-28T11:00:00Z')).add(
+      KEY,
+    );
+    expect([...entities.values()]).toEqual([
+      {
+        partitionKey: '10',
+        rowKey: expect.stringMatching(/^[0-9a-f]{64}$/),
+        paid: 1,
+        lastPaidAt: '2026-09-28T11:00:00.000Z',
+      },
+    ]);
+  });
+
+  it('reads a malformed count as 0, and throws what is not a 404', async () => {
+    const { table, asTable } = fakeTable();
+    const paid = new TablePaidClassifications(asTable, 'r1');
+    table.getEntity.mockResolvedValueOnce({ paid: 'x' } as never);
+    expect(await paid.count(KEY)).toBe(0);
+    table.getEntity.mockRejectedValueOnce(Object.assign(new Error('down'), { statusCode: 503 }));
+    await expect(paid.count(KEY)).rejects.toThrow('down');
+  });
+
+  it('creates the table once, and again after a failed attempt', async () => {
+    const { table, asTable } = fakeTable();
+    table.createTable.mockRejectedValueOnce(Object.assign(new Error('down'), { statusCode: 503 }));
+    const paid = new TablePaidClassifications(asTable, 'r1');
+    await expect(paid.count(KEY)).rejects.toThrow('down');
+    await paid.count(KEY);
+    await paid.add(KEY);
+    expect(table.createTable).toHaveBeenCalledTimes(2);
+  });
+
+  it('builds from a connection string without calling the service', () => {
+    expect(
+      TablePaidClassifications.fromConnectionString('UseDevelopmentStorage=true', 'r1'),
+    ).toBeInstanceOf(TablePaidClassifications);
   });
 });
 

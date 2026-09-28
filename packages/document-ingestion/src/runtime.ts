@@ -21,7 +21,8 @@ import { BatchIngestor } from './services/batchIngestor';
 import { UserTypeReader } from './services/userDirectory';
 import { ChannelInbox, MAX_INBOX_FILE_BYTES } from './services/channelInbox';
 import { INDEX_OFF, LedgerDocumentIndex, type DocumentIndex } from './services/documentIndex';
-import { TableShadowMemo } from './services/shadowMemo';
+import { TablePaidClassifications, TableShadowMemo } from './services/shadowMemo';
+import { LedgerReviewNotices, ReviewNotifier, WorkflowsWebhook } from './services/reviewNotifier';
 
 export const config = loadIngestionConfig();
 
@@ -132,19 +133,19 @@ createLogger('ingestion/runtime').info(
  * document recorded in a transaction scoped to its client. Said once per
  * cold start: the mode, the server and the login, never a token.
  */
-export const documentIndex: DocumentIndex =
+const ledgerDb =
   config.ledgerIndexMode === 'write'
-    ? new LedgerDocumentIndex({
-        db: new LedgerDb(
-          createLedgerPool({
-            host: config.ledgerDbHost,
-            database: config.ledgerDbName,
-            user: config.ledgerDbUser,
-          }),
-        ),
-        directoryListId: config.clientDirectoryListId,
-      })
-    : INDEX_OFF;
+    ? new LedgerDb(
+        createLedgerPool({
+          host: config.ledgerDbHost,
+          database: config.ledgerDbName,
+          user: config.ledgerDbUser,
+        }),
+      )
+    : undefined;
+export const documentIndex: DocumentIndex = ledgerDb
+  ? new LedgerDocumentIndex({ db: ledgerDb, directoryListId: config.clientDirectoryListId })
+  : INDEX_OFF;
 createLogger('ingestion/runtime').info(
   {
     event: 'index.config',
@@ -176,11 +177,17 @@ export const batchIngestor = new BatchIngestor({
  * The upload path keeps its reader, cache and retries as they were.
  *
  * In `shadow`, what was reported is kept in the host's storage account under
- * this classifier release, so a restart does not pay to classify it again.
+ * this classifier release, so a restart does not pay to classify it again; in
+ * `enforce`, how many paid classifications each file version has had, at most
+ * `MAX_PAID_CLASSIFICATIONS` across restarts.
  */
 const shadowMemo =
   config.inboxSweepMode === 'shadow' && config.webJobsStorage !== ''
     ? TableShadowMemo.fromConnectionString(config.webJobsStorage, classifierRelease)
+    : undefined;
+const paidClassifications =
+  config.inboxSweepMode === 'enforce' && config.webJobsStorage !== ''
+    ? TablePaidClassifications.fromConnectionString(config.webJobsStorage, classifierRelease)
     : undefined;
 export const channelInbox = new ChannelInbox({
   mode: config.inboxSweepMode,
@@ -198,6 +205,7 @@ export const channelInbox = new ChannelInbox({
   // Written only after a move, so never in shadow.
   index: documentIndex,
   ...(shadowMemo ? { shadowMemo } : {}),
+  ...(paidClassifications ? { paidClassifications } : {}),
 });
 if (config.inboxSweepMode !== 'off') {
   createLogger('ingestion/runtime').info(
@@ -206,6 +214,9 @@ if (config.inboxSweepMode !== 'off') {
       mode: config.inboxSweepMode,
       ...(config.inboxSweepMode === 'shadow'
         ? { shadowMemo: shadowMemo ? 'table' : 'worker_memory' }
+        : {}),
+      ...(config.inboxSweepMode === 'enforce'
+        ? { paidClassifications: paidClassifications ? 'table' : 'worker_memory' }
         : {}),
       rows: config.inboxSweepRows.length ? config.inboxSweepRows : 'all',
       createdAfter:
@@ -216,3 +227,37 @@ if (config.inboxSweepMode !== 'off') {
     'inbox.sweep_mode',
   );
 }
+
+/**
+ * Review notices to the staff chat (functions/reviewNotify.ts), read from the
+ * document index: on only when the index writes and `REVIEW_WEBHOOK_URL`
+ * resolved to an https URL (a Key Vault reference that did not resolve stays
+ * the literal reference: off). Said once per cold start, with the reason when
+ * off; the URL is never logged.
+ */
+const reviewNoticesOff = !ledgerDb
+  ? 'index_off'
+  : config.reviewWebhookUrl === ''
+    ? 'no_webhook'
+    : !config.reviewWebhookUrl.startsWith('https://')
+      ? 'webhook_unresolved'
+      : undefined;
+export const reviewNotifier: ReviewNotifier | undefined =
+  ledgerDb && !reviewNoticesOff
+    ? new ReviewNotifier({
+        directory: clientDirectory,
+        source: new LedgerReviewNotices({
+          db: ledgerDb,
+          directoryListId: config.clientDirectoryListId,
+        }),
+        poster: new WorkflowsWebhook(config.reviewWebhookUrl),
+      })
+    : undefined;
+createLogger('ingestion/runtime').info(
+  {
+    event: 'review_notice.config',
+    mode: reviewNotifier ? 'on' : 'off',
+    ...(reviewNoticesOff ? { reason: reviewNoticesOff } : {}),
+  },
+  'review_notice.config',
+);
