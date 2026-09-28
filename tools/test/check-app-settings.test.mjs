@@ -619,6 +619,9 @@ describe('this repo', () => {
 
   // The classification release: a deploy must never put the old model back or
   // re-add the retired threshold, and must write a threshold the code accepts.
+  // The model is one that takes the classifier's request as it is: claude-opus-5
+  // (the code's default) or claude-sonnet-5 (dev's, Yahor's decision of 27
+  // September 2026 after the Sonnet test), never claude-opus-4-5.
   test('the template and both parameter files carry the classification release', (t) => {
     const template = readFileSync(join(REPO, 'infrastructure/main.bicep'), 'utf8');
     const dist = join(REPO, 'packages/shared/dist/config.js');
@@ -645,7 +648,7 @@ describe('this repo', () => {
         ]),
       );
       const where = env ?? 'template defaults';
-      if (settings.ANTHROPIC_MODEL?.value !== 'claude-opus-5') {
+      if (!['claude-opus-5', 'claude-sonnet-5'].includes(settings.ANTHROPIC_MODEL?.value)) {
         offenders.push(`${where}: ANTHROPIC_MODEL ${JSON.stringify(settings.ANTHROPIC_MODEL)}`);
       }
       if ('ANTHROPIC_CONFIDENCE_THRESHOLD' in settings) {

@@ -14,12 +14,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Corepack before setup-node, not after: `cache: yarn` makes setup-node
+      # run yarn while it resolves the cache folder, and with `packageManager:
+      # yarn@4.3.1` the runner's global yarn 1.22 refuses the project. Every job
+      # failed at setup-node from 26 September 2026 until this order.
+      - name: Enable Corepack
+        run: corepack enable
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: yarn
 
-      - name: Enable Corepack
+      - name: Enable Corepack for this Node
         run: corepack enable
 
       - name: Install dependencies
@@ -75,12 +82,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Corepack before setup-node, not after: `cache: yarn` makes setup-node
+      # run yarn while it resolves the cache folder, and with `packageManager:
+      # yarn@4.3.1` the runner's global yarn 1.22 refuses the project. Every job
+      # failed at setup-node from 26 September 2026 until this order.
+      - name: Enable Corepack
+        run: corepack enable
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: yarn
 
-      - name: Enable Corepack
+      - name: Enable Corepack for this Node
         run: corepack enable
 
       - name: Install dependencies
@@ -103,12 +117,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Corepack before setup-node, not after: `cache: yarn` makes setup-node
+      # run yarn while it resolves the cache folder, and with `packageManager:
+      # yarn@4.3.1` the runner's global yarn 1.22 refuses the project. Every job
+      # failed at setup-node from 26 September 2026 until this order.
+      - name: Enable Corepack
+        run: corepack enable
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: yarn
 
-      - name: Enable Corepack
+      - name: Enable Corepack for this Node
         run: corepack enable
 
       - name: Install dependencies
