@@ -20,7 +20,7 @@
     "quarantineRootFolder": { "value": "Kwarantanna" },
     "forbiddenTargetSitePaths": { "value": "/sites/BCRGROUPSp.zo.o" },
     "inboxSweepMode": { "value": "enforce" },
-    "inboxSweepRows": { "value": "10" },
+    "inboxSweepRows": { "value": "10,2" },
     "inboxCreatedAfter": { "value": "2026-09-28T11:10:29Z" },
     "inboxMaxFilesPerTick": { "value": "50" },
     "enableReviewNotices": { "value": false },
