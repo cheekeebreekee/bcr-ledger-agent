@@ -2739,7 +2739,8 @@ chat's membership, managed in Teams.
    server's Entra administrator, with a dated firewall rule as in the
    [Document index release](#document-index-release) step 3. Run `migrate status` (0002
    pending), `migrate` (`applying 0002_review_notices`, `verify.sql: no problems`), then
-   `migrate status` again, and delete the rule. The running build ignores the two new columns;
+   `migrate status` again, and delete the rule. A connect that times out right after the rule
+   was created is the rule still spreading: run it again a minute later. The running build ignores the two new columns;
    the new build writes `web_url` and fails every index write without it.
 1. **The chat.** In Teams, start a group chat named `Weryfikacja dokumentów (Ledger)` with
    `roman.kachniuk@bcr-group.pl`. Add `katarzyna.pomian@bcr-group.pl` whenever she starts; nothing
