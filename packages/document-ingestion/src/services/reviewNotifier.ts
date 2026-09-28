@@ -14,7 +14,7 @@ import {
 import { boundClientRows, type ClientDirectorySnapshot } from './clientDirectoryReader';
 
 /**
- * Review notices: staff are told, in a Teams chat, which documents wait in a
+ * Review notices: staff are told, in a Teams channel, which documents wait in a
  * client's `98_Nieposortowane` for review. Every few minutes the notifier reads,
  * per bound client and in that client's own scope, the index rows in review
  * that no notice has named yet, posts one card per client (bounded in size),
@@ -25,18 +25,19 @@ import { boundClientRows, type ClientDirectorySnapshot } from './clientDirectory
  * limit and the runbook checks the flow's run history.
  *
  * The notice goes to a Teams **Workflows** webhook ("Send webhook alerts to a
- * chat"), whose URL is the credential and lives in Key Vault
- * (`review-webhook-url`): Graph cannot post to a chat as an application
- * without Protected API approval. The chat is staff only (Roman, later the
- * accountants); who is in it is managed in Teams.
+ * channel"), whose URL is the credential and lives in Key Vault
+ * (`review-webhook-url`): Graph cannot post to a channel as an application
+ * without Protected API approval. The channel is a shared one in BCR GROUP,
+ * `Weryfikacja dokumentów`, staff only (Roman, later the accountants); who is
+ * in it is managed in Teams.
  *
  * What a notice carries: the Directory row's title (the client's name, which
  * staff know anyway), and per document the suggested category's Polish label,
  * the review reasons in Polish, the document's month and a link "Otwórz plik".
  * The link's target is the file's SharePoint `webUrl` as Graph returns it: the
  * site, the channel folder and the file name, so whatever the file name says
- * is visible on hover to the chat's members and to the flow's owners in its
- * run history. That is why the chat is staff only. The text itself carries no
+ * is visible on hover to the channel's members and to the flow's owners in its
+ * run history. That is why the channel is staff only. The text itself carries no
  * file name, amount, NIP or anything the model wrote, and the link opens only
  * for someone with access to the client's Team.
  */
@@ -99,7 +100,7 @@ export interface NoticePoster {
 export class NoticePostError extends Error {
   constructor(readonly status: number | 'unreachable') {
     super(
-      `The review chat webhook ${status === 'unreachable' ? 'could not be reached' : `returned ${status}`}`,
+      `The review channel webhook ${status === 'unreachable' ? 'could not be reached' : `returned ${status}`}`,
     );
     this.name = 'NoticePostError';
   }

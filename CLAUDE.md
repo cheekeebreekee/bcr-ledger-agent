@@ -334,7 +334,7 @@ only; its API is point 5. Rows carry the file's `web_url` (migration 0002) for s
 **Review notices** (`services/reviewNotifier.ts`, timer `reviewNotify`, every 10 min): per bound
 row and in that client's scope, the `NEEDS_REVIEW` rows with no `review_notified_at` are posted
 as one Adaptive Card per client (under `REVIEW_NOTICE_MAX_BYTES`, well inside Teams' ~28 KB) to a
-staff chat through a Teams Workflows webhook (`REVIEW_WEBHOOK_URL`, a Key Vault reference to
+staff channel (shared, `Weryfikacja dokumentów` in BCR GROUP) through a Teams Workflows webhook (`REVIEW_WEBHOOK_URL`, a Key Vault reference to
 `review-webhook-url`; the URL is the credential and is never logged), and only the rows a card
 named are marked, after the webhook accepted it; a new move into `98_` clears the mark. The card
 text carries the row's title, the suggestion's Polish label, reasons in Polish and the month;

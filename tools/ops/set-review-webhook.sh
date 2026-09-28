@@ -8,8 +8,8 @@
 # Usage:
 #   tools/ops/set-review-webhook.sh [<resource-group>]    (default rg-bcr-ledger-dev)
 #
-# The URL comes from Teams: in the staff chat, ⋯ → Workflows → "Send webhook
-# alerts to a chat". The whole URL is the credential (its `sig` parameter is
+# The URL comes from Teams: in the Workflows app, "Send webhook alerts to a
+# channel" for the shared channel Weryfikacja dokumentów in BCR GROUP. The whole URL is the credential (its `sig` parameter is
 # the signature). If it is ever exposed, delete the flow and create it again,
 # then run this again.
 # -----------------------------------------------------------------------------

@@ -2719,7 +2719,7 @@ which can stay set.
 **Owner:** Yahor (the chat and the webhook), Claude (the migration, the deploy, the setting).
 **What it does:** every 10 minutes the ingestion reads, per bound client and in that client's
 own scope of the document index, the documents sorted to `98_Nieposortowane` that no notice has
-named yet. It posts one card per client into a staff chat, kept well under Teams' message limit,
+named yet. It posts one card per client into a staff channel, kept well under Teams' message limit,
 and after the webhook accepted a card, marks the rows that card named (`review_notified_at`). A
 card the webhook refuses is retried on the next run. A 2xx only means the flow accepted it: a
 flow run that fails afterwards loses that card, so check the flow's run history now and then. A
@@ -2742,11 +2742,14 @@ chat's membership, managed in Teams.
    `migrate status` again, and delete the rule. A connect that times out right after the rule
    was created is the rule still spreading: run it again a minute later. The running build ignores the two new columns;
    the new build writes `web_url` and fails every index write without it.
-1. **The chat.** In Teams, start a group chat named `Weryfikacja dokumentów (Ledger)` with
-   `roman.kachniuk@bcr-group.pl`. Add `katarzyna.pomian@bcr-group.pl` whenever she starts; nothing
-   else changes. A flow posts only into a chat its owner is in, so you stay in it.
-2. **The webhook.** In that chat: **⋯ → Workflows → "Send webhook alerts to a chat"**. Accept the
-   chat it proposes, and copy the URL it shows at the end.
+1. **The channel.** In BCR GROUP: **+ Add channel** → `Weryfikacja dokumentów` → type **Shared**,
+   layout **Posts** → add `roman.kachniuk@bcr-group.pl`. Add `katarzyna.pomian@bcr-group.pl`
+   whenever she starts; nothing else changes. Only the people added see a shared channel. Never
+   add a guest or share it outside BCR. A private channel does not work: Workflows cannot post
+   there as the Flow bot.
+2. **The webhook.** In the Workflows app: **Send webhook alerts to a channel** → name it
+   `Send webhook alerts to Weryfikacja dokumentów` → Team BCR GROUP, channel Weryfikacja
+   dokumentów → create, and copy the URL it shows at the end. Done this way on 28 September 2026.
    - **The whole URL is the credential.** Never paste it into a chat, a ticket or a file.
    - **A flow stops when its owner or its Teams connection goes.** In Power Automate, add Roman
      as a co-owner.
