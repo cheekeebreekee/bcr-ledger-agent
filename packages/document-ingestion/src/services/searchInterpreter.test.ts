@@ -15,6 +15,7 @@ import {
   searchInterpretationSchema,
   searchInterpreterFingerprint,
   searchUserTurn,
+  toModelAnswer,
   type SearchInterpretation,
 } from './searchInterpreter';
 
@@ -31,7 +32,13 @@ const nothing: SearchInterpretation = {
   status: null,
 };
 
-/** A structured-output response carrying `output` as its JSON text. */
+/** `output` as the model writes it: an interpretation's empty groups spelled out (`toModelAnswer`). */
+const wire = (output: unknown) =>
+  typeof output === 'object' && output !== null && 'intent' in output
+    ? toModelAnswer(output as SearchInterpretation)
+    : output;
+
+/** A structured-output response carrying `output` (as the model writes it) as its JSON text. */
 function answer(output: unknown, over: Record<string, unknown> = {}) {
   return {
     model: SEARCH_MODEL,
@@ -42,7 +49,9 @@ function answer(output: unknown, over: Record<string, unknown> = {}) {
       cache_read_input_tokens: 1400,
       cache_creation_input_tokens: 0,
     },
-    content: [{ type: 'text', text: typeof output === 'string' ? output : JSON.stringify(output) }],
+    content: [
+      { type: 'text', text: typeof output === 'string' ? output : JSON.stringify(wire(output)) },
+    ],
     ...over,
   };
 }
@@ -150,13 +159,13 @@ describe('the prompt and the schema', () => {
   it('are locked, byte for byte', () => {
     const sha = (text: string) => createHash('sha256').update(text).digest('hex');
     expect(sha(SEARCH_SYSTEM_PROMPT)).toBe(
-      'a7085fe9b1022c371001117d6ab20ed70baf1d340658ab68dc977aece2bed4d0',
+      '929c4472b0a10843ca6e9298e66da01433ad13a95e34436bc9115acbc3699475',
     );
     expect(sha(JSON.stringify(NL_SEARCH_SCHEMA))).toBe(
-      'eaedda2c62944ddd15ca9f792b8010c69ab26ef6c74031cf11e38971bddf4eba',
+      '43df0d911e56e31767b97b1d55e580992643cdeec337dc3fda08282618140a79',
     );
     // What search.config says at cold start.
-    expect(searchInterpreterFingerprint()).toBe('e867300ec89475dc');
+    expect(searchInterpreterFingerprint()).toBe('9e6d5555c9ed4b2c');
   });
 
   it('is the same bytes whatever the date: no date is in it', async () => {

@@ -670,6 +670,13 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
   identity: search then fails closed (403) until the grant and the setting follow.
 - `MICROSOFT_APP_TYPE` must be `SingleTenant` (the app registration is `AzureADMyOrg`); the wrong
   value is a 401 at Bot Framework auth.
+- **A structured-output schema may hold at most 16 nullable or union-typed parameters.** Above
+  that the API refuses every call with a 400 (`too many parameters with union types`) before the
+  model runs, and a fake client never sees it: client search's first schema had 18, and only the
+  local `eval:search` caught it. `services/structuredOutput.test.ts` counts every schema we send
+  (`unionParameterCount`); in the search schema the groups `period`, `amount` and `counterparty`
+  are therefore always present (`kind: "none"`, both fields `null`), and
+  `searchInterpretationSchema` turns them back into `null`.
 - `@anthropic-ai/sdk` 0.104.2 (the locked version) has what the classifier sends: typed PDF
   `document` blocks, `output_config.format` (`json_schema`) and `output_config.effort`. Keep the
   request free of `temperature`/`top_p`/`top_k`, `thinking.budget_tokens` and forced

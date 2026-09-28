@@ -37,10 +37,17 @@ const ACCOUNT_REASONS: ReadonlySet<string> = new Set(['billing', 'unavailable'])
 
 const CATEGORY_IDS = categoryCatalog.map((c) => c.id) as [DocumentCategory, ...DocumentCategory[]];
 
-/** The period kinds the model may name; no period at all is `period: null`. */
-const MODEL_PERIOD_KINDS = PERIOD_KINDS.filter((k) => k !== 'none') as [
-  Exclude<(typeof PERIOD_KINDS)[number], 'none'>,
-  ...Exclude<(typeof PERIOD_KINDS)[number], 'none'>[],
+/**
+ * The period kinds the model writes: `none` too, for no period. The API
+ * compiles a structured-output schema only with at most 16 nullable or
+ * union-typed parameters (a 400 `invalid_request_error` otherwise, on every
+ * call), so the three groups (`period`, `amount`, `counterparty`) are always
+ * present and "none" is said inside them; {@link searchInterpretationSchema}
+ * turns an empty group back into `null`.
+ */
+const WIRE_PERIOD_KINDS = [...PERIOD_KINDS] as [
+  (typeof PERIOD_KINDS)[number],
+  ...(typeof PERIOD_KINDS)[number][],
 ];
 
 const nullable = (schema: Record<string, unknown>) => ({ anyOf: [schema, { type: 'null' }] });
@@ -57,7 +64,9 @@ const nullableInteger = (description: string) => ({
 
 /**
  * The structured output the model must return (`output_config.format`). Every
- * key is required and nullable, and no object takes another key: nothing in
+ * key is required, every value nullable except the three groups (see
+ * {@link WIRE_PERIOD_KINDS}; `structuredOutput.test.ts` counts them against
+ * the API's limit), and no object takes another key: nothing in
  * it can name a client, a scope, a column, a limit or SQL. Free strings (a
  * name, an invoice number, a NIP) are only kept when they occur in the
  * question (`toSearchFilter`).
@@ -75,47 +84,43 @@ export const NL_SEARCH_SCHEMA: Record<string, unknown> = {
       description: 'Kategorie dokumentów, o które pyta klient; null, gdy nie wskazał rodzaju.',
     },
     period: {
-      ...nullable({
-        type: 'object',
-        properties: {
-          kind: { type: 'string', enum: MODEL_PERIOD_KINDS },
-          year: nullableInteger('Rok miesiąca, kwartału lub roku albo początku zakresu.'),
-          month: nullableInteger('Miesiąc 1-12 albo pierwszy miesiąc zakresu.'),
-          quarter: nullableInteger('Kwartał 1-4.'),
-          to_year: nullableInteger('Rok ostatniego miesiąca zakresu.'),
-          to_month: nullableInteger('Ostatni miesiąc zakresu, 1-12.'),
-          offset: nullableInteger('relative_*: 0 bieżący, -1 poprzedni, -2 jeszcze wcześniejszy.'),
-          count: nullableInteger('last_n_months: liczba miesięcy razem z bieżącym.'),
-        },
-        required: ['kind', 'year', 'month', 'quarter', 'to_year', 'to_month', 'offset', 'count'],
-        additionalProperties: false,
-      }),
-      description: 'Okres, którego dotyczy pytanie, opisany słowami klienta; null bez okresu.',
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: WIRE_PERIOD_KINDS },
+        year: nullableInteger('Rok miesiąca, kwartału lub roku albo początku zakresu.'),
+        month: nullableInteger('Miesiąc 1-12 albo pierwszy miesiąc zakresu.'),
+        quarter: nullableInteger('Kwartał 1-4.'),
+        to_year: nullableInteger('Rok ostatniego miesiąca zakresu.'),
+        to_month: nullableInteger('Ostatni miesiąc zakresu, 1-12.'),
+        offset: nullableInteger('relative_*: 0 bieżący, -1 poprzedni, -2 jeszcze wcześniejszy.'),
+        count: nullableInteger('last_n_months: liczba miesięcy razem z bieżącym.'),
+      },
+      required: ['kind', 'year', 'month', 'quarter', 'to_year', 'to_month', 'offset', 'count'],
+      additionalProperties: false,
+      description:
+        'Okres, którego dotyczy pytanie, opisany słowami klienta; bez okresu kind "none", reszta null.',
     },
     amount: {
-      ...nullable({
-        type: 'object',
-        properties: {
-          min: nullableString('Najniższa kwota brutto: cyfry z kropką dziesiętną, np. 5000.00.'),
-          max: nullableString('Najwyższa kwota brutto, w tym samym zapisie.'),
-        },
-        required: ['min', 'max'],
-        additionalProperties: false,
-      }),
-      description: 'Granice kwoty brutto dokumentu; null, gdy pytanie nie podaje kwoty.',
+      type: 'object',
+      properties: {
+        min: nullableString('Najniższa kwota brutto: cyfry z kropką dziesiętną, np. 5000.00.'),
+        max: nullableString('Najwyższa kwota brutto, w tym samym zapisie.'),
+      },
+      required: ['min', 'max'],
+      additionalProperties: false,
+      description: 'Granice kwoty brutto dokumentu; oba pola null, gdy pytanie nie podaje kwoty.',
     },
     currency: nullableString('Kod waluty ISO 4217, np. PLN, EUR.'),
     counterparty: {
-      ...nullable({
-        type: 'object',
-        properties: {
-          nip: nullableString('NIP kontrahenta przepisany z pytania.'),
-          name: nullableString('Fragment nazwy kontrahenta przepisany z pytania.'),
-        },
-        required: ['nip', 'name'],
-        additionalProperties: false,
-      }),
-      description: 'Druga strona dokumentu (sprzedawca albo nabywca); null bez kontrahenta.',
+      type: 'object',
+      properties: {
+        nip: nullableString('NIP kontrahenta przepisany z pytania.'),
+        name: nullableString('Fragment nazwy kontrahenta przepisany z pytania.'),
+      },
+      required: ['nip', 'name'],
+      additionalProperties: false,
+      description:
+        'Druga strona dokumentu (sprzedawca albo nabywca); oba pola null bez kontrahenta.',
     },
     invoice_number: nullableString('Numer faktury przepisany dokładnie z pytania.'),
     status: {
@@ -138,14 +143,19 @@ export const NL_SEARCH_SCHEMA: Record<string, unknown> = {
 
 const nullableInt = z.number().nullable();
 
-/** The model's answer, checked again after the call: structured output is the first check, not the only one. */
+/**
+ * The model's answer as written (`NL_SEARCH_SCHEMA`), checked again after the
+ * call: structured output is the first check, not the only one. It becomes a
+ * {@link SearchInterpretation}, where an empty group is `null`: a period of
+ * kind `none`, an amount or a counterparty with both fields `null`.
+ */
 export const searchInterpretationSchema = z
   .object({
     intent: z.enum(['search', 'help', 'unsupported']),
     categories: z.array(z.enum(CATEGORY_IDS)).nullable(),
     period: z
       .object({
-        kind: z.enum(MODEL_PERIOD_KINDS),
+        kind: z.enum(WIRE_PERIOD_KINDS),
         year: nullableInt,
         month: nullableInt,
         quarter: nullableInt,
@@ -154,24 +164,48 @@ export const searchInterpretationSchema = z
         offset: nullableInt,
         count: nullableInt,
       })
-      .strict()
-      .nullable(),
-    amount: z
-      .object({ min: z.string().nullable(), max: z.string().nullable() })
-      .strict()
-      .nullable(),
+      .strict(),
+    amount: z.object({ min: z.string().nullable(), max: z.string().nullable() }).strict(),
     currency: z.string().nullable(),
-    counterparty: z
-      .object({ nip: z.string().nullable(), name: z.string().nullable() })
-      .strict()
-      .nullable(),
+    counterparty: z.object({ nip: z.string().nullable(), name: z.string().nullable() }).strict(),
     invoice_number: z.string().nullable(),
     status: z.enum(['in_review', 'filed']).nullable(),
   })
-  .strict();
+  .strict()
+  .transform(({ period, amount, counterparty, ...rest }) => ({
+    ...rest,
+    period: period.kind === 'none' ? null : { ...period, kind: period.kind },
+    amount: amount.min === null && amount.max === null ? null : amount,
+    counterparty: counterparty.nip === null && counterparty.name === null ? null : counterparty,
+  }));
 
 /** What the model read from a question. Only a suggestion: `toSearchFilter` decides the filter. */
-export type SearchInterpretation = z.infer<typeof searchInterpretationSchema>;
+export type SearchInterpretation = z.output<typeof searchInterpretationSchema>;
+
+/** No period, as the model writes it. */
+const NO_WIRE_PERIOD = {
+  kind: 'none',
+  year: null,
+  month: null,
+  quarter: null,
+  to_year: null,
+  to_month: null,
+  offset: null,
+  count: null,
+} as const;
+
+/** The model's answer as written for `interpretation` (the prompt's examples, tests). */
+export function toModelAnswer(
+  interpretation: SearchInterpretation,
+): z.input<typeof searchInterpretationSchema> {
+  const { period, amount, counterparty, ...rest } = interpretation;
+  return {
+    ...rest,
+    period: period ?? { ...NO_WIRE_PERIOD },
+    amount: amount ?? { min: null, max: null },
+    counterparty: counterparty ?? { nip: null, name: null },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // The prompt
@@ -248,12 +282,21 @@ const EXAMPLES: readonly (readonly [string, SearchInterpretation])[] = [
   ],
   ['gdzie jest faktura FV/2025/07/113?', { ...NOTHING, invoice_number: 'FV/2025/07/113' }],
   [
-    'faktury do weryfikacji w euro do 200',
+    'dokumenty do weryfikacji z września',
     {
       ...NOTHING,
+      period: period({ kind: 'month', month: 9 }),
+      status: 'in_review',
+    },
+  ],
+  [
+    'faktury dla firmy Zielińska w euro do 200',
+    {
+      ...NOTHING,
+      categories: ['faktury_sprzedazy'],
       amount: { min: null, max: '200.00' },
       currency: 'EUR',
-      status: 'in_review',
+      counterparty: { nip: null, name: 'Zielińska' },
     },
   ],
   ['ile wydałem w sumie na paliwo w tym roku?', { ...NOTHING, intent: 'unsupported' }],
@@ -283,25 +326,30 @@ export const SEARCH_SYSTEM_PROMPT: string = [
   '',
   'intent:',
   '- "search": pytanie o dokumenty klienta, które da się opisać polami poniżej. Także samo ' +
-    '"pokaż moje dokumenty": wtedy każde inne pole jest null (najnowsze dokumenty).',
+    '"pokaż moje dokumenty": wtedy każde inne pole jest puste (najnowsze dokumenty).',
   '- "help": powitanie, podziękowanie, "pomoc", "help", "?", "menu" albo pytanie, jak korzystać ' +
     'z wyszukiwarki.',
   '- "unsupported": sumy, liczenie, porównania, zestawienia, porady księgowe lub podatkowe, ' +
     'terminy płatności, dane innych firm, zmiana lub usuwanie dokumentów i wszystko inne, ' +
     'czego nie da się opisać polami filtra.',
-  'Gdy intent to "help" albo "unsupported", każde inne pole jest null.',
+  'Gdy intent to "help" albo "unsupported", każde inne pole jest puste.',
+  'Puste pole to null. Pusty okres to period z kind "none" i resztą pól null; pusta kwota i ' +
+    'pusty kontrahent to amount i counterparty z oboma polami null.',
   '',
   'Zasady (intent "search"):',
-  '- Wypełniaj tylko to, o co pytanie wprost prosi; każde inne pole null. Nie zgaduj i nie ' +
+  '- Wypełniaj tylko to, o co pytanie wprost prosi; każde inne pole puste. Nie zgaduj i nie ' +
     'dodawaj niczego, czego w pytaniu nie ma.',
-  '- categories: kategorie z listy niżej, gdy pytanie wskazuje rodzaj dokumentu. "Faktury" bez ' +
-    'kierunku to faktury_sprzedazy i faktury_zakupu. Null, gdy rodzaj nie jest podany.',
+  '- categories: kategorie z listy niżej, gdy pytanie wskazuje rodzaj dokumentu. Kierunek ' +
+    'faktury: "faktury od <firmy>" (firma ją wystawiła, klient kupił) to faktury_zakupu; ' +
+    '"faktury dla <firmy>" (klient ją wystawił) to faktury_sprzedazy. "Faktury" bez kierunku, ' +
+    'także z kwotą, walutą lub okresem, to faktury_sprzedazy i faktury_zakupu. Null, gdy rodzaj ' +
+    'nie jest podany.',
   '- period: opisz okres słowami pytania, nie licz dat (nie znasz dzisiejszej daty). Miesiąc: ' +
     'kind "month" (year null, gdy rok nie jest podany). Kwartał: "quarter". Rok: "year". ' +
     'Zakres "od … do …": "range" (month i year to początek, to_month i to_year koniec). ' +
     '"W tym / zeszłym miesiącu": "relative_month" z offset 0 / -1; tak samo "relative_quarter" ' +
     'i "relative_year". "Ostatnie N miesięcy": "last_n_months" z count N. Pola, których ' +
-    'rodzaj nie używa, są null. Bez okresu period to null.',
+    'rodzaj nie używa, są null. Bez okresu kind to "none".',
   '- amount: zawsze kwota brutto dokumentu. "Powyżej", "od", "ponad", "więcej niż" to min; ' +
     '"poniżej", "do", "mniej niż" to max; "od X do Y" to oba. Zapis: cyfry z kropką ' +
     'dziesiętną, bez spacji i waluty ("1 234,50 zł" to "1234.50").',
@@ -323,7 +371,7 @@ export const SEARCH_SYSTEM_PROMPT: string = [
   'Przykłady (pytanie, a pod nim odpowiedź):',
   ...EXAMPLES.flatMap(([question, answer]) => [
     `<pytanie-przyklad>${question}</pytanie-przyklad>`,
-    JSON.stringify(answer),
+    JSON.stringify(toModelAnswer(answer)),
   ]),
 ].join('\n');
 

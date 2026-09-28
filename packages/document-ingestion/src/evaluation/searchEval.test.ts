@@ -15,7 +15,12 @@ import {
   type SearchCase,
   type SearchCaseResult,
 } from './searchEval';
-import { NL_SEARCH_SCHEMA, SEARCH_MODEL } from '../services/searchInterpreter';
+import {
+  NL_SEARCH_SCHEMA,
+  SEARCH_MODEL,
+  toModelAnswer,
+  type SearchInterpretation,
+} from '../services/searchInterpreter';
 
 const NOW = new Date('2026-09-28T10:00:00Z');
 /** The synthetic cases: outside `src/`, which the packager allows to hold TypeScript only. */
@@ -42,8 +47,15 @@ function answer(output: unknown) {
       cache_read_input_tokens: 1500,
       cache_creation_input_tokens: 0,
     },
-    content: [{ type: 'text', text: JSON.stringify(output) }],
+    content: [{ type: 'text', text: JSON.stringify(wire(output)) }],
   };
+}
+
+/** `output` as the model writes it: an interpretation's empty groups spelled out. */
+function wire(output: unknown): unknown {
+  return typeof output === 'object' && output !== null && 'intent' in output
+    ? toModelAnswer(output as SearchInterpretation)
+    : output;
 }
 
 /** A fake Messages API: `answers` maps a question to the model's raw JSON, or an error. */
