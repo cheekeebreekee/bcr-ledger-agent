@@ -761,7 +761,7 @@ the admin centre shows. Anything else: do not upload it.
    BCR → Uninstall**. The gate already refuses those installs.
 
 **Verify.** The admin centre shows the version just uploaded for Asystent BCR (**0.2.0** in
-Phase 0; 0.2.1 on 26 September; 0.2.2 with the client identity release; 0.2.3 next). The canary client
+Phase 0; 0.2.1 on 26 September; 0.2.2 with the client identity release; 0.2.3 on 29 September). The canary client
 account finds "Asystent BCR", opens the chat and gets the help card, and so does PESKOVOI's
 `{NIP}@` account when it next uses it. (In Phase 0 this check used the TEST guest; a guest still
 gets the card, but has no other capability.) Only if availability was later restricted: a staff
@@ -796,4 +796,4 @@ laptops (`.env`) are an accepted risk, recorded in
 | `BCROnboarding@` | Roman | enabled 2026-09-28 17:33:38Z–17:34:32Z | — | The onboarding shared mailbox, disabled since before 22 Sep (not by this response). Stays enabled: Roman reads it. Outside the ledger |
 | T-8 | | | | TEST invite checked; the canary client account opens BCR Kanarek, its files and the bot DM (not a guest) |
 | T-9 | Roman confirms tenant level | | | Checked with the canary client account (not a guest); a contact's guest still opens its Team's files; Roman's decision on company-wide links on client sites |
-| T-10 | | | | Everyone (Phase 0); version 0.2.0 shown; sha256 of the uploaded zip. 0.2.1 uploaded 2026-09-26 (H-10); 0.2.2 uploaded 2026-09-29 by Yahor (zip `32ff2cf8…`, built from `5beb0b9` with the bot's app id) |
+| T-10 | | | | Everyone (Phase 0); version 0.2.0 shown; sha256 of the uploaded zip. 0.2.1 uploaded 2026-09-26 (H-10); 0.2.2 uploaded 2026-09-29 by Yahor (zip `32ff2cf8…`, built from `5beb0b9` with the bot's app id); 0.2.3 uploaded 2026-09-29 by Yahor (zip `48fcf6e2…`, built from `70b9348`: the privacy and terms links point at `/pl/polityka-prywatnosci` and `/pl/regulamin`) |
