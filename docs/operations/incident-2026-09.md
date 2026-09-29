@@ -761,22 +761,40 @@ acted on it, with no step in between that asked the owner.
   NIP used for the classifier re-tests, is saved off-repo). The canary guest stays, as the
   negative canary. Its object id is in the status table.
 
-**Planned, not done** (as of 29 September):
+**Done, 29 September** (the [Client identity release](human-steps.md#client-identity-release)):
 
-- The ledger code for the decision is in the working tree, uncommitted and not deployed:
-  ingestion refuses a guest on every path with nothing stored, files and searches only for a
-  row's `{NIP}@` account, and quarantines any other Member; the bot's texts name the `{NIP}@`
-  login; the binding tool binds the `{NIP}@` account, removes guest ids and exits 5 when a bound
-  client account is disabled. Until it is deployed, the running build still serves guests.
-- Rows 2 and 10 are not re-bound yet: each still holds its guest. The re-bind puts 0002's
-  `{NIP}@` account on row 2 and the canary client account on row 10.
-- The onboarding change (the audit tool read-only, step 13 no longer refusing an enabled
-  `{NIP}@` account, the mailbox runbook never converting one) is in that repo's working tree,
-  not merged and not deployed. Until it is, nobody runs the onboarding audit with `--apply`, or
-  the onboarding repo's `infrastructure/deploy.sh`.
-- The rollout, in order, is the
-  [Client identity release](human-steps.md#client-identity-release): re-bind the two rows, then
-  ingestion, then the bot, then the canaries.
+- The ledger change was committed as `5beb0b9` and the onboarding change as `226828c`. All
+  checks passed in both repos before the commits, including the real-Postgres tests.
+- **Rows 2 and 10 re-bound at 10:58:42Z** by `directory-bindings.mjs apply`, whole plan. Row 2
+  now holds 0002's `{NIP}@` account and row 10 the canary client account; each guest id was
+  removed. Nothing else on either row changed. The apply log's sha256 is `9aa53da1…`, and
+  `check` afterwards exits 0.
+- **Ingestion deployed at 11:02:13Z.** The previous package was saved as
+  `document-ingestion-p7-20260929T105902Z.zip` (`10bf0709…`) and the deployed zip is `fc83c0bc…`;
+  the running hash matches. `/api/health` reports `clientIdentity: nip-member`, and the other
+  fields are unchanged. The `identity.config` line says `nip-member`, and every inbox tick since
+  shows `failed 0` and `rowsFailed 0`.
+- **The bot deployed at 11:08:06Z.** The previous package was saved as
+  `teams-bot-p2-20260929T105902Z.zip` (`0e008e53…`) and the deployed zip is `05f5ebbd…`; the
+  running hash matches.
+- **Canaries, with the canary client account:**
+  - `pomoc` got the new help card (11:32:40Z).
+  - **A PDF sent in the 1:1 chat** was routed to row 10 with `account: verified` and
+    `membership: verified`, classified as `faktury_zakupu`, filed to
+    `01_Faktury/02_Faktury_zakupu/2026/09`, and indexed as `FILED` (11:33Z). These are the
+    bot-path proofs that H-12/H-15 had to drop.
+  - **A PDF posted in the channel** was sorted by the inbox to `98_Nieposortowane/2026/09`
+    (`MODEL_UNSORTED`) and indexed as `NEEDS_REVIEW` (11:36Z). The review notice was posted at
+    11:40Z.
+  - A staff post in the canary channel is left untouched (`inbox.skipped` `not_bound`).
+- **Not run live:** the canary guest's own negative proof, because the guest can no longer sign
+  in. The refusal is proven by `clientAccountRegression.test.ts`, which runs the real resolver,
+  batch, search and inbox against fakes and was checked by mutation. Graph reads the old canary
+  guest as `Guest`, and the rule refuses it before any Directory lookup.
+- **Still open:**
+  - the Teams admin uploads manifest 0.2.2;
+  - the onboarding change is deployed once it is pushed;
+  - Vitali and the canary account change the passwords that were exposed.
 
 **Redefined** (28 September; the rows above keep their first wording beside the correction):
 
@@ -845,7 +863,7 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | Owner's decision: the `{NIP}@bcr-group.pl` Member account is the client identity; guests have no ledger capability; never block, disable, unlicense or convert a `{NIP}@` account | Yahor (owner) | decided; T-1, T-2 withdrawn and T-7 made a read-only record in [`tenant-hardening.md`](tenant-hardening.md) | 2026-09-28 | [Client lockout](#client-lockout-2628-september-t-1-reversed) |
 | 0002's new password, sent over Telegram in plain text on 28 Sep 07:34Z: the client changes it | Roman | todo | | the date it was changed (no password, no address) |
 | IR-3: the lockout as an availability event for 0002, 0003 and 0004: does it need its own view in the breach register? | IOD | todo: open question | | the IOD's answer |
-| Client identity release: ledger code committed, CI green; onboarding change merged; rows 2 and 10 re-bound; ingestion, then the bot, deployed; manifest 0.2.2; canaries ([`human-steps.md`](human-steps.md#client-identity-release)) | Yahor; the Teams admin for the manifest | todo: the code is uncommitted and undeployed, the rows are not re-bound, the onboarding change is not deployed (29 Sep) | | the commit; the apply log's hash; the saved `document-ingestion-p7-*` and `teams-bot-p2-*` packages' sha256 and the deployed zips'; `/api/health` `clientIdentity` `nip-member`; each canary's times |
+| Client identity release: ledger code committed, CI green; onboarding change merged; rows 2 and 10 re-bound; ingestion, then the bot, deployed; manifest 0.2.2; canaries ([`human-steps.md`](human-steps.md#client-identity-release)) | Yahor; the Teams admin for the manifest | done 29 Sep (manifest 0.2.2 upload and the onboarding deploy open) | 2026-09-29 10:58–11:40Z | the commit; the apply log's hash; the saved `document-ingestion-p7-*` and `teams-bot-p2-*` packages' sha256 and the deployed zips'; `/api/health` `clientIdentity` `nip-member`; each canary's times |
 | H-13: ingestion grant on BCR GROUP downgraded to `read` | Yahor (Global Admin) | done | 2026-09-26 | Graph Explorer PATCH → `roles: ["read"]` for the ingestion managed identity. The only other application entry is the onboarding Function App (`write`), which writes the Client Directory rows: kept |
 | H-14: `FALLBACK_*` settings removed, pre-Phase-0 packages deleted | Yahor | done (early, by Yahor's decision) | 2026-09-26 18:10:32Z | all five `FALLBACK_*` deleted; `*-before-p0.zip` removed; health OK |
 | IR-2 relocation complete, allow-lists issued | Roman + second person | todo | | |
