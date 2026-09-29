@@ -36,7 +36,7 @@
     "searchRows": { "value": "10" },
     "searchCallerAppIds": { "value": "28157eb1-03f8-4e6b-bf70-d4b74ced3fc6" },
     "botGateMode": { "value": "enforce" },
-    "botSearchMode": { "value": "off" },
+    "botSearchMode": { "value": "on" },
     "logLevel": { "value": "debug" }
   }
 }
