@@ -123,6 +123,15 @@ apps, the template's default) until the
 `Documents.Search` grant (`infrastructure/identity/grant-bot-search-caller.sh`, which also adds
 the role to the Ingestion API registration), migration 0003, then the settings.
 
+It does not deploy the email alerts either. They are `infrastructure/alerts.bicep`, a separate
+template of one action group and the log alert rules, which sets no app setting. It is deployed
+alone, in incremental mode, by `infrastructure/alerts-deploy.sh <env>` (what-if first, then
+`--apply`), and has an `alerts.<env>.parameters.json` of its own with the recipients. In a new
+environment it goes after `main.bicep`, because the rules query that environment's App Insights
+component. A new address receives nothing until it enters Azure's one-time passcode (within 30
+minutes; *Resend* in the portal if it expires) ([Alerts](operations/human-steps.md#alerts),
+step 4).
+
 ### 3a. App settings
 
 The template sets every app setting from the parameter file, the Phase-0 ingestion settings

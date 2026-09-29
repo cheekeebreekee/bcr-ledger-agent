@@ -168,6 +168,14 @@ jobs:
           bicep build infrastructure/db.bicep --outdir /tmp/bicep-out
           bicep lint infrastructure/db.bicep
 
+      # The email alerts: a standalone template, never part of main.bicep,
+      # deployed on its own by infrastructure/alerts-deploy.sh. Its script and
+      # its queries' event names are tested offline in tools/test (Test tools).
+      - name: bicep build and lint (alerts.bicep)
+        run: |
+          bicep build infrastructure/alerts.bicep --outdir /tmp/bicep-out
+          bicep lint infrastructure/alerts.bicep
+
       # A Bicep deploy replaces every app setting, so a setting the code needs
       # and the template lacks is an outage at the next deploy, and one the
       # template still sets after the code stopped reading it lingers for

@@ -8,6 +8,7 @@ import {
   type ClientDirectoryEntry,
   type InboxSweepMode,
   type Logger,
+  type MembershipCheckMode,
   type SharePointTarget,
 } from '@bcr/shared';
 import {
@@ -124,6 +125,13 @@ export interface InboxSharePointFactory {
 export interface ChannelInboxDeps {
   /** `INBOX_SWEEP_MODE`. `off` sweeps nothing; `shadow` writes nothing. */
   readonly mode: InboxSweepMode;
+  /**
+   * `MEMBERSHIP_CHECK_MODE`, said on every `inbox.tick` line, so an `off` is
+   * in the logs for as long as it lasts, not only in the resolver's
+   * `membership.check_off` at a cold start. The sweep's own Team check does
+   * not depend on it.
+   */
+  readonly membershipCheck: MembershipCheckMode;
   readonly directory: { getSnapshot(): Promise<ClientDirectorySnapshot> };
   /**
    * The client factory (`clientSharePointFactory`), never the quarantine's:
@@ -201,9 +209,11 @@ export interface ChannelInboxDeps {
   readonly log?: Logger;
 }
 
-/** The `inbox.tick` line: counts only. */
+/** The `inbox.tick` line: the modes, then counts only. */
 export interface InboxTickSummary {
   readonly mode: InboxSweepMode;
+  /** `MEMBERSHIP_CHECK_MODE` as configured (the bot path's Teams check). */
+  readonly membershipCheck: MembershipCheckMode;
   /** Bound client rows due to be swept (only those in `INBOX_SWEEP_ROWS`, when it is set). */
   readonly rows: number;
   /** Direct children that are files old enough, with a creator id. */
@@ -233,11 +243,23 @@ export interface InboxTickSummary {
   readonly retryLaterWaiting: number;
   /**
    * Created by someone who is not this row's client account (a guest, staff,
-   * another client's account, an account not in the row's Team alone), or
-   * last changed by anyone but its creator; no creator id; or no such user:
-   * left untouched.
+   * another client's account, an unbound account), or last changed by anyone
+   * but its creator; no creator id; or no such user: left untouched.
    */
   readonly skippedNotClient: number;
+  /**
+   * Created by a Member bound on this row that is not its client account (a
+   * UPN other than `{row NIP}@domain`, or a row without a valid NIP:
+   * `not_client_account`): left untouched until the binding is fixed. Counted
+   * on every tick the file waits.
+   */
+  readonly skippedNotClientAccount: number;
+  /**
+   * Created by the row's client account while it is not in the row's Team, or
+   * is also in another (`not_in_team`, `other_teams`): left untouched until
+   * the membership is fixed. Counted on every tick the file waits.
+   */
+  readonly skippedMembership: number;
   /** The uploader could not be read this tick: left untouched, read again next tick. */
   readonly skippedUnverified: number;
   /** Modified within `INBOX_MIN_AGE_MS`. */
@@ -264,6 +286,8 @@ export interface InboxTickSummary {
 }
 
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
+type TickCounts = Omit<InboxTickSummary, 'mode' | 'membershipCheck' | 'durationMs'>;
 
 /** A direct child the sweep may process, once its uploader is checked. */
 export interface InboxCandidate {
@@ -323,7 +347,7 @@ interface RowIds {
 interface Tick {
   readonly startedAt: number;
   readonly log: Logger;
-  readonly counts: Mutable<Omit<InboxTickSummary, 'mode' | 'durationMs'>>;
+  readonly counts: Mutable<TickCounts>;
   processed: number;
   /** Memo operations (`event|operation`) whose failure this tick has logged already. */
   readonly memoFailures: Set<string>;
@@ -432,6 +456,8 @@ export class ChannelInbox {
         retryLater: 0,
         retryLaterWaiting: 0,
         skippedNotClient: 0,
+        skippedNotClientAccount: 0,
+        skippedMembership: 0,
         skippedUnverified: 0,
         skippedYoung: 0,
         skippedIneligible: 0,
@@ -566,8 +592,8 @@ export class ChannelInbox {
       }
       const uploader = await this.uploaderVerdict(candidate, row, clientAccountIds);
       if (uploader.verdict !== 'client') {
-        if (uploader.verdict === 'unverified') tick.counts.skippedUnverified += 1;
-        else tick.counts.skippedNotClient += 1;
+        // Counted on every tick; the `inbox.skipped` line with its ids only once.
+        tick.counts[skipCountOf(uploader.verdict)] += 1;
         this.reportSkipOnce(tick, ids, candidate, uploader.verdict, uploader.status);
         continue;
       }
@@ -1129,9 +1155,34 @@ export class ChannelInbox {
   private summary(tick: Tick): InboxTickSummary {
     return {
       mode: this.deps.mode,
+      membershipCheck: this.deps.membershipCheck,
       ...tick.counts,
       durationMs: this.now().getTime() - tick.startedAt,
     };
+  }
+}
+
+/**
+ * The tick count a skipped file adds to. A binding or a membership that is
+ * wrong has its own count, so a file waiting on one shows on every tick (the
+ * bindings alert reads them), not only in its one `inbox.skipped` line.
+ */
+function skipCountOf(
+  verdict: Exclude<UploaderVerdict, 'client'>,
+): keyof Pick<
+  TickCounts,
+  'skippedUnverified' | 'skippedNotClientAccount' | 'skippedMembership' | 'skippedNotClient'
+> {
+  switch (verdict) {
+    case 'unverified':
+      return 'skippedUnverified';
+    case 'not_client_account':
+      return 'skippedNotClientAccount';
+    case 'not_in_team':
+    case 'other_teams':
+      return 'skippedMembership';
+    default:
+      return 'skippedNotClient';
   }
 }
 

@@ -153,6 +153,7 @@ step 1). No Graph, SharePoint, Key Vault or database permission changes.
 | Azure Bot resource | `bot-bcr-dev-vyyintffz6ehq` (Teams channel enabled) |
 | Key Vault | `kv-bcr-dev-vyyintffz6ehq` (RBAC mode) |
 | App Insights | `appi-bcr-dev-vyyintffz6ehq` |
+| Alerts (not deployed yet) | Action group `ag-bcr-dev-vyyintffz6ehq` (email to `yahor.simak@bcr-group.pl`) and eight log alert rules `alert-bcr-<rule>-dev-vyyintffz6ehq` on App Insights, from `infrastructure/alerts.bicep`: USD 4.00 a month (`docs/operations/human-steps.md` → Alerts) |
 | Storage | `stbcrdevvyyintffz6ehq` |
 | SharePoint sites | `/sites/0002PESKOVOISp.zo.o.-Ksigowo` (PESKOVOI), `/sites/0000TESTSp.zo.o.-Ksigowo` (TEST), `/sites/BCRLedgerKwarantanna` (quarantine, created in Phase 0), `/sites/BCRGROUPSp.zo.o` (hosts the Client Directory list; never a target). All on `bcrgroupeu.sharepoint.com`. |
 | SharePoint drive | **Dokumenty** (Polish locale, NOT "Documents"). Per client from the Directory's `DriveName`; the quarantine's from `QUARANTINE_DRIVE_NAME`. |
@@ -255,6 +256,7 @@ bcr-ledger-agent/
 │   ├── main.bicep                       # Azure resources and every app setting (lesson 20)
 │   ├── main.dev.parameters.json
 │   ├── db.bicep, db-deploy.sh           # the index database: a separate template, never main.bicep
+│   ├── alerts.bicep, alerts-deploy.sh   # the email alerts: a separate template, never main.bicep
 │   ├── deploy.sh                        # Bicep + zip-deploy wrapper. New environments only; refuses dev.
 │   ├── app-settings-gate.sh             # before any Bicep deploy: template vs running app settings
 │   ├── quarantine/                      # quarantine site script, and the managed identity's site grant

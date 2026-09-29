@@ -11,6 +11,8 @@ import {
   escapeMarkdown,
   fitToCard,
   reviewNoticeCard,
+  reviewNoticesOffReason,
+  runReviewNotices,
   type ReviewNoticeSource,
 } from './reviewNotifier';
 
@@ -337,5 +339,54 @@ describe('LedgerReviewNotices', () => {
     await notices.markNotified(PESKOVOI, []).catch(() => undefined);
     expect(new Set(scopes).size).toBe(1);
     expect(scopes[0]).toMatch(/^[0-9a-f-]{36}$/);
+  });
+});
+
+describe('review notices off', () => {
+  const RESOLVED =
+    'https://prod-00.westeurope.logic.azure.com/workflows/x/triggers/manual/paths/invoke?sig=s';
+
+  it.each([
+    [false, RESOLVED, 'index_off'],
+    [false, '', 'index_off'],
+    [true, '', 'no_webhook'],
+    [
+      true,
+      '@Microsoft.KeyVault(SecretUri=https://kv.vault.azure.net/secrets/review-webhook-url)',
+      'webhook_unresolved',
+    ],
+    [true, 'http://example.test/hook', 'webhook_unresolved'],
+    [true, RESOLVED, undefined],
+  ] as const)('index writes %s, webhook %s: %s', (indexWrites, webhookUrl, reason) => {
+    expect(reviewNoticesOffReason({ indexWrites, webhookUrl })).toBe(reason);
+  });
+
+  // The review-notices alert reads this line: a setting that stopped
+  // resolving must show on every run, not only at the cold start.
+  it('says a webhook that did not resolve on every run, without the URL', async () => {
+    const { log, lines } = recordingLogger();
+    await runReviewNotices(undefined, 'webhook_unresolved', log);
+    await runReviewNotices(undefined, 'webhook_unresolved', log);
+    expect(lines).toEqual([
+      { event: 'review_notice.off', reason: 'webhook_unresolved' },
+      { event: 'review_notice.off', reason: 'webhook_unresolved' },
+    ]);
+  });
+
+  it.each(['index_off', 'no_webhook', undefined] as const)(
+    'says nothing when off on purpose (%s)',
+    async (reason) => {
+      const { log, lines } = recordingLogger();
+      await runReviewNotices(undefined, reason, log);
+      expect(lines).toEqual([]);
+    },
+  );
+
+  it('runs the notifier when on, and says nothing of its own', async () => {
+    const { log, lines } = recordingLogger();
+    const run = jest.fn(async () => ({ clients: 0, documents: 0, posted: false, readFailures: 0 }));
+    await runReviewNotices({ run }, undefined, log);
+    expect(run).toHaveBeenCalledWith(log);
+    expect(lines).toEqual([]);
   });
 });

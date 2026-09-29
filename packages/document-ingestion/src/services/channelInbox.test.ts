@@ -536,6 +536,7 @@ function setup(opts: SetupOptions = {}) {
     opts.classify ?? jest.fn(async (_ctx: ClassifierContext): Promise<Classification> => invoice);
   const inbox = new ChannelInbox({
     mode: opts.mode ?? 'enforce',
+    membershipCheck: 'enforce',
     directory: { getSnapshot: async () => opts.snapshot ?? snapshotOf(opts.rows ?? [rowA]) },
     sharePointFactory: createSharePointWiring(tenant.client, wiringConfig).clientSharePointFactory,
     accounts: new UserAccountReader(tenant.client, noRetry),
@@ -1197,10 +1198,72 @@ describe("ChannelInbox: the row's client account", () => {
     const summary = await inbox.sweep();
 
     expect(skipped(events)).toEqual(['other_teams']);
-    expect(summary).toMatchObject({ skippedNotClient: 1, filed: 0 });
+    expect(summary).toMatchObject({ skippedMembership: 1, skippedNotClient: 0, filed: 0 });
     expect(classify).not.toHaveBeenCalled();
     expect(tenant.pathOf(id)).toBe(`${CHANNEL}/x.pdf`);
   });
+
+  // The bindings alert reads these counts: a file waiting on a binding or a
+  // membership must show on every tick, not only in its one skipped line.
+  it('counts a file waiting on a binding on every tick, and logs its line once', async () => {
+    const row = { ...rowA, userAadObjectIds: [CLIENT_A, STAFF] };
+    const { tenant, inbox, events } = setup({ rows: [row] });
+    tenant.addFile('inbox-a', { name: 'x.pdf', createdBy: STAFF });
+
+    await inbox.sweep();
+    await inbox.sweep();
+
+    expect(skipped(events)).toEqual(['not_client_account']);
+    expect(
+      events('inbox.tick').map((t) => [
+        t['skippedNotClientAccount'],
+        t['skippedMembership'],
+        t['skippedNotClient'],
+      ]),
+    ).toEqual([
+      [1, 0, 0],
+      [1, 0, 0],
+    ]);
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  it.each([
+    ['not in the row’s Team', [], 'not_in_team'],
+    ['also in another Team', [TEAM_A, TEAM_B], 'other_teams'],
+  ])(
+    'counts the client account %s as skippedMembership on every tick',
+    async (_label, teams, reason) => {
+      const tenant = new FakeTenant();
+      tenant.users.set(CLIENT_A, { ...tenant.users.get(CLIENT_A)!, teams });
+      const { inbox, events } = setup({ tenant, rows: [rowA, rowB] });
+      tenant.addFile('inbox-a', { name: 'x.pdf' });
+
+      await inbox.sweep();
+      await inbox.sweep();
+
+      expect(skipped(events)).toEqual([reason]);
+      expect(events('inbox.tick').map((t) => t['skippedMembership'])).toEqual([1, 1]);
+      expect(events('inbox.tick').map((t) => t['skippedNotClientAccount'])).toEqual([0, 0]);
+      expect(events('inbox.tick').map((t) => t['skippedNotClient'])).toEqual([0, 0]);
+      expect(tenant.writes()).toEqual([]);
+    },
+  );
+
+  it.each(['enforce', 'off'] as const)(
+    'says MEMBERSHIP_CHECK_MODE=%s on every tick, in either sweep mode',
+    async (membershipCheck) => {
+      for (const mode of ['enforce', 'shadow'] as const) {
+        const { inbox, events } = setup({ mode, deps: { membershipCheck } });
+        const summary = await inbox.sweep();
+        await inbox.sweep();
+        expect(summary.membershipCheck).toBe(membershipCheck);
+        expect(events('inbox.tick').map((t) => t['membershipCheck'])).toEqual([
+          membershipCheck,
+          membershipCheck,
+        ]);
+      }
+    },
+  );
 
   it('compares Team ids case-insensitively', async () => {
     const tenant = new FakeTenant();
@@ -1247,7 +1310,7 @@ describe("ChannelInbox: the row's client account", () => {
 
     const summary = await inbox.sweep();
 
-    expect(summary).toMatchObject({ filed: 0, skippedNotClient: 2 });
+    expect(summary).toMatchObject({ filed: 0, skippedNotClient: 1, skippedNotClientAccount: 1 });
     expect(skipped(events).sort()).toEqual(['guest', 'not_client_account']);
     expect(classify).not.toHaveBeenCalled();
     expect(tenant.writes()).toEqual([]);
@@ -1687,6 +1750,7 @@ describe('ChannelInbox: modes', () => {
     const { log, lines } = recordingLogger();
     const inbox = new ChannelInbox({
       mode: 'enforce',
+      membershipCheck: 'enforce',
       directory: {
         getSnapshot: async () => {
           if (fail) throw new Error('boom');
@@ -2748,6 +2812,7 @@ describe('ChannelInbox: logs', () => {
       event: 'inbox.tick',
       msg: 'inbox.tick',
       mode: 'enforce',
+      membershipCheck: 'enforce',
       rows: 1,
       candidates: 1,
       filed: 1,
@@ -2757,6 +2822,8 @@ describe('ChannelInbox: logs', () => {
       retryLater: 0,
       retryLaterWaiting: 0,
       skippedNotClient: 0,
+      skippedNotClientAccount: 0,
+      skippedMembership: 0,
       skippedUnverified: 0,
       skippedYoung: 0,
       skippedIneligible: 0,

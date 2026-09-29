@@ -739,8 +739,11 @@ is never taken (§4.2, *The client account*); the intake itself is unchanged.
   client's file that someone else overwrote with other content has the client as creator and the
   other person as modifier, and is left as `modified_by_other`. Guests (this Team's included),
   staff, other clients' accounts, and the client account when it is not in the row's Team or is
-  also in another are left untouched (`skippedNotClient`, with the reason); a user who cannot be
-  read is left for the next tick (`skippedUnverified`). A client account in a second Team is
+  also in another are left untouched, with the reason (`skippedNotClient`; a Member bound on the
+  row that is not its `{NIP}@` account is `skippedNotClientAccount`, and the client account in
+  the wrong Teams `skippedMembership`: a binding or a membership to fix, counted on every tick
+  the file waits, which the bindings alert reads); a user who cannot be read is left for the next
+  tick (`skippedUnverified`). A client account in a second Team is
   refused here as on the bot path (`other_teams`): the file waits until the membership is fixed.
   Until 28 September 2026 the rule was the reverse (a guest of this row's Team, with a guest in
   other Teams accepted, because the file was already in this client's space).
@@ -813,8 +816,10 @@ is never taken (§4.2, *The client account*); the intake itself is unchanged.
   `unknown_user`, `not_bound`, `not_client_account`, `not_in_team`, `other_teams`,
   `modified_by_other`, `unverified` with Graph's `status`, or `changed`), `inbox.row_failed`
   (`stage` `resolve` or `list`, and `err` as above), and one
-  `inbox.tick` per tick: `mode`, `rows`, `candidates`, `filed`, `sortedToReview`, `wouldMove`,
-  `alreadyReported`, `retryLater`, `retryLaterWaiting`, `skippedNotClient`, `skippedUnverified`, `skippedYoung`, `skippedIneligible`,
+  `inbox.tick` per tick: `mode`, `membershipCheck` (`MEMBERSHIP_CHECK_MODE`, said on every tick
+  for the bindings alert), `rows`, `candidates`, `filed`, `sortedToReview`, `wouldMove`,
+  `alreadyReported`, `retryLater`, `retryLaterWaiting`, `skippedNotClient`,
+  `skippedNotClientAccount`, `skippedMembership`, `skippedUnverified`, `skippedYoung`, `skippedIneligible`,
   `skippedBeforeCutoff`, `skippedChanged`, `deferred`, `failed`, `rowsFailed`, `durationMs`.
   Never a file name, title, path or NIP.
 
@@ -1143,7 +1148,7 @@ and site grants through the onboarding repo's `Grant-TeamSiteAccess.ps1` runbook
 | File > 4 MB | Graph upload session (`createUploadSession`), 320 KiB chunks, also with `conflictBehavior=fail`. |
 | Antivirus block (Graph 423) | Generic Polish message; no retry. |
 | Activity fails the bot gate | In `enforce` mode: no download and no ingestion call; one fixed line in a 1:1 chat, silence elsewhere. |
-| Channel inbox: a file not created by the row's client account (a guest, staff, another client's account, the account in a second Team), or last changed by someone else | Left untouched and unclassified (`skippedNotClient`, one `inbox.skipped` line per file, with the reason). |
+| Channel inbox: a file not created by the row's client account (a guest, staff, another client's account, the account in a second Team), or last changed by someone else | Left untouched and unclassified (`skippedNotClient`; `skippedNotClientAccount` for a Member bound on the row that is not its `{NIP}@` account, `skippedMembership` for the account in the wrong Teams; one `inbox.skipped` line per file, with the reason). |
 | Channel inbox: the uploader cannot be read | Left for the next tick (`skippedUnverified`); never counted as a failure, never moved. |
 | Channel inbox: the row's site resolves to BCR GROUP or the quarantine, or its channel folder is missing or in another drive | Row skipped before any listing (`inbox.row_failed`); `sharepoint.forbidden_site` for a guarded site. Nothing is moved. |
 | Channel inbox: a download, folder or move fails | `inbox.failed` with the `stage`; the file stays and is tried again next tick, with its classification reused. After three failures it is moved to `98_Nieposortowane/YYYY/MM` unclassified. |
@@ -1187,6 +1192,7 @@ rg-bcr-ledger-<env>
 ├── kv-bcr-<env>-<sfx>        (Key Vault, RBAC mode)
 ├── appi-bcr-<env>-<sfx>      (Application Insights)
 ├── log-bcr-<env>-<sfx>       (Log Analytics workspace)
+├── ag-bcr-<env>-<sfx>, alert-bcr-*-<env>-<sfx>  (email alerts on App Insights: alerts.bicep; not deployed yet)
 └── psql-bcr-<env>-<sfx>      (PostgreSQL Flexible Server, the document index: db.bicep)
 ```
 
@@ -1207,6 +1213,14 @@ settings rule above and gate G1 do not apply to it. The server: Burstable B1ms, 
 access admitting Azure services only (`0.0.0.0`) — a Y1 Consumption app has no VNet
 integration or fixed egress IP, so that is the one network trade-off, covered in
 [`docs/security.md` T19](./docs/security.md#t19-the-document-index-database).
+
+The email alerts are not in `main.bicep` either. `infrastructure/alerts.bicep` (with
+`modules/alerts.bicep`) declares one action group and eight log alert rules on the App Insights
+component's `traces`. `infrastructure/alerts-deploy.sh` deploys it on its own, in incremental
+mode, and refuses any other resource type and any what-if change outside `ag-bcr-*` and
+`alert-bcr-*`. It sets no app setting, so gate G1 does not apply to it. Every rule returns only
+fixed signal codes and counts, so an alert email never carries a log line. The rules and what
+to do for each are in [Alerts](./docs/operations/human-steps.md#alerts).
 
 ⚠️ **"dev" is production: it serves PESKOVOI.** Its routing settings were set by hand during
 Phase 0; the template now records them (v2 gate G1), but there is still no deploy on push, and

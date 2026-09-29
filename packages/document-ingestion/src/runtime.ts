@@ -28,7 +28,12 @@ import { UserAccountReader } from './services/userDirectory';
 import { ChannelInbox, MAX_INBOX_FILE_BYTES } from './services/channelInbox';
 import { INDEX_OFF, LedgerDocumentIndex, type DocumentIndex } from './services/documentIndex';
 import { TablePaidClassifications, TableShadowMemo } from './services/shadowMemo';
-import { LedgerReviewNotices, ReviewNotifier, WorkflowsWebhook } from './services/reviewNotifier';
+import {
+  LedgerReviewNotices,
+  ReviewNotifier,
+  reviewNoticesOffReason,
+  WorkflowsWebhook,
+} from './services/reviewNotifier';
 import { ClientSearchService } from './services/clientSearch';
 import {
   SEARCH_MODEL,
@@ -217,6 +222,8 @@ const paidClassifications =
     : undefined;
 export const channelInbox = new ChannelInbox({
   mode: config.inboxSweepMode,
+  // Said on every tick, for the bindings alert: the resolver says it once.
+  membershipCheck: config.membershipCheckMode,
   directory: clientDirectory,
   sharePointFactory: clientSharePointFactory,
   accounts: new UserAccountReader(graph, { sdkRetries: false }),
@@ -259,15 +266,13 @@ if (config.inboxSweepMode !== 'off') {
  * document index: on only when the index writes and `REVIEW_WEBHOOK_URL`
  * resolved to an https URL (a Key Vault reference that did not resolve stays
  * the literal reference: off). Said once per cold start, with the reason when
- * off; the URL is never logged.
+ * off; the URL is never logged. The reason is exported for the timer, which
+ * repeats a `webhook_unresolved` on every run (`runReviewNotices`).
  */
-const reviewNoticesOff = !ledgerDb
-  ? 'index_off'
-  : config.reviewWebhookUrl === ''
-    ? 'no_webhook'
-    : !config.reviewWebhookUrl.startsWith('https://')
-      ? 'webhook_unresolved'
-      : undefined;
+export const reviewNoticesOff = reviewNoticesOffReason({
+  indexWrites: ledgerDb !== undefined,
+  webhookUrl: config.reviewWebhookUrl,
+});
 export const reviewNotifier: ReviewNotifier | undefined =
   ledgerDb && !reviewNoticesOff
     ? new ReviewNotifier({

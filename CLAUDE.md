@@ -154,6 +154,23 @@ group's name is typed back; it refuses a template or a what-if touching anything
 not held by gate G1. The index's app settings (`LEDGER_INDEX_MODE`, `LEDGER_DB_*`) live in
 `main.bicep` and the parameter files like every other.
 
+`infrastructure/alerts.bicep` (the email alerts; not deployed yet) is likewise **not**
+`main.bicep`. It declares one action group (`ag-bcr-<env>-<sfx>`, with the recipients from
+`alerts.<env>.parameters.json`) and eight log alert rules (`alert-bcr-*`) on the App Insights
+component's `traces`. `infrastructure/alerts-deploy.sh <env>` deploys it alone, in incremental
+mode: what-if first, then `--apply` after the resource group's name is typed back. The script
+refuses any other resource type, `Microsoft.Insights/components` included, and any what-if
+change outside `ag-bcr-*`/`alert-bcr-*`. It sets no app setting, so it is not held by gate G1. A
+rule matches the pino `msg` (or `event`, where the two differ) and the `level` inside the JSON,
+never `severityLevel`. It returns only fixed `signal` codes and counts: never put a log line, an
+id or a name into an alert query's output. CI builds and lints the template, and
+`tools/test/alerts-deploy.test.mjs` fails when a query compares a literal that the code no longer
+logs in the field the query compares (an `event:` value, or a log message), or reads a JSON field
+the code no longer names, so rename an event in the code and in its query together. A state a
+rule watches must be logged again for as long as it lasts (on every `inbox.tick`, snapshot
+refresh or timer run), never only at a cold start. What each alert
+means, and the runbook: *Alerts* in `docs/operations/human-steps.md`.
+
 `yarn workspace @bcr/<pkg> package` builds a fresh zip into `artifacts/`. It cleans `dist` and the
 `tsbuildinfo`, rebuilds, then runs `tools/package-function.mjs`, which deletes the old zip first,
 fails if any `dist/**/*.js` (the app's, or that of a workspace package it ships: `@bcr/shared`,
@@ -369,7 +386,8 @@ named are marked, after the webhook accepted it; a new move into `98_` clears th
 text carries the row's title, the suggestion's Polish label, reasons in Polish and the month;
 its link "Otwórz plik" targets the file's SharePoint `webUrl`, which contains the file name —
 hence a staff-only chat. Off unless the index writes and the URL resolved
-(`review_notice.config`). **A migration goes in before the build that uses it** (0002 first).
+(`review_notice.config`; a URL that did not resolve is also a `review_notice.off` warning on
+every run, for the alert). **A migration goes in before the build that uses it** (0002 first).
 
 ### Client search (`POST /api/search`)
 

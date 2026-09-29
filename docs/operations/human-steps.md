@@ -1603,6 +1603,8 @@ anywhere; users get the bot's generic error. `az functionapp start` resumes.
             rows = tostring(m.rows), candidates = tostring(m.candidates),
             wouldMove = tostring(m.wouldMove), filed = tostring(m.filed),
             skippedNotClient = tostring(m.skippedNotClient),
+            skippedNotClientAccount = tostring(m.skippedNotClientAccount),
+            skippedMembership = tostring(m.skippedMembership),
             skippedUnverified = tostring(m.skippedUnverified),
             skippedChanged = tostring(m.skippedChanged), deferred = tostring(m.deferred),
             rowsFailed = tostring(m.rowsFailed)
@@ -2970,7 +2972,8 @@ chat's membership, managed in Teams.
 
    4. Run `--live` again: it is clean.
    5. The cold-start `review_notice.config` line says `mode` `on`. It says `off` with `reason`
-      `webhook_unresolved` while the reference does not resolve.
+      `webhook_unresolved` while the reference does not resolve, and every 10-minute run then
+      logs a `review_notice.off` warning, which the review-notices [alert](#alerts) reads.
 5. **Verify.** The next document sorted to review appears in the chat within 10 minutes.
    `review_notice.posted` logs its counts and document ids. The flow's run history shows
    *Succeeded*.
@@ -3746,3 +3749,290 @@ grant on its site (H-12 step 3, confirmed read-only), `propose` and apply of the
 which binds its `{NIP}@` account, and its list item id added to `INBOX_SWEEP_ROWS`: a setting
 change, recorded in `main.dev.parameters.json` in the same change and set by hand while gate G1
 holds.
+
+---
+
+## Alerts
+
+**Owner:** Yahor, the operator and, by the owner's decision of 29 September, the alerts' only
+recipient (`yahor.simak@bcr-group.pl`; another recipient is one more address in the parameter
+file and a redeploy). **When:** outside the 1st–10th freeze (29–30 September, or from
+11 October), and not in the same window as another change.
+
+Until the steps below are done the ledger has no alert rule, and the
+[standing checks](#standing-checks) are the only way anyone learns of a failure. The alerts do
+not replace those checks. They read the logs every 15 minutes and send an email when something
+needs a look the same day.
+
+**What it changes.** One action group and eight log alert rules in `rg-bcr-ledger-dev`, from
+`infrastructure/alerts.bicep` (with `modules/alerts.bicep` and `alerts.dev.parameters.json`).
+**It is not `main.bicep`.** `infrastructure/alerts-deploy.sh` deploys it alone, in incremental
+mode, and refuses two things: a template that declares anything but
+`Microsoft.Insights/actionGroups` and `Microsoft.Insights/scheduledQueryRules`, and a what-if
+that would delete anything or create or modify anything but `ag-bcr-*` and `alert-bcr-*`. It
+changes no app, no app setting and no code. It never touches App Insights, the workspace or
+Azure's own "Application Insights Smart Detection" group. So, like `db-deploy.sh`, it is not
+held by gate G1 and is not a way around it.
+
+**The ingestion build goes first.** Four signals read lines that only the ingestion build from the
+alerts' commit logs: `membershipCheck`, `skippedNotClientAccount` and `skippedMembership` on every
+`inbox.tick`, and `review_notice.off` on every review-notice run. That build adds these log fields
+and one warning line, and changes no routing, filing or setting. Deploy it first, code only, as
+the channel-inbox step of H-12, sub-step 1 (`save_running` under a new name, build, the marker
+checks, `config-zip`, trigger sync), with these checks added, each of which must print `1` or
+more:
+
+```bash
+unzip -p artifacts/document-ingestion.zip dist/services/channelInbox.js | grep -c skippedMembership
+unzip -p artifacts/document-ingestion.zip dist/services/reviewNotifier.js | grep -c review_notice.off
+```
+
+**Verify.** The ticks since the deploy say `enforce`:
+
+```bash
+aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
+  | extend m = parse_json(message) | where tostring(m.msg) == "inbox.tick"
+  | summarize n = count() by membershipCheck = tostring(m.membershipCheck)' \
+  <the deploy's time, UTC>
+```
+
+Until that build runs, `bindings` sees these states only in the lines said once per worker or per
+upload, and `review_notice.webhook_unresolved` cannot fire.
+
+The Phase 0 standing rules still call `db-deploy.sh` "the one Bicep deploy allowed". The first
+run of this script is therefore the owner's go. The docs change that records the deploy updates
+that rule, and the "no alert rule" lines in H-12 and the standing checks (step 7).
+
+**Cost: USD 4.00 a month.** A rule evaluated every 15 minutes costs USD 0.50 a month ("Alerts
+System Log Monitored at 15 Minute Frequency", Azure Retail Prices API, West Europe, checked
+28 September 2026), and there are eight rules. A rule split by `signal` also pays USD 0.05 a
+month for each extra signal it monitors in that month: a few cents when something fires. Emails
+are free up to 1,000 a month. The action group is free, and the rules' queries on App Insights
+are not charged. Check the [pricing calculator](https://azure.microsoft.com/pricing/calculator/)
+(West Europe) before changing a frequency.
+
+**What an alert email carries.**
+
+- the rule's name, severity and description: what it means and what to do first, in English;
+- the query text;
+- the `signal` code that fired, and the count;
+- the window;
+- a portal link, which needs an Azure sign-in.
+
+It never carries a log line. Every query reduces its lines to fixed codes and counts, so no file
+name, NIP, path, id or UPN reaches the email or the alert resource.
+
+Every rule is stateful. It sends one *Fired* email per signal, and one *Resolved* email about the
+rule's window plus 30-45 minutes after the last line that matched: about 45-60 minutes for the
+15-minute rules, 1 hour to 1 hour 15 minutes for the 30-minute ones (the heartbeat: after the
+first tick is back), and 1 hour 30 minutes to 1 hour 45 minutes for the 1-hour rules
+(`anthropic`, `bindings`). Nothing is sent in between.
+
+A *Resolved* email means the lines stopped, not that the cause is gone. The states the rules watch
+are logged again for as long as they last: the membership check and the inbox files that wait on
+a binding on every `inbox.tick` (2 minutes), the Directory's conflicts and excluded rows on every
+snapshot refresh, a webhook that did not resolve on every review-notice run. But a bot-path line
+comes once per upload, and `app.start_failed` only at a host start. So the fix is confirmed by the
+check the table names (for `bindings`: `node tools/directory-bindings.mjs check` exits `0`, and
+`GET /api/health` shows `build.membershipCheck` `enforce`), never by the email.
+
+### What each alert means, and what to do first
+
+Every rule runs every 15 minutes on the App Insights component's `traces`, where the pino line is
+in `message`. The rules read the `level` inside that JSON, never `severityLevel`, which is 1 on
+every pino line. A threshold is the count within the rule's window, and it is 1 unless the table
+gives another.
+
+| Rule (`alert-bcr-…`) | Sev | Window | Fires on (signal: threshold) | First |
+|---|---|---|---|---|
+| `inbox-heartbeat` | 1 | 30 min | No `inbox.tick` at all. The sweep logs one every 2 minutes; the longest gap in the week to 29 September was 6.5 minutes | `/api/health` (`build.inboxSweep`). `az functionapp function list -g $RG -n $INGEST --query "[].name" -o tsv` must list `inboxSweep`; if not, sync the triggers (H-12, the channel-inbox step). Then the host's `Executed 'Functions.inboxSweep'` lines, and the workspace's 1 GB daily cap (a capped workspace silences every rule). If you turned the sweep off on purpose, this email is expected. For a planned long stop, add `inbox-heartbeat` to `disabledRules` |
+| `anthropic` | 1 | 1 h | `claude.paused`, `search.interpreter_paused`. `claude.no_result` (`invalid_request`, `internal_error`, `malformed_output`, but not a refusal whose `apiErrorMessage` names an image, PDF, pages, dimensions, media, a password or encryption: the document's own limit): 5. `claude.capacity` (`claude.retry_later` `rate_limited` or `overloaded`, a 429 or 529): 9 of the hour's twelve 5-minute bins, so `n` counts bins. `billed_calls` (`claude.usage` + `search.usage`): 60, the parameter `billedCallsPerHour` | Paused: the Anthropic console, the credit and the key (BCR's key; Roman tops up). Nothing is filed wrong meanwhile: channel files wait, and bot uploads get the retry text. `claude.no_result`: `reason`, `status` and `apiErrorType` of those lines. `claude.capacity`: the Anthropic status page and the org's rate limits in the console; a 429 or 529 never counts toward `RETRY_EXHAUSTED`, so files wait for as long as it lasts. `billed_calls`: `claude.usage` by hour and the inbox ticks. A month-start flood is fine. A loop paying again (27 September: 86 calls in one hour) is stopped with `INBOX_SWEEP_MODE=off` |
+| `filing` | 2 | 15 min | The channel inbox: `inbox.failed`, `inbox.row_failed`, `inbox.tick_failed`, `inbox.directory_unavailable`, `inbox.shadow_memo_failed`, `inbox.paid_memo_failed`, `inbox.listing_truncated`. The bot path: `document.quarantine_failed`, `batch.deadline_exceeded`, `batch.document_failed`, `client_target.unusable`, `sharepoint.possible_duplicate`, `request.rejected` (a 400 to the bot), `bot.batch_failed`, `bot.download_failed`, `document.quarantined` (`unmapped`, `unbound_target`), `membership.unverified` (an upload held). Graph and the Directory: `graph.token_failed`, `directory.unavailable`, `directory.refresh_failed` (3), `quarantine.tagging_failed`, `classifier.threw`. `identity.unverified` (3): user reads are failing, so bot uploads answer RetryLater and channel files wait as `skippedUnverified`. `function.failed`: an invocation failed or timed out (the host's own line). `app.start_failed`: an app's worker could not load its code at a host start (the host's `Worker was unable to load entry point` or `No job functions found`), so none of its functions runs. `other_error`: an error line that no other rule names | The query by event (below), then H-12 step 13's table, or for `inbox.*` the channel-inbox step's table. A 403 on `identity.unverified` or `membership.unverified` is H-8b's `Directory.Read.All`. `document.quarantined` `unmapped` from an account you did not expect: a new client whose row is not bound yet (the standing checks' onboarding row). `app.start_failed`: an app setting that fails validation at cold start (the last setting change first), or a bad package; the bot then answers nothing in the DM, ingestion files nothing. Fix the setting or redeploy, restart, then `az functionapp function list -g $RG -n <app> --query "[].name" -o tsv` must list `messages` and `mydocs` (`$BOT`), or `inboxSweep`, `reviewNotify` and the HTTP functions (`$INGEST`). The line comes only at a host start, so the *Resolved* email can arrive while the app is still down: the function list is the proof |
+| `index` | 2 | 15 min | `index.write_failed`. `index.connection` (`index.pool_error` + `index.connection_error`): 5 | `reason` and `status` (SQLSTATE), the server's state, and the ingestion login and its `ledger_app` grant ([Document index release](#document-index-release)). Filing is unaffected |
+| `security` | 2 | 15 min | `caller.refused` (`ingestion.caller.rejected`, or a 403). `caller.unauthenticated` (a 401 at ingestion): 10. `bot.auth_refused`. `bot.gate_foreign` (`tenant`, `aad_object_id`). `sharepoint.forbidden_site` (a correctly spelled site path that resolved in Graph to BCR GROUP or the quarantine; a path spelled as one of them is `bindings`' `directory.forbidden_target`), `sharepoint.drive_mismatch`, `inbox.unexpected_child`. `search.no_access`: 10 | Every guard is fail-closed, so nothing was filed wrong. `forbidden_site` and `drive_mismatch` are incident indicators (H-12 step 13). `inbox.unexpected_child`: raise it with Roman. One `bot.auth_refused` right after your own negative check (step 6) is expected. On real Teams traffic it means the bot is unreachable: check `MICROSOFT_APP_TYPE`, the app id and the channel-token rule |
+| `bindings` | 2 | 1 h | `client_account.mismatch`, and the inbox's `not_client_account` (`skippedNotClientAccount` on every `inbox.tick` while the file waits). `membership.mismatch`, and the inbox's `other_teams` and `not_in_team` (`skippedMembership` on every tick). `directory.conflict`. `directory.forbidden_target`: a row excluded because its `SiteHostname` is not the tenant's host, or its `SitePath` is BCR GROUP, the quarantine, or not exactly `/sites\|teams/<name>` (`excludedByReason` on every Directory snapshot, and each upload held as `forbidden_target`); its uploads are quarantined and its channel is not swept. `membership.check_off` (on every tick, `membershipCheck`) | The same day: `node tools/directory-bindings.mjs check`, then `propose` and apply the **whole** plan ([standing checks](#standing-checks)). Never unbind a row or change an account for it. `directory.forbidden_target`: tell Roman and run `check`; never point the row elsewhere by hand; every row at once means `QUARANTINE_SITE_HOSTNAME` is wrong. The states repeat on every tick or snapshot, so the window is 1 hour; a bot-path mismatch is one line per upload, so the *Resolved* email proves nothing: `check` exits `0` (and `GET /api/health` `build.membershipCheck` is `enforce`) is the proof |
+| `review-notices` | 3 | 30 min | `review_notice.post_failed`, `read_failed`, `run_failed`: 2. `review_notice.mark_failed`. `review_notice.webhook_unresolved` (`review_notice.off`, `reason` `webhook_unresolved`, said on every 10-minute run while `REVIEW_WEBHOOK_URL` is not an https URL): 2 | The `status` of `post_failed`, then the Workflows flow, its owner and its run history. `webhook_unresolved`: the `REVIEW_WEBHOOK_URL` setting's Key Vault reference status (the app → Environment variables), then the `review-webhook-url` secret (present, enabled, not expired) and the app identity's access to the vault; notices are off until it resolves and the app restarts. `no_webhook` and `index_off` are off on purpose and not alerted. The documents are filed in `98_`; only the notice waits, and it is retried every 10 minutes |
+| `search` | 3 | 15 min | `search.unavailable` (any stage but `identity`): 2. `search.model_cap`. `search.record_failed`: 2. `bot.search_refused` (`search.http_error`, `search.bad_response`, `search.client_threw`). `bot.search_call_failed`: 2 | The `search.*` lines by stage and status. A 401 or 403 to the bot is the managed identity's grant or `SEARCH_CALLER_APP_IDS` ([Client search release](#client-search-release)) |
+
+**Not alerted, on purpose.**
+
+- **`claude.retry_later` and `inbox.retry_later`, line by line.** An outage logs one line per
+  file per tick (1,032 lines in 45 minutes on 27 September), so a count of lines says how many
+  files wait, not how long. The files wait and are retried. `RETRY_EXHAUSTED` bounds only
+  timeouts, 5xx other than 529, and lost connections; a 429 or 529 never counts toward it, so a
+  sustained one is `claude.capacity` (5-minute bins, above). An account refusal shows as
+  `claude.paused`, above.
+- **A 400 the document causes.** `claude.no_result` whose `apiErrorMessage` names an image, a
+  PDF, pages, dimensions, media, a password or encryption is left out of the `anthropic` count:
+  the document went to `98_` for review, and the review notice says so. On the direct Claude API
+  an image may be up to 10 MB base64-encoded (about 7.5 MB raw; the 5 MB limit is Bedrock's and
+  Vertex's) and 8000 px a side, a PDF up to 100 pages and not encrypted, and the refusal is a
+  400, never a 413 (a request may be 32 MB, which the classifier's 10 MiB cap cannot reach).
+  The filter matches words, so it would also hide a request-shape 400 whose message names an
+  image or a PDF. Follow-up: the classifier gives a refusal that names a document limit its own
+  reason (`document_rejected`), and the rule counts `invalid_request` alone again.
+- **`identity.refused`, `batch.refused`, and `inbox.skipped` for `guest`, `not_bound`,
+  `unknown_user` and `not_member`.** These are a guest, or staff, doing something the ledger
+  refuses by design. The daily inbox query (`guestFiles`) and the weekly `identity.refused` trend
+  cover them.
+- **A client locked out.** A disabled `{NIP}@` account cannot sign in, so it leaves no log line
+  for an alert to see. The only signals are the weekly `check` (**exit `5`**) and the weekly
+  account audit, and both stay.
+- **Cold-start and config lines, and `bot.gate.rejected` `conversation_type`** (the bot added to
+  a channel). A state the alerts need is said again for as long as it lasts instead:
+  `MEMBERSHIP_CHECK_MODE` on every `inbox.tick` (`membershipCheck`), and a webhook that did not
+  resolve on every review-notice run (`review_notice.off`).
+- **The bot's liveness, beyond a failed start.** A bot whose worker cannot load its code (an app
+  setting that fails validation at cold start, a bad package) is `app.start_failed` in the
+  `filing` rule. A bot that stops without a line (the app stopped, a host gone quiet) is not
+  seen: it logs only when it is used, so its logs cannot carry a heartbeat. Follow-up: a
+  `GET /api/health` on the bot, an App Insights standard availability test on it, and a metric
+  alert.
+
+### The query by event
+
+An alert names a signal. This query lists the events behind it, by code only (the runbook's
+[variables](#variables-used-below) and `aiq`):
+
+```bash
+aiq 'traces | where cloud_RoleName startswith "func-bcr-"
+  | extend m = parse_json(message)
+  | extend msg = tostring(m.msg), lvl = toint(m.level)
+  | where lvl >= 40 or msg in ("document.quarantined", "inbox.skipped", "search.no_access",
+      "claude.usage", "search.usage", "claude.no_result")
+      or message contains "(Failed" or message startswith "Timeout value of"
+      or message has "Worker was unable to load entry point"
+      or message startswith "No job functions found"
+  | summarize n = sum(itemCount), firstAt = min(timestamp), lastAt = max(timestamp)
+      by app = cloud_RoleName, msg = iff(isempty(msg), substring(message, 0, 40), msg),
+      event = tostring(m.event), reason = coalesce(tostring(m.reason), tostring(m.quarantineReason)),
+      stage = tostring(m.stage), code = tostring(m.code),
+      status = coalesce(tostring(m.status), tostring(m.err.status), tostring(m.statusCode))
+  | order by lastAt desc' \
+  <the alert window's start, UTC>
+```
+
+A host line has no JSON, so it shows by its first 40 characters. The `bindings` states read from
+`inbox.tick` counts and the Directory snapshot are not listed here:
+`node tools/directory-bindings.mjs check` names the rows, and each waiting file has one
+`inbox.skipped` line with its ids per worker.
+
+### Steps
+
+The runbook's [variables](#variables-used-below): `RG`, `BOT`, `INGEST`, `APPI` and `aiq`.
+
+1. **Check the commit.** From the repo root, on the commit that has the alerts:
+
+   ```bash
+   az bicep build --file infrastructure/alerts.bicep --stdout > /dev/null && echo built
+   corepack yarn test:tools
+   ```
+
+   `built`, and no failing test. `tools/test/alerts-deploy.test.mjs` fails if a query compares a
+   literal that the code no longer logs in the field the query compares (an `event` value, or a
+   log message), or reads a JSON field the code no longer names.
+
+2. **What-if.** This step changes nothing:
+
+   ```bash
+   infrastructure/alerts-deploy.sh dev
+   ```
+
+   **Verify.** Exactly nine `Create` lines, then "What-if clean":
+   - the action group `ag-bcr-dev-<suffix>`;
+   - the rules `alert-bcr-<rule>-dev-<suffix>`, for `anthropic`, `bindings`, `filing`,
+     `inbox-heartbeat`, `index`, `review-notices`, `search` and `security`.
+
+   On 29 September it gave nine `Create` lines, and `Ignore` for the eleven existing resources.
+   A later update shows `Modify` for these names only. Anything else: stop.
+
+3. **Deploy.** First, let Azure's senders through the bcr-group.pl mail filtering, so the
+   passcode the deploy sends arrives: `azure-noreply@microsoft.com`,
+   `azureemail-noreply@microsoft.com` and `alerts-noreply@mail.windowsazure.com`. Then:
+
+   ```bash
+   infrastructure/alerts-deploy.sh dev --apply
+   ```
+
+   Type `rg-bcr-ledger-dev` when asked. The script prints the action group and the eight rule
+   names.
+
+4. **Verify the address, at once.**
+   - A new address gets a one-time passcode (OTP) from Azure when it is saved in the action
+     group. Enter it within 30 minutes. An address already verified in the tenant gets a plain
+     notice instead. An unverified address receives no alert and no test email.
+   - If the code expired or never arrived: Monitor → Alerts → Action groups →
+     `ag-bcr-dev-<suffix>` → the email receiver → *Resend*, then enter the new code. Running
+     `alerts-deploy.sh` again is not the way to get a new code: the action group is unchanged,
+     so nothing is sent.
+   - Send a test from the portal: Monitor → Alerts → Action groups → `ag-bcr-dev-<suffix>` →
+     *Test action group*. Azure allows 2 tests per 5 minutes.
+
+   **Verify.** The test email arrives. No test email: the address is not verified; *Resend* as
+   above.
+
+5. **Verify the rules.** This check is read-only:
+
+   ```bash
+   for r in $(az resource list -g $RG --resource-type Microsoft.Insights/scheduledQueryRules \
+       --query "[?starts_with(name, 'alert-bcr-')].name" -o tsv); do
+     echo "$r $(az resource show -g $RG -n "$r" \
+       --resource-type Microsoft.Insights/scheduledQueryRules --query properties.enabled -o tsv)"
+   done
+   ```
+
+   **Verify.** Eight lines, each ending in `true`, unless a rule is in `disabledRules`. Run the
+   same loop once a month: Azure disables a rule whose query has failed for a week, and says so
+   only in the Activity Log.
+
+6. **Prove one alert end to end.** Send one request to the bot with no token. It is synthetic,
+   carries no data, and is the same negative check as after a bot deploy:
+
+   ```bash
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST "https://$BOT.azurewebsites.net/api/messages" \
+     -H 'Content-Type: application/json' -d '{"type":"message"}'
+   ```
+
+   **Verify.**
+   - The command prints `500`: the bot refused the missing token.
+   - Within about 30 minutes, a *Fired* email arrives for `alert-bcr-security-…` with the signal
+     `bot.auth_refused` and count 1.
+   - 45-60 minutes after that, a *Resolved* email arrives.
+
+   No email within an hour: check step 4 (the OTP, *Resend*, and the mail filtering), then the
+   rule's history in the portal (Monitor → Alerts).
+
+7. **Record it.** Record the deploy's date and the step 6 proof in the incident's
+   [status table](incident-2026-09.md#status). In the same docs change, update these lines,
+   which say there is no alert rule or that db-deploy.sh is the only Bicep deploy allowed:
+   - the Phase 0 standing rule ("The one Bicep deploy allowed");
+   - H-12's "After the window";
+   - the standing checks' "Phase 0 still has no alert rule";
+   - `docs/diagrams/00-phase0-routing.md`.
+
+**Updating.** Every change starts as a commit:
+- **A threshold or a rule:** edit the template. A noisy rule is silenced by adding its short name
+  to `disabledRules` in `alerts.dev.parameters.json`, until its query is fixed.
+- **A recipient:** add an address to `alertEmails`. It must be in bcr-group.pl; a test pins
+  that. The new address confirms as in step 4.
+
+Then run steps 2 to 5. Expect a `Modify` for each rule that changed. When the code renames or
+removes an event, or moves a literal to another field (a log message instead of an `event`
+value), `alerts-deploy.test.mjs` fails until the query follows.
+
+**Rollback.** Yahor runs it, and records it in the status table.
+
+- **One rule:** add it to `disabledRules`, then run steps 2 and 3.
+- **All of the alerts:** delete the eight rules, then the action group. These are the only
+  resources the template creates. The name filter keeps the loop off anything else, including
+  the Smart Detection group:
+
+  ```bash
+  for id in $(az resource list -g $RG --resource-type Microsoft.Insights/scheduledQueryRules \
+      --query "[?starts_with(name, 'alert-bcr-')].id" -o tsv); do
+    az resource delete --ids "$id"
+  done
+  az resource delete -g $RG -n "ag-bcr-dev-<suffix>" --resource-type Microsoft.Insights/actionGroups
+  ```
+
+  The template in the repo stays. Running step 3 again brings the alerts back.

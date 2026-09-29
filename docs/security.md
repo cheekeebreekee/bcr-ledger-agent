@@ -774,6 +774,12 @@ first.
   checked 26 September; `appInsights.bicep` now pins 90, and the Log Analytics workspace's own
   30 days is a separate setting). From Phase 0 it
   holds ids and codes, not names, file names or URLs.
+- **Alert emails** (`infrastructure/alerts.bicep`; not deployed yet,
+  [Alerts](operations/human-steps.md#alerts)): Azure Monitor emails `yahor.simak@bcr-group.pl`.
+  An email carries a rule's description, its query text, a fixed signal code and a count, never
+  a log line, id, file name, NIP or UPN: every query returns only codes and counts, and a tool
+  test pins that. The rules query App Insights with the deploying operator's read access (no
+  identity of their own).
 - **IR evidence store:** the pre-Phase-0 logs, the Purview export, the sign-in exports and the
   Directory export for the incident. It is immutable, readable by Roman, the IOD and
   `yahor.simak@bcr-group.pl` only, and kept until the date the IOD sets.

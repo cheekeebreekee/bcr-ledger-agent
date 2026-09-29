@@ -263,6 +263,46 @@ export class ReviewNotifier {
   }
 }
 
+/** Why review notices are off at this cold start (`review_notice.config`'s `reason`). */
+export type ReviewNoticesOffReason = 'index_off' | 'no_webhook' | 'webhook_unresolved';
+
+/**
+ * Review notices run only when the index writes and `REVIEW_WEBHOOK_URL`
+ * resolved to an https URL. A Key Vault reference that did not resolve (the
+ * secret disabled, deleted or expired, or the app's access to the vault
+ * broken) stays the literal reference: `webhook_unresolved`. Undefined: on.
+ */
+export function reviewNoticesOffReason(opts: {
+  readonly indexWrites: boolean;
+  readonly webhookUrl: string;
+}): ReviewNoticesOffReason | undefined {
+  if (!opts.indexWrites) return 'index_off';
+  if (opts.webhookUrl === '') return 'no_webhook';
+  if (!opts.webhookUrl.startsWith('https://')) return 'webhook_unresolved';
+  return undefined;
+}
+
+/**
+ * One `reviewNotify` timer run. On: the notifier's run. Off because the
+ * webhook did not resolve: one `review_notice.off` warning on every run, so
+ * the review-notices alert sees the state for as long as it lasts (the cold
+ * start's `review_notice.config` is said once, and a worker can live a day).
+ * Off on purpose (`index_off`, `no_webhook`): nothing. Never the URL.
+ */
+export async function runReviewNotices(
+  notifier: Pick<ReviewNotifier, 'run'> | undefined,
+  offReason: ReviewNoticesOffReason | undefined,
+  log: Logger,
+): Promise<void> {
+  if (notifier) {
+    await notifier.run(log);
+    return;
+  }
+  if (offReason === 'webhook_unresolved') {
+    log.warn({ event: 'review_notice.off', reason: offReason }, 'review_notice.off');
+  }
+}
+
 /** Polish, for staff; a code without a label is shown as it is. */
 const REASON_LABELS: Readonly<Record<string, string>> = {
   NOT_CLASSIFIED: 'nie sklasyfikowano',

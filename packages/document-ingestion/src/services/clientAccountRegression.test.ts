@@ -300,6 +300,7 @@ function world(rows: readonly ClientDirectoryEntry[]) {
   const inboxFor = (creator: string) =>
     new ChannelInbox({
       mode: 'enforce',
+      membershipCheck: 'enforce',
       directory: { getSnapshot: async () => snapshot },
       sharePointFactory: { forTarget: () => fakeInbox(creator, inboxCalls) },
       accounts: new UserAccountReader(graph.client, { ...noRetry, sdkRetries: false }),
@@ -433,7 +434,7 @@ describe('the client account rule, across every path', () => {
 
     // Channel post: left untouched.
     const summary = await w.post(STAFF);
-    expect(summary).toMatchObject({ filed: 0, skippedNotClient: 1 });
+    expect(summary).toMatchObject({ filed: 0, skippedNotClient: 0, skippedNotClientAccount: 1 });
     expect(skipped(w.lines)).toEqual(['not_client_account']);
     expect(w.inboxCalls).toEqual(['resolveInbox', 'listInboxChildren']);
 
