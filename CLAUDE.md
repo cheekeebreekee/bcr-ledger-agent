@@ -33,9 +33,8 @@ PostgreSQL database whose row-level security keeps each client's rows to that cl
 own client's rows by asking in the bot's 1:1 chat ([Client search](#client-search-post-apisearch);
 off until its release).
 
-> The code for this decision (the client-account rule) is in the working tree, uncommitted and
-> not deployed as of 29 September 2026; the running build still serves guests, and rows 2 and 10
-> are not yet re-bound. The rest of this file describes the code as it now stands.
+> The client-account rule is live since 29 September 2026 (rows 2 and 10 re-bound, then ingestion
+> and the bot deployed). The onboarding repo's matching change deploys with that repo's next push.
 
 UI strings are **Polish**; code, comments and logs are English.
 

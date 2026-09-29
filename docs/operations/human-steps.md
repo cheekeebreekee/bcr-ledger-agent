@@ -45,8 +45,7 @@ Phase 0 is here, then the releases that followed it: [Lifting gate G1](#lifting-
 > - In the canaries, **the canary client account** (`9000000000@bcr-group.pl`, a Member of BCR
 >   Kanarek) gives the positive proofs, and **the canary guest** (H-5b) is the negative one.
 > - The rollout of the decision is the [Client identity release](#client-identity-release). As
->   of 29 September its code is uncommitted and not deployed, and rows 2 and 10 are not
->   re-bound: until then the running build still serves guests.
+>   was done on 29 September (rows re-bound 10:58Z, ingestion 11:02Z, the bot 11:08Z).
 
 ---
 
@@ -3467,9 +3466,9 @@ documents' rows follow the documents (offboarding).
 
 **Owner:** Yahor runs it; Roman creates, enables and licenses the `{NIP}@` accounts by hand, and
 tells PESKOVOI; the Teams Administrator uploads the manifest. **When:** a working day outside the
-change freeze (1st–10th), not in the same window as another change. **Status on 29 September:
-not started.** The ledger code is in the working tree, uncommitted and not deployed, and rows 2
-and 10 still hold their guests.
+change freeze (1st–10th), not in the same window as another change. **Status: done on
+29 September** (`5beb0b9`; rows re-bound 10:58Z, ingestion 11:02Z, the bot 11:08Z; canaries in the
+[incident record](incident-2026-09.md)). Open: the Teams admin uploads manifest 0.2.2.
 
 **Why.** The owner's decision of 28 September: a client is its `{NIP}@bcr-group.pl` account, an
 Entra Member, licensed, created by BCR and handed to the client, who uses it for the channel,

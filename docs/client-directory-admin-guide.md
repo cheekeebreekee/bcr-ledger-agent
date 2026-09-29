@@ -13,12 +13,9 @@ routed.
 > **Corrected 29 September 2026: the client is its `{NIP}@bcr-group.pl` account.** Until
 > 28 September this guide treated the clients' Teams guests as the clients. The owner's
 > decision of 28 September makes a client's identity its `{NIP}@bcr-group.pl` account, and guests
-> have no capability in the ledger ([Who the client is](#who-the-client-is)). The ingestion build
-> that enforces it is **not yet deployed**, and rows 2 and 10 are not yet re-bound to their
-> client accounts: until both are done, the running build still routes the guest bound on each
-> row, and the channel inbox files only posts by guests of the row's Team. Meanwhile a client
-> account's channel posts wait (`inbox.skipped` `not_guest`), and its uploads in the bot's chat
-> go to quarantine as `unmapped`, because no row holds its id yet.
+> have no capability in the ledger ([Who the client is](#who-the-client-is)). It is live since
+> 29 September 2026: rows 2 and 10 hold their client accounts, and the running build files and
+> searches only for them.
 
 ## What it's for
 

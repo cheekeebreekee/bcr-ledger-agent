@@ -13,10 +13,9 @@
 > `{NIP}@bcr-group.pl` account, an Entra Member created by BCR at onboarding; guests have no
 > capability in the ledger ([§4.2, *The client account*](#the-client-account)). Until that date
 > this page described clients as Teams guests, on the premise that the `{NIP}@` accounts were
-> shared mailboxes nobody signs in with; that premise was wrong. On 29 September 2026 the code
-> for the decision is in the working tree, uncommitted and not deployed: the running build still
-> files the channel posts of a guest of the row's Team, and rows 2 and 10 still hold guest ids
-> until they are re-bound.
+> shared mailboxes nobody signs in with; that premise was wrong. The code went live on
+> 29 September 2026: rows 2 and 10 re-bound to their `{NIP}@` accounts, then ingestion and the
+> bot deployed.
 
 ## 1. Goals and non-goals
 

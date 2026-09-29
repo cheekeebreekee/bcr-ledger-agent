@@ -12,7 +12,7 @@ one SharePoint site. Each threat now has a status:
 |---|---|
 | **Mitigated** | In place before Phase 0 and still valid. |
 | **P0** | Fixed by the Phase-0 code or a Phase-0 tenant step. Live once the steps in [`human-steps.md`](operations/human-steps.md#phase-0) are done. |
-| **Next build** | In the code for the client-account rule (below), not yet deployed. Live once that build is deployed and the rows are re-bound. |
+| **Client identity** | The client-account rule (below). Live since 29 September 2026: rows re-bound 10:58Z, ingestion deployed 11:02Z, the bot 11:08Z. |
 | **Phase N** | Planned in the v2 plan, phase N. Until then the threat is open. |
 | **Accepted** | Recorded as an accepted risk, with an owner, in [Accepted risks](#accepted-risks). |
 
@@ -23,12 +23,10 @@ client, who uses it for channel posts, the bot's 1:1 chat and search. Guests hav
 capability in the ledger. The entries below describe the code that implements this
 (`build.clientIdentity: 'nip-member'` in ingestion's `/api/health`); see T22.
 
-That code is **not yet deployed**, and rows 2 (PESKOVOI) and 10 (the canary) are not yet
-re-bound to their client accounts. Until the rollout in
-[`human-steps.md`](operations/human-steps.md) is done, the running build still routes the guest
-bound on each of those rows, and its channel inbox files only posts by guests of the row's Team.
-So a `{NIP}@` account's channel posts wait there (`not_guest`), and its uploads in the bot's
-chat go to quarantine as `unmapped`, because no row holds its id yet.
+That code went live on 29 September: rows 2 (PESKOVOI) and 10 (the canary) were re-bound to
+their client accounts at 10:58Z, ingestion was deployed at 11:02Z and the bot at 11:08Z, and the
+canary client account proved the chat and channel paths
+([incident record](operations/incident-2026-09.md)).
 
 The decision followed a lockout. On 26 September at 12:18Z, tenant step T-1 blocked sign-in on
 the three `{NIP}@` accounts (0002 PESKOVOI, 0003, 0004). The premise, taken from the onboarding
@@ -42,7 +40,7 @@ withdrawn: nothing may ever block, disable, unlicense or convert a `{NIP}@` acco
 
 | Trust boundary | Principal | Credential | Checked by |
 |---|---|---|---|
-| Client → Teams (and through it the bot and the channel) | The client's `{NIP}@bcr-group.pl` account: an Entra Member, licensed, created by hand by BCR (Roman) and handed to the client, a member (never an owner) of its own client Team only. Guests have no capability (T22) | A password BCR hands over (see T22 on the handover). No Conditional Access (no P1, T14); MFA follows the tenant's security defaults **[verify]** whether they are on | Entra at sign-in. Then the bot's gate (T1) and, in ingestion, the resolver: the account read first (a Guest, a non-Member or a deleted user is refused with nothing stored), bound on exactly one row, its UPN exactly `{row NIP}@bcr-group.pl`, its Teams exactly the row's `TeamId`. The channel inbox applies the same rule to a file's creator (T18). **Next build** |
+| Client → Teams (and through it the bot and the channel) | The client's `{NIP}@bcr-group.pl` account: an Entra Member, licensed, created by hand by BCR (Roman) and handed to the client, a member (never an owner) of its own client Team only. Guests have no capability (T22) | A password BCR hands over (see T22 on the handover). No Conditional Access (no P1, T14); MFA follows the tenant's security defaults **[verify]** whether they are on | Entra at sign-in. Then the bot's gate (T1) and, in ingestion, the resolver: the account read first (a Guest, a non-Member or a deleted user is refused with nothing stored), bound on exactly one row, its UPN exactly `{row NIP}@bcr-group.pl`, its Teams exactly the row's `TeamId`. The channel inbox applies the same rule to a file's creator (T18). **Client identity** |
 | Teams client → bot | Bot Framework | JWT signed by `login.botframework.com` | `CloudAdapter`, then the bot's gate on **every** activity type: a 1:1 chat, from the BCR tenant, with a GUID user object id (P0) |
 | Bot → ingestion (`/api/ingest/batch`) | The bot's app registration | Client secret (Key Vault, and laptop copies: see T15) → token for `api://<ingestion-app-id>` | `AuthMiddleware`: issuer, audience, the `Documents.Ingest` role, and **the caller's app id** (`appid`, else `azp`) in `BOT_CALLER_APP_IDS` (P0). Then the request body: `conversationType` must be `personal`, the user id must be a UUID, and the tenant must be BCR's (P0). |
 | Bot → ingestion (`/api/search`) | The bot Function App's system-assigned managed identity | Managed identity token for `api://<ingestion-app-id>`; no secret exists | `AuthMiddleware`, before the body is read: issuer, audience, the `Documents.Search` role, and the caller's app id in `SEARCH_CALLER_APP_IDS` (that identity only; never an id of `BOT_CALLER_APP_IDS`). Then a strict body, and the asker resolved like an uploader, so required to be the row's `{NIP}@` client account (see T21). |
@@ -466,7 +464,7 @@ keeps them in place) and what the client is told.
 `INBOX_SWEEP_MODE=shadow`, then `enforce`, first for the canary Team's row only. (Update,
 29 September 2026: `enforce` runs for the canary row since 28 September 11:10Z and for PESKOVOI,
 row 2, since 11:58Z, new uploads only. The running build applies the guest rule this entry
-replaced; the client-account rule above is **Next build**.)
+replaced; the client-account rule above is **Client identity**.)
 
 ### T19. The document index database
 
@@ -710,7 +708,7 @@ the person who creates the account, never by the agent or a model and never in a
 chat, handed over out of band (by phone or in person, never over Telegram or plain email),
 changed at first sign-in, with MFA registration as the tenant's security defaults require.
 
-**Status: Next build** for the rule; the credential handover is **open**. The Member exposure
+**Status: Client identity** (live since 29 September) for the rule; the credential handover is **open**. The Member exposure
 is an [accepted risk](#accepted-risks).
 
 ### Also fixed in Phase 0

@@ -462,10 +462,11 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
   28 September at 17:33–17:34Z. No document was lost. T-1 and T-2 are withdrawn, T-7 is a
   read-only record ([`tenant-hardening.md`](docs/operations/tenant-hardening.md),
   [`incident-2026-09.md`](docs/operations/incident-2026-09.md)); lesson 25.
-- ⏳ **The client-account rule** (owner's decision, 28 September): a client is its `{NIP}@`
-  Member account, and guests have no capability. The code is in the working tree, uncommitted
-  and not deployed; rows 2 and 10 are not yet re-bound to the `{NIP}@` accounts; the onboarding
-  change is not deployed. The canary client account for row 10 (a Member of BCR Kanarek only)
+- ✅ **The client-account rule** (owner's decision, 28 September): a client is its `{NIP}@`
+  Member account, and guests have no capability. Live since 29 September: rows 2 and 10
+  re-bound to the `{NIP}@` accounts at 10:58Z, ingestion deployed at 11:02Z and the bot at
+  11:08Z, proven with the canary client account; the onboarding change deploys with that repo's
+  next push. The canary client account for row 10 (a Member of BCR Kanarek only)
   was created on 29 September, and row 10's NIP was set to the canary's `9000000000`; the canary
   guest stays as the negative canary.
 

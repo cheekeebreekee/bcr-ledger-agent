@@ -25,7 +25,7 @@ ingestion sweeps on a timer (Teams channel uploads do not reach bots: drag-drop 
 Framework and `@mentions` carry no attachments, so the app is personal scope only). Guests
 have no capability in the ledger: onboarding still invites the client's contact as a guest,
 for the Team's files only. Clients find their files in their own Team, in the "Dokumenty
-księgowe" channel. (The code for this decision is in the working tree, not yet deployed.)
+księgowe" channel. (Live since 29 September 2026.)
 
 > **September 2026:** incident `IR-2026-09` found documents filed outside their client's
 > space. Phase 0 of v2 contains it; start with
