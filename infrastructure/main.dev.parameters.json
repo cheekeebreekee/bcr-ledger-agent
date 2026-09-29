@@ -32,9 +32,9 @@
     "ledgerIndexMode": { "value": "write" },
     "ledgerDbHost": { "value": "psql-bcr-dev-vyyintffz6ehq.postgres.database.azure.com" },
     "ledgerDbUser": { "value": "func-bcr-ingest-dev-vyyintffz6ehq" },
-    "searchMode": { "value": "off" },
-    "searchRows": { "value": "" },
-    "searchCallerAppIds": { "value": "" },
+    "searchMode": { "value": "on" },
+    "searchRows": { "value": "10" },
+    "searchCallerAppIds": { "value": "28157eb1-03f8-4e6b-bf70-d4b74ced3fc6" },
     "botGateMode": { "value": "enforce" },
     "botSearchMode": { "value": "off" },
     "logLevel": { "value": "debug" }
