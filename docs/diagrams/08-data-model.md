@@ -10,7 +10,7 @@ isolation and routing are shown.
 ```mermaid
 erDiagram
   clients ||--o| client_storage_targets : "one storage target"
-  clients ||--o{ client_users : "bound guests"
+  clients ||--o{ client_users : "bound client account"
   clients ||--o{ staff_assignments : "assigned accountants"
   staff_members ||--o{ staff_assignments : "holds"
   clients ||--o{ documents : "owns"
@@ -53,7 +53,7 @@ erDiagram
   }
   client_users {
     uuid client_id PK, FK "NOT NULL"
-    uuid user_oid PK "Guests only, never staff"
+    uuid user_oid PK "the client account only, never staff or a guest"
     text source "ONBOARDING, TEAM_SYNC, IMPORT"
     text status "ACTIVE, PENDING_APPROVAL, REVOKED"
     timestamptz last_seen_in_team_at "must be fresher than 1 h"
@@ -244,8 +244,13 @@ erDiagram
   - `notification_outbox` carries task ids only, and no client columns.
   - `audit_events` has `client_id` NULL for system events. Tenant roles may only insert rows for
     their own client, and only the humans-only `ledger_audit` role reads across clients.
-- **Staff are never client users (I9).** `client_users` holds Guests only. A trigger rejects the
-  same oid in `staff_members` and in an active `client_users` row, in both directions.
+- **Staff are never client users (I9).** A trigger rejects the same oid in `staff_members` and in
+  an active `client_users` row, in both directions. The plan had `client_users` hold Guests only.
+  Amended 29 September 2026: since the owner's decision of 28 September a client's identity is
+  its `{NIP}@bcr-group.pl` account, an Entra Member, and guests have no capability, so
+  `client_users` holds that client account and never a guest. Staff are Members too, so
+  `userType` no longer keeps them out; the trigger and the account's UPN (the client's NIP at the
+  client domain, as the Phase-0 `clientAccountVerdict` checks) do.
 - **Append-only:** `review_decisions`, `audit_events` and `learning.label`. `audit_events` is
   hash-chained per client.
 

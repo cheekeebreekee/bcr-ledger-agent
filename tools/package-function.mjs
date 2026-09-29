@@ -127,14 +127,17 @@ export function workspaceDir(name) {
 
 /**
  * What the vendored `@bcr/shared` must contain, for both apps: the Phase-0
- * config, and `searchMode` (the client search release), without which a bot
+ * config, `searchMode` (the client search release), without which a bot
  * or an ingestion built against an older `@bcr/shared` would ignore
- * `SEARCH_MODE`.
+ * `SEARCH_MODE`, and `clientAccountVerdict` (the client account rule of
+ * 28 Sep 2026), without which an ingestion would be built against a
+ * `@bcr/shared` that knows no refusal and no `{NIP}@` account.
  */
 export const SHARED_MARKERS = [
   ['config.js', 'botGateMode'],
   ['config.js', 'forbiddenTargetSitePaths'],
   ['config.js', 'searchMode'],
+  ['clientAccount.js', 'clientAccountVerdict'],
 ];
 
 /** Below this the archive cannot hold the dependencies. */

@@ -88,14 +88,24 @@ curl -X POST http://localhost:7071/api/ingest/batch \
   -d @/tmp/payload.json | jq .
 ```
 
-A user id that is on no row of your test Directory comes back as `quarantined`, with no result.
-That is the expected answer for an unbound uploader. To see a document filed, the test row must be
-bound (`RootFolder`, `DriveId` and `TeamId` set, `SitePath` exactly `/sites/<name>`, and
-`SiteHostname` equal to your local `QUARANTINE_SITE_HOSTNAME`); otherwise it is quarantined as
-`unbound_target` or `forbidden_target`. The uploader must also be a member of the row's Team and
-of no other Team, and your local credential (`az login`) must be able to read their `memberOf`;
-otherwise it is quarantined as `membership_mismatch` or `membership_unverified`. Do not set
-`MEMBERSHIP_CHECK_MODE=off` to get round it, even locally: test the check, not around it.
+Ingestion reads the uploader's account first (`userType`, `userPrincipalName`), before the
+Directory: a client is its `{NIP}@bcr-group.pl` account, and guests have no capability. A guest,
+a user of any other type, or a deleted one comes back `rejected` with `ClientAccountRequired`,
+and an account your local credential (`az login`) cannot read comes back `rejected` with
+`RetryLater`; nothing is stored for either, not even in the quarantine. A Member whose id is on
+no row of your test Directory comes back as `quarantined`, with no result: the expected answer
+for an unbound uploader. To see a document filed, the test row must be bound (`RootFolder`,
+`DriveId` and `TeamId` set, `SitePath` exactly `/sites/<name>`, and `SiteHostname` equal to your
+local `QUARANTINE_SITE_HOSTNAME`); otherwise it is quarantined as `unbound_target` or
+`forbidden_target`. The uploader must be the row's client account: a Member whose UPN is
+`<the row's 10-digit NIP>@bcr-group.pl` (otherwise `not_client_account`). The domain is a
+constant (`CLIENT_ACCOUNT_DOMAIN` in `@bcr/shared`), not a setting, so outside BCR's tenant a
+local run can show the refusals and the quarantine but never a filing; filing is tested with
+fakes (`clientResolver.test.ts`, `clientAccountRegression.test.ts`). The uploader must also be a
+member of the row's Team and of no other Team, and your local credential must be able to read
+their `memberOf`; otherwise it is quarantined as `membership_mismatch` or
+`membership_unverified`. Do not set `MEMBERSHIP_CHECK_MODE=off` to get round it, even locally:
+test the check, not around it (and it never skips the account rule).
 
 The channel-inbox timer is registered locally too, and with `INBOX_SWEEP_MODE=off` (the example
 setting) each tick returns at once. Do not set `shadow` or `enforce` against a real tenant from a
@@ -109,8 +119,8 @@ laptop: `enforce` moves files in client channels. The sweep is tested with fake 
 traces
 | where timestamp > ago(1h) and cloud_RoleName startswith "func-bcr-ingest"
 | extend m = parse_json(message), msg = tostring(parse_json(message).msg)
-| where msg in ("document.filed", "document.quarantined", "directory.conflict", "ingestion.caller.rejected", "membership.mismatch", "membership.unverified")
-| summarize count() by msg, reason = tostring(m.quarantineReason)
+| where msg in ("document.filed", "document.quarantined", "directory.conflict", "ingestion.caller.rejected", "membership.mismatch", "membership.unverified", "identity.refused", "identity.unverified", "client_account.mismatch", "batch.refused")
+| summarize count() by msg, reason = coalesce(tostring(m.quarantineReason), tostring(m.reason), tostring(m.accountCheck))
 ```
 
 ```kusto

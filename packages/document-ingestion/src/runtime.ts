@@ -5,7 +5,7 @@
  * setup.
  */
 import { createLedgerPool, LedgerDb } from '@bcr/ledger-db';
-import { createLogger } from '@bcr/shared';
+import { CLIENT_ACCOUNT_DOMAIN, createLogger } from '@bcr/shared';
 import {
   claudeConfigured,
   loadIngestionConfig,
@@ -24,7 +24,7 @@ import { AcceptancePolicy } from './services/acceptancePolicy';
 import { ClassificationService, FallbackClassifier } from './services/classificationService';
 import { ClaudeClassifier, classifierFingerprint } from './services/claudeClassifier';
 import { BatchIngestor } from './services/batchIngestor';
-import { UserTypeReader } from './services/userDirectory';
+import { UserAccountReader } from './services/userDirectory';
 import { ChannelInbox, MAX_INBOX_FILE_BYTES } from './services/channelInbox';
 import { INDEX_OFF, LedgerDocumentIndex, type DocumentIndex } from './services/documentIndex';
 import { TablePaidClassifications, TableShadowMemo } from './services/shadowMemo';
@@ -91,9 +91,23 @@ export const clientDirectory = new ClientDirectoryReader(graph, {
  */
 export const teamMembership = new TeamMembershipReader(graph);
 
+/**
+ * The uploader's account (`userType`, `userPrincipalName`), read from Entra
+ * on every request before the Directory (the same `Directory.Read.All`
+ * grant): a client is its `{NIP}@bcr-group.pl` Member account, and a guest
+ * is refused with nothing stored. The rule has no mode. Said once per cold
+ * start: the rule and the domain.
+ */
+export const userAccounts = new UserAccountReader(graph);
+createLogger('ingestion/runtime').info(
+  { event: 'identity.config', rule: 'nip-member', domain: CLIENT_ACCOUNT_DOMAIN },
+  'identity.config',
+);
+
 export const clientResolver = new ClientResolver(clientDirectory, {
   quarantineTarget,
   membership: membershipCheckFor(config.membershipCheckMode, teamMembership),
+  accounts: userAccounts,
 });
 
 /**
@@ -183,7 +197,7 @@ export const batchIngestor = new BatchIngestor({
  * guard refuses BCR GROUP and the quarantine. `INBOX_SWEEP_MODE` is said once
  * per cold start when it is not `off`, with the row allow-list and cutoff.
  *
- * Its user and Team readers are its own, with the Graph SDK's retries off
+ * Its account and Team readers are its own, with the Graph SDK's retries off
  * (as are its SharePoint calls): a tick must end well inside the timer's
  * 5-minute limit, and the SDK would sleep through `Retry-After` for minutes.
  * The upload path keeps its reader, cache and retries as they were.
@@ -205,7 +219,7 @@ export const channelInbox = new ChannelInbox({
   mode: config.inboxSweepMode,
   directory: clientDirectory,
   sharePointFactory: clientSharePointFactory,
-  users: new UserTypeReader(graph, { sdkRetries: false }),
+  accounts: new UserAccountReader(graph, { sdkRetries: false }),
   membership: new TeamMembershipReader(graph, { sdkRetries: false }),
   classification,
   minAgeMs: config.inboxMinAgeMs,
@@ -280,18 +294,17 @@ createLogger('ingestion/runtime').info(
  * index writes, Claude is configured, `SEARCH_CALLER_APP_IDS` is set and
  * shares no id with `BOT_CALLER_APP_IDS`, and the membership check enforces;
  * otherwise every search answers `disabled`, and nothing here stops
- * ingestion. The client is resolved by the uploads' own `clientResolver`.
- * Said once per cold start: on or off with the reason, the rows, the model
- * and the prompt's fingerprint; never a key.
- *
- * Its user-type reader is its own, with the Graph SDK's retries off (bounded
- * retries of ours): the guest waits in the chat, and the bot gives up after 20 s.
+ * ingestion. The client is resolved by the uploads' own `clientResolver`,
+ * which also confirms the client account (a guest, staff or any other
+ * account is `no_access`; an account or membership that could not be read is
+ * `unavailable`); search has no user reader of its own. Said once per cold
+ * start: on or off with the reason, the rows, the model and the prompt's
+ * fingerprint; never a key.
  */
 const searchOff = searchOffReason(config);
 export const clientSearch = new ClientSearchService({
   ...(searchOff ? { offReason: searchOff } : {}),
   resolver: clientResolver,
-  userTypes: new UserTypeReader(graph, { sdkRetries: false }),
   ...(ledgerDb && !searchOff ? { db: ledgerDb } : {}),
   ...(claudeOn && !searchOff
     ? { interpreter: new SearchInterpreter({ apiKey: config.anthropicApiKey }) }

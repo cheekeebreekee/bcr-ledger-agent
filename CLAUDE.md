@@ -12,21 +12,30 @@ applies to all of them; everything else is specific to this repo.
 
 A document intake for BCR's clients in Microsoft Teams. Each file is classified by reading its
 **content** with Claude and filed into the right folder of the right client's SharePoint Online
-site — all via Azure Functions + Microsoft Graph. There are **two intakes**:
+site — all via Azure Functions + Microsoft Graph.
 
-- **The channel inbox (clients).** Clients are Teams guests, and Teams lets a guest attach files
-  only to channel posts, never in a chat with the bot. So a client posts the file in their Team's
-  **"Dokumenty księgowe"** channel (a post with an attachment, or the „Udostępnione” tab), which
-  stores it in the channel folder, and a timer in ingestion files it into the taxonomy folder
-  **inside that same channel folder**.
-- **The bot's 1:1 DM (whoever can attach there).** The bot receives attachments, and ingestion
-  files them the same way.
+Clients sign in to Teams with their `{NIP}@bcr-group.pl` account (an Entra Member, licensed,
+created by BCR at onboarding, in its own client Team only; owner's decision, 28 September 2026).
+A client posts a file in their Team's "Dokumenty księgowe" channel, or sends it in the bot's 1:1
+chat, and both intakes file it into the taxonomy folder inside that channel folder. **Guests have
+no capability in the ledger**: onboarding still invites the client's contact as a guest, for Team
+access only, and every intake refuses them. There are **two intakes**:
+
+- **The channel inbox.** A client posts the file in their Team's **"Dokumenty księgowe"** channel
+  (a post with an attachment, or the „Udostępnione” tab), which stores it in the channel folder,
+  and a timer in ingestion files it into the taxonomy folder **inside that same channel folder**.
+- **The bot's 1:1 DM.** The client's account attaches files there; the bot receives them, and
+  ingestion files them the same way.
 
 Every document filed into a client's space also gets a row in the **document index**, a
 PostgreSQL database whose row-level security keeps each client's rows to that client
-(`packages/ledger-db`; billing reads it later). A client's guest can **search** their own
-client's rows by asking in the bot's 1:1 chat ([Client search](#client-search-post-apisearch);
+(`packages/ledger-db`; billing reads it later). A client's `{NIP}@` account can **search** their
+own client's rows by asking in the bot's 1:1 chat ([Client search](#client-search-post-apisearch);
 off until its release).
+
+> The code for this decision (the client-account rule) is in the working tree, uncommitted and
+> not deployed as of 29 September 2026; the running build still serves guests, and rows 2 and 10
+> are not yet re-bound. The rest of this file describes the code as it now stands.
 
 UI strings are **Polish**; code, comments and logs are English.
 
@@ -158,8 +167,10 @@ output: never commit one, and deploy only a zip built for that deploy. Before de
 check the vendored copy: `unzip -p artifacts/<pkg>.zip node_modules/@bcr/shared/dist/config.js |
 grep -c botGateMode` (both apps also `searchMode`; ingestion also `forbiddenTargetSitePaths`,
 `membershipCheckMode`, `inboxSweepMode`, `inboxSweepRows`, `classificationAcceptThreshold` and
-`ledgerIndexMode`) must be greater than 0. The script itself refuses a `@bcr/shared` without
-`botGateMode`, `forbiddenTargetSitePaths` or `searchMode` (`SHARED_MARKERS`).
+`ledgerIndexMode`) must be greater than 0, and so must `unzip -p artifacts/<pkg>.zip
+node_modules/@bcr/shared/dist/clientAccount.js | grep -c clientAccountVerdict`. The script itself
+refuses a `@bcr/shared` without `botGateMode`, `forbiddenTargetSitePaths`, `searchMode` or
+`clientAccountVerdict` (`SHARED_MARKERS`).
 
 CI (`.github/workflows/ci.yml`) runs lint → type-check → build → test (and `test:tools`), the
 `db-integration` job (`test:db` against a `postgres:16` service container), plus `bicep build`,
@@ -203,14 +214,23 @@ others are `POST /api/search`, below, and `GET /api/health`);
 2. **Validate** — `functions/validation.ts` (zod): only `conversationType: 'personal'`, a GUID
    `userAadObjectId`, and the BCR tenant are accepted; filename has no path separators, base64
    shape, ≤25 docs per batch, ≤100 MiB decoded.
-3. **Resolve the client** — `services/clientResolver.ts#resolve()` maps `source.userAadObjectId` to
-   exactly one bound Client Directory row, then (`MEMBERSHIP_CHECK_MODE=enforce`, the default)
-   reads the uploader's Teams from Entra via `services/teamMembership.ts` and routes only if they
-   are exactly `{row.teamId}`. Otherwise it returns the **staff-only quarantine** with a reason:
-   `unmapped`, `staff`, `conflict`, `stale_directory`, `forbidden_target`, `unbound_target` (the
-   row lacks `RootFolder`, `DriveId` or `TeamId`), `membership_mismatch` (the Teams read differ
-   from the row's) or `membership_unverified` (they could not be read). The upload step adds
-   `target_unwritable`. Quarantined documents are never classified.
+3. **Resolve the client** — `services/clientResolver.ts#resolve()` first reads the uploader's
+   account (`userType`, `userPrincipalName`; `services/userDirectory.ts`, `UserAccountReader`). A
+   Guest, a non-Member, a deleted user or an unreadable account is **refused**
+   (`identity.refused`; `RefusalReason` `guest`, `not_member`, `unknown_user`, `no_identity`,
+   `identity_unverified`): the batch is `rejected` (`ClientAccountRequired`, or `RetryLater` when
+   unreadable) before anything is decoded, nothing is stored, classified or indexed, and it is
+   never a quarantine reason. A Member is then mapped by `source.userAadObjectId` to exactly one
+   bound Client Directory row, confirmed as that row's client account (`clientAccountVerdict`:
+   UPN = `{row NIP}@bcr-group.pl`), and (`MEMBERSHIP_CHECK_MODE=enforce`, the default) routed only
+   if their Teams, read from Entra via `services/teamMembership.ts`, are exactly `{row.teamId}`.
+   Otherwise it returns the **staff-only quarantine** with a reason: `unmapped`, `staff`,
+   `conflict`, `stale_directory`, `forbidden_target`, `unbound_target` (the row lacks
+   `RootFolder`, `DriveId` or `TeamId`), `not_client_account` (a Member bound on the row who is
+   not its `{NIP}@` account, or a row without a valid 10-digit NIP; checked before the Teams
+   read), `membership_mismatch` (the Teams read differ from the row's) or `membership_unverified`
+   (they could not be read). The upload step adds `target_unwritable`. Quarantined documents are
+   never classified.
 4. **Classify** — `services/classificationService.ts` takes the first classifier with an answer
    from `ClaudeClassifier → FallbackClassifier` (Claude only if `ANTHROPIC_ENABLED` + key) and
    passes it through `services/acceptancePolicy.ts`, which decides the folder. `ClaudeClassifier`
@@ -282,10 +302,12 @@ writes nothing) | `enforce` (moves); `/api/health` shows it as `build.inboxSweep
    `parentReference` is not this folder in this drive dropped. `selectCandidates()`: a file,
    `0 < size ≤ 100 MiB`, not `~$`/`.`, with an `eTag`, created after `INBOX_CREATED_AFTER` if
    set, older than `INBOX_MIN_AGE_MS`, with `createdBy.user.id`.
-4. **Uploader** — the creator **and** the last modifier (`lastModifiedBy`) are each `userType`
-   `Guest` (`services/userDirectory.ts`) **and** a member of this row's Team
-   (`TeamMembershipReader.teamsOf`, cached). Anything else is left untouched (`not_guest`,
-   `not_in_team`, `modified_by_other`, …); an unreadable user is `unverified` and waits.
+4. **Uploader** — the creator is the row's client account (an id the snapshot routes to this
+   row, `Member`, UPN `{row NIP}@bcr-group.pl`, Teams exactly the row's;
+   `services/userDirectory.ts` `accountOf`, `TeamMembershipReader.teamsOf`, both cached) and the
+   last modifier (`lastModifiedBy`) is the same id, never read. Anything else is left untouched:
+   `guest`, `not_member`, `unknown_user`, `not_bound`, `not_client_account`, `not_in_team`,
+   `other_teams`, `modified_by_other`; an unreadable user is `unverified` and waits.
 5. **Classify** — only with 120 s left before the tick's 270 s limit, and only after
    `checkInboxItem()` re-reads the item: still a direct child at the **listed `eTag`**. Same
    `ClassificationService` (direction from this row's identity, then the acceptance policy),
@@ -352,16 +374,16 @@ hence a staff-only chat. Off unless the index writes and the URL resolved
 
 ### Client search (`POST /api/search`)
 
-A client's guest asks in the bot's 1:1 chat ("faktury od X z września") and gets their own
-client's filed documents from the index, 10 to a card. Off until the *Client search release*
-(`docs/operations/human-steps.md`): `SEARCH_MODE` on both apps; on ingestion also `SEARCH_ROWS`
-(list item ids, canary first; `/api/health` `build.search`: `off`|`listed`|`all`) and
-`SEARCH_CALLER_APP_IDS`. The contract is `@bcr/shared` `types/search.ts`: strict zod, so a body
+The client's `{NIP}@` account asks in the bot's 1:1 chat ("faktury od X z września") and gets
+their own client's filed documents from the index, 10 to a card. Off until the *Client search
+release* (`docs/operations/human-steps.md`): `SEARCH_MODE` on both apps; on ingestion also
+`SEARCH_ROWS` (list item ids, canary first; `/api/health` `build.search`: `off`|`listed`|`all`)
+and `SEARCH_CALLER_APP_IDS`. The contract is `@bcr/shared` `types/search.ts`: strict zod, so a body
 naming a client, row, scope or limit is a 400.
 
 - **Bot.** Attachments take the upload path unchanged. With `SEARCH_MODE=on`, text (normalised,
   1–300 characters; `pomoc`/`help`/`?`/`menu` get `buildHelpCard({ search: true })`; 20 a minute per
-  guest per worker, `services/userLimiter.ts`) and the card's own `activity.value`
+  user per worker, `services/userLimiter.ts`) and the card's own `activity.value`
   (`bcr.search.page`, `bcr.search.filter`: a filter and a cursor, nothing else) go to
   `services/searchClient.ts`. It POSTs `{ source, query }` with a token of the bot Function App's
   **managed identity** (`ManagedIdentityCredential`, `INGESTION_SCOPE`), never the bot secret,
@@ -372,9 +394,11 @@ naming a client, row, scope or limit is a 400.
   (`Documents.Search`, app id in `SEARCH_CALLER_APP_IDS`), then the body. Search answers
   `disabled` while it cannot run safely (mode off, index or Claude off, no caller, a caller also
   in `BOT_CALLER_APP_IDS`, `MEMBERSHIP_CHECK_MODE` not `enforce`), with a `search.config` reason
-  at cold start; it never stops ingestion. Then the uploads' `ClientResolver` singleton, then
-  `userTypeOf` must be `Guest`: anything else is `no_access`, with no DB read and no model call.
-  A resolved row not in `SEARCH_ROWS` is `disabled`. Scope = `clientIdForDirectoryRow`. tx1:
+  at cold start; it never stops ingestion. Then the uploads' `ClientResolver` singleton, which
+  also confirms the client account: a refusal or a quarantine is `no_access`, an unverified
+  account or membership (`identity_unverified`, `membership_unverified`) is `unavailable`, with
+  no DB read and no model call; search has no user reader of its own. A resolved row not in
+  `SEARCH_ROWS` is `disabled`. Scope = `clientIdForDirectoryRow`. tx1:
   `clientsRepo.upsertFromDirectory` + `searchQueriesRepo.reserve` (the durable limits). For a
   question only: `services/searchInterpreter.ts` (`SEARCH_MODEL = 'claude-sonnet-5'`, a static
   cached prompt built from `categoryCatalog[].searchTerms`, a closed output schema; never throws;
@@ -383,9 +407,10 @@ naming a client, row, scope or limit is a 400.
   `documentsRepo.searchClientView` + `countMatching` (capped at 500). tx3,
   `searchQueriesRepo.finish`, is best effort. `services/searchResult.ts` maps rows to
   `SearchResultItem`; a link survives only if it is https on the row's own site.
-- **Limits**: per guest, questions 10 per 5 minutes and 60 per 24 hours, typed and page requests
-  30 per 5 minutes; per client, 300 questions per 24 hours (all in `search_queries`, under a
-  per-client advisory lock); per worker, 2 concurrent searches and 300 model calls an hour.
+- **Limits**: per user (the client account), questions 10 per 5 minutes and 60 per 24 hours,
+  typed and page requests 30 per 5 minutes; per client, 300 questions per 24 hours (all in
+  `search_queries`, under a per-client advisory lock); per worker, 2 concurrent searches and 300
+  model calls an hour.
 - **Records**: `search.*` logs and `search_queries` carry ids, codes, the filter's SHA-256 and
   field names, counts and tokens; never the question, never a filter value. `search_queries` is
   kept 13 months, deleted by the operator (the runbook); `ledger_app` cannot delete.
@@ -394,23 +419,45 @@ naming a client, row, scope or limit is a 400.
 
 ### Invariants — break these and documents mis-file
 
+- **A client is its `{NIP}@bcr-group.pl` account; guests have no capability.** The client
+  account of a Directory row is the one id bound on it (`UserAadObjectIds`, written only by
+  `tools/directory-bindings.mjs`) whose Entra `userType` is `Member`, whose
+  `userPrincipalName` is `<the row's 10-digit NIP>@bcr-group.pl` (`clientAccountVerdict`,
+  `CLIENT_ACCOUNT_DOMAIN` in `@bcr/shared`), and whose Teams are exactly the row's `TeamId`.
+  The row is chosen by object id (bot, search) or by the file's location (inbox), never by a
+  NIP or a UPN: the rule only confirms the row. A Guest (bound or not, of any Team) is refused
+  on every path before anything is stored, classified, indexed or searched. It is never
+  quarantined. A Member who is not the row's account is quarantined on the bot path
+  (`not_client_account`), left untouched in the inbox, and `no_access` in search. The rule has
+  no mode: `MEMBERSHIP_CHECK_MODE=off` never skips it. The runtime and the binding tool test
+  one case table (`tools/test/client-account-cases.json`); change both or neither.
+- **Nothing in this repo acts on whether an account may sign in, or changes it.** The runtime
+  never selects `accountEnabled` and never requires a licence. No tool writes to `/users/*`
+  (the tools' tests assert GET only); the binding tool reports a disabled client account
+  (`client_account_disabled`, `check` exits 5) and keeps it bound. Never block, disable,
+  unlicense or convert a `{NIP}@` account: T-1 did exactly that on 26 September 2026 on the
+  wrong premise that they were shared mailboxes nobody signs in with, and locked three clients
+  out of Teams until Roman re-enabled them on 28 September at 17:33–17:34Z. `BCROnboarding@` stays
+  enabled (Roman reads it), and `AuthoriseMe@` is not changed in any way.
 - **On the bot path, routing is decided ONLY from the authenticated uploader identity.** Document
   content — parties, NIPs, model output, the filename — can never select or change the client. The
   old phase 2 that "promoted" unrouted uploads to whichever client's NIP was in the document filed
   one client's papers into another client's Team and was steerable by prompt injection; it is
-  deleted, and `clientResolver.test.ts` fails if a NIP lookup or promotion comes back. Anything
-  that can't be tied to exactly one client goes to the staff-only quarantine — never BCR GROUP,
-  never a guess.
+  deleted, and `clientResolver.test.ts` fails if a NIP lookup, a lookup keyed by the UPN or
+  promotion comes back. A Member's upload that can't be tied to exactly one client goes to the
+  staff-only quarantine — never BCR GROUP, never a guess; a guest's is refused and stored
+  nowhere.
 - **In the channel inbox, the client is the file's location, never its uploader or content.** The
   client is the one bound row whose `DriveId` + `RootFolder` (the channel folder) hold the file.
   Nothing in the file, its name or the model's output picks another row, and the sweep never
   reads a row other than the one it is sweeping.
-- **The channel inbox processes only this Team's guests' uploads.** A file is touched only when its
-  creator **and** its last modifier are each `userType` `Guest` **and** a member of the row's
-  Team. Staff, members, guests of other Teams, a guest's file that staff replaced (`createdBy`
-  survives a replace; `lastModifiedBy` does not), files with no user creator, and users that
-  cannot be read are left exactly where they are (fail closed). A guest who is also in other
-  Teams is fine here: the file is already in this client's space.
+- **The channel inbox processes only the row's client account's uploads.** A file is touched
+  only when its creator is the row's client account and its last modifier is that same id.
+  Guests (of this Team or any other), staff, other clients' accounts, a client's file that
+  someone else replaced (`createdBy` survives a replace; `lastModifiedBy` does not), files with
+  no user creator, and users that cannot be read are left exactly where they are (fail
+  closed). A client account that is also in another Team waits (`other_teams`) like any
+  membership anomaly. A row with no valid NIP or no bound account sweeps nothing.
 - **Inbox moves stay inside the channel folder, by id, only on the version listed, and never
   overwrite.** Only the channel folder's direct children are candidates (never recurse —
   subfolders are the filed area); before the download and again before the move the item must
@@ -468,20 +515,23 @@ naming a client, row, scope or limit is a 400.
   both or neither. `QUARANTINE_SITE_PATH` and `FORBIDDEN_TARGET_SITE_PATHS` must pass it at cold
   start.
 - **Routing requires the uploader's Teams to be exactly `{row.TeamId}`, read at upload time.**
-  A guest bound to client A and later added to client B's Team (B's onboarding re-invited the
-  same email) used to keep routing B's documents into A (R46). `ClientResolver.resolve` now reads
-  the uploader's direct memberships (`GET /users/{id}/memberOf`, as the ingestion managed identity
-  with `Directory.Read.All`) and routes only when the Teams among them — by the binding tool's
+  A client account bound to client A and later added to client B's Team would keep routing B's
+  documents into A (R46, first found with a guest whom B's onboarding re-invited by the same
+  email). `ClientResolver.resolve` reads the uploader's direct memberships
+  (`GET /users/{id}/memberOf`, as the ingestion managed identity with `Directory.Read.All`) and
+  routes only when the Teams among them — by the binding tool's
   rule in `teamIdsIn`, kept identical by a test — are exactly the row's `TeamId`
   (case-insensitive); anything else is `membership_mismatch`, a failed read is
   `membership_unverified`. Fail closed: never route on a read that failed, never cache a
   failure (successes are cached 5 min per user), and keep the check in the resolver, not beside
-  it. Staff and already-quarantined uploads are not read. `MEMBERSHIP_CHECK_MODE=off` is an
-  emergency escape that reopens R46; it warns at cold start and shows in `/api/health`
-  (`build.membershipCheck`). Keep `build.phase: 'p0'` and `build.routing: 'identity-only'`
-  exactly: the operator tools gate on them. The binding tool's whole-plan apply after every
-  onboarding and weekly `check` stay as defence in depth; still never build a flow that binds
-  only the new row.
+  it. Staff, refused and already-quarantined uploads are not read. `MEMBERSHIP_CHECK_MODE=off`
+  is an emergency escape that reopens R46 (it never skips the client-account rule); it warns at
+  cold start and shows in `/api/health` (`build.membershipCheck`). Keep `build.phase: 'p0'` and
+  `build.routing: 'identity-only'` exactly: the operator tools gate on them;
+  `build.clientIdentity: 'nip-member'` says the account rule is in this build (operators check
+  it after a deploy; the binding tool does not require it). The binding tool's whole-plan apply
+  after every onboarding and weekly `check` stay as defence in depth; still never build a flow
+  that binds only the new row.
 - **Nothing is written into BCR GROUP or the quarantine site as a client target, whatever a row
   says.** The path checks compare spellings; `SharePointService` also compares the *resolved*
   site-collection id with BCR GROUP's (from `CLIENT_DIRECTORY_SITE_ID`) and the quarantine site's
@@ -504,7 +554,8 @@ naming a client, row, scope or limit is a 400.
 - **Responses and logs carry ids, not client data.** A quarantined row has no link, folder or name;
   the result card shows the taxonomy label, never the model's reasoning; logs carry `documentId`,
   `clientId`, `listItemId`, `teamId`, `driveItemId` — file names, titles, NIPs and SharePoint
-  locations are redacted by the root logger (`shared/src/logger.ts`). Filing lines
+  locations are redacted by the root logger (`shared/src/logger.ts`), and so is a user's UPN
+  (`userPrincipalName`, `upn`: a client account's carries its NIP). Filing lines
   (`document.filed`, `inbox.filed|sorted_to_review|would_move`) add codes from
   `decisionLogFields()`: `category`, `suggestedCategory` (review), `confidence` (2 decimals),
   `classifier`, `model`, `month`, `reviewReasons`, and `folder` — the **taxonomy** path only,
@@ -531,8 +582,9 @@ naming a client, row, scope or limit is a 400.
   model.
 - **Search's client comes only from the asker's identity.** `ClientSearchService`'s one scope
   source is `clientIdForDirectoryRow(CLIENT_DIRECTORY_LIST_ID, row.listItemId)` of the row the
-  uploads' `ClientResolver` resolved for the gate-checked user id, after `userTypeOf` said
-  `Guest`; any other outcome is `no_access` before any read or model call, and search does not
+  uploads' `ClientResolver` resolved for the gate-checked user id, after the resolver confirmed
+  it is that row's client account; a refusal or quarantine is `no_access`, an unverified
+  identity or membership `unavailable`, both before any read or model call, and search does not
   run while `MEMBERSHIP_CHECK_MODE` is off. The question, the model's output, a cursor or a card's
   data never reach the resolver (it runs first) and never carry a scope: it is derived again for
   every page. Reads are `readOnly` transactions of the client-view columns only. A property test
@@ -563,7 +615,7 @@ naming a client, row, scope or limit is a 400.
   writes, so it is only as good as the token behind the body. `createBotFrameworkAuth`
   (`bot/channelAuth.ts`) refuses every issuer but `https://api.botframework.com`; the SDK's
   default also took an "emulator" AAD token the bot secret alone can mint, and then replied to
-  any `serviceUrl`, which let the secret act as any guest. Never build the adapter's
+  any `serviceUrl`, which let the secret act as any client account. Never build the adapter's
   authentication another way, and keep `channelAuth.test.ts` proving the SDK default still
   accepts what ours refuses.
 
@@ -575,10 +627,13 @@ All attachments from one activity are downloaded in parallel and sent as **one b
 gets a single consolidated result card. A per-file download or ingest failure becomes a `rejected`
 row in that card rather than an aborted turn. The gate (`BOT_GATE_MODE=log|enforce`) runs for every
 activity type before the turn logic; the card escapes every inserted value and renders Polish text by
-error code, never raw error messages. The help card (`buildHelpCard`) sends clients to their Team's
-„Dokumenty księgowe” channel, because guests cannot attach files in the chat; with `SEARCH_MODE=on`
-it adds a „Wyszukiwanie” section, and with it off it is byte for byte the card from before
-search (a test pins its hash). Text goes to client search only with `SEARCH_MODE=on`.
+error code, never raw error messages. The help card (`buildHelpCard`) offers the 1:1 chat first
+(the client's `{NIP}@` account can attach there), the channel second, and says the assistant works
+only on the `{NIP}@` account; with `SEARCH_MODE=on` it adds „Wyszukiwanie”, with it off it is
+byte for byte the pinned post-decision card (a test pins its hash). The bot makes no user or role
+lookup of its own: it forwards every admitted upload, and ingestion alone refuses anyone but the
+row's client account (`ClientAccountRequired` rows, nothing stored). Text goes to client search
+only with `SEARCH_MODE=on`.
 
 ---
 
@@ -646,7 +701,7 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
 
 ## Azure / SharePoint facts that bite
 
-`PROJECT_OVERVIEW.md` → *Lessons learned* has the full list (24 items). The ones that affect code:
+`PROJECT_OVERVIEW.md` → *Lessons learned* has the full list (25 items). The ones that affect code:
 
 - **SharePoint drive names are locale-dependent** — Polish tenants use `Dokumenty`, not `Documents`.
   Always resolve via `GET /sites/{id}/drives`; per-client names come from the Directory's `DriveName`
@@ -656,11 +711,13 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
   per-site grants take ~5 min to propagate. Every grant names the MI's app id (`INGEST_MI_APPID`);
   a grant to the API app registration does nothing. See `docs/setup-guide.md` §5 and
   `infrastructure/quarantine/README.md` (the old `grant-sharepoint-permission.sh` is deleted).
-  The membership check also needs Graph `Directory.Read.All` on that identity, granted only by
+  The membership check and the account read (`userType`, `userPrincipalName`) also need Graph
+  `Directory.Read.All` on that identity, granted only by
   `infrastructure/identity/grant-ingestion-membership-read.sh` (dry run by default; Graph calls
   use a delegated `GRAPH_TOKEN`, since the CLI's token hits `AADSTS65002` here). A managed
   identity's token carries its roles and the platform caches it ~24 h with no forced refresh,
-  so grant a day before the deploy; until then bound uploads are `membership_unverified`.
+  so grant a day before the deploy; until then every bot upload is refused `RetryLater`
+  (`identity_unverified`) and every channel post waits (`unverified`).
 - **Client search's caller is the bot Function App's own managed identity**, with the app role
   `Documents.Search` on the Ingestion API registration, which
   `infrastructure/identity/grant-bot-search-caller.sh` creates (Applications only, a fixed id)
@@ -711,8 +768,8 @@ and Playwright (`test:e2e`), `typecheck` rather than `type-check`.
 | `docs/admin-sharepoint-grant.md` | `Sites.Selected` via Graph Explorer |
 | `docs/security.md` | Threat model + secrets inventory; T21 client search |
 | `docs/operations/human-steps.md` | Ordered Phase-0 rollout: who runs what, verification, rollback; "Lifting gate G1"; the *Classification release* runbook (evaluate, deploy, switch the model, go/no-go); the *Document index release* runbook (cost, db.bicep, the login, migrations, settings, canary, rollback); the *Classifier cost release* (caching, excerpts, `ANTHROPIC_EFFORT`/`ANTHROPIC_THINKING`, the Sonnet 5 test on the canary); the *Client search release* (the grant a day ahead, migration 0003 before the ingestion build, both apps off then on, the canary on row 10, the owner's go per client, the 13-month `search_queries` retention) |
-| `docs/operations/incident-2026-09.md` | The cross-client routing incident: causes, IR-0..IR-3, status |
-| `docs/operations/tenant-hardening.md` | Tenant settings that keep clients apart (BCR GROUP stays Private, read-only check) |
+| `docs/operations/incident-2026-09.md` | The cross-client routing incident: causes, IR-0..IR-3, status; the client lockout of 26–28 September (T-1 reversed) |
+| `docs/operations/tenant-hardening.md` | Tenant settings that keep clients apart (BCR GROUP stays Private, read-only check); T-1 and T-2 withdrawn (never block, convert or unlicense a `{NIP}@` account), T-7 a read-only record |
 | `docs/diagrams/` | Mermaid: as-is, Phase-0 routing, target business logic/architecture/data flow, sequences, data model |
 | `packages/ledger-db/README.md` | The document index: RLS model, commands, how to add a migration |
 | `tools/README.md` | Operator tools (directory bindings, IR-0/IR-1): dry-run by default, `--apply` to write |

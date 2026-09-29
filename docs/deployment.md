@@ -220,8 +220,13 @@ curl https://func-bcr-ingest-<env>-XXXX.azurewebsites.net/api/health
 curl -i https://func-bcr-bot-<env>-XXXX.azurewebsites.net/api/messages
 ```
 
-Then, as a test guest bound to a test client, send a synthetic PDF to the bot in a 1:1 chat.
-The card shows the document, its category (**Kategoria**) and the folder, with an "Otwórz"
-link into that client's space. An uploader who is not bound to a client instead gets "Dokument
-przekazano do weryfikacji przez zespół BCR.", with no link. Never smoke-test with a real client
-document.
+`/api/health` must report `build.phase` `p0` and `build.routing` `identity-only`, and a build
+with the client-account rule also `build.clientIdentity` `nip-member`.
+
+Then, as a test client's account (an Entra Member whose UPN is the test row's
+`<NIP>@bcr-group.pl`, bound to that row by `tools/directory-bindings.mjs`, in the test Team
+only), send a synthetic PDF to the bot in a 1:1 chat. The card shows the document, its category
+(**Kategoria**) and the folder, with an "Otwórz" link into that client's space. A Member who is
+not that row's client account instead gets "Dokument przekazano do weryfikacji przez zespół
+BCR.", with no link. A guest gets "Tego pliku nie mogę przyjąć z tego konta. …", and nothing is
+stored: guests have no capability in the ledger. Never smoke-test with a real client document.

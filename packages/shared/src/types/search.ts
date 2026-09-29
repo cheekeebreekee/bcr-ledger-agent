@@ -7,10 +7,11 @@ import { categoryCatalog, type DocumentCategory } from '../parsers/folderTaxonom
  * release", CLAUDE.md "Client search").
  *
  * The asker is `source.userAadObjectId`, the Bot-Framework-authenticated
- * guest the bot's gate passed; ingestion resolves their client exactly as it
- * routes their uploads. Nothing in a request can name a client, a scope, a
- * row, a limit or a column: every schema here is `.strict()`, so such a key is
- * a 400, never ignored.
+ * user the bot's gate passed; ingestion resolves their client exactly as it
+ * routes their uploads, and only a row's `{NIP}@bcr-group.pl` client account
+ * may search. Nothing in a request can name a client, a scope, a row, a limit
+ * or a column: every schema here is `.strict()`, so such a key is a 400,
+ * never ignored.
  */
 
 /** Results per page. */
@@ -92,7 +93,7 @@ export const searchRequestSchema = z
   .object({
     source: searchSourceSchema,
     query: z.discriminatedUnion('kind', [
-      /** A question in the guest's words: the model turns it into a filter. */
+      /** A question in the client's words: the model turns it into a filter. */
       z
         .object({
           kind: z.literal('question'),
@@ -168,7 +169,7 @@ export type SearchResponsePayload =
   | { readonly status: 'help' }
   /** The question could not become a filter (`unclear`), or asks what search does not do. */
   | { readonly status: 'not_understood'; readonly reason: 'unclear' | 'unsupported' }
-  /** The asker is not a guest bound to exactly one client. One answer for every reason. */
+  /** The asker is not the client account of exactly one client. One answer for every reason. */
   | { readonly status: 'no_access' }
   | { readonly status: 'rate_limited'; readonly retryAfterSeconds: number }
   /** The model or the index cannot answer now; the typed form may still work. */

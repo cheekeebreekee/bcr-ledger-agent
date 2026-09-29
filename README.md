@@ -6,19 +6,26 @@ and uploads it to the correct folder in the user's client's SharePoint Online
 space — all hosted on Microsoft Azure and written in Node.js + TypeScript.
 
 > Example  
-> A client's contact person sends the bot a KSeF purchase invoice in a 1:1 chat.  
+> A client, signed in with its `{NIP}@bcr-group.pl` account, sends the bot a KSeF purchase
+> invoice in a 1:1 chat.  
 > The bot replies with an adaptive card: the document, its category, and the folder
 > `01_Faktury/02_Faktury_zakupu/2026/02/` in that client's "Dokumenty księgowe" channel.
 
 **One deployment serves many clients.** Which client a document belongs to is decided
 per upload from **the uploader's identity only**, looked up in a *Client Directory*
-SharePoint list. The document's content chooses the folder, never the client. An
-uploader who cannot be tied to exactly one client goes to a staff-only quarantine. See
+SharePoint list. The document's content chooses the folder, never the client. A Member
+who cannot be tied to exactly one client goes to a staff-only quarantine; a guest is
+refused, with nothing stored. See
 [`docs/client-directory-admin-guide.md`](./docs/client-directory-admin-guide.md).
 
-**Users interact in a 1:1 chat.** Teams channel uploads do not reach bots (drag-drop
-bypasses Bot Framework; `@mentions` carry no attachments), so the app is personal scope
-only. Clients find their files in their own Team, in the "Dokumenty księgowe" channel.
+**A client is its `{NIP}@bcr-group.pl` account** (owner's decision, 28 September 2026): an
+Entra Member that BCR creates at onboarding and hands to the client. It sends documents in a
+1:1 chat with the bot, or posts them in its Team's "Dokumenty księgowe" channel, which
+ingestion sweeps on a timer (Teams channel uploads do not reach bots: drag-drop bypasses Bot
+Framework and `@mentions` carry no attachments, so the app is personal scope only). Guests
+have no capability in the ledger: onboarding still invites the client's contact as a guest,
+for the Team's files only. Clients find their files in their own Team, in the "Dokumenty
+księgowe" channel. (The code for this decision is in the working tree, not yet deployed.)
 
 > **September 2026:** incident `IR-2026-09` found documents filed outside their client's
 > space. Phase 0 of v2 contains it; start with
@@ -137,8 +144,8 @@ tokens (`bot/channelAuth.ts`), and the Emulator's token is refused before any tu
    caller's app id is the bot's (`BOT_CALLER_APP_IDS`).
 3. **Ingestion Function → Microsoft Graph** uses the Function App's **system-assigned managed
    identity** with `Sites.Selected`. There is a per-site grant on every client site it files
-   into, so it can write to all of them by design. Routing by identity only is what keeps
-   clients apart.
+   into, so it can write to all of them by design. Routing by identity only, and filing only
+   for a row's own `{NIP}@` client account, is what keeps clients apart.
 4. **Secrets** live in **Key Vault** and are referenced from Function App settings
    (`@Microsoft.KeyVault(SecretUri=...)`), never in source.
 5. Uploads are logged to **Application Insights** as ids and codes (`document.filed`,

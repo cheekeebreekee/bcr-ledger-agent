@@ -1,12 +1,22 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { describe, test } from 'node:test';
 
 import {
+  CLIENT_ACCOUNT_DOMAIN,
+  DRIFT_UNASSESSED_CODES,
+  GUARD_FIELDS,
+  PLAN_VERSION,
+  ROUTING_DRIFT_CODES,
   assessRow,
   buildPlan,
   changedSinceApply,
   checkVerdict,
-  classifyTeamPeople,
+  classifyClientAccount,
+  clientAccountNipOf,
+  clientAccountUpn,
+  clientAccountVerdict,
+  clientNipsOf,
   diffBinding,
   evaluateWriteGrant,
   findDuplicates,
@@ -16,10 +26,13 @@ import {
   healthExpectations,
   healthSatisfies,
   idsRollbackAdds,
+  idsRollbackRemoves,
   isBoundRow,
+  isClientDomain,
   isSiteCollectionPath,
   isTeamGroup,
   mapSitesToTeams,
+  nipChecksumOk,
   normalizeSitePath,
   parseDirectoryRow,
   pickAccountingChannel,
@@ -43,10 +56,19 @@ const GUEST_A = g('b001');
 const GUEST_2 = g('b002');
 const STAFF = g('c001');
 const OWNER = g('c002');
+const CLIENT_A = g('c0a1');
+const CLIENT_B = g('c0a2');
 const INGEST = g('e1');
 const DRIVE_A = 'b!fakeDriveA';
 const ROOT_A = 'ROOT-A';
 const CHANNEL = 'Dokumenty księgowe';
+/** The fixtures' client-account domain; the tool's default is CLIENT_ACCOUNT_DOMAIN. */
+const DOMAIN = 'contoso.example';
+const UPN_A = `0000000001@${DOMAIN}`;
+const UPN_B = `0000000002@${DOMAIN}`;
+
+/** The one case table the runtime (`@bcr/shared` clientAccount.test.ts) tests too. */
+const CASES = JSON.parse(readFileSync(new URL('./client-account-cases.json', import.meta.url), 'utf8'));
 
 function item(id, fields) {
   return {
@@ -85,6 +107,11 @@ const plainTeam = (id, displayName) => ({ id, displayName, description: '', reso
 /** A group that is not a Team (a security group, a plain M365 group). */
 const plainGroup = (id) => ({ id, displayName: 'unrelated', description: 'unrelated', resourceProvisioningOptions: [] });
 
+/** Client A's account as `GET /users/{upn}` returns it. */
+const accountA = (over = {}) => ({ id: CLIENT_A, userType: 'Member', userPrincipalName: UPN_A, accountEnabled: true, ...over });
+/** A Team member entry. */
+const member = (id, userType, userPrincipalName) => ({ id, userType, ...(userPrincipalName ? { userPrincipalName } : {}) });
+
 /** Facts for a clean row A, with overrides. */
 function factsA(over = {}) {
   return {
@@ -106,18 +133,22 @@ function factsA(over = {}) {
       driveRootId: ROOT_A,
     },
     members: [
-      { id: GUEST_A, userType: 'Guest', userPrincipalName: 'guest.a#EXT#' },
-      { id: STAFF, userType: 'Member', userPrincipalName: 'staff@contoso.example' },
-      { id: OWNER, userType: 'Member' },
+      member(CLIENT_A, 'Member', UPN_A),
+      member(GUEST_A, 'Guest', 'guest.a#EXT#'),
+      member(STAFF, 'Member', 'staff@contoso.example'),
+      member(OWNER, 'Member'),
     ],
     owners: [{ id: OWNER }],
-    memberOfByUser: new Map([[GUEST_A, [bcrGroup(TEAM_A), plainGroup(g('f1'))]]]),
+    account: accountA(),
+    accountMemberOf: [bcrGroup(TEAM_A), plainGroup(g('f1'))],
     permissions: [{ roles: ['write'], grantedToIdentitiesV2: [{ application: { id: INGEST } }] }],
     ...over,
   };
 }
 
-const ctxA = (over = {}) => ({ ingestAppIds: new Set([INGEST]), duplicates: [], ...over });
+const normalize = (id) => String(id).toLowerCase();
+const ctxA = (over = {}) => ({ ingestAppIds: new Set([INGEST]), duplicates: [], clientDomain: DOMAIN, ...over });
+const user = (id, userType, userPrincipalName, extra = {}) => [id, { id, userType, userPrincipalName, ...extra }];
 const codes = (a) => a.problems.map((p) => `${p.severity}:${p.code}`);
 const skipCodes = (a) => a.problems.filter((p) => p.severity === 'skip').map((p) => p.code);
 
@@ -137,6 +168,55 @@ describe('parseDirectoryRow', () => {
 
   test('NIP keeps digits only', () => {
     assert.equal(rowA({ NIP: '000-000-00 01' }).nip, '0000000001');
+  });
+});
+
+describe('the client-account rule (shared with @bcr/shared)', () => {
+  test('clientAccountVerdict answers every case of the shared table', () => {
+    const wrong = CASES.cases
+      .filter((c) => clientAccountVerdict(c, c.rowNip, c.domain) !== c.verdict)
+      .map((c) => `${c.name}: want ${c.verdict}, got ${clientAccountVerdict(c, c.rowNip, c.domain)}`);
+    assert.deepEqual(wrong, []);
+    assert.ok(CASES.cases.length >= 30, 'the table was read');
+  });
+
+  test("the domain is the table's, and the default argument", () => {
+    assert.equal(CLIENT_ACCOUNT_DOMAIN, CASES.domain);
+    const own = CASES.cases.find((c) => c.name === "the row's account");
+    assert.equal(clientAccountVerdict(own, own.rowNip), 'client');
+    assert.equal(clientAccountVerdict({ userType: 'Member', userPrincipalName: UPN_A }, '0000000001'), 'upn_mismatch');
+    assert.equal(clientAccountUpn('0000000001'), `0000000001@${CLIENT_ACCOUNT_DOMAIN}`);
+    assert.equal(clientAccountUpn('0000000001', DOMAIN), UPN_A);
+  });
+
+  test('clientAccountNipOf reads only the exact client shape', () => {
+    assert.equal(clientAccountNipOf(' 0000000002@Contoso.Example ', DOMAIN), '0000000002');
+    for (const upn of [
+      'staff@contoso.example',
+      '00000000020@contoso.example',
+      '0000000002@sub.contoso.example',
+      '0000000002@contoso.example.x',
+      '0000000002_contoso.example#EXT#@contoso.onmicrosoft.com',
+      '０００００００００２@contoso.example',
+      '',
+      undefined,
+    ]) {
+      assert.equal(clientAccountNipOf(upn, DOMAIN), '', String(upn));
+    }
+  });
+
+  test('isClientDomain takes a lower-case host name and nothing else', () => {
+    for (const d of ['bcr-group.pl', 'contoso.example', 'a.b.c']) assert.equal(isClientDomain(d), true, d);
+    for (const d of ['BCR-Group.pl', 'bcr-group', '@bcr-group.pl', 'bcr-group.pl.', 'https://bcr-group.pl', 'x.pl/y', '-a.pl', '', null, 7]) {
+      assert.equal(isClientDomain(d), false, String(d));
+    }
+  });
+
+  test('nipChecksumOk: the Polish NIP checksum; the canary NIP never passes', () => {
+    assert.equal(nipChecksumOk('1234563218'), true);
+    assert.equal(nipChecksumOk('1234563219'), false);
+    assert.equal(nipChecksumOk('9000000000'), false, 'remainder 10: no company can hold it');
+    assert.equal(nipChecksumOk('123'), false);
   });
 });
 
@@ -292,68 +372,125 @@ describe('team facts', () => {
     assert.equal(pickAccountingChannel([{ ...std, membershipType: 'shared' }]).status, 'not_standard');
   });
 
-  test('classifyTeamPeople binds guests of this Team alone, never Members or owners', () => {
-    const memberOf = new Map([
-      [GUEST_A, [bcrGroup(TEAM_A), plainGroup(g('f1'))]],
-      [GUEST_2, [bcrGroup(TEAM_A), bcrGroup(TEAM_X, '0099')]],
-      [g('b003'), [bcrGroup(TEAM_X, '0099')]],
-      [g('b004'), { error: '403' }],
-      [g('b005'), [bcrGroup(TEAM_A)]],
-      [g('b006'), [plainGroup(g('f1'))]],
-    ]);
-    const { eligible, excluded } = classifyTeamPeople({
-      teamId: TEAM_A,
-      members: [
-        { id: GUEST_A, userType: 'Guest' },
-        { id: GUEST_2, userType: 'Guest' },
-        { id: g('b003'), userType: 'Guest' },
-        { id: g('b004'), userType: 'Guest' },
-        { id: g('b005'), userType: 'Guest' },
-        { id: g('b006'), userType: 'Guest' },
-        { id: STAFF, userType: 'Member' },
-      ],
-      owners: [{ id: g('b005') }],
-      memberOfByUser: memberOf,
+  describe('classifyClientAccount', () => {
+    const classify = (over = {}) =>
+      classifyClientAccount({
+        teamId: TEAM_A,
+        rowNip: '0000000001',
+        clientDomain: DOMAIN,
+        account: accountA(),
+        accountMemberOf: [bcrGroup(TEAM_A), plainGroup(g('f1'))],
+        members: [
+          member(CLIENT_A, 'Member', UPN_A),
+          member(GUEST_A, 'Guest', 'guest.a#EXT#'),
+          member(g('b004'), 'Guest', '0000000001_contoso.example#EXT#@contoso.onmicrosoft.com'),
+          member(STAFF, 'Member', 'staff@contoso.example'),
+          member(CLIENT_B, 'Member', UPN_B),
+          member(OWNER, 'Member', 'owner@contoso.example'),
+        ],
+        owners: [{ id: OWNER }],
+        ...over,
+      });
+    const codesOf = (r) => r.problems.map((p) => `${p.severity}:${p.code}`);
+
+    test("the row's account is eligible; every other person is not bound, with the reason", () => {
+      const r = classify();
+      assert.deepEqual(r.eligible.map((e) => e.id), [CLIENT_A]);
+      assert.equal(r.assessed, true);
+      assert.deepEqual(r.problems, []);
+      assert.deepEqual(r.account, { id: CLIENT_A, displayName: '', userPrincipalName: UPN_A, accountEnabled: true });
+      const reason = Object.fromEntries(r.notBound.map((p) => [p.id, p.reason]));
+      assert.deepEqual(reason, {
+        [GUEST_A]: 'guest', // a guest of this Team alone: guests have no capability
+        [g('b004')]: 'guest', // invited with the client's own address
+        [STAFF]: 'staff',
+        [CLIENT_B]: 'other_client_account',
+        [OWNER]: 'owner',
+      });
+      assert.ok(!(CLIENT_A in reason), 'never staff_ids, never not bound');
     });
-    assert.deepEqual(eligible.map((e) => e.id), [GUEST_A], 'a non-Team group does not count');
-    const reason = Object.fromEntries(excluded.map((e) => [e.id, e.reason]));
-    assert.deepEqual(reason, {
-      [GUEST_2]: 'guest_in_other_team',
-      [g('b003')]: 'guest_in_other_team',
-      [g('b004')]: 'memberships_unreadable',
-      [g('b005')]: 'owner',
-      [g('b006')]: 'guest_not_in_this_team',
-      [STAFF]: 'not_a_guest',
+
+    test('an owner is refused, whatever else holds', () => {
+      const r = classify({ owners: [{ id: OWNER }, { id: CLIENT_A }] });
+      assert.deepEqual(r.eligible, []);
+      assert.ok(codesOf(r).includes('warn:client_account_owner'));
+      assert.equal(r.notBound.find((p) => p.id === CLIENT_A).reason, 'owner');
     });
-    const other = excluded.find((e) => e.id === GUEST_2);
-    assert.deepEqual(other.otherTeams, [{ id: TEAM_X, displayName: '0099 Client' }]);
+
+    test('a disabled account is still eligible, and is reported', () => {
+      const r = classify({ account: accountA({ accountEnabled: false }) });
+      assert.deepEqual(r.eligible.map((e) => [e.id, e.accountEnabled]), [[CLIENT_A, false]]);
+      assert.deepEqual(codesOf(r), ['warn:client_account_disabled']);
+      assert.match(r.problems[0].detail, /never unbinds or blocks a client/);
+    });
+
+    test('in any other Team it is not bound: a client Team, BCR GROUP, a group of unknown kind', () => {
+      for (const [other, name] of [
+        [bcrGroup(TEAM_X, '0099'), 'client Team'],
+        [plainTeam(TEAM_STAFF, 'BCR GROUP'), 'BCR GROUP'],
+        [plainTeam(TEAM_LEGACY, '0003 Legacy client'), 'legacy Team'],
+        [{ id: g('f9'), displayName: '?' }, 'kind not returned'],
+      ]) {
+        const r = classify({ accountMemberOf: [bcrGroup(TEAM_A), other] });
+        assert.deepEqual(r.eligible, [], name);
+        const w = r.problems.find((p) => p.code === 'client_account_in_other_team');
+        assert.equal(w?.severity, 'warn', name);
+        assert.match(w.detail, new RegExp(normalize(other.id)), name);
+        const nb = r.notBound.find((p) => p.id === CLIENT_A);
+        assert.equal(nb.reason, 'client_account_ineligible', name);
+        assert.deepEqual(nb.otherTeams.map((t) => t.id), [normalize(other.id)], name);
+      }
+      // The tenant's Team listing counts even when memberOf leaves the options empty.
+      const listed = classify({ accountMemberOf: [bcrGroup(TEAM_A), plainGroup(TEAM_X)], knownTeamIds: new Set([TEAM_X]) });
+      assert.ok(listed.problems.some((p) => p.code === 'client_account_in_other_team'));
+      // A group that is not a Team does not count.
+      assert.deepEqual(classify({ accountMemberOf: [bcrGroup(TEAM_A), plainGroup(g('f1'))] }).eligible.length, 1);
+    });
+
+    test("not on the Team's roster, or its memberships without the Team: not bound", () => {
+      const off = classify({ members: [member(GUEST_A, 'Guest')] });
+      assert.deepEqual(off.eligible, []);
+      assert.ok(codesOf(off).includes('warn:client_account_not_in_team'));
+      const disagree = classify({ accountMemberOf: [plainGroup(g('f1'))] });
+      assert.deepEqual(disagree.eligible, []);
+      assert.deepEqual(codesOf(disagree), ['warn:client_account_not_in_this_team']);
+    });
+
+    test('memberships or the account unreadable: a skip, and not assessed', () => {
+      const memberships = classify({ accountMemberOf: { error: '403 accessDenied' } });
+      assert.deepEqual([memberships.eligible, memberships.assessed], [[], false]);
+      assert.deepEqual(codesOf(memberships), ['skip:client_account_memberships_unreadable']);
+      for (const account of [{ error: '403 accessDenied' }, undefined]) {
+        const r = classify({ account });
+        assert.deepEqual([r.eligible, r.assessed, r.account], [[], false, null]);
+        assert.deepEqual(codesOf(r), ['skip:client_account_lookup_failed']);
+      }
+    });
+
+    test('no account at the UPN, or one that is not a Member: no id', () => {
+      const missing = classify({ account: null });
+      assert.deepEqual([missing.eligible, missing.assessed], [[], true]);
+      assert.deepEqual(codesOf(missing), ['warn:client_account_missing']);
+      assert.match(missing.problems[0].detail, new RegExp(UPN_A));
+      for (const userType of ['Guest', null]) {
+        const r = classify({ account: accountA({ userType }) });
+        assert.deepEqual(r.eligible, [], String(userType));
+        assert.deepEqual(codesOf(r), ['warn:client_account_not_member'], String(userType));
+      }
+    });
+
+    test('a row without a valid NIP has no client account and reads none', () => {
+      for (const rowNip of ['', '000000001', '00000000011']) {
+        const r = classify({ rowNip, account: undefined, accountMemberOf: undefined });
+        assert.deepEqual([r.eligible, r.problems, r.assessed], [[], [], true], rowNip);
+        assert.equal(r.notBound.find((p) => p.id === CLIENT_A).reason, 'other_client_account', rowNip);
+      }
+    });
   });
 
-  test('every Team counts, marked or not; an unreadable kind counts as a Team', () => {
-    const run = (groups, knownTeamIds) =>
-      classifyTeamPeople({
-        teamId: TEAM_A,
-        members: [{ id: GUEST_A, userType: 'Guest' }],
-        owners: [],
-        memberOfByUser: new Map([[GUEST_A, groups]]),
-        ...(knownTeamIds ? { knownTeamIds } : {}),
-      });
-    const legacy = run([bcrGroup(TEAM_A), plainTeam(TEAM_LEGACY, '0003 Legacy client')]);
-    assert.deepEqual(legacy.eligible, []);
-    assert.deepEqual(legacy.excluded[0].otherTeams, [{ id: TEAM_LEGACY, displayName: '0003 Legacy client' }]);
-
-    const staff = run([bcrGroup(TEAM_A), plainTeam(TEAM_STAFF, 'BCR GROUP')]);
-    assert.equal(staff.excluded[0].reason, 'guest_in_other_team');
-
-    // The tenant's Team listing counts even when memberOf leaves the options empty.
-    const listed = run([bcrGroup(TEAM_A), plainGroup(TEAM_X)], new Set([TEAM_X]));
-    assert.equal(listed.excluded[0].reason, 'guest_in_other_team');
-
-    // A group whose kind was not returned at all may only exclude, never bind.
+  test('isTeamGroup: a group whose kind was not returned at all may only exclude, never bind', () => {
     assert.equal(isTeamGroup({ id: g('f9') }), true);
     assert.equal(isTeamGroup(plainGroup(g('f9'))), false);
-    const unknownKind = run([bcrGroup(TEAM_A), { id: g('f9'), displayName: '?' }]);
-    assert.equal(unknownKind.excluded[0].reason, 'guest_in_other_team');
   });
 
   test('evaluateWriteGrant', () => {
@@ -403,34 +540,169 @@ describe('team facts', () => {
 });
 
 describe('assessRow', () => {
-  test('a clean row proposes the channel folder, its drive, its team and its one guest', () => {
+  test('a clean row proposes the channel folder, its drive, its team and its one client account', () => {
     const a = assessRow(rowA(), factsA(), ctxA());
     assert.deepEqual(skipCodes(a), []);
     assert.deepEqual(a.proposed, {
       RootFolder: CHANNEL,
-      UserAadObjectIds: GUEST_A,
+      UserAadObjectIds: CLIENT_A,
       DriveId: DRIVE_A,
       TeamId: TEAM_A,
     });
-    assert.deepEqual(a.addedUserIds.map((u) => u.id), [GUEST_A]);
+    assert.deepEqual(a.addedUserIds, [{ id: CLIENT_A, userPrincipalName: UPN_A }]);
+    assert.deepEqual(a.clientAccount, { id: CLIENT_A, userPrincipalName: UPN_A, accountEnabled: true });
+    assert.equal(a.accountAssessed, true);
+    assert.equal(a.lockedOut, false);
     assert.equal(a.evidence.writeGrant, 'granted');
+    // The guest of this Team alone is never proposed.
+    assert.equal(a.notBound.find((p) => p.id === GUEST_A).reason, 'guest');
   });
 
-  test('staff on a client row: skipped until confirmed, then removed', () => {
+  test('without a client domain in ctx, the default domain names the account', () => {
+    const upn = `0000000001@${CLIENT_ACCOUNT_DOMAIN}`;
+    const facts = factsA({ account: accountA({ userPrincipalName: upn }), members: [member(CLIENT_A, 'Member', upn)] });
+    const a = assessRow(rowA(), facts, { ingestAppIds: new Set([INGEST]) });
+    assert.equal(a.proposed.UserAadObjectIds, CLIENT_A);
+    const wrongDomain = assessRow(rowA(), factsA(), { ingestAppIds: new Set([INGEST]) });
+    assert.equal(wrongDomain.proposed.UserAadObjectIds, '');
+    assert.ok(codes(wrongDomain).includes('warn:client_account_not_member'));
+  });
+
+  test("staff on a client row: skipped until confirmed, then removed; another client's account is named so", () => {
     const facts = factsA({
       usersById: new Map([
-        [STAFF, { id: STAFF, userType: 'Member', userPrincipalName: 'staff@contoso.example' }],
-        [GUEST_A, { id: GUEST_A, userType: 'Guest' }],
+        user(STAFF, 'Member', 'staff@contoso.example'),
+        user(CLIENT_B, 'Member', UPN_B),
+        user(CLIENT_A, 'Member', UPN_A),
       ]),
     });
-    const row = rowA({ UserAadObjectIds: `${STAFF}\n${GUEST_A}` });
-    assert.ok(skipCodes(assessRow(row, facts, ctxA())).includes('staff_ids'));
+    const row = rowA({ UserAadObjectIds: `${STAFF}\n${CLIENT_B}\n${CLIENT_A}` });
+    const clientNips = new Map([['0000000001', ['1']], ['0000000002', ['2']]]);
+    const skipped = assessRow(row, facts, ctxA({ clientNips }));
+    assert.ok(skipCodes(skipped).includes('staff_ids'));
+    const detail = skipped.problems.find((p) => p.code === 'staff_ids').detail;
+    assert.match(detail, /staff@contoso\.example/);
+    assert.match(detail, new RegExp(`${UPN_B} \\(another client's account: the NIP of row\\(s\\) 2\\)`));
+    assert.ok(!codes(skipped).includes('warn:client_account_ineligible'));
 
-    const confirmed = assessRow(row, facts, ctxA({ confirmRemoveStaff: new Set(['1']) }));
+    const confirmed = assessRow(row, facts, ctxA({ clientNips, confirmRemoveStaff: new Set(['1']) }));
     assert.deepEqual(skipCodes(confirmed), []);
     assert.ok(codes(confirmed).includes('warn:staff_ids_removed'));
-    assert.equal(confirmed.proposed.UserAadObjectIds, GUEST_A);
-    assert.deepEqual(confirmed.removedUserIds.map((r) => [r.id, r.reason]), [[STAFF, 'staff']]);
+    assert.equal(confirmed.proposed.UserAadObjectIds, CLIENT_A);
+    assert.deepEqual(confirmed.removedUserIds.map((r) => [r.id, r.reason]), [
+      [STAFF, 'staff'],
+      [CLIENT_B, 'other_client_account'],
+    ]);
+  });
+
+  test('a guest id on a bound row is removed without a flag, as guest_ids (drift)', () => {
+    const bound = { RootFolder: CHANNEL, DriveId: DRIVE_A, TeamId: TEAM_A };
+    const row = rowA({ ...bound, UserAadObjectIds: `${GUEST_A}\n${CLIENT_A}` });
+    const facts = factsA({
+      usersById: new Map([user(GUEST_A, 'Guest', 'guest.a#EXT#'), user(CLIENT_A, 'Member', UPN_A)]),
+    });
+    const a = assessRow(row, facts, ctxA());
+    assert.deepEqual(skipCodes(a), [], 'no --confirm-remove-staff needed');
+    const w = a.problems.find((p) => p.code === 'guest_ids');
+    assert.equal(w.severity, 'warn');
+    assert.match(w.detail, /^1 guest id\(s\) on a client row: guest\.a#EXT#\. Guests have no capability/);
+    assert.equal(a.proposed.UserAadObjectIds, CLIENT_A);
+    assert.deepEqual(a.removedUserIds.map((r) => [r.id, r.reason]), [[GUEST_A, 'guest']]);
+    assert.deepEqual(checkVerdict([row], [a]).routingDrift, ['1']);
+  });
+
+  test("this row's account that no longer qualifies is client_account_ineligible, and the PATCH takes it off", () => {
+    const bound = { RootFolder: CHANNEL, DriveId: DRIVE_A, TeamId: TEAM_A, UserAadObjectIds: CLIENT_A };
+    const users = new Map([user(CLIENT_A, 'Member', UPN_A)]);
+    for (const [name, over, why] of [
+      ['in a second Team (R46)', { accountMemberOf: [bcrGroup(TEAM_A), bcrGroup(TEAM_X, '0099')] }, `client_account_in_other_team: also in ${TEAM_X}`],
+      ['made an owner', { owners: [{ id: OWNER }, { id: CLIENT_A }] }, 'client_account_owner'],
+      ['taken out of the Team', { members: [member(GUEST_A, 'Guest')], accountMemberOf: [] }, 'client_account_not_in_team'],
+    ]) {
+      const a = assessRow(rowA(bound), factsA({ usersById: users, ...over }), ctxA());
+      const w = a.problems.find((p) => p.code === 'client_account_ineligible');
+      assert.equal(w?.severity, 'warn', name);
+      assert.match(w.detail, new RegExp(`${UPN_A} \\(${why}`), name);
+      assert.equal(a.proposed.UserAadObjectIds, '', name);
+      assert.deepEqual(a.removedUserIds.map((r) => [r.id, r.reason]), [[CLIENT_A, 'client_account_ineligible']], name);
+      assert.equal(checkVerdict([rowA(bound)], [a]).exitCode, 3, name);
+    }
+  });
+
+  test('a NIP edited by hand (or the account renamed): the bound account is client_account_ineligible', () => {
+    const bound = { RootFolder: CHANNEL, DriveId: DRIVE_A, TeamId: TEAM_A, UserAadObjectIds: CLIENT_A };
+    const row = rowA({ ...bound, NIP: '0000000009' });
+    const facts = factsA({ usersById: new Map([user(CLIENT_A, 'Member', UPN_A)]), account: null });
+    const a = assessRow(row, facts, ctxA({ clientNips: new Map([['0000000009', ['1']]]) }));
+    assert.deepEqual(skipCodes(a), [], 'no flag: it is a client account, never staff');
+    const w = a.problems.find((p) => p.code === 'client_account_ineligible');
+    assert.match(w.detail, /a client account for NIP 0000000001, not this row's 0000000009: was the NIP edited/);
+    assert.ok(codes(a).includes('warn:client_account_missing'), 'the new NIP names no account');
+    assert.equal(a.proposed.UserAadObjectIds, '');
+    assert.deepEqual(a.removedUserIds.map((r) => [r.id, r.reason]), [[CLIENT_A, 'client_account_ineligible']]);
+  });
+
+  test("an account with this row's UPN but no Member type is client_account_ineligible, removed without a flag", () => {
+    const row = rowA({ UserAadObjectIds: CLIENT_A });
+    const facts = factsA({ usersById: new Map([user(CLIENT_A, null, UPN_A)]), account: accountA({ userType: null }) });
+    const a = assessRow(row, facts, ctxA({ clientNips: new Map([['0000000001', ['1']]]) }));
+    assert.deepEqual(skipCodes(a), []);
+    assert.match(a.problems.find((p) => p.code === 'client_account_ineligible').detail, /this row's UPN, but userType none, not Member/);
+    assert.deepEqual(a.removedUserIds.map((r) => [r.id, r.reason]), [[CLIENT_A, 'client_account_ineligible']]);
+  });
+
+  test('a row without a valid NIP: client_nip_invalid, no id, the target still proposed', () => {
+    for (const NIP of ['', '12345', '000-000-00-011']) {
+      const a = assessRow(rowA({ NIP }), factsA({ account: undefined, accountMemberOf: undefined }), ctxA());
+      assert.ok(codes(a).includes('warn:client_nip_invalid'), NIP);
+      assert.deepEqual(skipCodes(a), [], NIP);
+      assert.deepEqual(a.proposed, { RootFolder: CHANNEL, UserAadObjectIds: '', DriveId: DRIVE_A, TeamId: TEAM_A }, NIP);
+      assert.equal(a.clientAccount, null, NIP);
+    }
+    // A NIP that fails the checksum only warns; its account is bound.
+    const checksum = assessRow(rowA(), factsA(), ctxA());
+    assert.ok(codes(checksum).includes('warn:client_nip_checksum'));
+    assert.equal(checksum.proposed.UserAadObjectIds, CLIENT_A);
+  });
+
+  test('a disabled bound account stays bound and marks the row locked out', () => {
+    const bound = { RootFolder: CHANNEL, DriveId: DRIVE_A, TeamId: TEAM_A, UserAadObjectIds: CLIENT_A };
+    const facts = factsA({
+      usersById: new Map([user(CLIENT_A, 'Member', UPN_A, { accountEnabled: false })]),
+      account: accountA({ accountEnabled: false }),
+    });
+    const a = assessRow(rowA(bound), facts, ctxA());
+    assert.equal(a.lockedOut, true);
+    assert.equal(a.problems.filter((p) => p.code === 'client_account_disabled').length, 1);
+    assert.equal(a.proposed.UserAadObjectIds, CLIENT_A, 'never unbound for it');
+    assert.deepEqual(a.removedUserIds, []);
+    // Read on the row only (the UPN read failed): still reported once.
+    const rowOnly = assessRow(rowA(bound), { ...facts, account: { error: '503' } }, ctxA());
+    assert.equal(rowOnly.lockedOut, true);
+    assert.equal(rowOnly.problems.filter((p) => p.code === 'client_account_disabled').length, 1);
+    // Read by UPN only (the read by id failed): the lockout is not hidden.
+    const upnOnly = assessRow(rowA(bound), { ...facts, usersById: new Map([[CLIENT_A, { error: '429' }]]) }, ctxA());
+    assert.equal(upnOnly.lockedOut, true);
+    assert.equal(upnOnly.problems.filter((p) => p.code === 'client_account_disabled').length, 1);
+    assert.deepEqual(checkVerdict([rowA(bound)], [upnOnly]).lockedOut, [upnOnly.listItemId]);
+  });
+
+  test('an id that was not read, or could not be, skips the row', () => {
+    const row = rowA({ UserAadObjectIds: CLIENT_A });
+    assert.ok(skipCodes(assessRow(row, factsA(), ctxA())).includes('user_lookup_failed'));
+    const failed = assessRow(row, factsA({ usersById: new Map([[CLIENT_A, { error: '403' }]]) }), ctxA());
+    assert.ok(skipCodes(failed).includes('user_lookup_failed'));
+    // On a bound row, an unread id is unassessed: check exits 4, never 0.
+    const boundRow = rowA({ RootFolder: CHANNEL, DriveId: DRIVE_A, TeamId: TEAM_A, UserAadObjectIds: STAFF });
+    const unread = assessRow(boundRow, factsA({ usersById: new Map([[STAFF, { error: '503' }]]) }), ctxA());
+    const verdict = checkVerdict([boundRow], [unread]);
+    assert.deepEqual(verdict.incomplete, [unread.listItemId]);
+    assert.equal(verdict.exitCode, 4);
+    // A deleted user: reported, and the PATCH drops it.
+    const gone = assessRow(rowA({ UserAadObjectIds: STAFF }), factsA({ usersById: new Map([[STAFF, null]]) }), ctxA());
+    assert.ok(codes(gone).includes('warn:unknown_user_ids'));
+    assert.deepEqual(gone.removedUserIds.map((r) => [r.id, r.reason]), [[STAFF, 'not_found']]);
+    assert.equal(gone.proposed.UserAadObjectIds, CLIENT_A);
   });
 
   test('a Public team is skipped and never changed', () => {
@@ -527,31 +799,31 @@ describe('assessRow', () => {
     }
   });
 
-  test('a Team without the "BCR Group —" marker still binds its guest, with a warning', () => {
+  test('a Team without the "BCR Group —" marker still binds its client account, with a warning', () => {
     const legacyTeam = team({ description: '' });
     const facts = factsA({
       team: legacyTeam,
-      memberOfByUser: new Map([[GUEST_A, [plainTeam(TEAM_A, '0001 Client A'), plainGroup(g('f1'))]]]),
+      accountMemberOf: [plainTeam(TEAM_A, '0001 Client A'), plainGroup(g('f1'))],
     });
     const a = assessRow(rowA(), facts, ctxA({ knownTeamIds: new Set([TEAM_A]) }));
     assert.deepEqual(skipCodes(a), []);
     assert.ok(codes(a).includes('warn:team_not_bcr'));
-    assert.equal(a.proposed.UserAadObjectIds, GUEST_A);
+    assert.equal(a.proposed.UserAadObjectIds, CLIENT_A);
     assert.equal(a.proposed.TeamId, TEAM_A);
   });
 
-  test('a guest also in an unmarked Team, or in BCR GROUP, is not bound, and says where', () => {
+  test('a client account also in an unmarked Team, or in BCR GROUP, is not bound, and says where', () => {
     for (const [other, name] of [
       [TEAM_LEGACY, '0003 Legacy client'],
       [TEAM_STAFF, 'BCR GROUP'],
     ]) {
-      const facts = factsA({ memberOfByUser: new Map([[GUEST_A, [bcrGroup(TEAM_A), plainTeam(other, name)]]]) });
+      const facts = factsA({ accountMemberOf: [bcrGroup(TEAM_A), plainTeam(other, name)] });
       const a = assessRow(rowA(), facts, ctxA({ knownTeamIds: new Set([TEAM_A, other]) }));
       assert.equal(a.proposed.UserAadObjectIds, '', name);
-      const w = a.problems.find((p) => p.code === 'guest_in_other_team');
+      assert.equal(a.clientAccount, null, name);
+      const w = a.problems.find((p) => p.code === 'client_account_in_other_team');
       assert.equal(w.severity, 'warn');
       assert.match(w.detail, new RegExp(other));
-      assert.ok(codes(a).includes('warn:no_eligible_guest'));
     }
   });
 
@@ -565,8 +837,12 @@ describe('assessRow', () => {
     assert.ok(skipCodes(assessRow(rowA(), factsA({ site: { error: '404' } }), ctxA())).includes('site_unresolved'));
     assert.ok(skipCodes(assessRow(rowA(), factsA({ team: null }), ctxA())).includes('no_team'));
     assert.ok(skipCodes(assessRow(rowA(), factsA({ members: { error: '403' } }), ctxA())).includes('membership_lookup_failed'));
-    const unreadable = factsA({ memberOfByUser: new Map([[GUEST_A, { error: '403' }]]) });
-    assert.ok(skipCodes(assessRow(rowA(), unreadable, ctxA())).includes('guest_memberships_unreadable'));
+    const unreadable = factsA({ accountMemberOf: { error: '403' } });
+    assert.ok(skipCodes(assessRow(rowA(), unreadable, ctxA())).includes('client_account_memberships_unreadable'));
+    const noAccount = factsA({ account: { error: '403' } });
+    const a = assessRow(rowA(), noAccount, ctxA());
+    assert.ok(skipCodes(a).includes('client_account_lookup_failed'));
+    assert.equal(a.accountAssessed, false);
   });
 
   test('a client row without RootFolder, DriveId and TeamId is reported as routing nobody (C3)', () => {
@@ -578,22 +854,36 @@ describe('assessRow', () => {
     assert.ok(!codes(assessRow(rowA({ IsAdmin: true }), {}, ctxA())).includes('warn:unbound_target'));
   });
 
-  test('an id on the row that is no longer a guest of this Team alone is named as drift (R46)', () => {
+  test('each kind of id on the row has its own code; guests and staff never read as drift of the account', () => {
     const users = new Map([
-      [GUEST_A, { id: GUEST_A, userType: 'Guest' }],
-      [GUEST_2, { id: GUEST_2, userType: 'Guest' }],
-      [STAFF, { id: STAFF, userType: 'Member' }],
+      user(CLIENT_A, 'Member', UPN_A),
+      user(GUEST_A, 'Guest', 'guest.a#EXT#'),
+      user(GUEST_2, 'Guest', '0000000001_contoso.example#EXT#@contoso.onmicrosoft.com'),
+      user(STAFF, 'Member', 'staff@contoso.example'),
     ]);
-    const row = rowA({ UserAadObjectIds: `${GUEST_A}\n${GUEST_2}\n${STAFF}` });
+    const row = rowA({ UserAadObjectIds: `${GUEST_A}\n${GUEST_2}\n${STAFF}\n${CLIENT_A}` });
     const a = assessRow(row, factsA({ usersById: users }), ctxA({ confirmRemoveStaff: new Set(['1']) }));
-    const drift = a.problems.find((p) => p.code === 'bound_guest_ineligible');
-    assert.equal(drift.severity, 'warn', 'the PATCH that removes it must still be proposed');
-    assert.match(drift.detail, new RegExp(`^1 id\\(s\\)[\\s\\S]*${GUEST_2} \\(not a member of this Team\\)`));
-    assert.doesNotMatch(drift.detail, new RegExp(STAFF), 'staff have their own code');
-    assert.equal(a.proposed.UserAadObjectIds, GUEST_A);
+    assert.match(a.problems.find((p) => p.code === 'guest_ids').detail, /^2 guest id\(s\)/);
+    assert.match(a.problems.find((p) => p.code === 'staff_ids_removed').detail, /staff@contoso\.example/);
+    assert.ok(!codes(a).includes('warn:client_account_ineligible'), 'the account qualifies');
+    assert.equal(a.proposed.UserAadObjectIds, CLIENT_A);
+    assert.deepEqual(
+      a.removedUserIds.map((r) => [r.id, r.reason]),
+      [
+        [GUEST_A, 'guest'],
+        [GUEST_2, 'guest'],
+        [STAFF, 'staff'],
+      ],
+    );
   });
 
-  test('a duplicate key skips; a duplicate user id only warns', () => {
+  test('an admin row: its ids are never judged by the client-account rule', () => {
+    const users = new Map([user(STAFF, 'Member', 'staff@contoso.example'), user(GUEST_A, 'Guest', 'g#EXT#')]);
+    const a = assessRow(rowA({ IsAdmin: true, UserAadObjectIds: `${STAFF}\n${GUEST_A}` }), { usersById: users }, ctxA());
+    assert.deepEqual(codes(a).filter((c) => /staff|guest|client_/.test(c)), []);
+  });
+
+  test('a duplicate key skips; a duplicate user id only warns; a shared NIP gives neither row the account', () => {
     const dups = [
       { kind: 'nip', key: '0000000001', listItemIds: ['1', '7'] },
       { kind: 'userId', key: GUEST_A, listItemIds: ['1', '7'] },
@@ -601,6 +891,8 @@ describe('assessRow', () => {
     const a = assessRow(rowA(), factsA(), ctxA({ duplicates: dups }));
     assert.ok(codes(a).includes('skip:duplicate_nip'));
     assert.ok(codes(a).includes('warn:duplicate_user_id'));
+    assert.equal(a.proposed.UserAadObjectIds, '');
+    assert.equal(a.clientAccount, null);
   });
 });
 
@@ -609,13 +901,21 @@ describe('buildPlan', () => {
 
   function plan(rows, factsById, ctx = ctxA()) {
     const assessments = rows.map((r) => assessRow(r, factsById[r.listItemId], ctx));
-    return buildPlan({ rows, assessments, directory, ingestAppIds: [INGEST], createdAt: '2026-01-01T00:00:00.000Z' });
+    return buildPlan({
+      rows,
+      assessments,
+      directory,
+      ingestAppIds: [INGEST],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      clientDomain: DOMAIN,
+    });
   }
+  const readA = new Map([user(CLIENT_A, 'Member', UPN_A)]);
 
   test('PATCH carries only changed fields; a bound row is NOOP; SKIP keeps its reasons and proposal', () => {
     const TEAM_B = g('a002');
     const DRIVE_B = 'b!fakeDriveB';
-    const bound = rowA({ RootFolder: CHANNEL, UserAadObjectIds: GUEST_A, DriveId: DRIVE_A, TeamId: TEAM_A });
+    const bound = rowA({ RootFolder: CHANNEL, UserAadObjectIds: CLIENT_A, DriveId: DRIVE_A, TeamId: TEAM_A });
     const half = parseDirectoryRow(
       item(2, { ClientId: '0002', NIP: '0000000002', SitePath: '/sites/0002B', RootFolder: CHANNEL }),
     );
@@ -629,19 +929,26 @@ describe('buildPlan', () => {
         parentReference: { driveId: DRIVE_B, id: 'ROOT-B' },
         driveRootId: 'ROOT-B',
       },
-      members: [{ id: GUEST_2, userType: 'Guest' }],
+      members: [member(CLIENT_B, 'Member', UPN_B), member(GUEST_2, 'Guest')],
       owners: [],
-      memberOfByUser: new Map([[GUEST_2, [bcrGroup(TEAM_B, '0002')]]]),
+      account: { id: CLIENT_B, userType: 'Member', userPrincipalName: UPN_B, accountEnabled: true },
+      accountMemberOf: [bcrGroup(TEAM_B, '0002')],
     });
     const p = plan([bound, half, pub], {
-      1: factsA(),
+      1: factsA({ usersById: readA }),
       2: factsB,
       3: factsA({ team: team({ visibility: 'Public' }) }),
     });
     const [r1, r2, r3] = p.rows;
     assert.equal(r1.action, 'NOOP');
     assert.equal(r2.action, 'PATCH');
-    assert.deepEqual(r2.patch, { UserAadObjectIds: GUEST_2, DriveId: DRIVE_B, TeamId: TEAM_B });
+    assert.deepEqual(r2.patch, { UserAadObjectIds: CLIENT_B, DriveId: DRIVE_B, TeamId: TEAM_B });
+    assert.deepEqual(r2.clientAccount, { id: CLIENT_B, userPrincipalName: UPN_B, accountEnabled: true });
+    assert.deepEqual(r2.notBound.map((n) => [n.id, n.reason]), [[GUEST_2, 'guest']]);
+    assert.equal('eligibleGuests' in r2 || 'excludedGuests' in r2, false, 'no guest lists in a v2 plan');
+    assert.equal(p.version, PLAN_VERSION);
+    assert.equal(PLAN_VERSION, 2);
+    assert.equal(p.clientDomain, DOMAIN);
     assert.equal(r3.action, 'SKIP');
     assert.ok(r3.reasons.some((x) => x.code === 'public_team'));
     assert.deepEqual(r3.patch, {});
@@ -649,11 +956,11 @@ describe('buildPlan', () => {
     assert.deepEqual(validatePlan(p), []);
   });
 
-  test('a guest already on another row is not added (no new duplicate)', () => {
+  test('a client account already on another row is not added (no new duplicate)', () => {
     const other = parseDirectoryRow(
-      item(9, { ClientId: '0009', NIP: '0000000009', SitePath: '/sites/0009', UserAadObjectIds: GUEST_A }),
+      item(9, { ClientId: '0009', NIP: '0000000009', SitePath: '/sites/0009', UserAadObjectIds: CLIENT_A }),
     );
-    const p = plan([rowA(), other], { 1: factsA(), 9: { usersById: new Map(), site: { error: 'x' } } });
+    const p = plan([rowA(), other], { 1: factsA(), 9: { usersById: readA, site: { error: 'x' } } });
     const r1 = p.rows.find((r) => r.listItemId === '1');
     assert.equal(r1.action, 'PATCH');
     assert.equal('UserAadObjectIds' in r1.patch, false);
@@ -662,26 +969,23 @@ describe('buildPlan', () => {
     assert.deepEqual(r1.addedUserIds, []);
   });
 
-  test('the plan lists guests left out for being in another Team, with that Team', () => {
+  test('the plan lists who is not bound: a client account in another Team, with that Team', () => {
     const facts = factsA({
-      members: [
-        { id: GUEST_A, userType: 'Guest', userPrincipalName: 'guest.a#EXT#' },
-        { id: GUEST_2, userType: 'Guest', userPrincipalName: 'guest.2#EXT#' },
-      ],
+      members: [member(CLIENT_A, 'Member', UPN_A), member(GUEST_A, 'Guest', 'guest.a#EXT#')],
       owners: [],
-      memberOfByUser: new Map([
-        [GUEST_A, [bcrGroup(TEAM_A)]],
-        [GUEST_2, [bcrGroup(TEAM_A), plainTeam(TEAM_LEGACY, '0003 Legacy client')]],
-      ]),
+      accountMemberOf: [bcrGroup(TEAM_A), plainTeam(TEAM_LEGACY, '0003 Legacy client')],
     });
     const [r] = plan([rowA()], { 1: facts }).rows;
     assert.equal(r.action, 'PATCH');
-    assert.equal(r.patch.UserAadObjectIds, GUEST_A);
-    assert.deepEqual(r.excludedGuests, [
+    assert.equal('UserAadObjectIds' in r.patch, false, 'nothing to bind, nothing on the row');
+    assert.equal(r.clientAccount, null, 'assessed: no account qualifies');
+    assert.deepEqual(r.notBound, [
+      { id: GUEST_A, userPrincipalName: 'guest.a#EXT#', reason: 'guest' },
       {
-        id: GUEST_2,
-        userPrincipalName: 'guest.2#EXT#',
-        reason: 'guest_in_other_team',
+        id: CLIENT_A,
+        userPrincipalName: UPN_A,
+        reason: 'client_account_ineligible',
+        why: 'client_account_in_other_team',
         otherTeams: [{ id: TEAM_LEGACY, displayName: '0003 Legacy client' }],
       },
     ]);
@@ -691,7 +995,7 @@ describe('buildPlan', () => {
     const twin = parseDirectoryRow(
       item(2, { ClientId: '0002', NIP: '0000000002', SitePath: '/sites/0001CLIENTA' }),
     );
-    const noGuests = { members: [], owners: [], memberOfByUser: new Map() };
+    const noGuests = { members: [], owners: [], account: null };
     const p = plan([rowA(), twin], { 1: factsA(noGuests), 2: factsA(noGuests) });
     for (const r of p.rows) {
       assert.equal(r.action, 'SKIP');
@@ -701,7 +1005,7 @@ describe('buildPlan', () => {
 
   test('two rows on different sites that would end with one DriveId or TeamId are both skipped (C4)', () => {
     const twin = parseDirectoryRow(item(2, { ClientId: '0002', NIP: '0000000002', SitePath: '/sites/0002ALIAS' }));
-    const noGuests = { members: [], owners: [], memberOfByUser: new Map() };
+    const noGuests = { members: [], owners: [], account: null };
     // Both sites lead to Team A and its drive: the second is an alias.
     const p = plan([rowA(), twin], { 1: factsA(noGuests), 2: factsA(noGuests) });
     for (const r of p.rows) {
@@ -731,6 +1035,12 @@ describe('buildPlan', () => {
     edited.rows[0].patch.UserAadObjectIds = `${GUEST_A}\n${STAFF}`;
     assert.ok(validatePlan(edited).some((e) => /digest/.test(e)));
 
+    // A row binds one client account: two GUIDs are refused even with a fresh digest.
+    const two = structuredClone(p);
+    two.rows[0].patch.UserAadObjectIds = `${CLIENT_A}\n${GUEST_A}`;
+    two.digest = planDigest(two);
+    assert.deepEqual(validatePlan(two), ['row 1: UserAadObjectIds has 2 lines; a row binds one client account']);
+
     const forged = structuredClone(p);
     forged.rows[0].patch.Status = 'Inactive';
     forged.digest = planDigest(forged);
@@ -744,16 +1054,40 @@ describe('buildPlan', () => {
     assert.ok(validatePlan({ ...p, rows: [null] }).length > 0);
   });
 
-  test('the digest covers createdAt, directory and guards, not only the rows', () => {
+  test('validatePlan refuses a version-1 plan, and a missing or malformed clientDomain', () => {
+    const p = plan([rowA()], { 1: factsA() });
+    assert.deepEqual(validatePlan(p), []);
+    const refused = (change) => {
+      const x = structuredClone(p);
+      change(x);
+      x.digest = planDigest(x);
+      return validatePlan(x);
+    };
+    assert.deepEqual(refused((x) => (x.version = 1)), [
+      'version is not 2 (a plan made before the client-account rule, which bound guests). Re-run propose',
+    ]);
+    for (const bad of [undefined, '', 'Contoso.Example', '@contoso.example', 'contoso', 'contoso.example/x']) {
+      assert.deepEqual(
+        refused((x) => (bad === undefined ? delete x.clientDomain : (x.clientDomain = bad))),
+        ['clientDomain is missing or not a lower-case host name'],
+        String(bad),
+      );
+    }
+  });
+
+  test('the digest covers clientDomain, createdAt, directory and guards, not only the rows', () => {
     const p = buildPlan({
       rows: [rowA()],
       assessments: [assessRow(rowA(), factsA(), ctxA())],
       directory,
       guards: { forbiddenSitePaths: ['/sites/bcrgroup'], quarantineSitePath: '', tenantHost: '', directorySiteCollectionId: 'x' },
       createdAt: '2026-01-01T00:00:00.000Z',
+      clientDomain: DOMAIN,
     });
     assert.deepEqual(validatePlan(p), []);
+    assert.equal(buildPlan({ rows: [], assessments: [], directory }).clientDomain, CLIENT_ACCOUNT_DOMAIN, 'the default');
     for (const [name, change] of [
+      ['clientDomain', (x) => (x.clientDomain = 'bcr-group.pl')],
       ['createdAt', (x) => (x.createdAt = '2026-09-25T00:00:00.000Z')],
       ['directory', (x) => (x.directory.listId = 'another')],
       ['guards', (x) => (x.guards.forbiddenSitePaths = [])],
@@ -779,17 +1113,26 @@ describe('apply and rollback helpers', () => {
     );
   });
 
-  test('staleFields names what changed in the binding or the guard', () => {
+  test('staleFields names what changed in the binding or the guard, the NIP included', () => {
+    assert.ok(GUARD_FIELDS.includes('NIP'));
     const planRow = {
       before: { RootFolder: '', UserAadObjectIds: '', DriveId: '', TeamId: '' },
-      guard: { ClientId: '0001', SiteHostname: 'h', SitePath: '/sites/a', DriveName: 'Dokumenty', Status: 'Active', IsAdmin: '' },
+      guard: rowA().guard,
     };
-    const same = { ClientId: '0001', SiteHostname: 'h', SitePath: '/sites/a', DriveName: 'Dokumenty', Status: 'Active' };
+    const same = {
+      ClientId: '0001',
+      NIP: '0000000001',
+      SiteHostname: 'contoso.sharepoint.com',
+      SitePath: '/sites/0001CLIENTA',
+      DriveName: 'Dokumenty',
+      Status: 'Active',
+    };
     assert.deepEqual(staleFields(planRow, same), []);
     assert.deepEqual(staleFields(planRow, { ...same, SitePath: '/sites/b', RootFolder: 'x' }).sort(), [
       'RootFolder',
       'SitePath',
     ]);
+    assert.deepEqual(staleFields(planRow, { ...same, NIP: '0000000009' }), ['NIP']);
   });
 
   test('idsRollbackAdds names the GUIDs a restore puts back, as the ingestion reads them', () => {
@@ -801,6 +1144,13 @@ describe('apply and rollback helpers', () => {
     assert.deepEqual(idsRollbackAdds({ UserAadObjectIds: '' }, current), []);
     assert.deepEqual(idsRollbackAdds({ RootFolder: '' }, current), [], 'ids not restored');
     assert.deepEqual(idsRollbackAdds({ UserAadObjectIds: STAFF }, {}), [STAFF]);
+  });
+
+  test('idsRollbackRemoves names the GUIDs a restore takes off', () => {
+    const current = { UserAadObjectIds: `${CLIENT_A}\n${GUEST_A}` };
+    assert.deepEqual(idsRollbackRemoves({ UserAadObjectIds: GUEST_A.toUpperCase() }, current), [CLIENT_A]);
+    assert.deepEqual(idsRollbackRemoves({ UserAadObjectIds: '' }, current), [CLIENT_A, GUEST_A]);
+    assert.deepEqual(idsRollbackRemoves({ RootFolder: '' }, current), [], 'ids not restored');
   });
 
   test('rollbackPatch restores the before-state of patched fields only', () => {
@@ -833,6 +1183,19 @@ describe('apply and rollback helpers', () => {
   });
 });
 
+describe('clientNipsOf', () => {
+  test('the NIPs of the Active client rows, with the rows that carry each', () => {
+    const rows = [
+      rowA(),
+      parseDirectoryRow(item(2, { ClientId: '0002', NIP: '0000000001' })),
+      parseDirectoryRow(item(3, { ClientId: 'BCR', NIP: '0000000003', IsAdmin: true })),
+      parseDirectoryRow(item(4, { ClientId: '0004', NIP: '0000000004', Status: 'Inactive' })),
+      parseDirectoryRow(item(5, { ClientId: '0005', NIP: '' })),
+    ];
+    assert.deepEqual([...clientNipsOf(rows)], [['0000000001', ['1', '2']]]);
+  });
+});
+
 describe('checkVerdict', () => {
   const bound = { RootFolder: CHANNEL, DriveId: DRIVE_A, TeamId: TEAM_A };
   const rowOf = (id, fields) => parseDirectoryRow(item(id, { ClientId: `000${id}`, NIP: `000000000${id}`, ...fields }));
@@ -841,13 +1204,47 @@ describe('checkVerdict', () => {
   test('drift on a bound row is 3; on an unbound row it routes nobody and is only reported', () => {
     const rows = [rowOf(1, { ...bound, UserAadObjectIds: STAFF }), rowOf(2, { UserAadObjectIds: STAFF })];
     const v = checkVerdict(rows, [assessed(1, 'staff_ids'), assessed(2, 'staff_ids', 'unbound_target')]);
-    assert.deepEqual(v, { routingDrift: ['1'], incomplete: [], notRoutingUnbound: ['2'], exitCode: 3 });
-    const unboundOnly = checkVerdict([rows[1]], [assessed(2, 'bound_guest_ineligible')]);
+    assert.deepEqual(v, { routingDrift: ['1'], incomplete: [], notRoutingUnbound: ['2'], lockedOut: [], exitCode: 3 });
+    const unboundOnly = checkVerdict([rows[1]], [assessed(2, 'guest_ids')]);
     assert.deepEqual([unboundOnly.exitCode, unboundOnly.notRoutingUnbound], [0, ['2']]);
   });
 
+  test('guest_ids and client_account_ineligible on a bound row are drift: 3', () => {
+    assert.deepEqual([...ROUTING_DRIFT_CODES].sort(), ['client_account_ineligible', 'guest_ids', 'staff_ids', 'staff_ids_removed']);
+    for (const code of ['guest_ids', 'client_account_ineligible']) {
+      const rows = [rowOf(1, { ...bound, UserAadObjectIds: GUEST_A })];
+      assert.equal(checkVerdict(rows, [assessed(1, code)]).exitCode, 3, code);
+    }
+  });
+
+  test('a disabled client account bound on a bound row is 5; 3 and 4 win over it', () => {
+    const lockedOut = (id, ...codes) => ({ ...assessed(id, ...codes), lockedOut: true });
+    const rows = [rowOf(1, { ...bound, UserAadObjectIds: CLIENT_A })];
+    assert.deepEqual(checkVerdict(rows, [lockedOut(1, 'client_account_disabled')]), {
+      routingDrift: [],
+      incomplete: [],
+      notRoutingUnbound: [],
+      lockedOut: ['1'],
+      exitCode: 5,
+    });
+    // Unbound, the client routes nowhere anyway: reported by the warning only.
+    assert.equal(checkVerdict([rowOf(1, { UserAadObjectIds: CLIENT_A })], [lockedOut(1)]).exitCode, 0);
+    const two = [rows[0], rowOf(2, { ...bound, TeamId: g('a002'), UserAadObjectIds: CLIENT_B })];
+    assert.equal(checkVerdict(two, [lockedOut(1), assessed(2, 'client_account_lookup_failed')]).exitCode, 4);
+    assert.equal(checkVerdict(two, [lockedOut(1), assessed(2, 'guest_ids')]).exitCode, 3);
+  });
+
   test('a bound row with ids that could not be assessed is 4; 3 wins over 4', () => {
-    for (const code of ['site_unresolved', 'no_team', 'team_lookup_failed', 'membership_lookup_failed', 'guest_memberships_unreadable']) {
+    assert.deepEqual(DRIFT_UNASSESSED_CODES, [
+      'user_lookup_failed',
+      'site_unresolved',
+      'no_team',
+      'team_lookup_failed',
+      'membership_lookup_failed',
+      'client_account_lookup_failed',
+      'client_account_memberships_unreadable',
+    ]);
+    for (const code of DRIFT_UNASSESSED_CODES) {
       const rows = [rowOf(1, { ...bound, UserAadObjectIds: GUEST_A })];
       assert.deepEqual(checkVerdict(rows, [assessed(1, code)]).exitCode, 4, code);
       // No ids on it: it routes nobody, so there is nothing to assess.
@@ -856,8 +1253,8 @@ describe('checkVerdict', () => {
       assert.equal(checkVerdict([rowOf(1, { UserAadObjectIds: GUEST_A })], [assessed(1, code)]).exitCode, 0, `${code}, unbound`);
     }
     const rows = [rowOf(1, { ...bound, UserAadObjectIds: GUEST_A }), rowOf(2, { ...bound, TeamId: g('a002'), UserAadObjectIds: GUEST_2 })];
-    const v = checkVerdict(rows, [assessed(1, 'bound_guest_ineligible'), assessed(2, 'no_team')]);
-    assert.deepEqual(v, { routingDrift: ['1'], incomplete: ['2'], notRoutingUnbound: [], exitCode: 3 });
+    const v = checkVerdict(rows, [assessed(1, 'client_account_ineligible'), assessed(2, 'no_team')]);
+    assert.deepEqual(v, { routingDrift: ['1'], incomplete: ['2'], notRoutingUnbound: [], lockedOut: [], exitCode: 3 });
   });
 
   test('admin and inactive rows never count; isBoundRow needs all three binding fields', () => {

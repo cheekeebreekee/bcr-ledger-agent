@@ -1,5 +1,8 @@
 import type { IngestionBatchItemResult, IngestionUploadResult } from '@bcr/shared';
 import {
+  HELP_ACCOUNT_TEXT,
+  HELP_CHANNEL_TEXT,
+  HELP_CHAT_TEXT,
   QUARANTINED_TEXT,
   SEARCH_COVERAGE_TEXT,
   SEARCH_HELP_HEADING,
@@ -30,14 +33,16 @@ export interface HelpCardOptions {
 }
 
 /**
- * The help card. Clients are Teams guests, and Teams lets a guest attach a
- * file only to a channel post, never in a chat: so the card sends clients to
- * their Team's „Dokumenty księgowe” channel (the channel inbox), and keeps
- * the chat for whoever can attach here. Every string is fixed; nothing is
- * inserted.
+ * The help card. A client signs in with the `{NIP}@bcr-group.pl` account BCR
+ * created for its company (an Entra Member, which can attach files in this
+ * chat): so the card offers the chat first, their Team's „Dokumenty księgowe”
+ * channel (the channel inbox) second, and then says the assistant works only
+ * on that account. Guests have no capability in the ledger; ingestion refuses
+ * them. Every string is fixed; nothing is inserted.
  *
  * With search on, a „Wyszukiwanie” section follows; with it off the card is
- * byte for byte the one from before search existed (a test pins its hash).
+ * byte for byte the card of the 28 Sep 2026 account decision (a test pins its
+ * hash).
  */
 export function buildHelpCard(opts: HelpCardOptions = {}): unknown {
   return {
@@ -51,24 +56,9 @@ export function buildHelpCard(opts: HelpCardOptions = {}): unknown {
         weight: 'Bolder',
         size: 'Large',
       },
-      {
-        type: 'TextBlock',
-        text:
-          'Dokumenty (PDF, JPG, PNG lub tekst) dodawaj w swoim zespole w Teams, w kanale ' +
-          '„Dokumenty księgowe”: jako załącznik do wpisu w kanale albo na karcie ' +
-          '„Udostępnione”. Przeanalizuję treść każdego pliku i przeniosę go do odpowiedniego ' +
-          'folderu w tym samym kanale.',
-        wrap: true,
-      },
-      {
-        type: 'TextBlock',
-        text:
-          'Goście (konta spoza BCR) nie mogą dołączać plików w tym czacie — to ograniczenie ' +
-          'Microsoft Teams. Jeśli możesz dołączyć plik tutaj, wyślij go w tym prywatnym czacie, ' +
-          'a odpowiem kartą z kategorią i folderem docelowym każdego pliku.',
-        wrap: true,
-        spacing: 'Medium',
-      },
+      { type: 'TextBlock', text: HELP_CHAT_TEXT, wrap: true },
+      { type: 'TextBlock', text: HELP_CHANNEL_TEXT, wrap: true, spacing: 'Medium' },
+      { type: 'TextBlock', text: HELP_ACCOUNT_TEXT, wrap: true, spacing: 'Medium' },
       {
         type: 'TextBlock',
         text:
@@ -123,8 +113,10 @@ function searchHelpSection(): unknown[] {
  *  - uploaded: ✅ name | category label | folder, plus an "Otwórz" button
  *    into the uploader's own space;
  *  - quarantined: 📨 name | fixed "przekazano do weryfikacji" line | —, and
- *    no link (the document is in a staff-only area);
- *  - rejected: ⚠️ name | generic Polish message chosen by error code | —.
+ *    no link (a Member's document in a staff-only area);
+ *  - rejected: ⚠️ name | generic Polish message chosen by error code | —
+ *    (`ClientAccountRequired`: ingestion refused the account, e.g. a guest,
+ *    and stored nothing).
  */
 export function buildBatchResultCard(results: readonly IngestionBatchItemResult[]): unknown {
   const uploaded = results.filter((r) => r.status === 'uploaded' && r.result).length;

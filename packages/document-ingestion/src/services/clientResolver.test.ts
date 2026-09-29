@@ -12,13 +12,19 @@ import {
   type ClientDirectoryReader,
   type ClientDirectorySnapshot,
 } from './clientDirectoryReader';
-import { ClientResolver } from './clientResolver';
+import { ClientResolver, type ClientResolverOptions } from './clientResolver';
 import {
   TeamMembershipReadError,
   TeamMembershipReader,
   type MembershipCheck,
   type TeamMembershipSource,
 } from './teamMembership';
+import {
+  UserAccountReadError,
+  UserAccountReader,
+  type UserAccount,
+  type UserAccountSource,
+} from './userDirectory';
 
 const HOST = 'contoso.sharepoint.com';
 
@@ -32,6 +38,42 @@ const quarantineTarget: SharePointTarget = {
 const OID_A = 'ae3987d3-9a3a-4ff8-bcf7-713d24e79c48';
 const OID_B = '0b8c7a2e-51f4-4a7e-9d3e-2f1c6a9b8d70';
 const OID_STAFF = '5f0d2c11-7c3e-4b2a-8e61-9a4d3b2c1e0f';
+/** A guest (of client A's Team, as onboarding invites them). */
+const OID_GUEST = '6a1e3d22-8d4f-4c3b-9f72-0b5e4c3d2f10';
+/** A Member on no row: a `{NIP}@` account of a client without a row, or staff. */
+const OID_UNMAPPED = '9d1e2f3a-4b5c-4d6e-8f70-81a2b3c4d5e6';
+/** Entra has no such user. */
+const OID_DELETED = '7b2f4e33-9e50-4d4c-8a83-1c6f5d4e3a21';
+
+/**
+ * Entra's view of every test user (synthetic): each client's `{NIP}@` Member
+ * account, staff, a guest. `{NIP}@` UPNs are data a log must never carry.
+ */
+const ACCOUNTS: Readonly<Record<string, UserAccount>> = {
+  [OID_A]: { userType: 'Member', userPrincipalName: '1111111111@bcr-group.pl' },
+  [OID_B]: { userType: 'Member', userPrincipalName: '2222222222@bcr-group.pl' },
+  [OID_STAFF]: { userType: 'Member', userPrincipalName: 'staff@bcr-group.pl' },
+  [OID_GUEST]: {
+    userType: 'Guest',
+    userPrincipalName: 'guest_example.com#EXT#@contoso.onmicrosoft.com',
+  },
+  [OID_UNMAPPED]: { userType: 'Member', userPrincipalName: '3333333333@bcr-group.pl' },
+};
+
+/** An account source that answers from a table (or fails), recording who it was asked about. */
+function accountsFrom(
+  table: Readonly<Record<string, UserAccount>> | Error = ACCOUNTS,
+): UserAccountSource & { calls: string[] } {
+  const calls: string[] = [];
+  return {
+    calls,
+    accountOf: async (oid) => {
+      calls.push(oid);
+      if (table instanceof Error) throw table;
+      return table[oid] ?? null;
+    },
+  };
+}
 
 /** A client row as the binding tool leaves it: RootFolder, DriveId and TeamId all set. */
 function makeEntry(overrides: Partial<ClientDirectoryEntry>): ClientDirectoryEntry {
@@ -87,6 +129,19 @@ function makeReader(entries: ClientDirectoryEntry[]): ClientDirectoryReader {
 
 function readerFor(snapshot: ClientDirectorySnapshot): ClientDirectoryReader {
   return { getSnapshot: jest.fn().mockResolvedValue(snapshot) } as unknown as ClientDirectoryReader;
+}
+
+/** A resolver as runtime builds one: every option given, the accounts from the table unless set. */
+function resolverOf(
+  directory: ClientDirectoryReader,
+  opts: Partial<ClientResolverOptions> = {},
+): ClientResolver {
+  return new ClientResolver(directory, {
+    quarantineTarget,
+    membership: enforce,
+    accounts: accountsFrom(),
+    ...opts,
+  });
 }
 
 const clientA = makeEntry({
@@ -145,12 +200,9 @@ const baseSource: IngestionSource = {
 };
 
 describe('ClientResolver.resolve', () => {
-  const resolver = new ClientResolver(makeReader([clientA, clientB, staffRow]), {
-    quarantineTarget,
-    membership: enforce,
-  });
+  const resolver = resolverOf(makeReader([clientA, clientB, staffRow]));
 
-  it('routes a bound guest to their own client', async () => {
+  it("routes the row's {NIP}@ Member account to its own client", async () => {
     const resolved = await resolver.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toEqual({
       source: 'directory',
@@ -165,19 +217,21 @@ describe('ClientResolver.resolve', () => {
     });
   });
 
-  it('logs the routing decision with ids only — the Team id included', async () => {
+  it("routes the row's {NIP}@ Member account and logs account: verified, ids only", async () => {
     const { log, lines } = recordingLogger();
-    const r = new ClientResolver(makeReader([clientA]), { quarantineTarget, membership: enforce, log });
+    const r = resolverOf(makeReader([clientA]), { log });
     await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(lines).toEqual([
       {
         clientId: '0002',
         listItemId: '11',
         teamId: 'team-0002',
+        account: 'verified',
         membership: 'verified',
         msg: 'routed to client via userAadObjectId',
       },
     ]);
+    expect(JSON.stringify(lines)).not.toContain('1111111111');
   });
 
   it('matches the user id case-insensitively', async () => {
@@ -188,32 +242,30 @@ describe('ClientResolver.resolve', () => {
     expect(resolved.source).toBe('directory');
   });
 
-  it.each([
-    ['no user id', undefined],
-    ['an unknown user id', '9d1e2f3a-4b5c-4d6e-8f70-81a2b3c4d5e6'],
-  ])('quarantines %s as unmapped — never BCR GROUP, never another client', async (_label, oid) => {
-    const resolved = await resolver.resolve({ ...baseSource, userAadObjectId: oid });
+  it('quarantines a Member on no row as unmapped — never BCR GROUP, never another client', async () => {
+    const resolved = await resolver.resolve({ ...baseSource, userAadObjectId: OID_UNMAPPED });
     expect(resolved).toEqual({ source: 'quarantine', reason: 'unmapped', target: quarantineTarget });
   });
 
-  it('quarantines BCR staff as staff (they pick the client explicitly in a later phase)', async () => {
-    const resolved = await resolver.resolve({ ...baseSource, userAadObjectId: OID_STAFF });
+  it('still quarantines staff on an admin row as staff after reading their account', async () => {
+    const accounts = accountsFrom();
+    const r = resolverOf(makeReader([clientA, clientB, staffRow]), { accounts });
+    const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_STAFF });
     expect(resolved).toEqual({ source: 'quarantine', reason: 'staff', target: quarantineTarget });
+    expect(accounts.calls).toEqual([OID_STAFF]);
   });
 
   it('quarantines a user id that sits on a client row and an admin row as conflict', async () => {
-    const r = new ClientResolver(
+    const r = resolverOf(
       makeReader([clientA, { ...staffRow, userAadObjectIds: [OID_A] }]),
-      { quarantineTarget, membership: enforce },
     );
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toMatchObject({ source: 'quarantine', reason: 'conflict' });
   });
 
   it('quarantines a user whose only row points at BCR GROUP as forbidden_target', async () => {
-    const r = new ClientResolver(
+    const r = resolverOf(
       makeReader([{ ...clientA, target: { ...clientA.target, sitePath: '/sites/x/../BCRGROUP' } }]),
-      { quarantineTarget, membership: enforce },
     );
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toEqual({ source: 'quarantine', reason: 'forbidden_target', target: quarantineTarget });
@@ -231,20 +283,20 @@ describe('ClientResolver.resolve', () => {
       health: 'unavailable',
       fetchedAt: 0,
     };
-    const r = new ClientResolver(readerFor(unavailable), { quarantineTarget, membership: enforce });
+    const r = resolverOf(readerFor(unavailable));
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toMatchObject({ source: 'quarantine', reason: 'stale_directory' });
   });
 
   // Contract C3: a row the binding tool has not bound routes nobody — it
-  // would file into the library root, for a guest nobody checked is in this
-  // client's Team only.
+  // would file into the library root, for an account nobody checked is in
+  // this client's Team only.
   it.each([
     ['RootFolder', { target: { ...clientA.target, rootFolder: '' } }],
     ['DriveId', { target: { ...clientA.target, expectedDriveId: '' } }],
     ['TeamId', { teamId: '' }],
   ])('quarantines a user whose only row lacks %s as unbound_target', async (_missing, override) => {
-    const r = new ClientResolver(makeReader([{ ...clientA, ...override }, clientB]), { quarantineTarget, membership: enforce });
+    const r = resolverOf(makeReader([{ ...clientA, ...override }, clientB]));
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toEqual({ source: 'quarantine', reason: 'unbound_target', target: quarantineTarget });
     const other = await r.resolve({ ...baseSource, userAadObjectId: OID_B });
@@ -264,15 +316,14 @@ describe('ClientResolver.resolve', () => {
       health: 'fresh',
       fetchedAt: 0,
     };
-    const r = new ClientResolver(readerFor(snapshot), { quarantineTarget, membership: enforce });
+    const r = resolverOf(readerFor(snapshot));
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toMatchObject({ source: 'quarantine', reason: 'unbound_target' });
   });
 
   it('quarantines both users of rows that share a DriveId as conflict', async () => {
-    const r = new ClientResolver(
+    const r = resolverOf(
       makeReader([clientA, { ...clientB, target: { ...clientB.target, expectedDriveId: 'b!drive-0002' } }]),
-      { quarantineTarget, membership: enforce },
     );
     for (const oid of [OID_A, OID_B]) {
       const resolved = await r.resolve({ ...baseSource, userAadObjectId: oid });
@@ -281,18 +332,16 @@ describe('ClientResolver.resolve', () => {
   });
 
   it('quarantines a user whose row names a sub-site as forbidden_target', async () => {
-    const r = new ClientResolver(
+    const r = resolverOf(
       makeReader([{ ...clientA, target: { ...clientA.target, sitePath: '/sites/ClientB/sub' } }, clientB]),
-      { quarantineTarget, membership: enforce },
     );
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved).toMatchObject({ source: 'quarantine', reason: 'forbidden_target' });
   });
 
   it('falls back to the title as companyName when no aliases are set', async () => {
-    const r = new ClientResolver(
+    const r = resolverOf(
       makeReader([{ ...clientA, companyNameAliases: [] }]),
-      { quarantineTarget, membership: enforce },
     );
     const resolved = await r.resolve({ ...baseSource, userAadObjectId: OID_A });
     expect(resolved.source === 'directory' && resolved.companyName).toBe('[0002] Client A');
@@ -322,7 +371,7 @@ describe('ClientResolver.resolve — Team membership', () => {
     entries: ClientDirectoryEntry[] = [clientA, clientB, staffRow],
   ) {
     const { log, lines } = recordingLogger();
-    const r = new ClientResolver(makeReader(entries), { quarantineTarget, membership, log });
+    const r = resolverOf(makeReader(entries), { membership, log });
     return { r, lines };
   }
 
@@ -342,7 +391,7 @@ describe('ClientResolver.resolve — Team membership', () => {
 
   it.each([
     ["not in the row's Team", ['team-0099'], false, 1],
-    ["in the row's Team and another client's (the R46 guest)", ['team-0002', 'team-0003'], true, 1],
+    ["in the row's Team and another client's (R46)", ['team-0002', 'team-0003'], true, 1],
     ["in the row's Team and two others", ['team-0003', 'team-0002', 'team-0099'], true, 2],
     ['in no Team at all', [], false, 0],
   ] as const)(
@@ -395,15 +444,20 @@ describe('ClientResolver.resolve — Team membership', () => {
   });
 
   it.each([
-    ['staff', OID_STAFF, 'staff'],
-    ['an unmapped user', '9d1e2f3a-4b5c-4d6e-8f70-81a2b3c4d5e6', 'unmapped'],
-    ['no user id', undefined, 'unmapped'],
-  ])('does not read the Teams of %s: they are quarantined already', async (_label, oid, reason) => {
-    const teams = source(['team-0002']);
-    const { r } = resolverWith({ mode: 'enforce', source: teams });
-    expect(await r.resolve(uploadBy(oid))).toMatchObject({ source: 'quarantine', reason });
-    expect(teams.calls).toEqual([]);
-  });
+    ['staff', OID_STAFF, 'quarantine', 'staff'],
+    ['an unmapped Member', OID_UNMAPPED, 'quarantine', 'unmapped'],
+    ['a guest', OID_GUEST, 'refused', 'guest'],
+    ['a deleted user', OID_DELETED, 'refused', 'unknown_user'],
+    ['no user id', undefined, 'refused', 'no_identity'],
+  ])(
+    'does not read Teams for refused, staff or unmapped users: %s',
+    async (_label, oid, outcome, reason) => {
+      const teams = source(['team-0002']);
+      const { r } = resolverWith({ mode: 'enforce', source: teams });
+      expect(await r.resolve(uploadBy(oid))).toMatchObject({ source: outcome, reason });
+      expect(teams.calls).toEqual([]);
+    },
+  );
 
   it('does not read the Teams of a user whose row is not bound', async () => {
     const teams = source(['team-0002']);
@@ -509,16 +563,294 @@ describe('ClientResolver.resolve — Team membership', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The client account (owner's decision, 28 Sep 2026): a client is its
+// {NIP}@bcr-group.pl Member account; guests have no capability.
+// ---------------------------------------------------------------------------
+
+describe('ClientResolver.resolve — the client account', () => {
+  /** A membership source that records who it was asked about. */
+  function teamsSource(teams: readonly string[] = ['team-0002']) {
+    const calls: string[] = [];
+    const source: TeamMembershipSource = {
+      teamsOf: async (oid) => {
+        calls.push(oid);
+        return new Set(teams);
+      },
+    };
+    return { source, calls };
+  }
+
+  function setup(
+    entries: ClientDirectoryEntry[] = [clientA, clientB, staffRow],
+    opts: {
+      accounts?: UserAccountSource & { calls: string[] };
+      membership?: 'enforce' | 'off';
+      reader?: ClientDirectoryReader;
+    } = {},
+  ) {
+    const teams = teamsSource();
+    const accounts = opts.accounts ?? accountsFrom();
+    const directory = opts.reader ?? makeReader(entries);
+    const { log, lines } = recordingLogger();
+    const r = resolverOf(directory, {
+      accounts,
+      membership: opts.membership === 'off' ? { mode: 'off' } : { mode: 'enforce', source: teams.source },
+      log,
+    });
+    return { r, lines, teams, accounts, directory };
+  }
+
+  const by = (oid: string | undefined, purpose?: 'upload' | 'search') => ({
+    ...baseSource,
+    userAadObjectId: oid,
+    ...(purpose ? { purpose } : {}),
+  });
+
+  const guestOnA = { ...clientA, userAadObjectIds: [OID_GUEST] };
+
+  it("routes the row's {NIP}@ Member account and logs account: verified", async () => {
+    const { r, lines, accounts, teams } = setup();
+    expect(await r.resolve(by(OID_A))).toMatchObject({ source: 'directory', listItemId: '11' });
+    expect(accounts.calls).toEqual([OID_A]);
+    expect(teams.calls).toEqual([OID_A]);
+    expect(lines).toEqual([
+      expect.objectContaining({
+        account: 'verified',
+        membership: 'verified',
+        msg: 'routed to client via userAadObjectId',
+      }),
+    ]);
+  });
+
+  it('refuses a guest bound on a client row: no quarantine target, no Teams read, no snapshot needed', async () => {
+    const { r, lines, teams, directory } = setup([guestOnA, clientB]);
+    const resolved = await r.resolve(by(OID_GUEST));
+    expect(resolved).toEqual({ source: 'refused', reason: 'guest' });
+    expect(resolved).not.toHaveProperty('target');
+    expect(teams.calls).toEqual([]);
+    expect(directory.getSnapshot).not.toHaveBeenCalled();
+    expect(lines).toEqual([
+      {
+        event: 'identity.refused',
+        reason: 'guest',
+        purpose: 'upload',
+        userAadObjectId: OID_GUEST,
+        msg: 'identity.refused',
+      },
+    ]);
+  });
+
+  it('refuses a guest on no row, a guest on an admin row, and a guest while the Directory is unavailable', async () => {
+    const onNoRow = setup([clientA]);
+    const onAdminRow = setup([clientA, { ...staffRow, userAadObjectIds: [OID_GUEST] }]);
+    const unavailable = setup([], {
+      reader: readerFor({ ...buildSnapshot([], 0, { forbiddenSitePaths: [], allowedSiteHostname: HOST }), health: 'unavailable' }),
+    });
+    for (const t of [onNoRow, onAdminRow, unavailable]) {
+      expect(await t.r.resolve(by(OID_GUEST))).toEqual({ source: 'refused', reason: 'guest' });
+      expect(t.teams.calls).toEqual([]);
+    }
+  });
+
+  it('refuses a guest whatever the type spelling, for search too', async () => {
+    const accounts = accountsFrom({ [OID_GUEST]: { userType: ' GUEST ', userPrincipalName: 'x' } });
+    const { r, lines } = setup([guestOnA], { accounts });
+    expect(await r.resolve(by(OID_GUEST, 'search'))).toEqual({ source: 'refused', reason: 'guest' });
+    expect(lines[0]).toMatchObject({ event: 'identity.refused', purpose: 'search' });
+  });
+
+  it('refuses an unreadable account as identity_unverified and reads it again on the next call', async () => {
+    let failing = true;
+    const paths: string[] = [];
+    const graph = {
+      api: (path: string) => ({
+        get: async () => {
+          paths.push(path);
+          if (failing) throw Object.assign(new Error('Service Unavailable'), { statusCode: 503 });
+          return ACCOUNTS[OID_A];
+        },
+      }),
+    } as unknown as Client;
+    const reader = new UserAccountReader(graph, { retry: { retries: 0 } });
+    const { log, lines } = recordingLogger();
+    const r = resolverOf(makeReader([clientA]), { accounts: reader, log });
+
+    expect(await r.resolve(by(OID_A))).toEqual({ source: 'refused', reason: 'identity_unverified' });
+    expect(lines).toEqual([
+      { event: 'identity.unverified', purpose: 'upload', status: 503, msg: 'identity.unverified' },
+      {
+        event: 'identity.refused',
+        reason: 'identity_unverified',
+        purpose: 'upload',
+        userAadObjectId: OID_A,
+        msg: 'identity.refused',
+      },
+    ]);
+    failing = false;
+    expect(await r.resolve(by(OID_A))).toMatchObject({ source: 'directory' });
+    expect(paths).toHaveLength(2);
+  });
+
+  it.each([
+    ['a read error without a status', new UserAccountReadError('no')],
+    ['any other error', new Error('boom')],
+  ])('refuses as identity_unverified on %s, with no status', async (_label, error) => {
+    const { r, lines } = setup([clientA], { accounts: accountsFrom(error) });
+    expect(await r.resolve(by(OID_A))).toEqual({ source: 'refused', reason: 'identity_unverified' });
+    expect(lines[0]).toEqual({
+      event: 'identity.unverified',
+      purpose: 'upload',
+      msg: 'identity.unverified',
+    });
+  });
+
+  it('refuses a deleted user as unknown_user', async () => {
+    const { r, teams } = setup([{ ...clientA, userAadObjectIds: [OID_DELETED] }]);
+    expect(await r.resolve(by(OID_DELETED))).toEqual({ source: 'refused', reason: 'unknown_user' });
+    expect(teams.calls).toEqual([]);
+  });
+
+  it.each([['Other'], [''], ['   ']])(
+    'refuses a non-Member, non-Guest type (%j) as not_member',
+    async (userType) => {
+      const accounts = accountsFrom({
+        [OID_A]: { userType, userPrincipalName: '1111111111@bcr-group.pl' },
+      });
+      const { r, teams } = setup([clientA], { accounts });
+      expect(await r.resolve(by(OID_A))).toEqual({ source: 'refused', reason: 'not_member' });
+      expect(teams.calls).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['no id', undefined],
+    ['an empty id', '  '],
+    ['a non-GUID id', '../me'],
+  ])('refuses %s as no_identity without a Graph call', async (_label, oid) => {
+    const { r, accounts, directory, lines } = setup();
+    expect(await r.resolve(by(oid))).toEqual({ source: 'refused', reason: 'no_identity' });
+    expect(accounts.calls).toEqual([]);
+    expect(directory.getSnapshot).not.toHaveBeenCalled();
+    expect(lines).toEqual([
+      { event: 'identity.refused', reason: 'no_identity', purpose: 'upload', msg: 'identity.refused' },
+    ]);
+  });
+
+  // Regression: a staff id bound on a client row cannot route.
+  it('quarantines a staff Member bound on a client row as not_client_account, without a Teams read', async () => {
+    const { r, lines, teams } = setup([{ ...clientA, userAadObjectIds: [OID_STAFF] }]);
+    expect(await r.resolve(by(OID_STAFF))).toEqual({
+      source: 'quarantine',
+      reason: 'not_client_account',
+      target: quarantineTarget,
+    });
+    expect(teams.calls).toEqual([]);
+    expect(lines).toEqual([
+      {
+        event: 'client_account.mismatch',
+        clientId: '0002',
+        listItemId: '11',
+        teamId: 'team-0002',
+        purpose: 'upload',
+        accountCheck: 'upn_mismatch',
+        msg: 'client_account.mismatch',
+      },
+    ]);
+    expect(JSON.stringify(lines)).not.toContain('bcr-group.pl');
+  });
+
+  it("quarantines another client's {NIP}@ account bound on this row as not_client_account", async () => {
+    // Client B's account typed onto client A's row (and B's row without it).
+    const { r, teams } = setup([
+      { ...clientA, userAadObjectIds: [OID_B] },
+      { ...clientB, userAadObjectIds: [] },
+    ]);
+    expect(await r.resolve(by(OID_B))).toMatchObject({
+      source: 'quarantine',
+      reason: 'not_client_account',
+    });
+    expect(teams.calls).toEqual([]);
+  });
+
+  it.each([
+    ['no NIP', ''],
+    ['a 9-digit NIP', '111111111'],
+    ['an 11-digit NIP', '11111111111'],
+  ])('quarantines every Member of a row with %s as not_client_account', async (_label, nip) => {
+    const { r, lines } = setup([{ ...clientA, nip, userAadObjectIds: [OID_A, OID_STAFF] }]);
+    for (const oid of [OID_A, OID_STAFF]) {
+      expect(await r.resolve(by(oid))).toMatchObject({ reason: 'not_client_account' });
+    }
+    expect(lines.map((l) => l['accountCheck'])).toEqual(['row_nip_invalid', 'row_nip_invalid']);
+  });
+
+  it('compares the UPN case-insensitively and never accepts a subdomain or onmicrosoft alias', async () => {
+    const upns: [string, string][] = [
+      ['1111111111@BCR-Group.PL', 'directory'],
+      [' 1111111111@bcr-group.pl ', 'directory'],
+      ['1111111111@sub.bcr-group.pl', 'quarantine'],
+      ['1111111111@contoso.onmicrosoft.com', 'quarantine'],
+      ['1111111111_bcr-group.pl#EXT#@contoso.onmicrosoft.com', 'quarantine'],
+      ['x1111111111@bcr-group.pl', 'quarantine'],
+    ];
+    for (const [userPrincipalName, want] of upns) {
+      const accounts = accountsFrom({ [OID_A]: { userType: 'Member', userPrincipalName } });
+      const { r } = setup([clientA], { accounts });
+      expect([userPrincipalName, (await r.resolve(by(OID_A))).source]).toEqual([
+        userPrincipalName,
+        want,
+      ]);
+    }
+  });
+
+  it('uses the injected domain when given one', async () => {
+    const accounts = accountsFrom({
+      [OID_A]: { userType: 'Member', userPrincipalName: '1111111111@contoso.example' },
+    });
+    const r = resolverOf(makeReader([clientA]), { accounts, clientAccountDomain: 'contoso.example' });
+    expect(await r.resolve(by(OID_A))).toMatchObject({ source: 'directory' });
+  });
+
+  it('MEMBERSHIP_CHECK_MODE=off skips the Teams read but never the account check', async () => {
+    const off = setup([clientA, { ...clientB, userAadObjectIds: [OID_B, OID_STAFF, OID_GUEST] }], {
+      membership: 'off',
+    });
+    expect(await off.r.resolve(by(OID_A))).toMatchObject({ source: 'directory' });
+    expect(await off.r.resolve(by(OID_STAFF))).toMatchObject({ reason: 'not_client_account' });
+    expect(await off.r.resolve(by(OID_GUEST))).toEqual({ source: 'refused', reason: 'guest' });
+    expect(off.accounts.calls).toEqual([OID_A, OID_STAFF, OID_GUEST]);
+    expect(off.teams.calls).toEqual([]);
+  });
+});
+
 describe('content-based routing stays deleted', () => {
   // The control for the cross-client write path is that the code does not
   // exist. If someone re-adds a NIP lookup or a promotion step to the
   // resolver, this fails before it can ship.
   it('clientResolver.ts has no NIP lookup and no promotion', () => {
     const source = readFileSync(join(__dirname, 'clientResolver.ts'), 'utf8');
-    const offenders = ['byNip', 'promote', 'Promote', 'fallback'].filter((needle) =>
-      source.includes(needle),
+    const offenders = ['byNip', 'rowsByNip', 'snapshot.entries', 'promote', 'Promote', 'fallback'].filter(
+      (needle) => source.includes(needle),
     );
     expect(offenders).toEqual([]);
+  });
+
+  // The account confirms the row the object id chose; it never finds one. A
+  // lookup keyed by the UPN (or a NIP taken from it) would be content-free
+  // routing by another name.
+  it('clientResolver.ts never looks a row up by UPN or NIP', () => {
+    const source = readFileSync(join(__dirname, 'clientResolver.ts'), 'utf8');
+    const offenders = [
+      /\.get\([^)]*userPrincipalName/,
+      /\.get\([^)]*\.nip\b/,
+      /\.find\(/,
+      /\.filter\(/,
+      /entries\b/,
+    ].filter((pattern) => pattern.test(source));
+    expect(offenders).toEqual([]);
+    // The one map the resolver reads a row from is keyed by object id.
+    expect(source.match(/\.get\([^)]*\)/g)).toEqual(['.get(oid)']);
   });
 
   // Direction is settled inside classification, from the bound client's own

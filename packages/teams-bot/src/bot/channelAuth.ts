@@ -7,11 +7,11 @@
  * bot's app id, from the issuer of whatever tenant it names, with no audience
  * check, and it then replies to whatever `serviceUrl` the body names. So
  * anyone holding the bot registration's secret could mint one and post an
- * activity naming any guest's `aadObjectId`: the gate reads only body fields,
- * it would pass, and the bot would upload or search as that guest. A channel
- * token is signed with the Bot Framework's own keys and the SDK checks its
- * `serviceurl` claim against the activity, so the body is the channel's, not
- * the caller's.
+ * activity naming any client account's `aadObjectId`: the gate reads only
+ * body fields, it would pass, and the bot would upload or search as that
+ * client. A channel token is signed with the Bot Framework's own keys and the
+ * SDK checks its `serviceurl` claim against the activity, so the body is the
+ * channel's, not the caller's.
  *
  * `validateClaims` runs after every token path (channel, emulator, skill,
  * ASE), so this one issuer check closes all but the channel. The Bot

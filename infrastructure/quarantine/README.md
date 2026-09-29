@@ -8,7 +8,11 @@ that team can read. Content promotion could then move it into whichever client's
 site a NIP in the document pointed to. Now, every upload that cannot be tied to
 one client goes to this site, and nowhere else. That covers uploads that are
 unmapped, from staff, conflicting, from a stale directory, aimed at a forbidden
-target, or aimed at an unwritable one:
+target, aimed at an unwritable one, from a Member bound on a row who is not its
+`{NIP}@bcr-group.pl` client account (`not_client_account`), or from a client
+account whose Teams are not exactly its row's. Only Members' uploads reach it: a
+client is its `{NIP}@` account (owner's decision, 28 September 2026), and a
+guest's upload is refused and stored nowhere, not even here:
 
 ```
 <library>/Kwarantanna/YYYY/MM/<batchId>/<sanitised original filename>
@@ -25,11 +29,12 @@ After each upload, ingestion sets four columns on the item: `UploaderOid`,
 | Type | Communication site, **no Microsoft 365 group** | No Team, no group to join, no group membership to drift. |
 | Sharing | `SharingCapability = Disabled`, sharing for non-owners disabled | Nothing leaves by link. |
 | Library | Unique permissions: site owners Full Control, `Kwarantanna – weryfikujący` Contribute | Only reviewers open documents. |
-| Everyone / EEEU | Removed from the site, the library and the site's groups | "Everyone except external users" is every licensed account, including the `{NIP}@` client addresses. |
+| Everyone / EEEU | Removed from the site, the library and the site's groups | "Everyone except external users" is every Member account, including the clients' `{NIP}@bcr-group.pl` accounts, which are their Teams sign-ins. |
 | Columns | `UploaderOid`, `QuarantineReason`, `OriginalFilename`, `DocumentId` (single line of text) | Written by ingestion. |
 | Writer | The ingestion managed identity, via a per-site `Sites.Selected` grant | See "Write grant" below. |
 
-Reviewers are BCR staff only. The script refuses a guest UPN (`#EXT#`).
+Reviewers are BCR staff only. The script refuses a guest UPN (`#EXT#`) and a
+client account's UPN (ten digits before the `@`: `{NIP}@bcr-group.pl`).
 
 ## Create it
 
@@ -142,9 +147,11 @@ granted `Sites.Selected`, restart it after that role is granted.
    Or: `Get-PnPAzureADAppSitePermission -Site <SiteUrl>`.
 2. **The site is closed.**
    - Re-run the script without `-Apply`. It should report 0 changes planned.
-   - A client guest opening the site URL gets "access denied".
+   - A client account opening the site URL gets "access denied". Use the canary
+     client account (a Member of BCR Kanarek only), not a real client's; a guest
+     gets "access denied" too.
    - `Get-PnPTenantSite -Identity <SiteUrl> | Select SharingCapability` shows `Disabled`.
-3. **Ingestion writes here, and only here.** After the P0 deploy, upload a document as a test user that no Directory row maps. Expect:
+3. **Ingestion writes here, and only here.** After the P0 deploy, upload a document as a test user that no Directory row maps. It must be a Member (staff): since the client-account rule a guest's upload is refused (`ClientAccountRequired`) and never reaches the quarantine. Expect:
    - the bot shows the 📨 row and the Polish message, with no link;
    - the file appears under `Kwarantanna/YYYY/MM/<batchId>/`, with the four columns set;
    - App Insights shows `document.quarantined` with `quarantineReason: "unmapped"`.

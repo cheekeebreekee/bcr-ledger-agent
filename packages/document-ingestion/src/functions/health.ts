@@ -8,11 +8,16 @@ import { loadIngestionConfig, searchOffReason } from '../config';
  * availability tests. It reads only the configuration loaded at cold start.
  *
  * `build.routing` says which routing this build does. Operator tools gate on
- * it: `tools/directory-bindings.mjs apply` only writes guest ids and channel
+ * it: `tools/directory-bindings.mjs apply` only writes user ids and channel
  * folders into Directory rows once the running build routes by identity only
  * (`--expect-health build.routing=identity-only`). Writing them into rows the
  * old build still reads would feed its content-promotion path. Keep `phase`
  * and `routing` exactly as they are.
+ *
+ * `build.clientIdentity` is `nip-member`, a constant of this build: a client
+ * is its `{NIP}@bcr-group.pl` Member account, and a guest is refused on every
+ * path with nothing stored. Operators check it after the deploy; the binding
+ * tool does not require it.
  *
  * `build.membershipCheck` is `MEMBERSHIP_CHECK_MODE`: `enforce` when a bound
  * uploader must be in their row's Team and no other, `off` when that check is
@@ -75,6 +80,7 @@ export function healthBody(build: HealthBuild, now: Date) {
     build: {
       phase: 'p0',
       routing: 'identity-only',
+      clientIdentity: 'nip-member',
       membershipCheck: build.membershipCheck,
       inboxSweep: build.inboxSweep,
       inboxSweepRows: build.inboxSweepRows,

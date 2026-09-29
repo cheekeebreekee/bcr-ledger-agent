@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { IngestionBatchItemResult, IngestionUploadResult } from '@bcr/shared';
+import { CLIENT_ACCOUNT_REQUIRED } from '@bcr/shared';
 import {
+  HELP_ACCOUNT_TEXT,
+  HELP_CHANNEL_TEXT,
+  HELP_CHAT_TEXT,
   QUARANTINED_TEXT,
   rejectionText,
   SEARCH_COVERAGE_TEXT,
@@ -152,6 +156,18 @@ describe('buildBatchResultCard', () => {
     },
   );
 
+  it('renders a refused account (ClientAccountRequired) with its fixed text and nothing else', () => {
+    const c = card([rejected(CLIENT_ACCOUNT_REQUIRED, 'This account may not file documents')]);
+    const [, row] = cellTexts(c);
+    expect(row).toEqual(['⚠️ broken.pdf', rejectionText(CLIENT_ACCOUNT_REQUIRED), '—']);
+    expect(row?.[1]).toContain('(login: NIP@bcr-group.pl)');
+    expect(openUrlActions(c)).toHaveLength(0);
+    expect(JSON.stringify(c)).not.toContain('may not file');
+    expect(c.body[1]?.text).toBe(
+      'Zarchiwizowano: 0  •  Przekazano do weryfikacji: 0  •  Odrzucono: 1',
+    );
+  });
+
   it('treats a rejected row without an error as a generic failure', () => {
     const c = card([{ filename: 'x.pdf', status: 'rejected' }]);
     expect(cellTexts(c)[1]?.[1]).toBe(rejectionText(undefined));
@@ -254,20 +270,54 @@ describe('buildHelpCard', () => {
     expect(text).toContain('kanał „Dokumenty księgowe” → karta „Udostępnione”');
   });
 
-  // Teams lets a guest attach files to channel posts only, so clients are
-  // sent to their channel first; the chat is for whoever can attach.
-  it('sends clients to their Team’s Dokumenty księgowe channel: a post with an attachment, or Udostępnione', () => {
-    const blocks = (buildHelpCard() as Card).body.map((b) => b.text ?? '');
-    const first = blocks[1] ?? '';
-    expect(first).toContain('w kanale „Dokumenty księgowe”');
-    expect(first).toContain('załącznik do wpisu w kanale');
-    expect(first).toContain('na karcie „Udostępnione”');
-    expect(first).toContain('w tym samym kanale');
+  // The owner's decision of 28 Sep 2026: a client is its {NIP}@bcr-group.pl
+  // Member account, which can attach here, so the chat comes first.
+  it('offers the chat first: attachments here, a card back with category and folder', () => {
+    const blocks = (buildHelpCard() as Card).body;
+    expect(blocks[1]).toEqual({ type: 'TextBlock', text: HELP_CHAT_TEXT, wrap: true });
+    expect(HELP_CHAT_TEXT).toContain('w tym czacie, jako załączniki');
+    expect(HELP_CHAT_TEXT).toContain('kategorią i folderem docelowym');
   });
 
-  it('says guests cannot attach files in this chat, and keeps the chat for whoever can', () => {
-    expect(text).toContain('Goście (konta spoza BCR) nie mogą dołączać plików w tym czacie');
-    expect(text).toContain('Jeśli możesz dołączyć plik tutaj, wyślij go w tym prywatnym czacie');
+  it('offers the Team’s Dokumenty księgowe channel second: a post with an attachment, or Udostępnione', () => {
+    const blocks = (buildHelpCard() as Card).body;
+    expect(blocks[2]).toEqual({
+      type: 'TextBlock',
+      text: HELP_CHANNEL_TEXT,
+      wrap: true,
+      spacing: 'Medium',
+    });
+    expect(HELP_CHANNEL_TEXT).toContain('„Dokumenty księgowe”');
+    expect(HELP_CHANNEL_TEXT).toContain('załącznik do wpisu');
+    expect(HELP_CHANNEL_TEXT).toContain('„Udostępnione”');
+    expect(HELP_CHANNEL_TEXT).toContain('w tym samym kanale');
+  });
+
+  it('then says the assistant works only on the NIP@ account, and not for a guest', () => {
+    const blocks = (buildHelpCard() as Card).body;
+    expect(blocks[3]).toEqual({
+      type: 'TextBlock',
+      text: HELP_ACCOUNT_TEXT,
+      wrap: true,
+      spacing: 'Medium',
+    });
+    expect(HELP_ACCOUNT_TEXT).toContain('NIP@bcr-group.pl');
+    expect(HELP_ACCOUNT_TEXT).toContain('konta gościa');
+  });
+
+  it('no longer says guests cannot attach in this chat', () => {
+    expect(text).not.toContain('nie mogą dołączać');
+    expect(text).not.toContain('Goście (konta spoza BCR)');
+    expect(text).not.toContain('prywatnym czacie');
+  });
+
+  it('keeps the title and the last three blocks, in order', () => {
+    const blocks = (buildHelpCard() as Card).body.map((b) => b.text);
+    expect(blocks).toHaveLength(7);
+    expect(blocks[0]).toBe('📂 Asystent Archiwizacji Dokumentów');
+    expect(blocks[4]).toMatch(/^Klasyfikacja odbywa się na podstawie treści dokumentu/);
+    expect(blocks[5]).toMatch(/^Dokumenty, których nie da się jednoznacznie sklasyfikować/);
+    expect(blocks[6]).toMatch(/^Zarchiwizowane pliki znajdziesz w swoim zespole w Teams/);
   });
 
   it('inserts nothing: every block is fixed text with no markdown link', () => {
@@ -278,15 +328,21 @@ describe('buildHelpCard', () => {
 });
 
 describe('buildHelpCard with search', () => {
-  /** SHA-256 of the help card's JSON before search existed (HEAD b9d0182). */
-  const HELP_CARD_SHA256 = '85be6ea3de384bffdfd9ddc6d4bfe971b849c0ff8039f270f0647a8ad2ec154a';
+  /**
+   * SHA-256 of the help card's JSON with search off: the help card after the
+   * 28 Sep 2026 account decision (1,832 bytes). It replaces the pin of the
+   * card from before search (85be6ea3…154a, HEAD b9d0182); a change of wording
+   * means computing it again.
+   */
+  const HELP_CARD_SHA256 = '1254031f7ed6a0c4ca3a0f4711b8092f96f2fd6b524bd27a2d03802bc38bab2f';
   const sha256 = (card: unknown) =>
     createHash('sha256').update(JSON.stringify(card), 'utf8').digest('hex');
 
-  it('is, with search off, byte for byte the card from before search', () => {
+  it('is, with search off, byte for byte the pinned card', () => {
     expect(sha256(buildHelpCard())).toBe(HELP_CARD_SHA256);
     expect(sha256(buildHelpCard({}))).toBe(HELP_CARD_SHA256);
     expect(sha256(buildHelpCard({ search: false }))).toBe(HELP_CARD_SHA256);
+    expect(Buffer.byteLength(JSON.stringify(buildHelpCard()), 'utf8')).toBe(1832);
   });
 
   it('adds only a fixed „Wyszukiwanie” section at the end with search on', () => {

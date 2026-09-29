@@ -37,10 +37,11 @@ administrator's UPN). Its sub-commands: `status`, `verify`, `grant-app <login>`,
 
 ## Client search
 
-A client's guest searches their own client's documents through the ingestion (`POST /api/search`);
-this package holds its reads and its durable limits. The scope is the bound Directory row's
-`clientIdForDirectoryRow`, as for filing: nothing in a filter, a cursor or the model's output can
-name a client.
+A client's `{NIP}@bcr-group.pl` account searches its own client's documents through the
+ingestion (`POST /api/search`); a guest never does (ingestion answers `no_access` before any
+transaction). This package holds its reads and its durable limits. The scope is the bound
+Directory row's `clientIdForDirectoryRow`, as for filing: nothing in a filter, a cursor or the
+model's output can name a client.
 
 - **Reads** — `documentsRepo.searchClientView(tx, filter, { limit, after })` (10 a page by
   default, keyset cursor as `search`) and `documentsRepo.countMatching(tx, filter, cap)` (counts at

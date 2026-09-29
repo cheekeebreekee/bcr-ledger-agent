@@ -8,12 +8,18 @@
  *   1. it comes from a 1:1 (`personal`) conversation — group chats and team
  *      channels are shared spaces where a document or a reply would be seen
  *      by people who are not its owner;
- *   2. it comes from the BCR tenant (guests are homed in it too);
+ *   2. it comes from the BCR tenant (the clients' `{NIP}@bcr-group.pl`
+ *      accounts are Members of it; guests are homed in it too);
  *   3. the sender has an AAD object id shaped like a GUID — routing is
  *      identity-based, so an activity without a verifiable identity can
  *      never be tied to exactly one client.
  *
  * The checks run in that order and the first failure is the reported reason.
+ *
+ * The gate cannot tell a guest from a member, and it never looks a user up:
+ * it must never fail closed on a user-type lookup. Whether the sender is a
+ * client account (the row's `{NIP}@` Member; guests have no capability) is
+ * decided by ingestion alone, for every upload and every search.
  */
 
 export type GateReason = 'conversation_type' | 'tenant' | 'aad_object_id';

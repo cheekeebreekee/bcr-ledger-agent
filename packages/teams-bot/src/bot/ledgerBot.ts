@@ -68,6 +68,13 @@ type DownloadOutcome =
  * Which activities reach this class at all is decided earlier, by the gate
  * middleware registered on the adapter (`gateMiddleware.ts`).
  *
+ * Who may file or search is not decided here. A client is its company's
+ * `{NIP}@bcr-group.pl` Member account; guests have no capability. The bot
+ * makes no user or role lookup of its own: it forwards every admitted upload
+ * with the sender's AAD object id, and ingestion alone refuses anyone but the
+ * row's client account. A refused batch comes back as `rejected` rows with
+ * `ClientAccountRequired` (nothing stored), rendered as a fixed Polish text.
+ *
  * We deliberately keep this class free of HTTP/SDK plumbing — that lives
  * in `functions/messages.ts` — so it stays trivially unit-testable with
  * a `TestAdapter`.

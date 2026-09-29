@@ -16,7 +16,7 @@ onboarding repo; see [Phase 1: the generator port](#phase-1-the-generator-port).
 
 | File | Id | Status | What it shows | Kind |
 |---|---|---|---|---|
-| [00-phase0-routing.md](00-phase0-routing.md) | P0 | PHASE-0 | Routing on today's code after containment: bot gate, strict source, two-pass Directory snapshot, bound client target or quarantine, no promotion, `conflictBehavior=fail`, the result card | flowchart |
+| [00-phase0-routing.md](00-phase0-routing.md) | P0 | PHASE-0 | Routing on today's code after containment: bot gate, strict source, the uploader's account (a guest is refused), two-pass Directory snapshot, the row's client account, bound client target or quarantine, no promotion, `conflictBehavior=fail`, the result card | flowchart |
 | [01-as-is.md](01-as-is.md) | D1 | AS-IS, **private** | The flow before Phase 0, with defects X1 to X10 marked | flowchart |
 | [02-target-business-logic.md](02-target-business-logic.md) | D2 | TARGET | Business logic: identity binding, dedupe, KSeF match, the 0.70 gate, review, learning, search, billing | flowchart |
 | [03-target-architecture.md](03-target-architecture.md) | D3 | TARGET | Apps, identities, queues and permissions, and which identity may write SharePoint | flowchart |
@@ -30,13 +30,21 @@ D2, D3 and D4 are copied verbatim from the approved plan, which holds the reconc
 D5 to D8 follow the same reconciled design, including the review amendments that corrected
 earlier drafts.
 
+**Amended 29 September 2026: who the client is.** The plan drew the client as a Teams guest. The
+owner's decision of 28 September makes a client's identity its `{NIP}@bcr-group.pl` account, an
+Entra Member created by BCR and a member of its own client Team only, and gives guests no
+capability in the ledger. P0 shows the rule as the Phase-0 code implements it (in the next
+ingestion build, not yet deployed). D2 to D5 and D8 say "client account" where they drew a guest
+as the client, D6 notes that a client account is refused by the staff app like a guest, and each
+marks what it amended; D1 gets a dated correction in its "Removed by" column only.
+
 ## Status labels
 
 Each file names its status in its first paragraph.
 
 | Label | Meaning |
 |---|---|
-| **AS-IS** | The code as it was before Phase 0 (`cbf1630`, 25 Sep 2026). Frozen: it is never updated, because it records what the incident review is about. |
+| **AS-IS** | The code as it was before Phase 0 (`cbf1630`, 25 Sep 2026). Frozen: it is never updated, because it records what the incident review is about. The one exception is a dated correction in the "Removed by" column, which describes fixes, not the as-is state. |
 | **PHASE-0** | What Phase 0 ships on today's code, with no database. It is interim: the TARGET design replaces it. |
 | **TARGET** | The reconciled v2 design. None of it is built yet. When a workstream ships a flow, the PR that ships it updates the diagram and changes its label to IMPLEMENTED. |
 
@@ -50,7 +58,7 @@ slides from both repos match.
 
 | Class | Meaning | Fill | Stroke | Text |
 |---|---|---|---|---|
-| `client` | Client: a guest, a client Team, a client's folder | `#dbeafe` | `#2563eb` | `#0b2e6b` |
+| `client` | Client: the client's `{NIP}@` account, a client Team, a client's folder | `#dbeafe` | `#2563eb` | `#0b2e6b` |
 | `agent` | AI agent: Claude classification, learning, the future billing agent | `#e0e7ff` | `#4f46e5` | `#221a63` |
 | `staff` | BCR staff: accountants, triage, the staff app and channel | `#dcfce7` | `#16a34a` | `#0d3b1e` |
 | `system` | Ledger systems acting on their own: apps, queues, the database | `#f1f5f9` | `#64748b` | `#1e293b` |

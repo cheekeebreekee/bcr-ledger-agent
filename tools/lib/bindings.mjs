@@ -3,16 +3,29 @@
  * CLI gathers facts from Graph and these functions decide what they mean. That
  * split is what lets the decisions be unit-tested on synthetic fixtures.
  *
- * The decisions follow the Phase 0 isolation invariants:
+ * The decisions follow the Phase 0 isolation invariants, restated for the
+ * client accounts (the owner's decision of 28 Sep 2026):
  *
- * - **Staff are never client users (I9).** A `Member` id on a client row is
+ * - **A client is its `{NIP}@<domain>` account; guests have no capability.**
+ *   The one id a client row may route is its client account: the Entra
+ *   `Member` whose `userPrincipalName` is `<the row's 10-digit NIP>@<domain>`
+ *   (`clientAccountVerdict`, the rule `@bcr/shared` applies at runtime; one
+ *   case table tests both), a member (never an owner) of the row's Team, and
+ *   in no other Team. It is found by that UPN for the row already chosen,
+ *   never the other way round. A Guest id on a client row is removed without
+ *   a flag (`guest_ids`), and a guest is never proposed.
+ * - **Staff are never client users (I9).** A `Member` id on a client row that
+ *   is not its client account (staff, or another client's account) is
  *   reported, and removed only when the operator confirms it for that row.
- *   Only Guests are proposed, and never a team owner.
- * - **Ambiguity is skipped, never guessed (I3).** A guest who belongs to any
- *   Team besides the row's own (a client Team with or without the
- *   `BCR Group —` marker, or BCR GROUP) is not bound. A duplicate ClientId,
- *   NIP, site or target skips every row that shares it. An unreadable fact
- *   skips the row rather than being read as "absent".
+ * - **An account's sign-in state is reported, never acted on.** A disabled
+ *   client account stays bound (`client_account_disabled`; `check` exits 5
+ *   for a bound one): the ledger never locks a client out, and no tool
+ *   writes to `/users/*`.
+ * - **Ambiguity is skipped, never guessed (I3).** A client account that
+ *   belongs to any Team besides the row's own (a client Team with or without
+ *   the `BCR Group —` marker, or BCR GROUP) is not bound. A duplicate
+ *   ClientId, NIP, site or target skips every row that shares it. An
+ *   unreadable fact skips the row rather than being read as "absent".
  * - **A site path means one site.** SitePath is canonicalised by the same
  *   rule as the ingestion (contract C1: exactly `/sites/<name>` or
  *   `/teams/<name>`, a plain name, empty segments dropped, case folded).
@@ -39,7 +52,7 @@ export const CHANNEL_NAME = 'Dokumenty księgowe';
  * Any dash is accepted. Onboarding writes it; the Teams that predate
  * onboarding (`[0000]`–`[0004]`, among them TEST and PESKOVOI) do not carry
  * it. So it is a sanity check on a row's own Team (a warning), and it never
- * decides which Teams a guest belongs to: every Team-provisioned group counts.
+ * decides which Teams an account belongs to: every Team-provisioned group counts.
  */
 export const BCR_TEAM_DESCRIPTION = /^\s*BCR\s+Group\s*[—–-]/i;
 
@@ -52,14 +65,23 @@ export const P0_HEALTH_EXPECTATION = 'build.routing=identity-only';
 export const PLAN_KIND = 'bcr.directory-bindings.plan';
 export const LOG_KIND = 'bcr.directory-bindings.apply-log';
 export const ROLLBACK_KIND = 'bcr.directory-bindings.rollback-log';
-export const PLAN_VERSION = 1;
+/**
+ * 2 since the client-account rule (28 Sep 2026): a plan binds a row's
+ * `{NIP}@<domain>` account and records `clientDomain`. A version-1 plan bound
+ * guests, and `apply` refuses it.
+ */
+export const PLAN_VERSION = 2;
 
 /** The columns this tool writes. Nothing else on a row is ever patched. */
 export const BINDING_FIELDS = Object.freeze(['RootFolder', 'UserAadObjectIds', 'DriveId', 'TeamId']);
 
-/** Columns a stale plan is detected by, besides the binding itself. */
+/**
+ * Columns a stale plan is detected by, besides the binding itself. `NIP`
+ * names the row's client account, so a plan made before a NIP edit is stale.
+ */
 export const GUARD_FIELDS = Object.freeze([
   'ClientId',
+  'NIP',
   'SiteHostname',
   'SitePath',
   'DriveName',
@@ -69,25 +91,34 @@ export const GUARD_FIELDS = Object.freeze([
 
 /**
  * Problems that mean an id on an Active client row routes where it should
- * not: staff on a client row, or a guest on it who is no longer a guest of
- * that row's Team alone. `check` exits 3 when a **bound** row has one, so a
- * scheduled run can raise it (C12). On an unbound row the ingestion routes
- * nobody (`unbound_target`), so there it is reported as not routing.
+ * not, or would under an older ingestion build: staff on a client row, a
+ * guest on it, or its client account when it no longer qualifies. `check`
+ * exits 3 when a **bound** row has one, so a scheduled run can raise it
+ * (C12). On an unbound row the ingestion routes nobody (`unbound_target`), so
+ * there it is reported as not routing.
  */
-export const ROUTING_DRIFT_CODES = Object.freeze(['staff_ids', 'staff_ids_removed', 'bound_guest_ineligible']);
+export const ROUTING_DRIFT_CODES = Object.freeze([
+  'staff_ids',
+  'staff_ids_removed',
+  'guest_ids',
+  'client_account_ineligible',
+]);
 
 /**
  * Problems that leave a row's ids unassessed for drift: the site, its Team,
- * the Team's people or a guest's own memberships could not be read, so no
- * drift code could be raised either way. On a bound row that holds user ids
- * `check` exits 4 (incomplete) rather than 0.
+ * the Team's people, the client account or its own memberships, or an id on
+ * the row could not be read, so no drift code could be raised either way. On
+ * a bound row that holds user ids `check` exits 4 (incomplete) rather than 0:
+ * nothing found is not nothing there.
  */
 export const DRIFT_UNASSESSED_CODES = Object.freeze([
+  'user_lookup_failed',
   'site_unresolved',
   'no_team',
   'team_lookup_failed',
   'membership_lookup_failed',
-  'guest_memberships_unreadable',
+  'client_account_lookup_failed',
+  'client_account_memberships_unreadable',
 ]);
 
 /** Columns `--add-columns` creates (single line of text). */
@@ -116,6 +147,88 @@ export function splitLines(raw) {
 
 export function normalizeNip(value) {
   return String(value ?? '').replace(/\D+/g, '');
+}
+
+// ---------------------------------------------------------------------------
+// Client accounts
+// ---------------------------------------------------------------------------
+
+/**
+ * The client accounts' domain: `{NIP}@bcr-group.pl` (owner's decision, 28 Sep
+ * 2026). The same constant as `CLIENT_ACCOUNT_DOMAIN` in `@bcr/shared`; both
+ * sides test it against `test/client-account-cases.json`.
+ */
+export const CLIENT_ACCOUNT_DOMAIN = 'bcr-group.pl';
+
+/**
+ * Whether `account` is the client account of a Directory row whose NIP is
+ * `rowNip` (digits only, as the Directory readers normalise it). Pure; no I/O.
+ * It confirms a row already chosen, and is never used to find one. Order: the
+ * type (Guest, then anything but Member), then the row's NIP, then the UPN.
+ *
+ * Character for character the rule of `clientAccountVerdict` in
+ * `packages/shared/src/clientAccount.ts` (these tools are `.mjs` and cannot
+ * import TypeScript). Both test `test/client-account-cases.json`: change both
+ * or neither.
+ *
+ * @param {{ userType?: string | null, userPrincipalName?: string | null }} account
+ * @param {string} rowNip
+ * @param {string} [domain]
+ * @returns {'client' | 'guest' | 'not_member' | 'row_nip_invalid' | 'upn_mismatch'}
+ */
+export function clientAccountVerdict(account, rowNip, domain = CLIENT_ACCOUNT_DOMAIN) {
+  const type = (account.userType ?? '').trim().toLowerCase();
+  if (type === 'guest') return 'guest';
+  if (type !== 'member') return 'not_member';
+  if (!/^[0-9]{10}$/.test(rowNip)) return 'row_nip_invalid';
+  const upn = (account.userPrincipalName ?? '').trim().toLowerCase();
+  return upn === `${rowNip}@${domain.trim().toLowerCase()}` ? 'client' : 'upn_mismatch';
+}
+
+/** The UPN a row's client account has: `<nip>@<domain>`. */
+export function clientAccountUpn(nip, domain = CLIENT_ACCOUNT_DOMAIN) {
+  return `${nip}@${domain}`;
+}
+
+/**
+ * The NIP in a UPN shaped like a client account (`<10 ASCII digits>@<domain>`,
+ * trimmed, case folded), or `''`. It only labels an id already on a row
+ * (another client's account, or this row's after a NIP edit); it never finds
+ * a row.
+ */
+export function clientAccountNipOf(userPrincipalName, domain = CLIENT_ACCOUNT_DOMAIN) {
+  const upn = String(userPrincipalName ?? '').trim().toLowerCase();
+  const at = upn.indexOf('@');
+  if (at !== 10 || upn.slice(at + 1) !== String(domain).trim().toLowerCase()) return '';
+  const local = upn.slice(0, at);
+  return /^[0-9]{10}$/.test(local) ? local : '';
+}
+
+const HOST_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
+const CLIENT_DOMAIN = new RegExp(`^(?=.{1,253}$)${HOST_LABEL}(?:\\.${HOST_LABEL})+$`);
+
+/**
+ * Whether `value` may be a client-account domain: a lower-case host name with
+ * at least two labels (`bcr-group.pl`, `contoso.example`). No `@`, no port, no
+ * trailing dot, no upper case.
+ */
+export function isClientDomain(value) {
+  return typeof value === 'string' && CLIENT_DOMAIN.test(value);
+}
+
+const NIP_WEIGHTS = [6, 5, 7, 2, 3, 4, 5, 6, 7];
+
+/**
+ * Whether a 10-digit NIP passes the Polish checksum. Only ever a warning
+ * (`client_nip_checksum`): the rule needs 10 digits and nothing more, so a
+ * typo C4 already catches can never lock a client out, and the canary row may
+ * carry a NIP no company can hold (9000000000).
+ */
+export function nipChecksumOk(nip) {
+  if (!/^[0-9]{10}$/.test(String(nip ?? ''))) return false;
+  const digits = [...nip].map(Number);
+  const sum = NIP_WEIGHTS.reduce((acc, w, i) => acc + w * digits[i], 0) % 11;
+  return sum !== 10 && sum === digits[9];
 }
 
 const SITE_KIND = /^(sites|teams)$/i;
@@ -364,6 +477,23 @@ function byNumericId(a, b) {
 }
 
 /**
+ * The NIPs of the Active client rows, each with the rows that carry it. Only
+ * used to tell another client's account on a row (its NIP is another row's)
+ * from this row's own account after a NIP edit or a rename; never to bind.
+ *
+ * @returns {Map<string, string[]>}
+ */
+export function clientNipsOf(rows) {
+  const out = new Map();
+  for (const row of rows ?? []) {
+    if (!row.active || row.isAdmin || !row.nip) continue;
+    if (!out.has(row.nip)) out.set(row.nip, []);
+    out.get(row.nip).push(row.listItemId);
+  }
+  return out;
+}
+
+/**
  * Whether the ingestion can route to this row at all: an Active client row
  * with RootFolder, DriveId and TeamId all set (C3). Any other row's users are
  * quarantined (`unbound_target`), whatever ids it holds.
@@ -383,9 +513,12 @@ export function isBoundRow(row) {
  * - `notRoutingUnbound`: unbound rows with a drift problem. Reported only:
  *   the Phase-0 ingestion routes nobody to them, and the PATCH that binds
  *   such a row also takes those ids off.
+ * - `lockedOut`: bound rows whose bound client account is disabled
+ *   (`assessRow`'s `lockedOut`): the client cannot sign in. Exit 5. The row
+ *   is never unbound for it; the account is re-enabled in Entra.
  *
- * 3 wins over 4, and 0 means every bound row with ids was assessed and none
- * routes where it should not.
+ * 3 wins over 4, and 4 over 5. 0 means every bound row with ids was assessed,
+ * none routes where it should not, and no bound client account is disabled.
  *
  * @param {ReturnType<typeof parseDirectoryRow>[]} rows
  * @param {ReturnType<typeof assessRow>[]} assessments
@@ -395,6 +528,7 @@ export function checkVerdict(rows, assessments) {
   const routingDrift = [];
   const incomplete = [];
   const notRoutingUnbound = [];
+  const lockedOut = [];
   for (const a of assessments) {
     const row = rowById.get(a.listItemId);
     if (!row?.active || row.isAdmin) continue;
@@ -406,9 +540,10 @@ export function checkVerdict(rows, assessments) {
     if (bound && row.userIds.length && DRIFT_UNASSESSED_CODES.some((c) => codes.has(c))) {
       incomplete.push(a.listItemId);
     }
+    if (bound && a.lockedOut === true) lockedOut.push(a.listItemId);
   }
-  const exitCode = routingDrift.length ? 3 : incomplete.length ? 4 : 0;
-  return { routingDrift, incomplete, notRoutingUnbound, exitCode };
+  const exitCode = routingDrift.length ? 3 : incomplete.length ? 4 : lockedOut.length ? 5 : 0;
+  return { routingDrift, incomplete, notRoutingUnbound, lockedOut, exitCode };
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +559,7 @@ export function isBcrTeamGroup(group) {
  * `resourceProvisioningOptions` contains `Team`, or it is one of the Teams the
  * tenant listing returned, or it carries the client-team marker. A group whose
  * `resourceProvisioningOptions` was not returned at all cannot be told apart,
- * so it counts as a Team: an unknown may only exclude a guest, never bind one.
+ * so it counts as a Team: an unknown may only exclude an account, never bind one.
  *
  * @param {{id?:string, description?:string, resourceProvisioningOptions?:string[]}} group
  * @param {Set<string>} [knownTeamIds]  normalised ids of every Team in the tenant
@@ -497,64 +632,179 @@ export function pickAccountingChannel(channels, name = CHANNEL_NAME) {
 }
 
 /**
- * Split a team's people into the guests that may be bound to this client and
- * everyone else, with the reason.
+ * The row's client account, and why each other person of its Team is not
+ * bound.
  *
- * A guest is eligible only when this Team is the only Team they belong to.
- * Every Team counts, not only those carrying the `BCR Group —` marker: the
- * client Teams that predate onboarding have no marker, and neither has BCR
- * GROUP. A guest who is also in any other Team is excluded as
- * `guest_in_other_team`, with those Teams listed for the reviewer; binding
- * them here would file every upload of theirs, including another company's
- * documents, into this client's channel.
+ * The account is the one `propose` read by its UPN, `<rowNip>@<clientDomain>`
+ * (`GET /users/{upn}`), for this row: the row is already chosen, and the NIP
+ * only names who may route to it. It is eligible only when all of these hold:
+ * its verdict is `client` (a Member with exactly that UPN), it is on this
+ * Team's roster and not an owner (an owner can change the channel folder's
+ * permissions, and BCR never makes a client one), its own memberships could
+ * be read, and its Teams are exactly this Team. Every Team counts, marked or
+ * not (see `isTeamGroup`): a client account belongs to one company, so a
+ * second Team is always an anomaly, never a reused email.
+ *
+ * `accountEnabled` is reported (`client_account_disabled`), never a reason not
+ * to bind: the ledger must never act as a lock on a client.
+ *
+ * Everyone else on the roster is in `notBound`, with the reason: `owner`,
+ * `guest` (every Guest, a guest of this Team alone included: guests have no
+ * capability in the ledger), `client_account_ineligible` (the row's own
+ * account when it does not qualify), `other_client_account` (a Member whose
+ * UPN is shaped like another NIP's client account) or `staff`.
  *
  * @param {object} p
  * @param {string} p.teamId
+ * @param {string} p.rowNip        digits only, as parseDirectoryRow normalises it
+ * @param {string} [p.clientDomain]
+ * @param {object | null | {error:string}} [p.account]  the `GET /users/{upn}` answer: `null` is 404,
+ *   `undefined` means not read (a skip, like an error)
+ * @param {Array<object> | {error:string}} [p.accountMemberOf]  the account's `memberOf`
  * @param {Array<{id:string,userType?:string,displayName?:string,userPrincipalName?:string}>} p.members
  * @param {Array<{id:string}>} p.owners
- * @param {Map<string, Array<{id:string,displayName?:string,description?:string,resourceProvisioningOptions?:string[]}> | {error:string}>} p.memberOfByUser
  * @param {Set<string>} [p.knownTeamIds]  normalised ids of every Team in the tenant
+ * @returns {{ eligible: object[], problems: object[], notBound: object[], assessed: boolean, account: object | null }}
+ *   `eligible` has at most one entry. `assessed` is false when a read left the
+ *   question open (then a skip problem says which). `account` is the row's
+ *   client account as read (verdict `client`), eligible or not.
  */
-export function classifyTeamPeople({ teamId, members, owners, memberOfByUser, knownTeamIds }) {
+export function classifyClientAccount({
+  teamId,
+  rowNip,
+  clientDomain = CLIENT_ACCOUNT_DOMAIN,
+  account,
+  accountMemberOf,
+  members,
+  owners,
+  knownTeamIds,
+}) {
   const team = normalizeGuid(teamId);
   const ownerIds = new Set((owners ?? []).map((o) => normalizeGuid(o.id)).filter(Boolean));
-  const eligible = [];
-  const excluded = [];
+  const rosterIds = new Set((members ?? []).map((m) => normalizeGuid(m.id)).filter(Boolean));
+  const problems = [];
+  const add = (code, severity, detail) => problems.push({ code, severity, detail });
+  const upn = clientAccountUpn(rowNip, clientDomain);
+  let found = null;
+  let assessed = true;
+  const why = [];
+  let otherTeams = [];
+
+  if (!/^[0-9]{10}$/.test(String(rowNip ?? ''))) {
+    // No valid NIP, no client account: nothing to read. assessRow reports
+    // `client_nip_invalid`; the row may still be bound, and routes nobody.
+  } else if (account === undefined || isError(account)) {
+    assessed = false;
+    add(
+      'client_account_lookup_failed',
+      'skip',
+      account === undefined ? `${upn} was not read` : `could not read ${upn}: ${account.error}`,
+    );
+  } else if (account === null) {
+    add(
+      'client_account_missing',
+      'warn',
+      `no account ${upn}: nobody routes to this row until BCR creates it (a Member, licensed, a member ` +
+        'of this Team only), then propose and apply again',
+    );
+  } else {
+    const verdict = clientAccountVerdict(account, rowNip, clientDomain);
+    const id = normalizeGuid(account.id);
+    if (verdict !== 'client' || !id) {
+      add(
+        'client_account_not_member',
+        'warn',
+        `${upn} is not a client account (${verdict === 'client' ? 'no object id' : verdict}` +
+          `${account.userType ? `, userType ${account.userType}` : ''}); not bound`,
+      );
+    } else {
+      found = {
+        id,
+        displayName: account.displayName ?? '',
+        userPrincipalName: account.userPrincipalName ?? '',
+        accountEnabled: typeof account.accountEnabled === 'boolean' ? account.accountEnabled : null,
+      };
+      if (account.accountEnabled === false) {
+        add(
+          'client_account_disabled',
+          'warn',
+          `${upn} is disabled: the client cannot sign in to Teams. It is bound all the same: the ` +
+            'ledger never unbinds or blocks a client for this. Tell Roman; re-enabling it in Entra is his',
+        );
+      }
+      if (!rosterIds.has(id)) {
+        why.push('client_account_not_in_team');
+        add('client_account_not_in_team', 'warn', `${upn} is not a member of this Team; not bound`);
+      }
+      if (ownerIds.has(id)) {
+        why.push('client_account_owner');
+        add(
+          'client_account_owner',
+          'warn',
+          `${upn} is an owner of this Team, and an owner can change the channel folder's permissions. ` +
+            'Not bound: make it a member, never an owner, then propose again',
+        );
+      }
+      if (!Array.isArray(accountMemberOf)) {
+        assessed = false;
+        why.push('client_account_memberships_unreadable');
+        add(
+          'client_account_memberships_unreadable',
+          'skip',
+          `${upn}'s memberships could not be read${isError(accountMemberOf) ? ` (${accountMemberOf.error})` : ''}, ` +
+            'so it cannot be shown to be in this Team alone',
+        );
+      } else {
+        const teams = accountMemberOf.filter((g) => isTeamGroup(g, knownTeamIds));
+        otherTeams = teams
+          .filter((g) => normalizeGuid(g.id) !== team)
+          .map((g) => ({ id: normalizeGuid(g.id) || String(g.id ?? ''), displayName: g.displayName ?? '' }));
+        if (otherTeams.length) {
+          why.push('client_account_in_other_team');
+          add(
+            'client_account_in_other_team',
+            'warn',
+            `${upn} is also in ${otherTeams.map(describeTeam).join(', ')}; not bound. A client account ` +
+              'belongs to one company, so this is an anomaly: its uploads are quarantined ' +
+              '(membership_mismatch) and its channel posts wait (other_teams) until it is taken out ' +
+              'of the other Team(s)',
+          );
+        }
+        if (rosterIds.has(id) && !teams.some((g) => normalizeGuid(g.id) === team)) {
+          // The roster says it is a member; its own memberships do not. Two
+          // reads disagree, so nothing is inferred from either.
+          why.push('client_account_not_in_this_team');
+          add(
+            'client_account_not_in_this_team',
+            'warn',
+            `${upn} is listed as a member of this Team, but its memberships do not include it; not bound`,
+          );
+        }
+      }
+    }
+  }
+
+  const eligible = found && !why.length ? [found] : [];
+  const notBound = [];
   for (const m of members ?? []) {
     const id = normalizeGuid(m.id);
-    if (!id) continue;
+    if (!id || eligible.some((e) => e.id === id)) continue;
     const who = { id, displayName: m.displayName ?? '', userPrincipalName: m.userPrincipalName ?? '' };
-    if (ownerIds.has(id)) {
-      excluded.push({ ...who, reason: 'owner' });
-      continue;
-    }
-    if (m.userType !== 'Guest') {
-      excluded.push({ ...who, reason: 'not_a_guest', userType: m.userType ?? 'unknown' });
-      continue;
-    }
-    const groups = memberOfByUser?.get(id);
-    if (!Array.isArray(groups)) {
-      excluded.push({ ...who, reason: 'memberships_unreadable' });
-      continue;
-    }
-    const teams = groups.filter((g) => isTeamGroup(g, knownTeamIds));
-    const otherTeams = teams
-      .filter((g) => normalizeGuid(g.id) !== team)
-      .map((g) => ({ id: normalizeGuid(g.id) || String(g.id ?? ''), displayName: g.displayName ?? '' }));
-    if (otherTeams.length) {
-      excluded.push({ ...who, reason: 'guest_in_other_team', otherTeams });
-      continue;
-    }
-    if (!teams.length) {
-      // The roster says they are a member; their own memberships do not.
-      // Two reads disagree, so nothing is inferred from either.
-      excluded.push({ ...who, reason: 'guest_not_in_this_team' });
-      continue;
-    }
-    eligible.push(who);
+    if (ownerIds.has(id)) notBound.push({ ...who, reason: 'owner' });
+    else if (String(m.userType ?? '').trim().toLowerCase() === 'guest') notBound.push({ ...who, reason: 'guest' });
+    else if (found && id === found.id) {
+      notBound.push({
+        ...who,
+        reason: 'client_account_ineligible',
+        why: why.join(', '),
+        ...(otherTeams.length ? { otherTeams } : {}),
+      });
+    } else if (clientAccountNipOf(m.userPrincipalName, clientDomain)) {
+      notBound.push({ ...who, reason: 'other_client_account' });
+    } else notBound.push({ ...who, reason: 'staff', userType: m.userType ?? 'unknown' });
   }
-  eligible.sort((a, b) => a.id.localeCompare(b.id));
-  return { eligible, excluded };
+  notBound.sort((a, b) => a.id.localeCompare(b.id));
+  return { eligible, problems, notBound, assessed, account: found };
 }
 
 /**
@@ -757,29 +1007,102 @@ export function assessRow(row, facts = {}, ctx = {}) {
     );
   }
 
+  // --- the row's NIP: it names the row's client account ---------------------
+  const clientDomain = ctx.clientDomain ?? CLIENT_ACCOUNT_DOMAIN;
+  const nipValid = /^[0-9]{10}$/.test(row.nip);
+  if (!row.isAdmin && !nipValid) {
+    add(
+      'client_nip_invalid',
+      'warn',
+      `the row's NIP is ${row.nip ? `${row.nip.length} digits` : 'empty'}, not 10: it names no client ` +
+        'account, so nobody routes to this row. The target may still be bound; nothing is guessed. ' +
+        'Correct the NIP by hand, then propose again',
+    );
+  }
+  if (!row.isAdmin && nipValid && !nipChecksumOk(row.nip)) {
+    add(
+      'client_nip_checksum',
+      'warn',
+      "the row's NIP fails the NIP checksum. The client account is still the one it names; check " +
+        'the NIP for a typo (expected on the canary row)',
+    );
+  }
+
   // --- the ids already on the row ------------------------------------------
+  // Each is judged by the client-account rule against this row's NIP: this
+  // row's account, a Guest (removed, no flag), or any other Member (staff, or
+  // another client's account: removed only when confirmed).
   const usersById = facts.usersById ?? new Map();
   const staff = [];
+  const guests = [];
+  const ownIds = [];
+  const renamedAccounts = [];
   const notFound = [];
+  const userOf = (id) => usersById.get(id);
+  let lockedOut = false;
   for (const id of row.userIds) {
-    const user = usersById.get(id);
-    if (user === undefined) continue;
-    if (user === null) notFound.push(id);
-    else if (isError(user)) add('user_lookup_failed', 'skip', `could not read user ${id}: ${user.error}`);
-    else if (user.userType === 'Member') staff.push({ id, userPrincipalName: user.userPrincipalName ?? '' });
+    const user = userOf(id);
+    if (user === undefined) {
+      add('user_lookup_failed', 'skip', `user ${id} was not read`);
+      continue;
+    }
+    if (user === null) {
+      notFound.push(id);
+      continue;
+    }
+    if (isError(user)) {
+      add('user_lookup_failed', 'skip', `could not read user ${id}: ${user.error}`);
+      continue;
+    }
+    if (row.isAdmin) continue;
+    const who = { id, userPrincipalName: user.userPrincipalName ?? '' };
+    const verdict = clientAccountVerdict(user, row.nip, clientDomain);
+    if (verdict === 'guest') {
+      guests.push(who);
+    } else if (verdict === 'client') {
+      ownIds.push(id);
+      if (user.accountEnabled === false) lockedOut = true;
+    } else {
+      // A Member (or an account of no type) that is not this row's account.
+      // Shaped like a client account for another NIP: another client's
+      // account when an Active row carries that NIP, otherwise most likely
+      // this row's own after a NIP edit or a rename.
+      const nip = clientAccountNipOf(user.userPrincipalName, clientDomain);
+      const holders = nip ? (ctx.clientNips?.get(nip) ?? []).filter((r) => r !== row.listItemId) : [];
+      if (nip && !holders.length) renamedAccounts.push({ ...who, nip, userType: user.userType ?? '' });
+      else staff.push({ ...who, userType: user.userType ?? '', ...(holders.length ? { rows: holders } : {}) });
+    }
   }
-  if (!row.isAdmin && staff.length) {
-    const list = staff.map((s) => s.userPrincipalName || s.id).join(', ');
+  if (staff.length) {
+    const list = staff
+      .map((s) => {
+        const name = s.userPrincipalName || s.id;
+        if (s.rows) return `${name} (another client's account: the NIP of row(s) ${s.rows.join(', ')})`;
+        return String(s.userType).toLowerCase() === 'member' ? name : `${name} (userType ${s.userType || 'none'})`;
+      })
+      .join(', ');
     if (ctx.confirmRemoveStaff?.has(row.listItemId)) {
-      add('staff_ids_removed', 'warn', `staff (Member) ids will be removed, as confirmed: ${list}`);
+      add(
+        'staff_ids_removed',
+        'warn',
+        `Member ids that are not this row's client account will be removed, as confirmed: ${list}`,
+      );
     } else {
       add(
         'staff_ids',
         'skip',
-        `staff (Member) ids on a client row: ${list}. Re-run propose with ` +
-          `--confirm-remove-staff ${row.listItemId} to remove them`,
+        `Member ids on a client row that are not its client account (staff, or another client's): ${list}. ` +
+          `Re-run propose with --confirm-remove-staff ${row.listItemId} to remove them`,
       );
     }
+  }
+  if (guests.length) {
+    add(
+      'guest_ids',
+      'warn',
+      `${guests.length} guest id(s) on a client row: ${guests.map((g) => g.userPrincipalName || g.id).join(', ')}. ` +
+        'Guests have no capability in the ledger; the PATCH removes them (no flag needed). Apply the whole plan',
+    );
   }
   if (notFound.length) add('unknown_user_ids', 'warn', `${notFound.length} id(s) match no user`);
 
@@ -888,76 +1211,78 @@ export function assessRow(row, facts = {}, ctx = {}) {
     add('root_folder_conflict', 'skip', `row already has RootFolder "${row.rootFolder}"; change bindings by hand`);
   }
 
-  // --- people --------------------------------------------------------------
+  // --- people: the row's client account -----------------------------------
   const { members, owners } = facts;
   let people;
   if (teamOk) {
     if (isError(members) || isError(owners)) {
       add('membership_lookup_failed', 'skip', (isError(members) ? members : owners).error);
-    } else if (Array.isArray(members) && Array.isArray(owners)) {
-      people = classifyTeamPeople({
+    } else if (Array.isArray(members) && Array.isArray(owners) && !row.isAdmin) {
+      people = classifyClientAccount({
         teamId: team.id,
+        rowNip: row.nip,
+        clientDomain,
+        account: facts.account,
+        accountMemberOf: facts.accountMemberOf,
         members,
         owners,
-        memberOfByUser: facts.memberOfByUser ?? new Map(),
         ...(ctx.knownTeamIds ? { knownTeamIds: ctx.knownTeamIds } : {}),
       });
-      const unreadable = people.excluded.filter((e) => e.reason === 'memberships_unreadable');
-      if (unreadable.length) {
-        add('guest_memberships_unreadable', 'skip', `${unreadable.length} guest(s) whose memberships could not be read`);
-      }
-      const inOther = people.excluded.filter((e) => e.reason === 'guest_in_other_team');
-      if (inOther.length) {
-        const list = inOther
-          .map((e) => `${e.userPrincipalName || e.id} also in ${e.otherTeams.map(describeTeam).join(', ')}`)
-          .join('; ');
-        add('guest_in_other_team', 'warn', `${inOther.length} guest(s) not bound: ${list}`);
-      }
-      const disagree = people.excluded.filter((e) => e.reason === 'guest_not_in_this_team');
-      if (disagree.length) {
-        add(
-          'guest_not_in_this_team',
-          'warn',
-          `${disagree.length} guest(s) not bound: listed as members, but their memberships do not include this Team`,
-        );
-      }
-      if (people.eligible.length === 0) {
-        add(
-          'no_eligible_guest',
-          'warn',
-          "no guest belongs to this Team alone; the client's uploads go to quarantine",
-        );
-      }
-      // Ids already on the row that this Team no longer vouches for: a guest
-      // since added to another Team, or dropped from this one (R46). They
-      // route here until a PATCH takes them off. Staff and unknown ids have
-      // their own codes.
-      const eligibleIds = new Set(people.eligible.map((p) => p.id));
-      const excludedById = new Map(people.excluded.map((e) => [e.id, e]));
-      const drifted = row.isAdmin
-        ? []
-        : row.userIds.filter((id) => {
-            const user = usersById.get(id);
-            if (user === null || (user && !isError(user) && user.userType === 'Member')) return false;
-            return !eligibleIds.has(id);
-          });
-      if (drifted.length) {
-        const list = drifted
-          .map((id) => {
-            const e = excludedById.get(id);
-            if (!e) return `${id} (not a member of this Team)`;
-            const teams = e.otherTeams?.length ? `: also in ${e.otherTeams.map(describeTeam).join(', ')}` : '';
-            return `${e.userPrincipalName || id} (${e.reason}${teams})`;
-          })
-          .join('; ');
-        add(
-          'bound_guest_ineligible',
-          'warn',
-          `${drifted.length} id(s) on the row are not guests of this Team alone, and route here until ` +
-            `the plan's PATCH takes them off. Run propose and apply the whole plan: ${list}`,
-        );
-      }
+      for (const p of people.problems) add(p.code, p.severity, p.detail);
     }
+  }
+  const qualified = new Set((people?.eligible ?? []).map((e) => e.id));
+  // The account read by its UPN also says whether the client is locked out,
+  // so a failed read by id cannot hide it (exit 5).
+  const byUpn = facts.account;
+  if (
+    byUpn &&
+    !isError(byUpn) &&
+    byUpn.accountEnabled === false &&
+    typeof byUpn.id === 'string' &&
+    row.userIds.includes(normalizeGuid(byUpn.id))
+  ) {
+    lockedOut = true;
+  }
+  if (lockedOut && !problems.some((p) => p.code === 'client_account_disabled')) {
+    add(
+      'client_account_disabled',
+      'warn',
+      "the client account bound on this row is disabled: the client cannot sign in to Teams. It stays " +
+        'bound: the ledger never unbinds or blocks a client for this. Tell Roman; re-enabling it in Entra is his',
+    );
+  }
+  // This row's client account on the row, when it no longer qualifies (since
+  // added to another Team, made an owner, taken out of this Team: R46), and
+  // client-shaped ids for a NIP no Active row carries (this row's own account
+  // after a NIP edit or a rename). Each routes here, or did on an older
+  // build, until a PATCH takes it off.
+  const ineligible = [
+    ...(people?.assessed ? ownIds.filter((id) => !qualified.has(id)) : []).map((id) => {
+      const name = userOf(id)?.userPrincipalName || id;
+      if (people.account?.id !== id) {
+        return `${name} (not the account ${clientAccountUpn(row.nip, clientDomain)} resolves to)`;
+      }
+      const nb = people.notBound.find((p) => p.id === id);
+      const teams = nb?.otherTeams?.length ? `: also in ${nb.otherTeams.map(describeTeam).join(', ')}` : '';
+      const why = nb?.why || (nb?.reason === 'owner' ? 'client_account_owner' : 'client_account_not_in_team');
+      return `${name} (${why}${teams})`;
+    }),
+    ...renamedAccounts.map((a) =>
+      a.nip === row.nip
+        ? `${a.userPrincipalName || a.id} (this row's UPN, but userType ${a.userType || 'none'}, not Member)`
+        : `${a.userPrincipalName || a.id} (a client account for NIP ${a.nip}, not this row's ` +
+          `${row.nip || '(no NIP)'}: was the NIP edited, or the account renamed?)`,
+    ),
+  ];
+  if (ineligible.length) {
+    add(
+      'client_account_ineligible',
+      'warn',
+      `${ineligible.length} client account id(s) on the row do not qualify for it, and route here (or did, ` +
+        `on an older build) until the plan's PATCH takes them off. Run propose and apply the whole plan: ` +
+        ineligible.join('; '),
+    );
   }
 
   // --- write grant ---------------------------------------------------------
@@ -987,26 +1312,32 @@ export function assessRow(row, facts = {}, ctx = {}) {
   }
 
   // --- the proposal --------------------------------------------------------
+  // At most one id: the row's client account, if it qualifies. A NIP two
+  // Active rows share names one account for both, so neither gets it (both
+  // rows are SKIP as duplicate_nip anyway).
+  const nipShared = (ctx.duplicates ?? []).some((d) => d.kind === 'nip' && d.listItemIds.includes(row.listItemId));
+  const bindable = nipShared ? [] : (people?.eligible ?? []);
   let proposed = null;
   const removedUserIds = [];
   const addedUserIds = [];
   if (folderOk && drive && teamOk && people) {
-    const eligibleIds = people.eligible.map((g) => g.id);
+    const eligibleIds = bindable.map((g) => g.id);
     proposed = {
       RootFolder: filesFolder.name,
       UserAadObjectIds: eligibleIds.join('\n'),
       DriveId: drive.id,
       TeamId: team.id,
     };
-    const excludedById = new Map(people.excluded.map((e) => [e.id, e]));
+    const staffIds = new Map(staff.map((s) => [s.id, s]));
     for (const id of row.userIds) {
       if (eligibleIds.includes(id)) continue;
-      const user = usersById.get(id);
-      let reason = 'not_a_member_of_this_team';
+      const user = userOf(id);
+      let reason = 'client_account_ineligible';
       if (user === null) reason = 'not_found';
-      else if (user && !isError(user) && user.userType === 'Member') reason = 'staff';
-      else if (excludedById.has(id)) reason = excludedById.get(id).reason;
-      const otherTeams = excludedById.get(id)?.otherTeams;
+      else if (user === undefined || isError(user)) reason = 'user_lookup_failed';
+      else if (guests.some((g) => g.id === id)) reason = 'guest';
+      else if (staffIds.has(id)) reason = staffIds.get(id).rows ? 'other_client_account' : 'staff';
+      const otherTeams = people.notBound.find((p) => p.id === id)?.otherTeams;
       removedUserIds.push({
         id,
         reason,
@@ -1015,11 +1346,12 @@ export function assessRow(row, facts = {}, ctx = {}) {
       });
     }
     for (const raw of row.invalidUserIds) removedUserIds.push({ id: raw, reason: 'not_a_guid' });
-    for (const g of people.eligible) {
+    for (const g of bindable) {
       if (!row.userIds.includes(g.id)) addedUserIds.push({ id: g.id, userPrincipalName: g.userPrincipalName });
     }
   }
 
+  const bound = bindable[0];
   return {
     listItemId: row.listItemId,
     clientId: row.clientId,
@@ -1030,9 +1362,17 @@ export function assessRow(row, facts = {}, ctx = {}) {
     proposed,
     removedUserIds,
     addedUserIds,
-    eligibleGuests: people?.eligible ?? [],
-    excludedPeople: people?.excluded ?? [],
-    guestsRead: Boolean(people),
+    // The row's client account where it could be assessed: the one id that
+    // may route here, or null. IR-1 checks uploaders against it.
+    clientAccount: bound
+      ? { id: bound.id, userPrincipalName: bound.userPrincipalName, accountEnabled: bound.accountEnabled }
+      : null,
+    accountAssessed: Boolean(people?.assessed),
+    // The account as read by its UPN, eligible or not, for `check` to show.
+    account: people?.account ?? null,
+    notBound: people?.notBound ?? [],
+    // The client account bound on the row is disabled: the client is locked out.
+    lockedOut,
   };
 }
 
@@ -1063,8 +1403,8 @@ export function diffBinding(before, proposed) {
 
 /**
  * Digest of the whole plan as propose wrote it: every field but `digest`
- * itself, so `createdAt` (the age cap), `directory` and `guards` as well as
- * the rows. `apply` recomputes it, so a plan edited by hand after review is
+ * itself, so `clientDomain`, `createdAt` (the age cap), `directory` and
+ * `guards` as well as the rows. `apply` recomputes it, so a plan edited by hand after review is
  * refused rather than applied; a plan too old to apply needs a new propose,
  * not a new date.
  */
@@ -1073,6 +1413,7 @@ export function planDigest(plan) {
     JSON.stringify({
       kind: plan?.kind,
       version: plan?.version,
+      clientDomain: plan?.clientDomain,
       createdAt: plan?.createdAt,
       directory: plan?.directory,
       ingestAppIds: plan?.ingestAppIds,
@@ -1095,7 +1436,15 @@ export function planDigest(plan) {
  * Repeats until nothing changes, since a skip reverts a row to its current
  * values and can create a new collision.
  */
-export function buildPlan({ rows, assessments, directory, ingestAppIds = [], guards, createdAt }) {
+export function buildPlan({
+  rows,
+  assessments,
+  directory,
+  ingestAppIds = [],
+  guards,
+  createdAt,
+  clientDomain = CLIENT_ACCOUNT_DOMAIN,
+}) {
   const rowById = new Map(rows.map((r) => [r.listItemId, r]));
   const entries = assessments.map((a) => {
     const row = rowById.get(a.listItemId);
@@ -1114,22 +1463,32 @@ export function buildPlan({ rows, assessments, directory, ingestAppIds = [], gua
       proposed: a.proposed ? { ...a.proposed } : null,
       removedUserIds: a.removedUserIds,
       addedUserIds: a.addedUserIds,
-      // The guests of this Team alone, where the Team's people were read.
-      // IR-1 (`inventory-misfiled.mjs --bindings-plan`) checks uploaders
-      // against them; it is not what gets written (that is `patch`).
-      ...(a.guestsRead
-        ? { eligibleGuests: a.eligibleGuests.map(({ id, userPrincipalName }) => ({ id, userPrincipalName })) }
+      // The row's client account, where it could be assessed: the one id
+      // that may route here, or null when none qualifies. IR-1
+      // (`inventory-misfiled.mjs --bindings-plan`) checks uploaders against
+      // it; it is not what gets written (that is `patch`).
+      ...(a.accountAssessed
+        ? {
+            clientAccount: a.clientAccount
+              ? {
+                  id: a.clientAccount.id,
+                  userPrincipalName: a.clientAccount.userPrincipalName,
+                  accountEnabled: a.clientAccount.accountEnabled,
+                }
+              : null,
+          }
         : {}),
-      // The Team's guests who are not bound, and why: a reviewer must see a
-      // guest left out because they are also in another Team, and which one.
-      excludedGuests: (a.excludedPeople ?? [])
-        .filter((p) => p.reason !== 'owner' && p.reason !== 'not_a_guest')
-        .map(({ id, userPrincipalName, reason, otherTeams }) => ({
-          id,
-          userPrincipalName,
-          reason,
-          ...(otherTeams ? { otherTeams } : {}),
-        })),
+      // Everyone else on the Team's roster, and why they are not bound
+      // (guest, staff, other_client_account, owner, client_account_ineligible):
+      // a reviewer must see a client account left out because it is also in
+      // another Team, and which one.
+      notBound: (a.notBound ?? []).map(({ id, userPrincipalName, reason, why, otherTeams }) => ({
+        id,
+        userPrincipalName,
+        reason,
+        ...(why ? { why } : {}),
+        ...(otherTeams ? { otherTeams } : {}),
+      })),
       evidence: a.evidence,
     };
     if (skips.length === 0 && !a.proposed) {
@@ -1216,6 +1575,9 @@ export function buildPlan({ rows, assessments, directory, ingestAppIds = [], gua
   const plan = {
     kind: PLAN_KIND,
     version: PLAN_VERSION,
+    // The domain every row's client account was read under: `<NIP>@<domain>`.
+    // `apply` re-checks each account against it.
+    clientDomain,
     createdAt: createdAt ?? new Date().toISOString(),
     directory,
     ingestAppIds: [...ingestAppIds],
@@ -1235,7 +1597,11 @@ export function buildPlan({ rows, assessments, directory, ingestAppIds = [], gua
 export function validatePlan(plan) {
   const errors = [];
   if (plan?.kind !== PLAN_KIND) errors.push(`kind is not ${PLAN_KIND}`);
-  if (plan?.version !== PLAN_VERSION) errors.push(`version is not ${PLAN_VERSION}`);
+  if (plan?.version !== PLAN_VERSION) {
+    const why = plan?.version === 1 ? ' (a plan made before the client-account rule, which bound guests). Re-run propose' : '';
+    errors.push(`version is not ${PLAN_VERSION}${why}`);
+  }
+  if (!isClientDomain(plan?.clientDomain)) errors.push('clientDomain is missing or not a lower-case host name');
   if (!plan?.directory?.siteId || !plan?.directory?.listId) errors.push('directory.siteId/listId missing');
   if (!Array.isArray(plan?.rows)) {
     errors.push('rows is not an array');
@@ -1243,7 +1609,7 @@ export function validatePlan(plan) {
   }
   if (plan.digest !== planDigest(plan)) {
     errors.push(
-      'digest does not match: the plan (its rows, createdAt, directory or guards) was edited after ' +
+      'digest does not match: the plan (its rows, clientDomain, createdAt, directory or guards) was edited after ' +
         'propose. Re-run propose.',
     );
   }
@@ -1268,8 +1634,13 @@ export function validatePlan(plan) {
       if ('RootFolder' in p && !survivesIngestionSanitiser(p.RootFolder)) errors.push(`${at}: RootFolder unsafe`);
       if ('TeamId' in p && !normalizeGuid(p.TeamId)) errors.push(`${at}: TeamId is not a GUID`);
       if ('DriveId' in p && !String(p.DriveId).trim()) errors.push(`${at}: DriveId empty`);
-      if ('UserAadObjectIds' in p && !splitLines(p.UserAadObjectIds).every((l) => normalizeGuid(l))) {
-        errors.push(`${at}: UserAadObjectIds has a non-GUID line`);
+      if ('UserAadObjectIds' in p) {
+        const lines = splitLines(p.UserAadObjectIds);
+        if (!lines.every((l) => normalizeGuid(l))) errors.push(`${at}: UserAadObjectIds has a non-GUID line`);
+        // A row routes one client account, never a list.
+        if (lines.length > 1) {
+          errors.push(`${at}: UserAadObjectIds has ${lines.length} lines; a row binds one client account`);
+        }
       }
       for (const f of BINDING_FIELDS) if (typeof row.before?.[f] !== 'string') errors.push(`${at}: before.${f} missing`);
       // A row routes only once RootFolder, DriveId and TeamId are all set
@@ -1310,6 +1681,19 @@ export function idsRollbackAdds(patch, currentFields) {
   const guids = (text) => splitLines(fieldString(text)).map(normalizeGuid).filter(Boolean);
   const now = new Set(guids(currentFields?.UserAadObjectIds));
   return [...new Set(guids(patch.UserAadObjectIds))].filter((id) => !now.has(id));
+}
+
+/**
+ * The user ids a rollback patch would take off a row: on the row now, not in
+ * the restored `UserAadObjectIds`. Rollback warns when one of them is the
+ * row's client account, whose uploads then go to quarantine until it is bound
+ * again.
+ */
+export function idsRollbackRemoves(patch, currentFields) {
+  if (!('UserAadObjectIds' in (patch ?? {}))) return [];
+  const guids = (text) => splitLines(fieldString(text)).map(normalizeGuid).filter(Boolean);
+  const restored = new Set(guids(patch.UserAadObjectIds));
+  return [...new Set(guids(currentFields?.UserAadObjectIds))].filter((id) => !restored.has(id));
 }
 
 /** Fields of a logged row that changed since it was applied. */

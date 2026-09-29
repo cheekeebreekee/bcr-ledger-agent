@@ -4,7 +4,8 @@
 > attachments (faktury, paragony, umowy, wyciągi, raporty, deklaracje) into each client's
 > SharePoint folder structure. The folder comes from the document's **content, read by Claude**
 > (Anthropic API). The client comes from **the uploader's identity only**, looked up in a Client
-> Directory SharePoint list.
+> Directory SharePoint list, and a client's identity is its `{NIP}@bcr-group.pl` account (owner's
+> decision, 28 September 2026). Guests have no capability in the ledger.
 
 > **Phase 0 of v2, September 2026.** Incident [`IR-2026-09`](docs/operations/incident-2026-09.md)
 > found that documents were filed outside their client's space. Phase 0 removes the routing that
@@ -15,19 +16,26 @@
 
 ## What it does
 
-A client's guest opens a 1:1 chat with the bot in Teams. Channels do not work for this; see
-lesson 16.
+A client signs in to Teams with its `{NIP}@bcr-group.pl` account, an Entra Member that BCR
+creates at onboarding and hands to the client. It sends a file in a 1:1 chat with the bot, or
+posts it in its Team's "Dokumenty księgowe" channel, which a timer in ingestion sweeps (the
+channel inbox, [`ARCHITECTURE.md` §4.4](ARCHITECTURE.md#44-channel-inbox-intake-clients); the bot
+itself never sees channel files, lesson 16). Onboarding still invites the client's contact as a
+guest, for access to the Team's files: a guest can neither file nor search. Until 28 September
+2026 this page treated clients as Teams guests; that was wrong (lesson 25). The chat path:
 
 ```
-Client guest → 1:1 chat with "Asystent BCR" → attaches "Faktura_03_2026.pdf"
+Client account ({NIP}@) → 1:1 chat with "Asystent BCR" → attaches "Faktura_03_2026.pdf"
        ↓
        Bot gate: personal chat? BCR tenant? valid user id?   (otherwise: refused, nothing downloaded)
        ↓
        Bot downloads the attachment and calls ingestion (Bearer JWT, pinned to the bot's app id)
        ↓
        Ingestion:
+         (0) Reads the uploader's account: a guest, a non-Member or an unreadable account
+             is refused, and nothing is stored
          (1) Resolves the uploader's client from the Client Directory: exactly one bound
-             client, or quarantine with a reason
+             client whose {NIP}@ account the uploader is, or quarantine with a reason
          (2) Calls Claude with the content, primed with that client's NIP and name
          (3) Claude returns category + confidence + parties[] (seller/buyer/NIP)
          (4) Inside the bound client only: flips sales ⇄ purchase from the parties
@@ -38,11 +46,12 @@ Client guest → 1:1 chat with "Asystent BCR" → attaches "Faktura_03_2026.pdf"
          uploaded     → Dokument · Kategoria · Folder, and an "Otwórz" link into the client's space
          quarantined  → "📨 Faktura_03_2026.pdf: Dokument przekazano do weryfikacji przez zespół BCR."
                         (no link)
+         refused      → a fixed line: the assistant works only on the NIP@bcr-group.pl account
 ```
 
 A document Claude cannot classify confidently goes to `98_Nieposortowane/RRRR/MM/` in the
-client's own space. A document whose uploader is not bound to exactly one client goes to the
-quarantine site, where BCR staff decide.
+client's own space. A Member's document that cannot be tied to exactly one client goes to the
+quarantine site, where BCR staff decide; a guest's is refused and stored nowhere.
 
 **Content never chooses the client.** Until Phase 0, a document nobody could route was moved to
 whichever client's NIP it mentioned. That was the cross-client write in the incident, and it is
@@ -72,12 +81,12 @@ Microsoft Teams (1:1 chat only)
            ▼
 ┌────────────────────────────┐
 │  func-bcr-ingest-dev-…     │      Identity-only routing:
-│  (Node 22 Functions v4)    │      1. resolve(uploader) → bound client | quarantine(reason)
-│  @bcr/document-ingestion   │      2. classify() primed with the bound client
-│  ┝ /api/health             │      3. bound client only: flip invoice direction
-│  ┝ /api/ingest/batch       │      4. upload: client's channel folder, or quarantine
-│  ┝ /api/search             │      client search: the asker's own client, read only
-│  ┕ system-assigned MI      │
+│  (Node 22 Functions v4)    │      0. account: a guest or non-Member is refused, nothing stored
+│  @bcr/document-ingestion   │      1. resolve(uploader) → its {NIP}@ row | quarantine(reason)
+│  ┝ /api/health             │      2. classify() primed with the bound client
+│  ┝ /api/ingest/batch       │      3. bound client only: flip invoice direction
+│  ┝ /api/search             │      4. upload: client's channel folder, or quarantine
+│  ┕ system-assigned MI      │      client search: the asker's own client, read only
 │    d5226274-… / 7984e56c-… │
 │    role: Sites.Selected    │
 └──────────┬─────────────────┘
@@ -89,7 +98,7 @@ Microsoft Teams (1:1 chat only)
 │  Microsoft Graph → SharePoint Online                           │
 │                                                                │
 │  Client Directory (BCR GROUP site, list 2a5613f1-…)            │
-│    ClientId · NIP · UserAadObjectIds (guests only) ·           │
+│    ClientId · NIP · UserAadObjectIds (the {NIP}@ account) ·    │
 │    SiteHostname/SitePath/DriveName/RootFolder · DriveId ·      │
 │    TeamId · IsAdmin · Status                                   │
 │                                                                │
@@ -119,7 +128,9 @@ Two-step SharePoint grant (see lessons 1–5):
 
 The Phase-0 membership check needs one more app role on the same MI: `Directory.Read.All`, to
 read each bound uploader's `memberOf` (`docs/operations/human-steps.md` H-8b,
-`infrastructure/identity/grant-ingestion-membership-read.sh`). **Not granted yet**: pending H-8b.
+`infrastructure/identity/grant-ingestion-membership-read.sh`). Granted on 26 September 2026
+(H-8b). The client-account rule reads every uploader's `userType` and `userPrincipalName` under
+the same grant.
 
 Client search adds one grant, to the **bot's** managed identity: the app role `Documents.Search`
 on the ingestion API, which `infrastructure/identity/grant-bot-search-caller.sh` also creates on
@@ -184,7 +195,7 @@ difference, and CI checks that Bicep sets every setting the code needs.
 | `MICROSOFT_APP_TYPE` | **Required** since Phase 0. `SingleTenant` (lesson 12). |
 | `BOT_GATE_MODE` | **New.** `log` or `enforce` (default). `log` only for the first 24 h of the Phase-0 rollout. |
 | `INGESTION_BASE_URL`, `INGESTION_SCOPE` | Where ingestion is, and `api://<ingestion-app-id>/.default` |
-| `SEARCH_MODE` | **New.** Client search: `off` (default; text gets the help card) or `on` (a guest's text goes to ingestion's `/api/search` with the bot's managed identity). Anything else stops the bot at cold start. `off` in the template and both parameter files until the [Client search release](docs/operations/human-steps.md#client-search-release). |
+| `SEARCH_MODE` | **New.** Client search: `off` (default; text gets the help card) or `on` (a user's text goes to ingestion's `/api/search` with the bot's managed identity; ingestion answers only a row's `{NIP}@` client account). Anything else stops the bot at cold start. `off` in the template and both parameter files until the [Client search release](docs/operations/human-steps.md#client-search-release). |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING`, `LOG_LEVEL` | |
 
 **Ingestion (`func-bcr-ingest-…`)**
@@ -250,7 +261,7 @@ bcr-ledger-agent/
 │   └── ir/                              # IR evidence store
 ├── tools/                               # operator tools: directory-bindings, inventory-misfiled, ir0/
 ├── teams-app/
-│   ├── manifest.json                    # Teams app manifest 0.2.0 (personal scope only, no tab)
+│   ├── manifest.json                    # Teams app manifest 0.2.2 (personal scope only, no tab)
 │   └── …
 ├── docs/
 │   ├── operations/                      # incident, human steps, tenant hardening, GDPR drafts
@@ -326,18 +337,23 @@ catalogue, so they cannot drift apart.
 The cards are built in [`responseBuilder.ts`](packages/teams-bot/src/bot/responseBuilder.ts), and
 their fixed strings live in [`cardText.ts`](packages/teams-bot/src/bot/cardText.ts):
 
-- **Help / welcome.** "📂 Asystent Archiwizacji Dokumentów" and a short description.
+- **Help / welcome.** "📂 Asystent Archiwizacji Dokumentów" and a short description: send files
+  in this chat, or add them in the Team's „Dokumenty księgowe” channel, and the assistant works
+  only on the account BCR created for the company (`NIP@bcr-group.pl`); files and messages from
+  a guest account are not processed.
 - **Batch result.** One card per Teams activity, one row per attachment:
   - uploaded rows show **Dokument · Kategoria · Folder**, with an "Otwórz" action per file into
     the client's own space;
   - quarantined rows show "📨 {nazwa}: Dokument przekazano do weryfikacji przez zespół BCR.",
     with no link;
-  - rejected rows show a fixed Polish message by error code.
+  - rejected rows show a fixed Polish message by error code (`ClientAccountRequired`: ingestion
+    refused the account, e.g. a guest, and stored nothing).
 
   Every inserted value is escaped. The model's reasoning is never shown.
 - **Gate refusal.** One fixed line in a 1:1 chat; silence in any other conversation.
 
-Teams app metadata ([`teams-app/manifest.json`](teams-app/manifest.json), version 0.2.0):
+Teams app metadata ([`teams-app/manifest.json`](teams-app/manifest.json), version 0.2.2; its
+descriptions name the chat and the channel, and the `NIP@bcr-group.pl` account):
 
 - App name: **Asystent BCR** / **Asystent Archiwizacji Dokumentów BCR**
 - Scopes: `personal` only. No static tab.
@@ -401,7 +417,7 @@ staging folder:
 - it installs production dependencies at the exact versions in `yarn.lock`, with install scripts
   disabled, and checks every top-level dependency's version against the root `node_modules`;
 - it vendors `@bcr/shared` from the `packages/shared/dist` just built, and fails if that copy
-  lacks the Phase-0 config.
+  lacks the Phase-0 config, `searchMode` or `clientAccountVerdict` (the client-account rule).
 
 `artifacts/*.zip` are git-ignored and no longer tracked: the zips that used to be committed were
 pre-Phase-0 builds. Never commit a zip, and deploy only one built for this deploy.
@@ -419,6 +435,7 @@ unzip -p artifacts/teams-bot.zip          node_modules/@bcr/shared/dist/config.j
 unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js | grep -c forbiddenTargetSitePaths
 unzip -p artifacts/teams-bot.zip          node_modules/@bcr/shared/dist/config.js | grep -c searchMode
 unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/config.js | grep -c searchMode
+unzip -p artifacts/document-ingestion.zip node_modules/@bcr/shared/dist/clientAccount.js | grep -c clientAccountVerdict
 ```
 
 **4. Deploy,** one app at a time. `$RG`, `$BOT` and `$INGEST` are set as in
@@ -435,6 +452,24 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
 ---
 
 ## Current state (2026-09-25)
+
+**Update, 2026-09-29.**
+
+- ⚠️ **Client lockout, 26–28 September.** Tenant step T-1 blocked sign-in on the three
+  `{NIP}@bcr-group.pl` client accounts (0002 PESKOVOI, 0003, 0004) on 26 September at 12:18Z, on
+  the premise that they were shared mailboxes nobody signs in with; they are the clients' Teams
+  sign-ins. The clients could not sign in to Teams until Roman re-enabled the accounts on
+  28 September at 17:33–17:34Z. No document was lost. T-1 and T-2 are withdrawn, T-7 is a
+  read-only record ([`tenant-hardening.md`](docs/operations/tenant-hardening.md),
+  [`incident-2026-09.md`](docs/operations/incident-2026-09.md)); lesson 25.
+- ⏳ **The client-account rule** (owner's decision, 28 September): a client is its `{NIP}@`
+  Member account, and guests have no capability. The code is in the working tree, uncommitted
+  and not deployed; rows 2 and 10 are not yet re-bound to the `{NIP}@` accounts; the onboarding
+  change is not deployed. The canary client account for row 10 (a Member of BCR Kanarek only)
+  was created on 29 September, and row 10's NIP was set to the canary's `9000000000`; the canary
+  guest stays as the negative canary.
+
+**As of 2026-09-25.**
 
 - ⛔ **Incident IR-2026-09 open.** Containment is Phase 0. See
   [`docs/operations/incident-2026-09.md`](docs/operations/incident-2026-09.md) and
@@ -611,3 +646,10 @@ If the Kudu upload keeps failing, upload a new blob and point `WEBSITE_RUN_FROM_
     `Directory.Read.All` on the ingestion identity). Still apply the whole plan after every
     onboarding, never `--only` the new row, and run `check` at least weekly
     ([admin guide](docs/client-directory-admin-guide.md#keeping-the-bindings-current)).
+    *Since 28 September 2026* a row binds its `{NIP}@` client account, not guests; the same rule
+    holds for it, and a `{NIP}@` account in a second Team is always an anomaly.
+
+25. **The `{NIP}@bcr-group.pl` accounts are the clients' Teams sign-ins, not shared mailboxes.**
+    Blocking them (T-1, 26 Sep) locked clients out until 28 Sep. Never block, unlicense or
+    convert them, and confirm with the owner how clients sign in before any tenant change that
+    depends on it.

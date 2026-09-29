@@ -37,8 +37,10 @@ import {
 } from './searchText';
 
 /**
- * The search answer as the guest sees it. SDK-agnostic: plain Adaptive Card
- * JSON (1.5) and plain strings, so the Agents SDK port only re-wires it.
+ * The search answer as the client sees it (the company's `{NIP}@bcr-group.pl`
+ * account; anyone else gets the one no-access text). SDK-agnostic: plain
+ * Adaptive Card JSON (1.5) and plain strings, so the Agents SDK port only
+ * re-wires it.
  *
  * Every sentence is a fixed Polish string from `cardText.ts`; every value
  * from the index (the client's title, labels, numbers, names) goes through
@@ -68,7 +70,7 @@ export interface SearchReplyContext {
   /** 1-based position of the first result on this page. */
   readonly start: number;
   /**
-   * The answer is to a question, not to the card's form: a guest asking for
+   * The answer is to a question, not to the card's form: a client asking for
    * the first time has no „Zmień filtr” yet, so `unavailable` brings one.
    */
   readonly question?: boolean;

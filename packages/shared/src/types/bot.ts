@@ -108,15 +108,25 @@ export interface IngestionBatchRequestPayload {
 }
 
 /**
+ * A batch item's error code: the uploader is not a client account (a guest, or
+ * anything but the row's `{NIP}@` Member). Nothing was stored, classified or
+ * indexed. The bot renders a fixed Polish text.
+ */
+export const CLIENT_ACCOUNT_REQUIRED = 'ClientAccountRequired';
+
+/**
  * Per-document outcome inside a batch response.
  *
  *  - `uploaded`: filed in the uploader's client space; `result` is set.
- *  - `quarantined`: held in the staff-only quarantine because the upload could
- *    not be tied to exactly one client. Deliberately carries no link, folder,
+ *  - `quarantined`: held in the staff-only quarantine because a Member's
+ *    upload could not be tied to exactly one client. Only Members reach it:
+ *    a guest is never quarantined. Deliberately carries no link, folder,
  *    stored name or client name — the uploader learns nothing about where it
  *    went or which clients exist.
  *  - `rejected`: not stored; `error` explains why (generic, Polish-rendered by
- *    the bot).
+ *    the bot). `error.code` {@link CLIENT_ACCOUNT_REQUIRED} means the account
+ *    was refused (a guest, a non-Member, a deleted user): nothing was stored,
+ *    classified or indexed. An account that could not be read is `RetryLater`.
  */
 export interface IngestionBatchItemResult {
   readonly filename: string;

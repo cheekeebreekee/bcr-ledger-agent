@@ -11,6 +11,7 @@
  */
 
 import {
+  CLIENT_ACCOUNT_REQUIRED,
   SEARCH_MAX_QUESTION_CHARS,
   SEARCH_PAGE_SIZE,
   SEARCH_TOTAL_CAP,
@@ -54,6 +55,29 @@ export function escapeMarkdown(value: string): string {
 // Fixed Polish strings
 // ---------------------------------------------------------------------------
 
+/**
+ * The help card's opening blocks (owner's decision, 28 Sep 2026): a client
+ * uses the `{NIP}@bcr-group.pl` account BCR created for its company, which
+ * can attach files in this chat, so the chat comes first and the channel
+ * second; the third block says who the assistant works for. Guests have no
+ * capability in the ledger: ingestion refuses them, whatever the bot sends.
+ */
+export const HELP_CHAT_TEXT =
+  'Dokumenty (PDF, JPG, PNG lub tekst) wyślij tutaj, w tym czacie, jako załączniki. ' +
+  'Przeanalizuję treść każdego pliku, zapiszę go w kanale „Dokumenty księgowe” Twojego ' +
+  'zespołu i odpowiem kartą z kategorią i folderem docelowym każdego pliku.';
+
+export const HELP_CHANNEL_TEXT =
+  'Możesz też dodawać dokumenty bezpośrednio w kanale „Dokumenty księgowe” swojego zespołu ' +
+  'w Teams: jako załącznik do wpisu albo na karcie „Udostępnione”. Takie pliki przeniosę ' +
+  'do odpowiedniego folderu w tym samym kanale w ciągu kilku minut.';
+
+export const HELP_ACCOUNT_TEXT =
+  'Asystent działa tylko na koncie, które BCR założyło dla Twojej firmy ' +
+  '(login: NIP@bcr-group.pl). Pliki i wiadomości wysłane z konta gościa ' +
+  '(w Teams oznaczonego jako „Gość”) nie są przetwarzane.';
+
+/** A Member's upload that ingestion held for staff review; it never names a reason. */
 export const QUARANTINED_TEXT = 'Dokument przekazano do weryfikacji przez zespół BCR.';
 
 /** Sent once, only in a 1:1 chat, when the gate refuses a message in enforce mode. */
@@ -79,8 +103,17 @@ const REJECTION_TEXT: ReadonlyMap<string, string> = new Map([
     'Tego pliku nie można przyjąć (nieobsługiwany typ, zbyt duży rozmiar lub nieprawidłowa nazwa).',
   ],
   ['SharePointError', 'Nie udało się zapisać pliku. Spróbuj ponownie za chwilę.'],
-  // Ingestion ran out of time for this batch and did not start the file.
+  // Ingestion ran out of time for this batch and did not start the file, or
+  // could not read the uploader's account: nothing was stored either way.
   ['RetryLater', 'Nie zdążyłem przetworzyć tego pliku. Wyślij go ponownie za chwilę.'],
+  // Ingestion refused the account (a guest, a non-Member, a deleted user):
+  // nothing was stored, classified or indexed.
+  [
+    CLIENT_ACCOUNT_REQUIRED,
+    'Tego pliku nie mogę przyjąć z tego konta. Asystent działa tylko na koncie, które BCR ' +
+      'założyło dla Twojej firmy (login: NIP@bcr-group.pl) — zaloguj się na nie i wyślij ' +
+      'plik ponownie.',
+  ],
 ]);
 
 const DEFAULT_REJECTION_TEXT =
@@ -111,10 +144,13 @@ export const SEARCH_COVERAGE_TEXT =
   'Wyszukiwarka obejmuje dokumenty zarchiwizowane przez asystenta od 28.09.2026; ' +
   'pliki z kanału pojawiają się po kilku minutach.';
 
-/** One answer for every reason a user may not search: it names none of them. */
+/**
+ * One answer for every reason a user may not search (a guest, staff, an
+ * account not bound to a client, any quarantine reason): it names none of them.
+ */
 export const SEARCH_NO_ACCESS_TEXT =
-  'Wyszukiwanie dokumentów jest dostępne tylko dla klientów BCR z przypisaną firmą. ' +
-  'Jeśli to błąd, skontaktuj się z zespołem BCR.';
+  'Wyszukiwanie dokumentów działa tylko na koncie, które BCR założyło dla Twojej firmy ' +
+  '(login: NIP@bcr-group.pl). Jeśli korzystasz z tego konta, skontaktuj się z zespołem BCR.';
 
 export const SEARCH_UNAVAILABLE_TEXT =
   'Wyszukiwarka jest chwilowo niedostępna. Spróbuj ponownie za chwilę albo użyj ' +

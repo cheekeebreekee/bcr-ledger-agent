@@ -87,7 +87,7 @@ export function claudeConfigured(
  *    `BOT_CALLER_APP_IDS`: the bot registration's secret, which files documents,
  *    must never also read them;
  *  - `membership_off`: `MEMBERSHIP_CHECK_MODE` is not `enforce`: search has no
- *    way round the check that keeps a guest of two clients' Teams out.
+ *    way round the check that keeps an account in two clients' Teams out.
  *
  * None of these stops ingestion's cold start: filing does not depend on search.
  */

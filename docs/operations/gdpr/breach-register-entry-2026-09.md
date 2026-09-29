@@ -2,6 +2,31 @@
 
 > ⚠️ **DRAFT — the IOD or lawyer must confirm it before it goes into the register.**
 
+> **Correction, 29 September 2026. Read before filling in; the template below is unchanged.**
+>
+> - **The T-1/T-2 measure is withdrawn.** Do not enter "zablokowano logowanie na konta `{NIP}@`,
+>   a skrzynki przekształcono we współdzielone (T-1, T-2)" under *Zastosowane środki*. The
+>   `{NIP}@bcr-group.pl` accounts are the clients' legitimate Teams sign-ins, not mailboxes nobody
+>   signs in with (the owner's decision of 28 September 2026). T-1 was done on 26 September and
+>   reversed by Roman on 28 September at 17:33Z; T-2 was never run. Both are withdrawn
+>   (`tenant-hardening.md`).
+> - **W3 and R2 are redefined** (`incident-2026-09.md`, dated corrections). W3 is "client
+>   accounts are Members and reach tenant-wide surfaces", bounded by T-3, T-6, T-8, T-9 and
+>   `docs/security.md` T22, never by blocking sign-in: under *Okresy narażenia*, W3 has no
+>   blocking date. The exposure in R2 and W2 was BCR GROUP being public. A sign-in by a `{NIP}@`
+>   account is the client's own; under *Stwierdzony dostęp*, what matters is whether one joined
+>   BCR GROUP or opened its files while it was public.
+> - **The client is its `{NIP}@` account, not its guest.** *Przyczyny* (R1) and *Kto miał lub
+>   mógł mieć dostęp* (W4) name the client's guest as it was understood then. Keep R1 as written
+>   (the id onboarding did not write was the guest's); under W4, the receiving client's team
+>   members include its `{NIP}@` account as well as its guest. Guests have no capability in the
+>   ledger (`incident-2026-09.md`, R1's correction).
+> - **The lockout itself** (the three clients 0002, 0003 and 0004 could not sign in to Teams
+>   from 26 September 12:18Z to about 17:34Z on 28 September; no document was lost) is an
+>   availability event. Whether it needs its own view in this register is the IOD's call, an
+>   open question in the incident's status table (`incident-2026-09.md` → *Client lockout,
+>   26–28 September (T-1 reversed)*).
+
 GDPR Art. 33(5) requires BCR, as controller, to document breaches of the data it controls (here
 the Client Directory and the telemetry). For client documents, where BCR is the processor, the
 breach is documented to support the controllers, under Art. 28(3)(f) and the entrustment

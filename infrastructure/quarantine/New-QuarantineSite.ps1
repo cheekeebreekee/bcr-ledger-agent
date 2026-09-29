@@ -99,6 +99,7 @@ if ($ClientId -notmatch '^[0-9a-fA-F-]{36}$') { throw 'ClientId must be the app 
 foreach ($u in @($Owner) + $ReviewerUpn) {
     if ($u -notmatch '^[^@\s]+@[^@\s]+$') { throw "'$u' is not a UPN." }
     if ($u -match '#EXT#') { throw "'$u' is a guest. Quarantine reviewers are BCR staff only." }
+    if ($u -match '^\d{10}@') { throw "'$u' is a client account. Quarantine reviewers are BCR staff only." }
 }
 
 # Tenant site properties differ between PnP versions; under strict mode a

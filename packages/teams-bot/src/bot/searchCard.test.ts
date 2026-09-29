@@ -158,7 +158,14 @@ describe('searchReply', () => {
   });
 
   it('gives no_access one text whatever reason travels with it', () => {
-    const reasons = ['membership_mismatch', 'staff', 'not_guest', 'unmapped', undefined];
+    const reasons = [
+      'membership_mismatch',
+      'staff',
+      'guest',
+      'not_client_account',
+      'unmapped',
+      undefined,
+    ];
     const replies = reasons.map((reason) =>
       searchReply({ status: 'no_access', reason } as unknown as SearchResponsePayload, {
         now: NOW,
@@ -169,8 +176,8 @@ describe('searchReply', () => {
       expect(reply).toEqual({ kind: 'text', text: SEARCH_NO_ACCESS_TEXT });
     }
     expect(SEARCH_NO_ACCESS_TEXT).toBe(
-      'Wyszukiwanie dokumentów jest dostępne tylko dla klientów BCR z przypisaną firmą. ' +
-        'Jeśli to błąd, skontaktuj się z zespołem BCR.',
+      'Wyszukiwanie dokumentów działa tylko na koncie, które BCR założyło dla Twojej firmy ' +
+        '(login: NIP@bcr-group.pl). Jeśli korzystasz z tego konta, skontaktuj się z zespołem BCR.',
     );
   });
 

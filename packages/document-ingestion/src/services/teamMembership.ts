@@ -8,10 +8,10 @@ export const MEMBERSHIP_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const DEFAULT_RETRY: RetryOptions = { retries: 3, minTimeoutMs: 250, factor: 2 };
 
-/** Users whose Teams are held at once. Far above the number of guests who upload in 5 min. */
+/** Users whose Teams are held at once. Far above the number of users who upload in 5 min. */
 const DEFAULT_MAX_CACHED_USERS = 1000;
 
-/** At `$top=999` a page, 20 pages is more groups than any guest of this tenant is in. */
+/** At `$top=999` a page, 20 pages is more groups than any client account of this tenant is in. */
 const DEFAULT_MAX_PAGES = 20;
 
 const GRAPH_ORIGIN = 'https://graph.microsoft.com/';
@@ -86,12 +86,12 @@ interface CachedTeams {
  * Reads which Teams a user is a direct member of, from Entra ID:
  * `GET /users/{id}/memberOf?$select=id,description,resourceProvisioningOptions`,
  * every page. Which groups are Teams follows the rule
- * `tools/directory-bindings.mjs` applies when it binds a guest (see
+ * `tools/directory-bindings.mjs` applies when it binds a client account (see
  * {@link teamIdsIn}), so the tool and the runtime agree on who is in which
  * Team. The description is read only for that rule; it is never logged.
  *
  * Why Entra and not `/users/{id}/joinedTeams` (which would need only
- * `Team.ReadBasic.All`): onboarding adds a guest to a client's Team through
+ * `Team.ReadBasic.All`): a user is added to a client's Team through
  * its group (`POST /groups/{id}/members/$ref`). Entra has that membership at
  * once; Microsoft documents that a member added outside Teams "can take up to
  * 24 hours" to be reflected in Teams, and `joinedTeams` reads Teams. A check

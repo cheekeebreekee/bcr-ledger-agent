@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -15,6 +16,7 @@ import { describe, test } from 'node:test';
 import {
   APPS,
   PackageError,
+  SHARED_MARKERS,
   checkDependencyVersions,
   compareDistToSrc,
   descriptorFor,
@@ -60,8 +62,10 @@ function fakeRepo(extra = {}) {
     'packages/document-ingestion/dist/functions/health.js': "'identity-only'",
     'packages/document-ingestion/dist/services/batchIngestor.js': "'document.quarantined'",
     'packages/shared/package.json': '{"name":"@bcr/shared"}',
+    'packages/shared/src/clientAccount.ts': '',
     'packages/shared/src/config.ts': '',
     'packages/shared/src/index.ts': '',
+    'packages/shared/dist/clientAccount.js': 'function clientAccountVerdict() {}',
     'packages/shared/dist/config.js': 'botGateMode forbiddenTargetSitePaths searchMode',
     'packages/shared/dist/index.js': '',
     ...extra,
@@ -119,6 +123,14 @@ describe('dist ↔ src', () => {
         const src = join(REPO, 'packages', name, 'src', file.replace(/\.js$/, '.ts'));
         assert.equal(existsSync(src), true, `${name}: ${src}`);
       }
+    }
+  });
+
+  test("every @bcr/shared marker names a file that this repo's shared src still has", () => {
+    for (const [file, needle] of SHARED_MARKERS) {
+      const src = join(REPO, 'packages/shared/src', file.replace(/\.js$/, '.ts'));
+      assert.equal(existsSync(src), true, src);
+      assert.equal(readFileSync(src, 'utf8').includes(needle), true, `${file}: ${needle}`);
     }
   });
 
@@ -349,6 +361,41 @@ describe('packageFunction', () => {
         name,
       );
       assert.equal(existsSync(join(root, `artifacts/${name}.zip`)), false, name);
+    }
+  });
+
+  // The client account rule (28 Sep 2026): an ingestion built against an older
+  // @bcr/shared would know no refusal and no {NIP}@ account.
+  test('a @bcr/shared from before the client account rule fails, for either app', () => {
+    const bot = {
+      'artifacts/teams-bot.zip': 'an older build',
+      'packages/teams-bot/host.json': '{}',
+      'packages/teams-bot/package.json': '{"name":"@bcr/teams-bot"}',
+      'packages/teams-bot/src/index.ts': '',
+      'packages/teams-bot/src/bot/gateMiddleware.ts': '',
+      'packages/teams-bot/dist/index.js': '',
+      'packages/teams-bot/dist/bot/gateMiddleware.js': "'bot.gate.rejected'",
+    };
+    for (const name of ['document-ingestion', 'teams-bot']) {
+      // A clientAccount.js without the rule, then none at all.
+      const without = fakeRepo({ ...bot, 'packages/shared/dist/clientAccount.js': 'export {}' });
+      const none = fakeRepo(bot);
+      rmSync(join(none, 'packages/shared/src/clientAccount.ts'));
+      rmSync(join(none, 'packages/shared/dist/clientAccount.js'));
+      for (const [root, why] of [
+        [without, /clientAccount\.js does not contain "clientAccountVerdict"/],
+        [none, /clientAccount\.js is missing/],
+      ]) {
+        assert.throws(
+          () => packageFunction({ root, name, log: quiet }),
+          (err) =>
+            err instanceof PackageError &&
+            /@bcr\/shared: /.test(err.message) &&
+            why.test(err.message),
+          name,
+        );
+        assert.equal(existsSync(join(root, `artifacts/${name}.zip`)), false, name);
+      }
     }
   });
 

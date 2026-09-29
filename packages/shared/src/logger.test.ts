@@ -27,6 +27,9 @@ describe('root logger redaction', () => {
     'parties',
     'nip',
     'extraction',
+    // A client account's UPN is `{NIP}@bcr-group.pl`.
+    'userPrincipalName',
+    'upn',
   ])('censors %s at the top level and one level down', (key) => {
     const { logger, lines } = capture();
     logger.info({ [key]: 'sensitive', nested: { [key]: 'sensitive' } }, 'm');

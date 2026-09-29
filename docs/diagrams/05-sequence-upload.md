@@ -4,6 +4,13 @@
 Phase 2. None of it is built yet. [00-phase0-routing.md](00-phase0-routing.md) shows what runs
 after Phase 0.
 
+**Amended 29 September 2026.** The uploader was drawn as a client guest. Since the owner's
+decision of 28 September a client's identity is its `{NIP}@bcr-group.pl` account, an Entra
+Member created by BCR and a member of its own client Team only, and guests have no capability in
+the ledger: a guest is refused with nothing filed, indexed or quarantined, as the next Phase-0
+ingestion build does (not yet deployed). The actor, the first `alt` branch and the picker note
+are amended to match; the rest is the design as reconciled.
+
 Boxes mark whose side a participant is on: blue for Microsoft 365 and the client, grey for the
 ledger's own apps, amber for external services, green for staff only. See the
 [README](README.md#trust-boundaries).
@@ -11,7 +18,7 @@ ledger's own apps, amber for external services, green for staff only. See the
 ```mermaid
 sequenceDiagram
   autonumber
-  actor G as Client guest
+  actor G as Client account
   box rgb(219,234,254) Microsoft 365
     participant T as Teams and Bot Service
   end
@@ -41,7 +48,12 @@ sequenceDiagram
   B-->>G: Otrzymano N dok.
   ST->>W: dequeue, as the ingestion identity
   W->>DB: resolve_uploader(oid) returns client and staff options with reason codes, ids only
-  alt no active binding, revoked, unapproved multi-team guest, staff without assignment
+  alt a guest or any other non-Member, amended 29 Sep 2026
+    W->>ST: ingest-results: refused, ClientAccountRequired, no URL and no client name
+    ST->>B: dequeue result
+    B-->>G: card row: a fixed Polish text naming the client account login, no link
+    Note over W: nothing is filed, indexed or held in quarantine for this request
+  else no active binding, revoked, client account in a second Team, staff without assignment
     W->>QS: upload by id, server-made name, conflictBehavior fail
     W->>DB: quarantine_hold writes intake_quarantine, which has no client_id
     W->>ST: ingest-results: quarantined, no URL and no client name
@@ -49,6 +61,7 @@ sequenceDiagram
     B-->>G: card row: original filename and Dokument przekazano do weryfikacji, no link
     Note over W: nothing else happens for this request
   else several options, every one approved
+    Note over W,B: amended 29 Sep 2026: a client account is in one client Team only, so only staff with several assignments reach this branch
     W->>DB: pending_client_choices: pendingId, uploader oid, option ids, expires in 24 h
     W->>ST: ingest-results: picker with pendingId and the uploader's own options
     ST->>B: dequeue result
@@ -104,6 +117,9 @@ sequenceDiagram
   `ingest-requests`, and nothing else: it cannot read blobs back, it holds no ingestion role, and
   it has no database write (I6). Ingestion accepts a blob only under the message's own
   `ingest-staging/{requestId}/` prefix, and each blob is used once and then deleted.
+- **Guests are refused, not quarantined** (amended 29 Sep 2026). A guest has no capability in the
+  ledger, so its upload never reaches the quarantine or the index; the card names the client
+  account login instead.
 - **The picker card carries only a `pendingId`.** The uploader's oid on the choice comes from the
   new activity, never from the card. Ingestion accepts the choice only for the same uploader, and
   only for a client that is still among the options and the uploader's current bindings. An

@@ -16,7 +16,7 @@ const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MODEL = /^[A-Za-z0-9._:-]{1,100}$/;
 
 /**
- * `question`: the guest's words, read by the model. `typed`: a filter from the
+ * `question`: the client's words, read by the model. `typed`: a filter from the
  * card's form. `page`: the next page of an earlier search (a typed filter with
  * a cursor).
  */
@@ -49,7 +49,7 @@ export interface SearchQuota {
 /**
  * The durable limits, across every worker. Questions cost a model call, so
  * they have their own, tighter windows, and the client's daily one bounds
- * what one client's guests can spend together. A question the model did not
+ * what one client can spend in a day. A question the model did not
  * understand still counts. Typed and page requests cost no model call.
  */
 export const SEARCH_QUOTAS: readonly SearchQuota[] = [

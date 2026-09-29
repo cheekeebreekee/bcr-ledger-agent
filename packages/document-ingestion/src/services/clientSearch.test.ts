@@ -9,6 +9,7 @@ import type {
   DirectoryClientResolution,
   Logger,
   QuarantineReason,
+  RefusalReason,
   ResolvedClient,
   SearchRequestPayload,
   SharePointTarget,
@@ -213,7 +214,6 @@ function recordingLogger(
 interface Setup {
   offReason?: SearchOffReason;
   resolved?: ResolvedClient;
-  userType?: string | null | Error;
   interpret?: InterpretResult | ((q: string) => Promise<InterpretResult>);
   db?: Partial<DbState>;
   searchRows?: string[];
@@ -226,11 +226,6 @@ interface Setup {
 
 function setup(s: Setup = {}) {
   const resolve = jest.fn(async () => s.resolved ?? KANAREK);
-  const userTypeOf = jest.fn(async () => {
-    const t = s.userType === undefined ? 'Guest' : s.userType;
-    if (t instanceof Error) throw t;
-    return t;
-  });
   const interpret = jest.fn(async (q: string) => {
     const i = s.interpret ?? understood();
     return typeof i === 'function' ? i(q) : i;
@@ -240,7 +235,6 @@ function setup(s: Setup = {}) {
   const service = new ClientSearchService({
     ...(s.offReason ? { offReason: s.offReason } : {}),
     resolver: { resolve },
-    userTypes: { userTypeOf },
     ...(s.withoutDb ? {} : { db: f.db }),
     ...(s.withoutInterpreter ? {} : { interpreter: { interpret } }),
     directoryListId: LIST_ID,
@@ -254,7 +248,7 @@ function setup(s: Setup = {}) {
   });
   const { log, lines } = recordingLogger();
   const search = (p: SearchRequestPayload) => service.search(p, log);
-  return { service, search, resolve, userTypeOf, interpret, lines, ...f };
+  return { service, search, resolve, interpret, lines, ...f };
 }
 
 const event = (lines: Record<string, unknown>[], name: string) =>
@@ -292,6 +286,8 @@ describe('ClientSearchService: refusals cost no model call and no transaction', 
     expect(setup({ offReason: 'mode_off' }).service.enabled).toBe(false);
   });
 
+  // Staff and any Member who is not the row's {NIP}@ account are quarantined
+  // by the resolver (`not_client_account`, `staff`, `unmapped`, …).
   it.each<QuarantineReason>([
     'unmapped',
     'staff',
@@ -299,41 +295,62 @@ describe('ClientSearchService: refusals cost no model call and no transaction', 
     'stale_directory',
     'forbidden_target',
     'unbound_target',
+    'not_client_account',
     'membership_mismatch',
-    'membership_unverified',
     'target_unwritable',
   ])('answers no_access to an asker the resolver quarantines (%s)', async (reason) => {
     const t = setup({ resolved: { source: 'quarantine', reason, target: target('Kwarantanna') } });
     await expect(t.search(question('faktury z marca'))).resolves.toEqual({ status: 'no_access' });
     await expect(t.search(typed({}))).resolves.toEqual({ status: 'no_access' });
-    expect(t.userTypeOf).not.toHaveBeenCalled();
     expect(t.interpret).not.toHaveBeenCalled();
     expect(t.withClientTx).not.toHaveBeenCalled();
-    expect(event(t.lines, 'search.no_access')[0]).toMatchObject({ reason });
+    expect(event(t.lines, 'search.no_access')[0]).toMatchObject({
+      resolution: 'quarantine',
+      reason,
+    });
   });
+
+  // Guests have no capability: the resolver refuses them (and anything but a
+  // Member) before the Directory is read.
+  it.each<RefusalReason>(['guest', 'not_member', 'unknown_user', 'no_identity'])(
+    'answers no_access to an asker the resolver refuses (%s)',
+    async (reason) => {
+      const t = setup({ resolved: { source: 'refused', reason } });
+      await expect(t.search(question('faktury z marca'))).resolves.toEqual({ status: 'no_access' });
+      await expect(t.search(typed({}))).resolves.toEqual({ status: 'no_access' });
+      expect(t.interpret).not.toHaveBeenCalled();
+      expect(t.withClientTx).not.toHaveBeenCalled();
+      expect(event(t.lines, 'search.no_access')[0]).toMatchObject({
+        resolution: 'refused',
+        reason,
+      });
+    },
+  );
+
+  // A Graph blip is not "this is only for the NIP account".
+  it.each<[string, ResolvedClient]>([
+    ['identity_unverified', { source: 'refused', reason: 'identity_unverified' }],
+    [
+      'membership_unverified',
+      { source: 'quarantine', reason: 'membership_unverified', target: target('Kwarantanna') },
+    ],
+  ])(
+    'answers unavailable when the resolver could not read the asker (%s)',
+    async (reason, resolved) => {
+      const t = setup({ resolved });
+      await expect(t.search(question('faktury'))).resolves.toEqual({ status: 'unavailable' });
+      await expect(t.search(typed({}))).resolves.toEqual({ status: 'unavailable' });
+      expect(t.interpret).not.toHaveBeenCalled();
+      expect(t.withClientTx).not.toHaveBeenCalled();
+      expect(event(t.lines, 'search.no_access')).toEqual([]);
+      expect(event(t.lines, 'search.unavailable')[0]).toMatchObject({ stage: 'identity', reason });
+    },
+  );
 
   it('asks the resolver with the authenticated id alone, for search', async () => {
     const t = setup();
     await t.search({ ...question('x'), source: { ...SOURCE, userAadObjectId: OID.toUpperCase() } });
     expect(t.resolve).toHaveBeenCalledWith({ userAadObjectId: OID, purpose: 'search' });
-    expect(t.userTypeOf).toHaveBeenCalledWith(OID);
-  });
-
-  it.each<[string, string | null | Error, string]>([
-    ['a member (staff on a client row)', 'Member', 'not_guest'],
-    ['a user Entra no longer has', null, 'not_guest'],
-    ['a user whose type cannot be read', new Error('graph down'), 'user_unverified'],
-  ])('answers no_access to %s', async (_label, userType, reason) => {
-    const t = setup({ userType });
-    await expect(t.search(question('faktury'))).resolves.toEqual({ status: 'no_access' });
-    expect(t.interpret).not.toHaveBeenCalled();
-    expect(t.withClientTx).not.toHaveBeenCalled();
-    expect(event(t.lines, 'search.no_access')[0]).toMatchObject({ reason, listItemId: '10' });
-  });
-
-  it('takes a guest in any case', async () => {
-    const t = setup({ userType: 'guest' });
-    await expect(t.search(typed({}))).resolves.toMatchObject({ status: 'ok' });
   });
 
   it('is disabled for a row SEARCH_ROWS does not list, and open to one it does', async () => {
@@ -879,7 +896,6 @@ describe('ClientSearchService: defaults', () => {
     const f = fakeDb();
     const service = new ClientSearchService({
       resolver: { resolve: async () => KANAREK },
-      userTypes: { userTypeOf: async () => 'Guest' },
       db: f.db,
       interpreter: { interpret: async () => understood() },
       directoryListId: LIST_ID,

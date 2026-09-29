@@ -32,8 +32,14 @@
  * An identity-routed upload went to the client row that held the uploader's
  * id. Before Phase 0 the only id on a client row was staff, so "routed by
  * identity" does not mean "uploaded by that client". The uploader is checked
- * against the guests of the site's own Team (`--site-guests`, or a
- * `directory-bindings` plan); without that list, the item is suspect.
+ * against the ids that may upload for the site's own client
+ * (`--site-guests`, alias `--site-accounts`, or a `directory-bindings`
+ * plan): the site's `{NIP}@` client account for a version-2 plan, the
+ * guests of the site's Team alone for a version-1 plan (so an IR-1 run from
+ * before the client-account rule is reproducible). Without that list, the
+ * item is suspect. The flag names `uploader_not_site_guest` and
+ * `uploader_guest_unverified` are kept, because registers already in the
+ * evidence store carry them.
  */
 
 import {
@@ -570,8 +576,9 @@ function loggedSitePath(upload) {
 /**
  * @param {object} ir0             an index entry (see `mergeUploads`)
  * @param {string} walkedSitePath  where the file is now; `''` when not found in the walk
- * @param {Map<string, Set<string>> | null} [siteGuests]  guests of each site's own
- *   Team, by canonical site path; `null` when no guest list was given at all
+ * @param {Map<string, Set<string>> | null} [siteGuests]  the ids that may upload for
+ *   each site's own client (its client account; the guests of its Team for a
+ *   v1 plan), by canonical site path; `null` when no list was given at all
  */
 function ir0Flags(ir0, walkedSitePath, siteGuests = null) {
   const flags = new Set();
@@ -586,8 +593,9 @@ function ir0Flags(ir0, walkedSitePath, siteGuests = null) {
     const logged = loggedSitePath(u);
     if (walked && (logged === null || (logged && logged !== walked))) flags.add('ir0_site_mismatch');
     // Routed by identity: to the row that held the uploader's id. Whether
-    // that uploader is the client (a guest of the site's own Team) is a
-    // separate question, and staff ids sat on client rows before Phase 0.
+    // that uploader is the client (an id on the site's list: its client
+    // account, or for a v1 plan the guests of its Team alone) is a separate
+    // question, and staff ids sat on client rows before Phase 0.
     if (u.resolution === 'directory' && !u.promotedFromFallback) {
       const site = walked || logged;
       const guests = site ? siteGuests?.get(site) : undefined;
@@ -604,29 +612,33 @@ function ir0Flags(ir0, walkedSitePath, siteGuests = null) {
 }
 
 /**
- * Guests of each site's own Team, from `--site-guests <site>=<oid,oid,...>`
- * values. `<site>` is a `--site` label or its path.
+ * The ids that may upload for each site's own client, from
+ * `--site-guests <site>=<oid,oid,...>` values (or its alias
+ * `--site-accounts`, named in `flag` for the messages). `<site>` is a `--site`
+ * label or its path. The ids are the site's client account, or for a run over
+ * the pre-rule history the guests of its Team.
  *
  * @param {string[]} specs
  * @param {Array<{label:string, sitePath:string}>} sites  the walked sites
+ * @param {string} [flag]
  * @returns {Map<string, Set<string>>} by canonical site path
  */
-export function parseSiteGuests(specs, sites) {
+export function parseSiteGuests(specs, sites, flag = '--site-guests') {
   const out = new Map();
   for (const spec of specs ?? []) {
     const text = String(spec);
     const eq = text.indexOf('=');
-    if (eq <= 0) throw new Error(`--site-guests "${text}": expected <site label>=<oid,oid,...>`);
+    if (eq <= 0) throw new Error(`${flag} "${text}": expected <site label>=<oid,oid,...>`);
     const name = text.slice(0, eq).trim();
     const site = findSite(sites, name);
-    if (!site) throw new Error(`--site-guests ${name}: not one of the --site values`);
+    if (!site) throw new Error(`${flag} ${name}: not one of the --site values`);
     const ids = text
       .slice(eq + 1)
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
     const bad = ids.filter((id) => !normalizeGuid(id));
-    if (bad.length) throw new Error(`--site-guests ${name}: not GUIDs: ${bad.join(', ')}`);
+    if (bad.length) throw new Error(`${flag} ${name}: not GUIDs: ${bad.join(', ')}`);
     const key = normalizeSitePath(site.sitePath);
     if (!out.has(key)) out.set(key, new Set());
     for (const id of ids) out.get(key).add(normalizeGuid(id));
@@ -635,11 +647,22 @@ export function parseSiteGuests(specs, sites) {
 }
 
 /**
- * Guests of each site's own Team, from a `directory-bindings.mjs propose`
- * plan: the guests who belong to that Team and to no other. A site that two
- * plan rows share is left out (it has no single client), so its items stay
- * `uploader_guest_unverified`. The plan shows membership when it was made,
- * not when a file was uploaded.
+ * The ids that may upload for each site's own client, from a
+ * `directory-bindings.mjs propose` plan:
+ *
+ * - a version-2 plan (the client-account rule): the row's `clientAccount`,
+ *   its `{NIP}@` Member in that Team alone. `null` means no account
+ *   qualified, so every identity-routed upload there is suspect; a row whose
+ *   account could not be assessed has no `clientAccount` and its site stays
+ *   unverified;
+ * - a version-1 plan: the guests who belonged to that Team and to no other
+ *   (`eligibleGuests`), as before, so an IR-1 run made with it is
+ *   reproducible.
+ *
+ * A site that two plan rows share is left out (it has no single client), so
+ * its items stay `uploader_guest_unverified`. The plan shows the Team as it
+ * was when it was made, not when a file was uploaded. `guests` keeps its name
+ * for the callers.
  *
  * @returns {{ guests: Map<string, Set<string>>, sharedSites: string[] }}
  */
@@ -647,6 +670,7 @@ export function siteGuestsFromPlan(plan) {
   if (plan?.kind !== PLAN_KIND || !Array.isArray(plan?.rows)) {
     throw new Error(`not a directory-bindings plan (kind ${PLAN_KIND})`);
   }
+  const v2 = Number(plan.version) >= 2;
   const guests = new Map();
   const shared = new Set();
   const rowsPerSite = new Map();
@@ -661,11 +685,15 @@ export function siteGuestsFromPlan(plan) {
       shared.add(key);
       continue;
     }
-    // `eligibleGuests` is present only where the Team's people were read; an
-    // older plan has only the proposal, which may also drop ids that sit on
-    // other rows (so it can only flag more, never fewer).
+    // v2: `clientAccount` is present only where the account was assessed.
+    // v1: `eligibleGuests` is present only where the Team's people were read;
+    // an older plan has only the proposal, which may also drop ids that sit
+    // on other rows (so it can only flag more, never fewer).
     let ids;
-    if (Array.isArray(row.eligibleGuests)) ids = row.eligibleGuests.map((g) => normalizeGuid(g?.id));
+    if (v2) {
+      if (!('clientAccount' in row)) continue;
+      ids = row.clientAccount ? [normalizeGuid(row.clientAccount.id)] : [];
+    } else if (Array.isArray(row.eligibleGuests)) ids = row.eligibleGuests.map((g) => normalizeGuid(g?.id));
     else if (row.proposed) ids = splitLines(row.proposed.UserAadObjectIds).map(normalizeGuid);
     else continue;
     guests.set(key, new Set(ids.filter(Boolean)));

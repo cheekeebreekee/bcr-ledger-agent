@@ -1,10 +1,17 @@
-import { type Activity, type Attachment, type ConversationAccount, TestAdapter } from 'botbuilder';
-import type {
-  IngestionBatchItemResult,
-  IngestionBatchRequestPayload,
-  IngestionBatchResponsePayload,
-  SearchRequestPayload,
-  SearchResponsePayload,
+import {
+  type Activity,
+  type Attachment,
+  type ConversationAccount,
+  TeamsInfo,
+  TestAdapter,
+} from 'botbuilder';
+import {
+  CLIENT_ACCOUNT_REQUIRED,
+  type IngestionBatchItemResult,
+  type IngestionBatchRequestPayload,
+  type IngestionBatchResponsePayload,
+  type SearchRequestPayload,
+  type SearchResponsePayload,
 } from '@bcr/shared';
 import { filterFileAttachments, LedgerBot, type LedgerBotDeps } from './ledgerBot';
 import {
@@ -232,6 +239,58 @@ describe('LedgerBot upload flow', () => {
     const { rows, json } = resultCard(sent);
     expect(rows[0]?.[0]).toBe('📨 \\[x\\]\\(https://evil\\).pdf');
     expect(json).not.toContain('[x](https://evil)');
+  });
+
+  it('ingestion answers ClientAccountRequired: the card shows the Polish text, no link, folder or category', async () => {
+    const f = fakes((payload) =>
+      payload.documents.map((d) => ({
+        filename: d.filename,
+        status: 'rejected' as const,
+        error: { code: CLIENT_ACCOUNT_REQUIRED, message: 'This account may not file documents' },
+      })),
+    );
+    const sent = await run(f.deps, message([teamsFile('a.pdf'), teamsFile('b.pdf')]));
+
+    const { rows, json } = resultCard(sent);
+    const text = rejectionText(CLIENT_ACCOUNT_REQUIRED);
+    expect(text).toContain('(login: NIP@bcr-group.pl)');
+    expect(rows).toEqual([
+      ['⚠️ a.pdf', text, '—'],
+      ['⚠️ b.pdf', text, '—'],
+    ]);
+    expect(json).not.toMatch(/may not file|Action\.OpenUrl|Faktur/);
+  });
+
+  // Owner's decision (28 Sep 2026): ingestion alone refuses guests. The bot
+  // asks Teams for no member or role before it downloads.
+  it('makes no role lookup before downloading: every admitted upload goes to ingestion, which decides', async () => {
+    const lookups = [
+      jest.spyOn(TeamsInfo, 'getMember'),
+      jest.spyOn(TeamsInfo, 'getMembers'),
+      jest.spyOn(TeamsInfo, 'getPagedMembers'),
+    ];
+    try {
+      const f = fakes((payload) =>
+        payload.documents.map((d) => ({
+          filename: d.filename,
+          status: 'rejected' as const,
+          error: { code: CLIENT_ACCOUNT_REQUIRED, message: 'refused' },
+        })),
+      );
+      const sent = await run(f.deps, message([teamsFile('a.pdf'), teamsFile('b.pdf')]));
+
+      for (const lookup of lookups) expect(lookup).not.toHaveBeenCalled();
+      expect(f.download).toHaveBeenCalledTimes(2);
+      expect(f.ingestBatch).toHaveBeenCalledTimes(1);
+      expect(f.ingestBatch.mock.calls[0]?.[0].source.userAadObjectId).toBe(USER_OID);
+      expect(sent.map((a) => a.type)).toEqual(['typing', 'message']);
+      expect(resultCard(sent).rows.map((r) => r[1])).toEqual([
+        rejectionText(CLIENT_ACCOUNT_REQUIRED),
+        rejectionText(CLIENT_ACCOUNT_REQUIRED),
+      ]);
+    } finally {
+      for (const lookup of lookups) lookup.mockRestore();
+    }
   });
 
   it('names a nameless attachment attachment.bin', async () => {

@@ -42,7 +42,8 @@ const HTML = `<!doctype html>
 <h1>Moje dokumenty</h1>
 <section>
 <p>Twoje dokumenty znajdziesz w swoim zespole w Teams: kanał „Dokumenty księgowe” → karta „Udostępnione”.</p>
-<p>Nowe dokumenty dodawaj w tym samym kanale: jako załącznik do wpisu albo na karcie „Udostępnione”. Asystent BCR przeniesie każdy plik do odpowiedniego folderu.</p>
+<p>Nowe dokumenty wysyłaj jako załączniki w czacie z Asystentem BCR albo dodawaj w tym samym kanale: jako załącznik do wpisu lub na karcie „Udostępnione”. Asystent BCR zapisze każdy plik w odpowiednim folderze.</p>
+<p>Asystent działa tylko na koncie, które BCR założyło dla Twojej firmy (login: NIP@bcr-group.pl).</p>
 </section>
 </main>
 </body>

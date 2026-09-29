@@ -11,7 +11,14 @@ What changes compared with [D1](01-as-is.md):
 - Every write goes into the client's channel folder, because the Directory row's `RootFolder` is
   set to it. A row without `RootFolder`, `DriveId` or `TeamId` routes nobody.
 - A bound uploader routes only while their Teams, read from Entra at upload time, are exactly
-  the row's `TeamId` (R46). A guest later added to another client's Team is quarantined.
+  the row's `TeamId` (R46). A client account later added to another client's Team is quarantined.
+- Only the row's client account routes: the Entra Member whose UPN is
+  `<the row's NIP>@bcr-group.pl` (the owner's decision of 28 September 2026). The uploader's
+  account is read before the Directory: a guest, any other non-Member or a deleted user is
+  **refused**, with nothing stored, classified or indexed, not even in quarantine. A Member bound
+  on a row who is not its client account is quarantined as `not_client_account`. This part is in
+  the next ingestion build, not yet deployed; until then the running build routes whatever id is
+  bound on a row (its Teams exactly the row's), and rows 2 and 10 still hold guests.
 
 Colours and conventions are in the [README](README.md).
 
@@ -24,7 +31,7 @@ flowchart TB
   classDef external fill:#fef3c7,stroke:#d97706,color:#5a3608
   classDef gate fill:#fee2e2,stroke:#dc2626,color:#6b1414
 
-  U["Client guest sends files<br/>in the 1:1 DM with the bot"]:::client
+  U["Client account sends files<br/>in the 1:1 DM with the bot"]:::client
   subgraph BOTAPP["teams-bot app"]
     GATE{"Bot gate on every activity:<br/>personal conversation, BCR tenant,<br/>GUID aadObjectId?"}:::gate
     GREJ["One fixed Polish line<br/>no download"]:::gate
@@ -34,10 +41,13 @@ flowchart TB
     AUTH{"Caller pinned? signature, audience,<br/>role, appid or azp in<br/>BOT_CALLER_APP_IDS"}:::gate
     SRC{"Strict source? conversationType personal,<br/>userAadObjectId is a UUID,<br/>tenantId is the BCR tenant"}:::gate
     REJ["Refused before any work<br/>401 or 403 caller, 400 source"]:::gate
+    ACC{"Uploader's account, read from Entra now<br/>userType Member?"}:::gate
+    RFS["Refused, nothing stored anywhere<br/>not classified, not indexed, no quarantine<br/>rejected ClientAccountRequired, or<br/>RetryLater when the read failed"]:::gate
     SNAP{"Directory snapshot younger than<br/>CLIENT_DIRECTORY_MAX_STALE_MS?"}:::gate
     PASS["Two-pass snapshot<br/>pass 1 collects every key per row,<br/>pass 2 admits clean keys and rows only"]:::system
     RULES["Pass 2 rules<br/>user-id conflict: drop only that key<br/>same site host + canonical path, same DriveId<br/>or same TeamId: exclude every row sharing it<br/>SitePath not exactly /sites or /teams + name,<br/>host not QUARANTINE_SITE_HOSTNAME,<br/>forbidden or quarantine site: exclude the row<br/>NIP or ClientId duplicate: alert only<br/>no alias or person-name maps"]:::system
     WHO{"Uploader AAD id on exactly<br/>one admitted client row?"}:::gate
+    NIPC{"Uploader is the row's client account?<br/>UPN is the row's NIP at the client domain<br/>checked before any Teams read"}:::gate
     MEM{"Uploader's Teams, read from Entra now<br/>memberOf as the managed identity, 5 min cache,<br/>exactly the row's TeamId?"}:::gate
     BOUND["Bound client target from that row<br/>site, drive, RootFolder = channel folder<br/>RootFolder, DriveId and TeamId all set"]:::client
     CLS["Claude claude-opus-5 suggests, primed with the<br/>bound client only. Acceptance policy: below<br/>CLASSIFICATION_ACCEPT_THRESHOLD or no answer:<br/>98_Nieposortowane/YYYY/MM. 429, 529, 5xx:<br/>retry later, rejected RetryLater, never 98_"]:::agent
@@ -49,7 +59,7 @@ flowchart TB
     QR["Quarantine, with one reason<br/>the folder never depends on content"]:::gate
     UPQ["PUT Kwarantanna/YYYY/MM/{batchId}/<br/>sanitised original filename, conflictBehavior=fail<br/>then PATCH UploaderOid, QuarantineReason,<br/>OriginalFilename, DocumentId"]:::system
     QFAIL["Quarantine write failed<br/>rejected row, spróbuj ponownie<br/>error log document.quarantine_failed<br/>never written anywhere else"]:::gate
-    LOG["Logs, ids only: document.filed with teamId,<br/>document.quarantined, directory.conflict,<br/>membership.mismatch, membership.unverified,<br/>document.quarantine_failed,<br/>sharepoint.forbidden_site,<br/>sharepoint.possible_duplicate"]:::system
+    LOG["Logs, ids only: document.filed with teamId,<br/>document.quarantined, directory.conflict,<br/>identity.refused, batch.refused,<br/>client_account.mismatch,<br/>membership.mismatch, membership.unverified,<br/>document.quarantine_failed,<br/>sharepoint.forbidden_site,<br/>sharepoint.possible_duplicate"]:::system
   end
   ANT["Anthropic API"]:::external
   subgraph M365["Microsoft 365 tenant BCR"]
@@ -67,7 +77,7 @@ flowchart TB
   subgraph CARD["One result card in the DM"]
     CU["Uploaded row: Dokument, Kategoria, Folder<br/>open link into the client's own space"]:::client
     CQ["Quarantined row: original filename and<br/>Dokument przekazano do weryfikacji<br/>przez zespół BCR. No link"]:::client
-    CR["Rejected row: a generic Polish<br/>message chosen by error code"]:::client
+    CR["Rejected row: a fixed Polish<br/>message chosen by error code"]:::client
   end
 
   U --> GATE
@@ -77,7 +87,10 @@ flowchart TB
   DL --> AUTH
   AUTH -->|"yes"| SRC
   AUTH -->|"no"| REJ
-  SRC -->|"yes"| SNAP
+  SRC -->|"yes"| ACC
+  ACC -->|"yes: Member"| SNAP
+  ACC -->|"no: guest, not_member, unknown_user"| RFS
+  ACC -->|"read failed: identity_unverified"| RFS
   SRC -->|"no"| REJ
   SNAP -->|"yes"| PASS
   SNAP -->|"no: empty snapshot, stale_directory"| QR
@@ -85,7 +98,9 @@ flowchart TB
   PASS -.- RULES
   PASS -.-|"a row pointing here is excluded"| FORB
   PASS --> WHO
-  WHO -->|"yes"| MEM
+  WHO -->|"yes"| NIPC
+  NIPC -->|"yes"| MEM
+  NIPC -->|"no: not_client_account"| QR
   MEM -->|"yes"| BOUND
   MEM -->|"no: membership_mismatch"| QR
   MEM -->|"read failed: membership_unverified"| QR
@@ -112,6 +127,7 @@ flowchart TB
   QS --> CQ
   QFAIL --> CR
   REJ --> CR
+  RFS --> CR
   UPC -.-> LOG
   UPQ -.-> LOG
   style SX fill:#ffffff,stroke:#dc2626,stroke-width:2px,stroke-dasharray: 6 4
@@ -132,9 +148,17 @@ quarantine library and in the `document.quarantined` log event.
 | `stale_directory` | The snapshot is older than `CLIENT_DIRECTORY_MAX_STALE_MS`, so it counts as empty. Or the resolved drive is not the row's `DriveId`. |
 | `forbidden_target` | The row's `SitePath` is in `FORBIDDEN_TARGET_SITE_PATHS` (BCR GROUP is always on the list, and the quarantine site is added automatically), is not exactly `/sites/<name>` or `/teams/<name>`, or its host is not `QUARANTINE_SITE_HOSTNAME`. Or, at upload time, the site Graph resolved is BCR GROUP or the quarantine site (`sharepoint.forbidden_site`). |
 | `unbound_target` | The uploader's only row lacks `RootFolder`, `DriveId` or `TeamId`. Only `directory-bindings.mjs apply` binds a row, and it writes all three together. |
+| `not_client_account` | The uploader is a Member bound on the row, but not its client account: their UPN is not the row's `{NIP}@bcr-group.pl` (staff or another client's account bound by mistake, a renamed account, a NIP edited by hand), or the row's NIP is not 10 digits. Checked before the Teams are read. Next build. |
 | `membership_mismatch` | The uploader's row is bound, but their Teams, read from Entra (`memberOf`) at upload time, are not exactly its `TeamId`: they are also in another Team, or no longer in this one. |
 | `membership_unverified` | The uploader's Teams could not be read after retries (no `Directory.Read.All` in the ingestion identity's token, the user gone, Graph down). Never cached. |
 | `target_unwritable` | The client target could not be written after retries. |
+
+Quarantine is for Members only. A guest, a `userType` that is neither Member nor Guest, a deleted
+user or a missing id is **refused** instead (`identity.refused`, then `batch.refused`): every
+document of the batch is a `rejected` row with `ClientAccountRequired`, whose Polish text names
+the `NIP@bcr-group.pl` login, and nothing is decoded, classified, stored or indexed. An account
+that cannot be read is refused the same way with `RetryLater`. Guests have no capability in the
+ledger, whether bound on a row or not. Next build.
 
 If the quarantine write itself fails, the user gets a rejected row asking them to try again, a
 `document.quarantine_failed` error is logged, and the file is not written anywhere else. No alert
@@ -158,6 +182,8 @@ the watch query and "After the window").
   and is logged; `DriveId` is a conflict key and is checked at upload time. The uploader's Team
   membership is checked twice: by the binding tool when it runs, and by ingestion at upload time
   against `TeamId` (the `MEM` node).
+- The row's `NIP` confirms the client account (the `NIPC` node); it never looks a row up. The row
+  is chosen by the uploader's id alone.
 
 ## Deploy order
 

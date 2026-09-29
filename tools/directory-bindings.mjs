@@ -1,19 +1,22 @@
 #!/usr/bin/env node
 /**
  * Binds each client row of the Client Directory to its own Team's
- * "Dokumenty księgowe" channel folder and to that Team's guests.
+ * "Dokumenty księgowe" channel folder and to the client's account, the
+ * `{NIP}@bcr-group.pl` Member named by the row's NIP (the owner's decision of
+ * 28 Sep 2026: guests have no capability in the ledger).
  *
  * ## Why
  *
  * Onboarding writes client rows with `RootFolder = ''` and no
  * `UserAadObjectIds`. The first sends every upload to the library root, where
- * the channel's Shared tab never shows it (R5). The second makes every
- * client's upload "unknown", which Phase 0 now sends to quarantine (R1). This
- * tool fills both from Graph, per row, with a reviewed plan in between:
+ * the channel's Shared tab never shows it (R5). The second routes nobody, so
+ * the client's chat uploads go to quarantine (R1) and its channel posts wait.
+ * This tool fills both from Graph, per row, with a reviewed plan in between:
  *
  *   check     report what each Active row is bound to and what is wrong;
  *             exit 3 on drift on a bound row, 4 when a bound row could not
- *             be fully assessed
+ *             be fully assessed, 5 when a bound row's client account is
+ *             disabled (3 wins over 4, 4 over 5)
  *   propose   compute the binding and write a plan file for review
  *   apply     apply a reviewed plan (PATCH list item fields), with a log
  *   rollback  restore the before-state from an apply log, re-checking every
@@ -27,12 +30,20 @@
  * - Only four columns are ever written: RootFolder, UserAadObjectIds, DriveId
  *   and TeamId. Nothing else on a row, and never a Team, channel, group,
  *   permission or visibility. BCR GROUP's visibility is read, never changed.
- * - Ambiguity skips the row: a duplicate key (a site, DriveId or TeamId shared
- *   with another row included), a non-canonical SitePath, a Public team, a
- *   missing or non-standard channel, a drive mismatch, an unknown write
- *   grant. A guest who is also in any other Team is never bound. Staff
- *   (Member) ids are removed from a client row only with
- *   `--confirm-remove-staff <listItemId>` for that row.
+ * - The one id a row may route is its client account: the Member whose UPN
+ *   is `<the row's 10-digit NIP>@<--client-domain>`, a member (never an
+ *   owner) of the row's Team and of no other Team. It is read by that UPN for
+ *   the row already chosen. Guest ids are taken off without a flag; a guest
+ *   is never bound. Other Member ids (staff, another client's account) are
+ *   removed from a client row only with `--confirm-remove-staff <listItemId>`
+ *   for that row.
+ * - Nothing here reads a sign-in state to act on it, and nothing writes to
+ *   `/users/*`: every user read is a GET. A disabled client account stays
+ *   bound, and `check` exits 5 for it (a client locked out).
+ * - Ambiguity skips the row: a duplicate key (a NIP, a site, DriveId or
+ *   TeamId shared with another row included), a non-canonical SitePath, a
+ *   Public team, a missing or non-standard channel, a drive mismatch, an
+ *   unknown write grant, an unreadable client account.
  * - Never BCR GROUP, never the quarantine (contract C8). The forbidden list is
  *   required, the quarantine path is always forbidden, a row on another host
  *   than `--tenant-host` is skipped, and a row whose site resolves to the
@@ -40,16 +51,20 @@
  * - `apply` refuses a plan that was edited after `propose` (the digest covers
  *   every field: rows, createdAt, directory, guards), is older than
  *   `--max-plan-age-hours` (at most 72), or whose row changed since (stale
- *   guard). Before each PATCH it checks the row again against the
- *   guards it is given, and re-reads every guest the row will route: each
- *   must still be a Guest in the row's Team and in no other Team. It refuses
- *   to run unless the ingestion `/api/health` reports
- *   `build.routing=identity-only`, the marker only the P0 build has.
- * - `rollback` puts ids back only after the same guest re-check: each id the
- *   restore would add to a row must be a Guest whose Teams are exactly the
- *   row's TeamId. Otherwise the row is refused (`guest_recheck_failed`):
- *   rolling back an apply that took a guest off must never route them to
- *   the old client again. `--only` limits it to named rows.
+ *   guard; `NIP` included). A plan must be version 2, and `--client-domain`,
+ *   if given, must equal the plan's. Before each PATCH it checks the row
+ *   again against the guards it is given, and re-reads the id the row will
+ *   route: it must still be the row's client account (a Member, UPN
+ *   `<NIP>@<domain>`), not an owner of the row's Team, and in that Team
+ *   alone. Whether it is enabled is never checked. It refuses to run unless
+ *   the ingestion `/api/health` reports `build.routing=identity-only`, the
+ *   marker only the P0 build has.
+ * - `rollback` puts ids back only after the same re-check: each id the
+ *   restore would add to a row must be the row's client account in the
+ *   row's Team alone. Otherwise the row is refused
+ *   (`client_account_recheck_failed`): a guest or a staff id is never put
+ *   back. It warns when a restore takes the row's client account off.
+ *   `--only` limits it to named rows.
  * - Every applied row is logged before the PATCH is sent (`writing`) and again
  *   after it, and the log is on disk at both points, so `rollback` knows every
  *   row an interrupted run may have written. The log is created fresh (an
@@ -81,6 +96,7 @@ import { GraphError, createGraph, describeToken, encodePath, mapLimit } from './
 import {
   BINDING_FIELDS,
   CHANNEL_NAME,
+  CLIENT_ACCOUNT_DOMAIN,
   GUARD_FIELDS,
   LOG_KIND,
   NEW_COLUMNS,
@@ -89,6 +105,10 @@ import {
   buildPlan,
   changedSinceApply,
   checkVerdict,
+  clientAccountNipOf,
+  clientAccountUpn,
+  clientAccountVerdict,
+  clientNipsOf,
   DRIFT_UNASSESSED_CODES,
   fieldString,
   findDuplicates,
@@ -97,10 +117,13 @@ import {
   healthExpectations,
   healthSatisfies,
   idsRollbackAdds,
+  idsRollbackRemoves,
+  isClientDomain,
   isSiteCollectionPath,
   isTeamGroup,
   mapSitesToTeams,
   normalizeGuid,
+  normalizeNip,
   normalizeSitePath,
   P0_HEALTH_EXPECTATION,
   ROUTING_DRIFT_CODES,
@@ -118,8 +141,8 @@ import {
 
 /**
  * The oldest plan `apply` takes, in hours, and its default. A hard cap: the
- * guests are re-read at apply, but everything else the plan saw (the Team,
- * its channel folder, its drive) is not.
+ * client account is re-read at apply, but everything else the plan saw (the
+ * Team, its channel folder, its drive) is not.
  */
 const MAX_PLAN_AGE_HOURS = 72;
 
@@ -129,19 +152,22 @@ Usage:
   node tools/directory-bindings.mjs propose  [common] [guards] [--out <plan.json>]
             [--write-verified <sitePath|listItemId>]... [--confirm-remove-staff <listItemId>]...
   node tools/directory-bindings.mjs apply    --plan <plan.json> --health-url https://<ingestion-host>/api/health
-            [guards] [--expect-health <key=value>]... [--only <listItemId>]...
+            [guards] [--client-domain <domain>] [--expect-health <key=value>]... [--only <listItemId>]...
             [--max-plan-age-hours ${MAX_PLAN_AGE_HOURS}] [--out <new log file>] [--apply]
 
   apply always requires the health body to report ${P0_HEALTH_EXPECTATION};
-  --expect-health adds further checks, it never replaces that one.
+  --expect-health adds further checks, it never replaces that one. apply takes the
+  plan's client domain; a --client-domain that differs is refused.
   node tools/directory-bindings.mjs rollback --log <apply-log.json> [--only <listItemId>]...
             [--out <new log file>] [--apply]
   node tools/directory-bindings.mjs --add-columns [--site-id ..] [--list-id ..] [--apply]
 
-  check exits 0 when every bound row with ids was assessed and none routes where it
-  should not, 3 on drift on a bound row, 4 when a bound row could not be fully
-  assessed (3 wins). rollback refuses a row whose restore would put back an id that
-  is not a Guest of that row's Team alone. --out never replaces an existing file.
+  check exits 0 when every bound row with ids was assessed, none routes where it
+  should not and no bound client account is disabled; 3 on drift on a bound row,
+  4 when a bound row could not be fully assessed, 5 when a bound row's client
+  account is disabled: a client locked out (3 wins over 4, 4 over 5). rollback
+  refuses a row whose restore would put back an id that is not that row's client
+  account in its Team alone. --out never replaces an existing file.
 
 Common:
   --site-id <id>              Graph site id of the Client Directory site (BCR GROUP)
@@ -151,6 +177,8 @@ Common:
   --ingest-app-ids <a,b>      app id of the ingestion Function App's managed identity,
                               INGEST_MI_APPID (env INGEST_APP_IDS)
   --channel-name <name>       default "${CHANNEL_NAME}"
+  --client-domain <domain>    the client accounts' domain: a row's account is
+                              <its 10-digit NIP>@<domain> (default ${CLIENT_ACCOUNT_DOMAIN})
   --concurrency <n>           parallel Graph requests, default 4
 
 Guards (check, propose and apply):
@@ -179,6 +207,7 @@ const OPTIONS = {
   'write-verified': { type: 'string', multiple: true },
   'confirm-remove-staff': { type: 'string', multiple: true },
   'channel-name': { type: 'string' },
+  'client-domain': { type: 'string' },
   concurrency: { type: 'string' },
   out: { type: 'string' },
   plan: { type: 'string' },
@@ -195,11 +224,12 @@ const GUARD_FLAGS = ['forbidden-site-paths', 'quarantine-site-path', 'tenant-hos
 /** Which flags each command accepts. A flag outside its command is refused, not ignored. */
 const ALLOWED = {
   check: ['site-id', 'list-id', 'ingest-app-ids', ...GUARD_FLAGS, 'write-verified',
-    'confirm-remove-staff', 'channel-name', 'concurrency', 'out'],
+    'confirm-remove-staff', 'channel-name', 'client-domain', 'concurrency', 'out'],
   propose: ['site-id', 'list-id', 'ingest-app-ids', ...GUARD_FLAGS, 'write-verified',
-    'confirm-remove-staff', 'channel-name', 'concurrency', 'out'],
+    'confirm-remove-staff', 'channel-name', 'client-domain', 'concurrency', 'out'],
   apply: ['plan', 'apply', 'only', 'health-url', 'expect-health', 'max-plan-age-hours', 'site-id',
-    'list-id', ...GUARD_FLAGS, 'out'],
+    'list-id', ...GUARD_FLAGS, 'client-domain', 'out'],
+  // rollback takes the client domain its apply log records.
   rollback: ['log', 'apply', 'only', 'out'],
   'add-columns': ['add-columns', 'apply', 'site-id', 'list-id'],
 };
@@ -306,6 +336,23 @@ function listPath({ siteId, listId }) {
   return `/sites/${siteId}/lists/${encodeURIComponent(listId)}`;
 }
 
+/**
+ * The client accounts' domain from `--client-domain`, trimmed and lower-cased,
+ * or the default. Checked before anything is read: a malformed value would
+ * name no account, and every row would read as having none.
+ */
+function clientDomainOf(values) {
+  const given = values['client-domain'];
+  if (given === undefined) return CLIENT_ACCOUNT_DOMAIN;
+  const domain = String(given).trim().toLowerCase();
+  if (!isClientDomain(domain)) {
+    throw new CliError(
+      `--client-domain: not a host name such as ${CLIENT_ACCOUNT_DOMAIN} (no "@", no scheme, no path): ${given}`,
+    );
+  }
+  return domain;
+}
+
 function concurrencyOf(values) {
   const n = Number(values.concurrency ?? 4);
   if (!Number.isInteger(n) || n < 1 || n > 16) throw new CliError('--concurrency must be 1..16');
@@ -382,7 +429,10 @@ function guardOptions(values, env, directorySiteId, recorded) {
   };
 }
 
-function printGuards(print, guards) {
+function printGuards(print, guards, clientDomain) {
+  if (clientDomain) {
+    print(`  accounts   <the row's 10-digit NIP>@${clientDomain}, a Member in the row's Team alone`);
+  }
   print(`  forbidden  ${guards.forbiddenSitePaths.join(', ')}`);
   print(
     `  guard      site collection ${guards.directorySiteCollectionId} (the Client Directory's) is never bound`,
@@ -399,6 +449,7 @@ function assessOptions(values, env, directorySiteId) {
   const badIds = ingestAppIds.filter((id) => !normalizeGuid(id));
   if (badIds.length) throw new CliError(`--ingest-app-ids: not GUIDs: ${badIds.join(', ')}`);
   const { guards, ctx: guardCtx } = guardOptions(values, env, directorySiteId);
+  const clientDomain = clientDomainOf(values);
   const writeVerified = new Set();
   for (const v of csvList(values['write-verified'])) {
     writeVerified.add(v);
@@ -408,8 +459,10 @@ function assessOptions(values, env, directorySiteId) {
   return {
     ingestAppIds,
     guards,
+    clientDomain,
     ctx: {
       ...guardCtx,
+      clientDomain,
       ingestAppIds: new Set(ingestAppIds.map(normalizeGuid)),
       writeVerified,
       confirmRemoveStaff: new Set(csvList(values['confirm-remove-staff'])),
@@ -457,10 +510,16 @@ async function safe(fn) {
   }
 }
 
-async function lookupUser(graph, id) {
+/**
+ * A user by object id or by UPN (a row's client account, `<NIP>@<domain>`):
+ * the user, `null` on 404, or `{ error }`. A GET: nothing here, or anywhere in
+ * this tool, writes to `/users/*`. `accountEnabled` is read to be reported,
+ * never to decide.
+ */
+async function lookupUser(graph, idOrUpn) {
   try {
     return await graph.get(
-      `/users/${id}?$select=id,displayName,userPrincipalName,userType,accountEnabled`,
+      `/users/${idOrUpn}?$select=id,displayName,userPrincipalName,userType,accountEnabled`,
     );
   } catch (err) {
     if (err instanceof GraphError && err.status === 404) return null;
@@ -513,7 +572,10 @@ async function readPermissions(graph, siteId) {
  * Everything `check` and `propose` need, read once. Nothing here decides; the
  * decisions are `assessRow` and `buildPlan` in lib/bindings.mjs.
  */
-export async function gather(graph, { siteId, listId, channelName, concurrency, print }) {
+export async function gather(
+  graph,
+  { siteId, listId, channelName, clientDomain = CLIENT_ACCOUNT_DOMAIN, concurrency, print },
+) {
   const items = await graph.all(`${listPath({ siteId, listId })}/items?expand=fields&$top=200`);
   const rows = items.map(parseDirectoryRow);
   const active = rows.filter((r) => r.active);
@@ -539,7 +601,8 @@ export async function gather(graph, { siteId, listId, channelName, concurrency, 
       memberOfCache.set(
         id,
         // resourceProvisioningOptions tells a Team from any other group. Every
-        // Team counts, marked or not: a guest in any second Team is not bound.
+        // Team counts, marked or not: a client account in any second Team is
+        // not bound.
         safe(() =>
           graph.all(
             `/users/${id}/memberOf?$select=id,displayName,description,resourceProvisioningOptions&$top=999`,
@@ -550,11 +613,34 @@ export async function gather(graph, { siteId, listId, channelName, concurrency, 
     return memberOfCache.get(id);
   };
 
+  // Each client row's account, read by the UPN its NIP names. Two rows with
+  // one NIP share one read (and are both skipped as duplicate_nip).
+  const accountCache = new Map();
+  const accountOf = (nip) => {
+    const upn = clientAccountUpn(nip, clientDomain);
+    if (!accountCache.has(upn)) accountCache.set(upn, lookupUser(graph, upn));
+    return accountCache.get(upn);
+  };
+
   const factsByRow = new Map();
   await mapLimit(active, concurrency, async (row) => {
     const facts = { usersById };
     factsByRow.set(row.listItemId, facts);
-    if (row.isAdmin || !row.siteHostname || !row.sitePath) return;
+    if (row.isAdmin) return;
+
+    // The row's client account, read by the UPN its NIP names (a row without
+    // a 10-digit NIP names none, and nothing is read), then its own
+    // memberships: no one else is ever bound, so no one else's are read. A
+    // failed read stays `{ error }`, and the row is skipped, never guessed.
+    if (/^[0-9]{10}$/.test(row.nip)) {
+      const account = await accountOf(row.nip);
+      facts.account = account;
+      if (account && !isErr(account) && clientAccountVerdict(account, row.nip, clientDomain) === 'client') {
+        facts.accountMemberOf = await memberOf(normalizeGuid(account.id) || account.id);
+      }
+    }
+
+    if (!row.siteHostname || !row.sitePath) return;
     // Not canonical (contract C1): not looked up, the row is skipped as such.
     const segments = sitePathSegments(row.sitePath);
     if (!segments) return;
@@ -581,7 +667,9 @@ export async function gather(graph, { siteId, listId, channelName, concurrency, 
     const [channels, members, owners] = await Promise.all([
       safe(() => graph.all(`/teams/${team.id}/channels?$select=id,displayName,membershipType`)),
       safe(() =>
-        graph.all(`/groups/${team.id}/members?$select=id,displayName,userPrincipalName,userType&$top=999`),
+        graph.all(
+          `/groups/${team.id}/members?$select=id,displayName,userPrincipalName,userType,accountEnabled&$top=999`,
+        ),
       ),
       safe(() =>
         graph.all(`/groups/${team.id}/owners?$select=id,displayName,userPrincipalName,userType&$top=999`),
@@ -595,18 +683,6 @@ export async function gather(graph, { siteId, listId, channelName, concurrency, 
       const pick = pickAccountingChannel(channels, channelName);
       if (pick.status === 'ok') facts.filesFolder = await readFilesFolder(graph, team.id, pick.channel.id);
     }
-
-    if (Array.isArray(facts.members) && Array.isArray(owners)) {
-      const ownerIds = new Set(owners.map((o) => normalizeGuid(o.id)));
-      const guests = facts.members.filter(
-        (m) => m.userType === 'Guest' && !ownerIds.has(normalizeGuid(m.id)),
-      );
-      // A failed read stays `{ error }`; classifyTeamPeople excludes that
-      // guest as "memberships_unreadable" rather than guessing.
-      facts.memberOfByUser = new Map(
-        await Promise.all(guests.map(async (g) => [normalizeGuid(g.id), await memberOf(g.id)])),
-      );
-    }
   });
 
   return { rows, active, duplicates, teams, teamIndex, usersById, factsByRow };
@@ -616,6 +692,7 @@ function assessAll(gathered, assessCtx) {
   const ctx = {
     ...assessCtx,
     duplicates: gathered.duplicates,
+    clientNips: clientNipsOf(gathered.rows),
     unreadableTeamSites: gathered.teamIndex.unreadable.length,
     knownTeamIds: new Set(gathered.teams.map((t) => normalizeGuid(t.id)).filter(Boolean)),
   };
@@ -630,24 +707,35 @@ function assessAll(gathered, assessCtx) {
 
 const q = (s) => `'${String(s ?? '')}'`;
 
-/** An excluded guest, with the other Teams that excluded them. */
+/** Someone not bound, with the reason and, for a client account in another Team, those Teams. */
 function describeExcluded(p) {
   const who = p.userPrincipalName || p.id;
   const teams = (p.otherTeams ?? []).map((t) => `${t.id}${t.displayName ? ` ${q(t.displayName)}` : ''}`);
-  return `${who ? `${who} ` : ''}(${p.reason}${teams.length ? `: also in ${teams.join(', ')}` : ''})`;
+  const why = p.why ? ` ${p.why}` : '';
+  return `${who ? `${who} ` : ''}(${p.reason}${why}${teams.length ? `: also in ${teams.join(', ')}` : ''})`;
 }
 
-function describeRowIds(row, usersById, eligible) {
-  const eligibleIds = new Set(eligible.map((g) => g.id));
+/** Each id on the row, labelled by the client-account rule against the row's NIP. */
+function describeRowIds(row, usersById, a, clientDomain) {
+  const bindable = a.clientAccount?.id;
   const parts = [...row.userIds].map((id) => {
     const u = usersById.get(id);
     if (u === null) return `${id} ${warn('not found')}`;
     if (!u) return `${id} ${dim('(not looked up)')}`;
     if (isErr(u)) return `${id} ${bad('lookup failed')}`;
     const who = u.userPrincipalName || u.displayName || '';
-    if (u.userType === 'Member') return `${id} ${bad('STAFF (Member)')} ${who}`;
-    const tag = eligibleIds.has(id) ? ok('guest of this team') : warn(`${u.userType ?? '?'}, not eligible`);
-    return `${id} ${tag} ${who}`;
+    const disabled = u.accountEnabled === false ? ` ${bad('DISABLED')}` : '';
+    if (row.isAdmin) return `${id} ${dim(u.userType ?? '?')} ${who}`;
+    const verdict = clientAccountVerdict(u, row.nip, clientDomain);
+    if (verdict === 'guest') return `${id} ${warn('GUEST (no capability; the PATCH removes it)')} ${who}`;
+    if (verdict === 'client') {
+      const tag = bindable === id ? ok("this row's client account") : bad("this row's client account, NOT eligible");
+      return `${id} ${tag}${disabled} ${who}`;
+    }
+    if (clientAccountNipOf(u.userPrincipalName, clientDomain)) {
+      return `${id} ${bad("A CLIENT ACCOUNT, NOT THIS ROW'S")}${disabled} ${who}`;
+    }
+    return `${id} ${bad(u.userType === 'Member' ? 'STAFF (Member)' : `NOT A MEMBER (${u.userType ?? 'no type'})`)} ${who}`;
   });
   for (const raw of row.invalidUserIds) parts.push(`${q(raw)} ${bad('not a GUID')}`);
   return parts;
@@ -660,7 +748,7 @@ function printProblems(print, problems) {
   }
 }
 
-function printRowCheck(print, row, a, facts, usersById, verdict) {
+function printRowCheck(print, row, a, facts, usersById, verdict, clientDomain) {
   const e = a.evidence;
   print('');
   print(bold(`Row ${row.listItemId} · ClientId ${row.clientId || '?'} · ${q(row.title)} · ${row.sitePath || '(no site)'}`));
@@ -679,16 +767,21 @@ function printRowCheck(print, row, a, facts, usersById, verdict) {
     const match = facts?.filesFolder?.parentReference?.driveId === e.driveId;
     print(`    drive      ${q(e.driveName)} → ${e.driveId}${e.filesFolderId ? (match ? ok(' (channel folder is in it)') : bad(' (channel folder is NOT in it)')) : ''}`);
   }
-  const ids = describeRowIds(row, usersById, a.eligibleGuests);
+  const ids = describeRowIds(row, usersById, a, clientDomain);
   print(`    row ids    ${ids.length ? ids.join('\n               ') : dim('(none)')}`);
-  if (a.eligibleGuests.length || a.excludedPeople.length) {
-    const el = a.eligibleGuests.map((g) => `${g.userPrincipalName || g.displayName} ${dim(g.id)}`);
-    print(`    guests     ${el.length ? el.join(', ') : warn('none eligible')}`);
-    const ex = a.excludedPeople.filter((p) => p.reason !== 'not_a_guest' && p.reason !== 'owner');
-    for (const p of ex) print(`               ${warn('excluded')} ${describeExcluded(p)}`);
-    const staffCount = a.excludedPeople.filter((p) => p.reason === 'not_a_guest').length;
-    const ownerCount = a.excludedPeople.filter((p) => p.reason === 'owner').length;
-    print(`               ${dim(`${staffCount} Member(s) and ${ownerCount} owner(s) of the team are never bound`)}`);
+  if (!row.isAdmin && (a.accountAssessed || a.account)) {
+    const acct = a.account;
+    const state = acct?.accountEnabled === false ? bad('DISABLED: the client is locked out') : 'enabled';
+    const eligible = a.clientAccount ? ok('eligible') : warn('not eligible');
+    const text = acct
+      ? `${acct.userPrincipalName} ${dim(acct.id)} · ${state} · ${eligible}`
+      : warn(`none eligible (${row.nip ? clientAccountUpn(row.nip, clientDomain) : 'no NIP'})`);
+    print(`    account    ${text}`);
+    const listed = a.notBound.filter((p) => p.reason !== 'staff' && p.reason !== 'owner');
+    for (const p of listed) print(`               ${warn('not bound')} ${describeExcluded(p)}`);
+    const staffCount = a.notBound.filter((p) => p.reason === 'staff').length;
+    const ownerCount = a.notBound.filter((p) => p.reason === 'owner').length;
+    print(`               ${dim(`${staffCount} staff Member(s) and ${ownerCount} owner(s) of the team are never bound`)}`);
   }
   if (!row.isAdmin) {
     const w = e.writeGrant;
@@ -711,6 +804,9 @@ function printRowCheck(print, row, a, facts, usersById, verdict) {
   if (verdict?.incomplete.includes(row.listItemId)) {
     print(`    ${bad('incomplete')} bound and holding user ids, but its drift could not be assessed`);
   }
+  if (verdict?.lockedOut.includes(row.listItemId)) {
+    print(`    ${bad('CLIENT LOCKED OUT')} the client account bound on this row is disabled; it stays bound`);
+  }
   const skips = a.problems.filter((p) => p.severity === 'skip').length;
   print(`    → ${skips ? bad(`SKIP (${skips} reason${skips > 1 ? 's' : ''})`) : ok('ready for propose')}`);
 }
@@ -732,7 +828,7 @@ async function gatherAndAssess(ctx, heading) {
   print('');
   print(bold(heading));
   print(`  directory  site ${ids.siteId} · list ${ids.listId}`);
-  printGuards(print, opts.guards);
+  printGuards(print, opts.guards, opts.clientDomain);
   tokenBanner(ctx);
   const graph = ctx.graph();
   if (!opts.ingestAppIds.length) {
@@ -741,6 +837,7 @@ async function gatherAndAssess(ctx, heading) {
   const gathered = await gather(graph, {
     ...ids,
     channelName: opts.ctx.channelName,
+    clientDomain: opts.clientDomain,
     concurrency: concurrencyOf(values),
     print,
   });
@@ -765,7 +862,7 @@ async function runCheck(ctx) {
   const rowById = new Map(gathered.rows.map((r) => [r.listItemId, r]));
   for (const a of assessments) {
     const row = rowById.get(a.listItemId);
-    printRowCheck(print, row, a, gathered.factsByRow.get(a.listItemId), gathered.usersById, verdict);
+    printRowCheck(print, row, a, gathered.factsByRow.get(a.listItemId), gathered.usersById, verdict, opts.clientDomain);
   }
   const ready = assessments.filter((a) => !a.problems.some((p) => p.severity === 'skip'));
   print('');
@@ -775,9 +872,10 @@ async function runCheck(ctx) {
   if (verdict.notRoutingUnbound.length) {
     print(
       warn(
-        `  not routing (unbound): row(s) ${verdict.notRoutingUnbound.join(', ')} hold staff ids or ids that ` +
-          "are not guests of that row's Team alone, but lack RootFolder, DriveId or TeamId, so the Phase-0 " +
-          'ingestion routes nobody there (unbound_target). The PATCH that binds such a row takes them off.',
+        `  not routing (unbound): row(s) ${verdict.notRoutingUnbound.join(', ')} hold ids that are not ` +
+          "the row's client account in its Team alone (guests, staff, other accounts), but lack RootFolder, " +
+          'DriveId or TeamId, so the Phase-0 ingestion routes nobody there (unbound_target). The PATCH that ' +
+          'binds such a row takes them off.',
       ),
     );
   }
@@ -799,7 +897,20 @@ async function runCheck(ctx) {
       ),
     );
   }
-  if (verdict.exitCode === 0) print(`  ${ok('every bound row with user ids was assessed; none routes where it should not')}`);
+  if (verdict.lockedOut.length) {
+    print(
+      bad(
+        `  CLIENT LOCKED OUT: row(s) ${verdict.lockedOut.join(', ')} are bound to a client account that is ` +
+          'disabled, so that client cannot sign in to Teams. Tell Roman at once; re-enabling it in Entra is ' +
+          'his. Never unbind the row for this, and never block, disable, unlicense or convert a client account.',
+      ),
+    );
+  }
+  if (verdict.exitCode === 0) {
+    print(
+      `  ${ok('every bound row with user ids was assessed; none routes where it should not; no client is locked out')}`,
+    );
+  }
 
   if (values.out) {
     const report = {
@@ -808,12 +919,14 @@ async function runCheck(ctx) {
       directory: ids,
       ingestAppIds: opts.ingestAppIds,
       guards: opts.guards,
+      clientDomain: opts.clientDomain,
       duplicates: gathered.duplicates,
       unreadableTeamSites: gathered.teamIndex.unreadable,
       exitCode: verdict.exitCode,
       routingDrift: verdict.routingDrift,
       incomplete: verdict.incomplete,
       notRoutingUnbound: verdict.notRoutingUnbound,
+      lockedOut: verdict.lockedOut,
       rows: assessments,
     };
     const written = writeJsonFile(values.out, report, { exclusive: true });
@@ -853,7 +966,16 @@ function printPlanRow(print, r) {
     for (const u of r.removedUserIds) print(`      ${bad('-')} ${u.id} ${describeExcluded({ ...u, id: '' })}`);
     for (const u of r.addedUserIds) print(`      ${ok('+')} ${u.id} ${u.userPrincipalName ?? ''}`);
   }
-  for (const g of r.excludedGuests ?? []) print(`    ${warn('not bound')} ${describeExcluded(g)}`);
+  if (r.clientAccount) {
+    const disabled = r.clientAccount.accountEnabled === false ? ` ${bad('DISABLED (bound all the same)')}` : '';
+    print(`    ${ok('client account')} ${r.clientAccount.userPrincipalName} ${dim(r.clientAccount.id)}${disabled}`);
+  }
+  const notBound = r.notBound ?? [];
+  for (const p of notBound.filter((x) => x.reason !== 'staff' && x.reason !== 'owner')) {
+    print(`    ${warn('not bound')} ${describeExcluded(p)}`);
+  }
+  const quiet = notBound.length - notBound.filter((x) => x.reason !== 'staff' && x.reason !== 'owner').length;
+  if (quiet) print(`    ${dim(`not bound: ${quiet} staff Member(s) or owner(s) of the Team (listed in the plan file)`)}`);
 }
 
 async function runPropose(ctx) {
@@ -871,6 +993,7 @@ async function runPropose(ctx) {
     ingestAppIds: opts.ingestAppIds,
     guards: opts.guards,
     createdAt: ctx.now().toISOString(),
+    clientDomain: opts.clientDomain,
   });
   for (const r of plan.rows) printPlanRow(print, r);
 
@@ -993,21 +1116,44 @@ function lazyTeamIds(graph) {
   };
 }
 
+/** Why an account is not a row's client account, in words, from its verdict. */
+function verdictReason(verdict, user, nip, clientDomain) {
+  if (verdict === 'guest') return 'is a Guest: guests have no capability in the ledger';
+  if (verdict === 'not_member') return `is ${user.userType ? `a ${user.userType}` : 'of no userType'}, not a Member`;
+  if (verdict === 'row_nip_invalid') return "cannot be the row's client account: the row's NIP is not 10 digits";
+  return (
+    `is not ${clientAccountUpn(nip, clientDomain)}, the row's client account ` +
+    "(staff, another client's account, or renamed)"
+  );
+}
+
 /**
- * Whether each of `ids` is a Guest who belongs to the Team `teamId` and to no
- * other Team (C8, R19), so that it may route to a row with that TeamId.
- * Memberships change, and a guest added to a second client's Team would file
- * that client's documents here. Reads only; a read that fails throws, and the
- * row is not written. A Member (staff) never qualifies, and neither does any
- * id when the row has no TeamId to check it against.
+ * Whether each of `ids` is the row's client account (C1–C6): at most one id;
+ * a Member whose UPN is `<nip>@<clientDomain>` (`clientAccountVerdict`), not
+ * an owner of the Team `teamId`, and in that Team and no other Team (C8,
+ * R19), so that it may route to a row with that TeamId. Memberships change,
+ * and an account added to a second client's Team is an anomaly the ingestion
+ * quarantines. Whether the account is enabled is never checked: the ledger
+ * never locks a client out. Reads only; a read that fails throws, and the row
+ * is not written. A Guest or a staff Member never qualifies, and neither does
+ * any id when the row has no TeamId to check it against.
  *
  * @param {string[]} ids  normalised GUIDs
  * @param {string} teamId  normalised GUID, or ''
  * @param {() => Promise<Set<string>>} knownTeamIds  every Team in the tenant, read once
+ * @param {{ nip: string, clientDomain: string }} account  the row's NIP now, and the plan's or log's domain
  * @returns {Promise<string[]>} why not; empty when every id qualifies
  */
-async function recheckIds(graph, ids, teamId, knownTeamIds) {
+async function recheckIds(graph, ids, teamId, knownTeamIds, { nip, clientDomain }) {
   const why = [];
+  if (ids.length > 1) why.push(`${ids.length} ids would route to the row; a row binds one client account`);
+  let ownerIds;
+  const ownersOfTeam = async () => {
+    ownerIds ??= graph
+      .all(`/groups/${teamId}/owners?$select=id&$top=999`)
+      .then((os) => new Set(os.map((o) => normalizeGuid(o.id)).filter(Boolean)));
+    return ownerIds;
+  };
   for (const id of ids) {
     const user = await lookupUser(graph, id);
     if (user === null) {
@@ -1015,10 +1161,16 @@ async function recheckIds(graph, ids, teamId, knownTeamIds) {
       continue;
     }
     if (isErr(user)) throw new Error(`could not read user ${id}: ${user.error}`);
-    if (user.userType !== 'Guest') {
-      why.push(`${id} is ${user.userType ? `a ${user.userType}` : 'not a Guest'}`);
+    const verdict = clientAccountVerdict(user, nip, clientDomain);
+    if (verdict !== 'client') {
+      why.push(`${id} ${verdictReason(verdict, user, nip, clientDomain)}`);
       continue;
     }
+    if (!teamId) {
+      why.push(`${id}: the row would have no TeamId, so it cannot be shown to be that Team's client account`);
+      continue;
+    }
+    if ((await ownersOfTeam()).has(id)) why.push(`${id} is an owner of the row's Team`);
     const groups = (
       await graph.all(
         `/users/${id}/memberOf?$select=id,displayName,description,resourceProvisioningOptions&$top=999`,
@@ -1026,8 +1178,7 @@ async function recheckIds(graph, ids, teamId, knownTeamIds) {
     ).filter(isGroup);
     const known = await knownTeamIds();
     const teams = new Set(groups.filter((g) => isTeamGroup(g, known)).map((g) => normalizeGuid(g.id) || String(g.id)));
-    if (!teamId) why.push(`${id}: the row would have no TeamId, so it cannot be shown to be that Team's guest`);
-    else if (!teams.has(teamId)) why.push(`${id} is no longer in the row's Team`);
+    if (!teams.has(teamId)) why.push(`${id} is no longer in the row's Team`);
     const others = [...teams].filter((t) => t !== teamId);
     if (others.length) why.push(`${id} is also in Team(s) ${others.join(', ')}`);
   }
@@ -1035,14 +1186,17 @@ async function recheckIds(graph, ids, teamId, knownTeamIds) {
 }
 
 /**
- * Whether every id the row will route after the PATCH still qualifies
- * (`recheckIds` against the row's final TeamId). Propose checked it; apply
- * checks it again right before the write.
+ * Whether the id the row will route after the PATCH still is its client
+ * account (`recheckIds` against the row's final TeamId and its NIP now).
+ * Propose checked it; apply checks it again right before the write.
  */
-async function recheckGuests(graph, planRow, knownTeamIds) {
+async function recheckClientAccount(graph, planRow, current, knownTeamIds, clientDomain) {
   const final = (field) => fieldString(field in planRow.patch ? planRow.patch[field] : planRow.before?.[field]);
   const ids = splitLines(final('UserAadObjectIds')).map(normalizeGuid).filter(Boolean);
-  return recheckIds(graph, ids, normalizeGuid(final('TeamId')), knownTeamIds);
+  return recheckIds(graph, ids, normalizeGuid(final('TeamId')), knownTeamIds, {
+    nip: normalizeNip(current?.NIP),
+    clientDomain,
+  });
 }
 
 async function runApply(ctx) {
@@ -1052,6 +1206,14 @@ async function runApply(ctx) {
   const { data: plan, sha256: planSha256 } = readJsonFile(values.plan);
   const errors = validatePlan(plan);
   if (errors.length) throw new CliError(`the plan is not applicable:\n  - ${errors.join('\n  - ')}`);
+  // The plan's domain decides: every account it binds was read under it.
+  const clientDomain = plan.clientDomain;
+  if (values['client-domain'] !== undefined && clientDomainOf(values) !== clientDomain) {
+    throw new CliError(
+      `--client-domain ${values['client-domain']} differs from the plan's (${clientDomain}); ` +
+        'apply takes the plan\'s. Re-run propose with the domain you mean.',
+    );
+  }
 
   const maxAgeHours = Number(values['max-plan-age-hours'] ?? MAX_PLAN_AGE_HOURS);
   if (!Number.isFinite(maxAgeHours) || maxAgeHours <= 0 || maxAgeHours > MAX_PLAN_AGE_HOURS) {
@@ -1082,8 +1244,9 @@ async function runApply(ctx) {
     }
   }
   const selected = plan.rows.filter((r) => r.action === 'PATCH' && (!only.size || only.has(r.listItemId)));
-  // A PATCH that takes an id off a row is what stops a guest now in two
-  // Teams from routing to the old one (C12). --only can leave it out.
+  // A PATCH that takes an id off a row is what keeps the Directory true: a
+  // guest, staff, or a client account now in two Teams (C12). --only can
+  // leave it out.
   const leftOut = plan.rows.filter(
     (r) => r.action === 'PATCH' && only.size && !only.has(r.listItemId) && (r.removedUserIds ?? []).length,
   );
@@ -1093,15 +1256,15 @@ async function runApply(ctx) {
   print(`  plan       ${values.plan}  sha256 ${planSha256}`);
   print(`  made       ${plan.createdAt} (${ageHours.toFixed(1)} h ago)`);
   print(`  directory  site ${directory.siteId} · list ${directory.listId}`);
-  printGuards(print, guards);
+  printGuards(print, guards, clientDomain);
   tokenBanner(ctx);
   print(`  rows       ${selected.length} PATCH selected · ${plan.rows.filter((r) => r.action === 'SKIP').length} SKIP refused · ${plan.rows.filter((r) => r.action === 'NOOP').length} NOOP`);
   if (leftOut.length) {
     print(
       warn(
         `  --only leaves out PATCH row(s) ${leftOut.map((r) => r.listItemId).join(', ')}, which take user ids ` +
-          'off a row. After an onboarding, apply the whole plan: until those rows are applied, a guest ' +
-          'who is now in two Teams still routes to the old one.',
+          'off a row. After an onboarding, apply the whole plan: until those rows are applied, an id that ' +
+          'no longer qualifies (a guest, staff, a client account now in two Teams) stays on its row.',
       ),
     );
   }
@@ -1136,8 +1299,10 @@ async function runApply(ctx) {
   const logFile = values.out ?? outPath(ctx.outDir, `directory-bindings-apply-${stamp(ctx.now())}.json`);
   const log = {
     kind: LOG_KIND,
-    version: 1,
+    version: 2,
     mode: APPLY ? 'apply' : 'dry-run',
+    // Rollback re-checks every id it would put back under this domain.
+    clientDomain,
     planFile: values.plan,
     planSha256,
     planDigest: plan.digest,
@@ -1194,7 +1359,10 @@ async function runApply(ctx) {
         flush();
         continue;
       }
-      const staleReasons = [...target.stale, ...(await recheckGuests(graph, r, knownTeamIds))];
+      const staleReasons = [
+        ...target.stale,
+        ...(await recheckClientAccount(graph, r, current, knownTeamIds, clientDomain)),
+      ];
       if (staleReasons.length) {
         entry.result = 'stale';
         entry.staleReasons = staleReasons;
@@ -1258,8 +1426,8 @@ async function runApply(ctx) {
     print(`  rollback node tools/directory-bindings.mjs rollback --log ${written.path} [--only <listItemId>]`);
     print(
       dim(
-        '           A dry run first. It refuses to put back an id that is not a Guest of that row\'s ' +
-          'Team alone; to undo an apply that took ids off, re-run propose and apply the whole plan.',
+        "           A dry run first. It refuses to put back an id that is not that row's client account in " +
+          'its Team alone; to undo an apply that took ids off, re-run propose and apply the whole plan.',
       ),
     );
     print('');
@@ -1273,6 +1441,23 @@ async function runApply(ctx) {
 // rollback
 // ---------------------------------------------------------------------------
 
+/**
+ * Which of `ids` (on a row now, taken off by a restore) are the row's client
+ * account, by the rule against the row's NIP now. Reads only; an id that
+ * cannot be read is listed as unreadable rather than guessed.
+ */
+async function clientAccountsAmong(graph, ids, current, clientDomain) {
+  const accounts = [];
+  const unreadable = [];
+  for (const id of ids) {
+    const user = await lookupUser(graph, id);
+    if (user === null) continue;
+    if (isErr(user)) unreadable.push(id);
+    else if (clientAccountVerdict(user, normalizeNip(current?.NIP), clientDomain) === 'client') accounts.push(id);
+  }
+  return { accounts, unreadable };
+}
+
 async function runRollback(ctx) {
   const { print, values } = ctx;
   const APPLY = Boolean(values.apply);
@@ -1283,6 +1468,13 @@ async function runRollback(ctx) {
   }
   const directory = log.directory;
   if (!directory?.siteId || !directory?.listId) throw new CliError('the log names no directory');
+  // The domain the apply bound client accounts under. A log from before the
+  // client-account rule (version 1) has none: the default is the strictest
+  // real rule, and a guest id it would put back never passes it.
+  const clientDomain = log.version === 1 && log.clientDomain === undefined ? CLIENT_ACCOUNT_DOMAIN : log.clientDomain;
+  if (!isClientDomain(clientDomain)) {
+    throw new CliError(`${values.log} records no valid clientDomain; it cannot be re-checked`);
+  }
 
   // `writing` (the run died with the PATCH in flight) and `write_unknown` (the
   // PATCH threw) may or may not have landed; each is checked against the row.
@@ -1300,6 +1492,7 @@ async function runRollback(ctx) {
   print(bold(`Rollback directory bindings — ${APPLY ? bad('APPLY') : 'DRY RUN (nothing is written)'}`));
   print(`  log        ${values.log}  sha256 ${logSha256}`);
   print(`  directory  site ${directory.siteId} · list ${directory.listId}`);
+  print(`  accounts   <the row's 10-digit NIP>@${clientDomain}, a Member in the row's Team alone`);
   tokenBanner(ctx);
   const graph = ctx.graph();
   const knownTeamIds = lazyTeamIds(graph);
@@ -1311,8 +1504,9 @@ async function runRollback(ctx) {
   const outFile = values.out ?? outPath(ctx.outDir, `directory-bindings-rollback-${stamp(ctx.now())}.json`);
   const out = {
     kind: ROLLBACK_KIND,
-    version: 1,
+    version: 2,
     mode: APPLY ? 'apply' : 'dry-run',
+    clientDomain,
     applyLog: values.log,
     applyLogSha256: logSha256,
     ...(only.size ? { only: [...only] } : {}),
@@ -1372,15 +1566,20 @@ async function runRollback(ctx) {
         continue;
       }
       // An id the restore puts back routes to this row again. The apply took
-      // it off for a reason (a second Team, staff), so it is re-read as apply
-      // re-reads the guests it binds, against the TeamId the row will have.
+      // it off for a reason (a guest, staff, a second Team), so it is re-read
+      // as apply re-reads the account it binds, against the TeamId the row
+      // will have and the row's NIP now. A guest or staff id never passes.
       const readded = idsRollbackAdds(patch, current);
       if (readded.length) {
         const teamId = normalizeGuid('TeamId' in patch ? patch.TeamId : fieldString(current.TeamId));
-        const why = await recheckIds(graph, readded, teamId, knownTeamIds);
+        const restoredIds = splitLines(fieldString(patch.UserAadObjectIds)).map(normalizeGuid).filter(Boolean);
+        const why = await recheckIds(graph, [...new Set(restoredIds)], teamId, knownTeamIds, {
+          nip: normalizeNip(current.NIP),
+          clientDomain,
+        });
         entry.readdedUserIds = readded;
         if (why.length) {
-          entry.result = 'guest_recheck_failed';
+          entry.result = 'client_account_recheck_failed';
           entry.recheckReasons = why;
           failures += 1;
           print(`    ${bad('refused')} it would put back id(s) that must not route here: ${why.join('; ')}.`);
@@ -1391,6 +1590,24 @@ async function runRollback(ctx) {
           flush();
           continue;
         }
+      }
+      // The restore may take the row's client account off (it undoes the
+      // apply that bound it). Allowed, but said: its chat uploads then go to
+      // quarantine (unmapped) and its channel posts wait until it is bound again.
+      const unbinds = await clientAccountsAmong(graph, idsRollbackRemoves(patch, current), current, clientDomain);
+      if (unbinds.accounts.length) {
+        entry.unbindsClientAccount = unbinds.accounts;
+        print(
+          `    ${warn('warning')} the restore takes the row's client account ${unbinds.accounts.join(', ')} off: ` +
+            'its chat uploads then go to quarantine (unmapped) and its channel posts wait, until propose ' +
+            'and apply bind it again',
+        );
+      }
+      for (const id of unbinds.unreadable) {
+        print(
+          `    ${warn('warning')} could not read ${id}, so whether the restore unbinds the row's client account ` +
+            'is unknown',
+        );
       }
       for (const [field, value] of Object.entries(patch)) {
         print(`    ${field.padEnd(17)} ${q(entry.before[field])} → ${q(value)}`);

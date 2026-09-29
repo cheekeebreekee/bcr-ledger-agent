@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { Client } from '@microsoft/microsoft-graph-client';
 import { PDFDocument } from 'pdf-lib';
 import {
+  CLIENT_ACCOUNT_REQUIRED,
   SharePointError,
   ValidationError,
   type Classification,
@@ -11,6 +12,7 @@ import {
   type IngestionBatchRequestPayload,
   type Logger,
   type QuarantineReason,
+  type RefusalReason,
   type ResolvedClient,
   type SharePointTarget,
 } from '@bcr/shared';
@@ -622,8 +624,9 @@ describe('BatchIngestor — quarantine', () => {
     ]);
   });
 
-  // The runtime Team check (R46): a bound guest who is not in their row's
-  // Team alone, or whose Teams cannot be read, is held like any other reason.
+  // The runtime Team check (R46): a bound client account that is not in its
+  // row's Team alone, or whose Teams cannot be read, is held like any other
+  // reason.
   it.each(['membership_mismatch', 'membership_unverified'] as const)(
     'holds a %s upload unclassified, and records the reason on the item',
     async (reason) => {
@@ -672,6 +675,145 @@ describe('BatchIngestor — quarantine', () => {
     expect(result).toMatchObject({ status: 'rejected', error: { code: 'QuarantineFailed' } });
     expect(sp.uploads).toHaveLength(0);
     expect(lines.some((l) => l['event'] === 'document.quarantine_failed')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Not a client account (owner's decision, 28 Sep 2026): guests have no
+// capability. The batch is refused before anything is decoded or stored.
+// ---------------------------------------------------------------------------
+
+describe('BatchIngestor — refused', () => {
+  const refused = (reason: RefusalReason): ResolvedClient => ({ source: 'refused', reason });
+
+  function indexSpy(): DocumentIndex & { record: jest.Mock } {
+    return { mode: 'write', record: jest.fn(async () => undefined) };
+  }
+
+  it("a guest's batch: every document rejected ClientAccountRequired; no upload through either factory, no setListItemFields, no classify, no index record, no document.received line", async () => {
+    const index = indexSpy();
+    const { ingestor, sp, classify, deps } = setup(refused('guest'), { index });
+    const quarantine = deps.resolver.quarantine as jest.Mock;
+    const { log, lines } = recordingLogger();
+    const decode = jest.spyOn(Buffer, 'from');
+
+    const results = await ingestor.ingestBatch(payload(['faktura.pdf', 'umowa.pdf']), log);
+
+    const decoded = decode.mock.calls.filter((c) => c[1] === 'base64');
+    decode.mockRestore();
+    expect(results).toEqual([
+      {
+        filename: 'faktura.pdf',
+        status: 'rejected',
+        error: { code: CLIENT_ACCOUNT_REQUIRED, message: 'This account may not file documents' },
+      },
+      {
+        filename: 'umowa.pdf',
+        status: 'rejected',
+        error: { code: CLIENT_ACCOUNT_REQUIRED, message: 'This account may not file documents' },
+      },
+    ]);
+    expect(decoded).toEqual([]);
+    expect(sp.uploads).toEqual([]);
+    expect(sp.fields).toEqual([]);
+    expect(classify).not.toHaveBeenCalled();
+    expect(quarantine).not.toHaveBeenCalled();
+    expect(index.record).not.toHaveBeenCalled();
+    expect(lines.some((l) => l['msg'] === 'document received')).toBe(false);
+    expect(lines.find((l) => l['msg'] === 'client resolved')).toEqual({
+      resolution: 'refused',
+      refusalReason: 'guest',
+      msg: 'client resolved',
+    });
+    expect(lines.filter((l) => l['event'] === 'batch.refused')).toEqual([
+      {
+        event: 'batch.refused',
+        resolution: 'refused',
+        refusalReason: 'guest',
+        uploaderOid: OID,
+        documentCount: 2,
+        code: CLIENT_ACCOUNT_REQUIRED,
+        msg: 'batch.refused',
+      },
+    ]);
+  });
+
+  it.each<RefusalReason>(['guest', 'not_member', 'unknown_user', 'no_identity'])(
+    'refuses a %s uploader with ClientAccountRequired, storing nothing',
+    async (reason) => {
+      const { ingestor, sp, classify } = setup(refused(reason));
+      const results = await ingestor.ingestBatch(payload(['a.pdf']), recordingLogger().log);
+      expect(results.map((r) => [r.status, r.error?.code])).toEqual([
+        ['rejected', CLIENT_ACCOUNT_REQUIRED],
+      ]);
+      expect(sp.uploads).toEqual([]);
+      expect(classify).not.toHaveBeenCalled();
+    },
+  );
+
+  it('identity_unverified: every document rejected RetryLater, nothing stored', async () => {
+    const index = indexSpy();
+    const { ingestor, sp, classify } = setup(refused('identity_unverified'), { index });
+    const { log, lines } = recordingLogger();
+    const results = await ingestor.ingestBatch(payload(['a.pdf', 'b.pdf']), log);
+    expect(results.map((r) => r.error)).toEqual([
+      { code: RETRY_LATER, message: 'The document was not processed now; send it again later' },
+      { code: RETRY_LATER, message: 'The document was not processed now; send it again later' },
+    ]);
+    expect(sp.uploads).toEqual([]);
+    expect(sp.fields).toEqual([]);
+    expect(classify).not.toHaveBeenCalled();
+    expect(index.record).not.toHaveBeenCalled();
+    expect(lines.find((l) => l['event'] === 'batch.refused')).toMatchObject({
+      refusalReason: 'identity_unverified',
+      code: RETRY_LATER,
+    });
+  });
+
+  it('the response for a refusal carries no link, folder, category or stored name', async () => {
+    const { ingestor } = setup(refused('guest'));
+    const results = await ingestor.ingestBatch(payload(['skan.pdf']), recordingLogger().log);
+    expect(results.every((r) => r.result === undefined)).toBe(true);
+    const json = JSON.stringify(results);
+    const leaks = ['sharepoint', 'Kwarantanna', 'sites', 'item-', 'guest', 'folder', 'category'].filter(
+      (x) => json.includes(x),
+    );
+    expect(leaks).toEqual([]);
+  });
+
+  it('refuses even a batch past the deadline without decoding it', async () => {
+    let t = Date.parse('2026-09-25T10:00:00Z');
+    const { ingestor, deps, sp } = setup(refused('guest'), { now: () => new Date(t) });
+    (deps.resolver.resolve as jest.Mock).mockImplementation(async () => {
+      t += 200_000;
+      return refused('guest');
+    });
+    const results = await ingestor.ingestBatch(payload(['a.pdf']), recordingLogger().log);
+    expect(results.map((r) => r.error?.code)).toEqual([CLIENT_ACCOUNT_REQUIRED]);
+    expect(sp.uploads).toEqual([]);
+  });
+
+  it('not_client_account is quarantined like any Member quarantine (UploaderOid, QuarantineReason set)', async () => {
+    const held: ResolvedClient = {
+      source: 'quarantine',
+      reason: 'not_client_account',
+      target: quarantineTarget,
+    };
+    const { ingestor, sp, classify } = setup(held);
+    const { log, lines } = recordingLogger();
+    const [result] = await ingestor.ingestBatch(payload(['skan.pdf']), log);
+
+    expect(result).toEqual({ filename: 'skan.pdf', status: 'quarantined' });
+    expect(classify).not.toHaveBeenCalled();
+    expect(sp.uploads.map((u) => u.factory)).toEqual(['quarantine']);
+    expect(sp.fields[0]!.fields).toMatchObject({
+      UploaderOid: OID,
+      QuarantineReason: 'not_client_account',
+    });
+    expect(lines.find((l) => l['msg'] === 'client resolved')).toMatchObject({
+      resolution: 'quarantine',
+      quarantineReason: 'not_client_account',
+    });
   });
 });
 

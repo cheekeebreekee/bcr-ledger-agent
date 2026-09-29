@@ -14,10 +14,16 @@ describe('buildMyDocsResponse (static "Moje dokumenty" page)', () => {
     );
   });
 
-  // Guests cannot attach files in a chat with the bot; the channel is the inbox.
-  it('sends new documents to the channel, not the private chat', () => {
-    expect(body).toContain('Nowe dokumenty dodawaj w tym samym kanale');
-    expect(body).not.toContain('prywatnym czacie');
+  // Owner's decision (28 Sep 2026): a client is its NIP@ Member account,
+  // which can attach in the bot's chat, so the page offers both intakes.
+  it('offers the bot chat and the channel, and names the NIP@ account', () => {
+    expect(body).toContain('w czacie z Asystentem BCR');
+    expect(body).toContain('w tym samym kanale');
+    expect(body).toContain('NIP@bcr-group.pl');
+    expect(body).toContain(
+      '<p>Asystent działa tylko na koncie, które BCR założyło dla Twojej firmy (login: NIP@bcr-group.pl).</p>',
+    );
+    expect(body).not.toContain('Nowe dokumenty dodawaj w tym samym kanale');
   });
 
   it('is the same bytes on every call — nothing is looked up or reflected', () => {

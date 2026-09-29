@@ -3,6 +3,11 @@
 **Status: TARGET.** The reconciled v2 design, copied verbatim from the approved plan. None of it
 is built yet.
 
+**Amended 29 September 2026.** The client node said "client guest". Since the owner's decision
+of 28 September a client's identity is its `{NIP}@bcr-group.pl` account, an Entra Member created
+by BCR and a member of its own client Team only; guests have no capability in the ledger. The
+rest is the plan as approved.
+
 Each edge names the identity or role it uses. Colours follow the
 [README](README.md#colour-key).
 
@@ -14,7 +19,7 @@ flowchart LR
   classDef system fill:#f1f5f9,stroke:#64748b,color:#1e293b
   classDef external fill:#fef3c7,stroke:#d97706,color:#5a3608
   classDef gate fill:#fee2e2,stroke:#dc2626,color:#6b1414
-  G["Client guest<br/>Teams 1:1 DM"]:::client
+  G["Client account, a tenant Member<br/>Teams 1:1 DM and its own Team"]:::client
   S["Accountant"]:::staff
   subgraph M365["Microsoft 365 tenant BCR"]
     BS["Azure Bot Service"]:::system
@@ -86,6 +91,10 @@ flowchart LR
   row-level security (I4).
 - **Site grants.** The onboarding Automation account grants site write to the ingestion identity
   only. The ledger's own Automation account adds and removes assigned accountants as Team members.
+- **Client accounts are Members** (amended 29 Sep 2026). They reach tenant-wide surfaces a guest
+  did not: the directory, Viva Engage, organisation-wide links.
+  [`security.md` T22](../security.md#t22-client-accounts-are-tenant-members) records what bounds
+  that. Blocking their sign-in is never one of those bounds: it locks the client out.
 - **KSeF credentials** live in `kv-ksef`, which only `ksef-sync` can read.
 - **Isolation audit** runs nightly, read-only, and can block a target (I12).
 - **Pending:** the onboarding-to-registry binding edge needs Roman to re-rule Q21.

@@ -35,7 +35,7 @@ sequenceDiagram
   TAB->>TAB: Teams SSO, getAuthToken
   TAB->>R: GET /api/review/tasks/{taskId} with the SSO token
   R->>E: verify signature, issuer, tenant and audience against JWKS
-  R->>R: require role Ledger.Reviewer and a upn claim. Guests and app-only tokens are refused
+  R->>R: require role Ledger.Reviewer and a upn claim. Guests, client accounts and app-only tokens are refused
   R->>DB: SET LOCAL ROLE ledger_reviewer, app.staff_oid and app.staff_upn, then SELECT the task and document
   Note over DB: RLS: the client must be among the reviewer's active staff_assignments, and the staff_members row must be active
   alt not assigned, or unknown id
@@ -67,6 +67,10 @@ sequenceDiagram
 
 - **Ids only.** The channel card and the queue message carry ids and codes. They carry no client
   name, filename or NIP (I7).
+- **Client accounts are Members too** (amended 29 Sep 2026). Since the owner's decision of
+  28 September a client's `{NIP}@bcr-group.pl` account is a tenant Member with a `upn` claim, so
+  being a Member proves nothing here: only the `Ledger.Reviewer` role, assigned to staff and never
+  to a client account, admits a reviewer.
 - **Scope comes from the token.** The reviewer's oid and upn come from the verified SSO token and
   are set per transaction. Row-level security then shows only clients the reviewer is actively
   assigned to. An unassigned or unknown task gives the same 404.

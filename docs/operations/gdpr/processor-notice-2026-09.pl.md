@@ -2,6 +2,28 @@
 
 > ⚠️ **PROJEKT — wymaga zatwierdzenia przez IOD lub prawnika. Nie wysyłać przed
 > zatwierdzeniem.**
+
+> **Korekta z 29 września 2026 r. Przeczytać przed wypełnieniem i usunąć razem z ramką poniżej
+> przed wysłaniem; tekst pisma pozostaje bez zmian.** Środek „zablokowaliśmy możliwość logowania
+> na konta skrzynek pocztowych przypisanych klientom” (T-1) oraz przekształcenie tych skrzynek we
+> współdzielone (T-2) są **wycofane**. Konta `{NIP}@bcr-group.pl` nie są skrzynkami, na które nikt
+> się nie loguje: są własnymi, prawidłowymi kontami, którymi klienci logują się do Teams (decyzja
+> właściciela z 28 września 2026 r.). T-1 wykonano 26 września i cofnięto 28 września; T-2 nigdy
+> nie wykonano (`incident-2026-09.md` → *Client lockout, 26–28 September (T-1 reversed)*). Przy
+> wypełnianiu:
+>
+> - **Punkt 1, wariant A:** pominąć „które nie powinny były mieć możliwości logowania” i pisać
+>   „trzy konta przypisane klientom BCR”, a nie konta skrzynek pocztowych. Narażenie polegało na
+>   tym, że zespół BCR GROUP był publiczny, więc mogło do niego dołączyć każde konto wewnętrzne,
+>   w tym konta samych klientów.
+> - **Punkt 4:** logowanie na te konta jest logowaniem samego klienta. Nie używać przykładu „nie
+>   stwierdziliśmy logowania na konta skrzynek pocztowych przypisanych klientom”; podać tylko,
+>   czy któreś z tych kont dołączyło do zespołu BCR GROUP albo otworzyło jego pliki, gdy był
+>   publiczny.
+> - **Punkt 6:** z pierwszego punktu listy „Zrobione” zostawić tylko to, że zespół BCR GROUP jest
+>   ustawiony jako prywatny.
+>
+> Wersja angielska zawiera tę samą korektę.
 >
 > **Instrukcja wypełnienia (usunąć całą ramkę przed wysłaniem).**
 >

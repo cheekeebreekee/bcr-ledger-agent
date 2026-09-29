@@ -1,6 +1,26 @@
 # Processor's notice of a personal data breach (phase 1)
 
 > ⚠️ **DRAFT — the IOD or lawyer must confirm it. Do not send before approval.**
+
+> **Correction, 29 September 2026. Read before filling in, and delete with the box below before
+> sending; the notice's text is unchanged.** The measure "we blocked sign-in on the mailbox
+> accounts assigned to clients" (T-1), and the conversion of those mailboxes to shared ones
+> (T-2), are **withdrawn**. The `{NIP}@bcr-group.pl` accounts are not mailboxes nobody signs in
+> with: they are the clients' own, legitimate Teams sign-ins (the owner's decision of
+> 28 September 2026). T-1 was done on 26 September and reversed on 28 September; T-2 was never
+> run (`incident-2026-09.md` → *Client lockout, 26–28 September (T-1 reversed)*). So, when
+> filling in:
+>
+> - **Section 1, Variant A:** drop "that should not have been able to sign in", and call them
+>   "three accounts assigned to BCR clients", not mailbox accounts. The exposure was that the
+>   BCR GROUP team was public, so any internal account could join it, the clients' own accounts
+>   among them.
+> - **Section 4:** a sign-in by these accounts is the client's own. Do not use the example "no
+>   sign-in to the mailbox accounts assigned to clients"; say only whether one of them joined the
+>   BCR GROUP team, or opened its files, while it was public.
+> - **Section 6:** of the first "Done" bullet keep only "the BCR GROUP team is set to private".
+>
+> The Polish version carries the same correction.
 >
 > **This is the English mirror of [`processor-notice-2026-09.pl.md`](processor-notice-2026-09.pl.md),
 > for review.** The Polish version is the one that is sent. Keep the two in step: a change to

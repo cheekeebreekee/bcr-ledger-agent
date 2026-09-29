@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  CLIENT_ACCOUNT_DOMAIN,
+  clientAccountVerdict,
   createLogger,
   LedgerAgentError,
   type ClassifierContext,
@@ -34,7 +36,7 @@ import {
   type SharePointService,
 } from './sharePointService';
 import { TeamMembershipReadError, type TeamMembershipSource } from './teamMembership';
-import { UserTypeReadError, type UserTypeSource } from './userDirectory';
+import { UserAccountReadError, type UserAccount, type UserAccountSource } from './userDirectory';
 
 /**
  * How long one sweep may start new work (a row, or a file). The host's
@@ -129,8 +131,14 @@ export interface ChannelInboxDeps {
    * before anything is listed there.
    */
   readonly sharePointFactory: InboxSharePointFactory;
-  /** Whether an uploader is a guest (`userType`). */
-  readonly users: UserTypeSource;
+  /**
+   * An uploader's account (`userType`, `userPrincipalName`): the creator must
+   * be the row's client account, an Entra Member whose UPN is
+   * `{row NIP}@bcr-group.pl`.
+   */
+  readonly accounts: UserAccountSource;
+  /** The client accounts' domain. Defaults to `CLIENT_ACCOUNT_DOMAIN`; injected in tests. */
+  readonly clientAccountDomain?: string;
   /** Which Teams an uploader is in (the cached Entra read the resolver uses). */
   readonly membership: TeamMembershipSource;
   /**
@@ -224,8 +232,10 @@ export interface InboxTickSummary {
    */
   readonly retryLaterWaiting: number;
   /**
-   * Created, or last changed, by someone who is not a guest of this row's
-   * Team; no creator id; or no such user: left untouched.
+   * Created by someone who is not this row's client account (a guest, staff,
+   * another client's account, an account not in the row's Team alone), or
+   * last changed by anyone but its creator; no creator id; or no such user:
+   * left untouched.
    */
   readonly skippedNotClient: number;
   /** The uploader could not be read this tick: left untouched, read again next tick. */
@@ -268,12 +278,26 @@ export interface InboxCandidate {
 
 type Stage = 'check' | 'download' | 'classify' | 'folder' | 'move';
 
+/** Whose upload a file is. Only `client` is filed; `unverified` waits and is read again. */
 type UploaderVerdict =
   | 'client'
-  | 'not_guest'
-  | 'not_in_team'
+  /** The creator is a Guest: any guest, this Team's included. */
+  | 'guest'
+  /** The creator's `userType` is neither Member nor Guest. */
+  | 'not_member'
+  /** Entra has no such user (404). */
   | 'unknown_user'
+  /** A Member not routed to THIS row: staff, another client's account, an unbound `{NIP}@` account. */
+  | 'not_bound'
+  /** Bound on this row, but its UPN is not `{row NIP}@domain`, or the row's NIP is invalid. */
+  | 'not_client_account'
+  /** The row's client account, not in the row's Team. */
+  | 'not_in_team'
+  /** The row's client account, also in another Team. */
+  | 'other_teams'
+  /** The last modifier is not the creator (or is missing). */
   | 'modified_by_other'
+  /** A read failed: the file waits, read again next tick. */
   | 'unverified';
 
 type SkipReason = Exclude<UploaderVerdict, 'client'> | 'changed';
@@ -309,20 +333,23 @@ interface Tick {
  * The channel-inbox intake: each bound client's channel folder
  * ("Dokumenty księgowe") is that client's inbox.
  *
- * Teams guests — every client — cannot attach a file in a 1:1 chat with the
- * bot, but can attach one to a channel post or upload it in the channel's
- * files tab, which stores it in the channel folder. Each tick this service
+ * A client signs in to Teams with its `{NIP}@bcr-group.pl` account and posts
+ * a file in its Team's channel (a post with an attachment, or the channel's
+ * files tab), which stores it in the channel folder. Each tick this service
  * takes the files at the top of every bound row's channel folder and moves
  * each client upload, by id, into its taxonomy folder inside that same
  * channel folder.
  *
  * Who the client is follows from WHERE the file is: the one bound Directory
  * row whose drive and channel folder hold it. Never from who uploaded it and
- * never from what it says. A file is taken only when its creator AND whoever
- * changed it last are guests and members of that row's Team (a guest who is
- * also in other Teams is fine: the file is already in this client's space,
- * and nothing crosses). Anything else — a staff or member upload, a guest's
- * file that staff replaced, a guest of another Team — is left untouched.
+ * never from what it says. A file is taken only when its creator is that
+ * row's client account — the one id the snapshot routes to this row, an Entra
+ * Member whose UPN is `{row NIP}@bcr-group.pl`, in this row's Team and no
+ * other — and whoever changed it last is that same id. Anything else — a
+ * guest (of this Team or any other), staff, another client's account, a
+ * client's file that someone else replaced, a client account also in another
+ * Team — is left untouched. A row with no valid NIP, or no bound client
+ * account, files nothing.
  *
  * It acts only on the version it listed: right before it reads a file, and
  * again before it moves it, the item must still be a direct child of the
@@ -352,6 +379,7 @@ export class ChannelInbox {
   private readonly maxAttempts: number;
   private readonly onlyRows: ReadonlySet<string> | undefined;
   private readonly index: DocumentIndex;
+  private readonly domain: string;
   private readonly placements = new Map<string, CachedPlacement>();
   private readonly failures = new Map<string, number>();
   private readonly reportedSkips = new Set<string>();
@@ -372,6 +400,7 @@ export class ChannelInbox {
     this.maxAttempts = deps.maxAttempts ?? MAX_PROCESSING_ATTEMPTS;
     this.onlyRows = deps.onlyRows?.length ? new Set(deps.onlyRows) : undefined;
     this.index = deps.index ?? INDEX_OFF;
+    this.domain = deps.clientAccountDomain ?? CLIENT_ACCOUNT_DOMAIN;
     this.retryLaters = new RetryLaterBound({
       maxAttempts: deps.maxRetryLaterAttempts ?? MAX_RETRY_LATER_ATTEMPTS,
       backoffMs: doublingBackoff(
@@ -449,7 +478,7 @@ export class ChannelInbox {
     for (const [index, row] of rows.entries()) {
       if (this.outOfBudget(tick)) break;
       lastTurn = index;
-      await this.sweepRow(row, tick);
+      await this.sweepRow(row, tick, clientAccountIdsOf(row, snapshot));
     }
     // Round robin: the next tick starts after the last row that had a turn,
     // so a row with a backlog cannot keep the others waiting.
@@ -478,7 +507,11 @@ export class ChannelInbox {
     return this.hardLimitMs - (this.now().getTime() - tick.startedAt) >= reserveMs;
   }
 
-  private async sweepRow(row: ClientDirectoryEntry, tick: Tick): Promise<void> {
+  private async sweepRow(
+    row: ClientDirectoryEntry,
+    tick: Tick,
+    clientAccountIds: ReadonlySet<string>,
+  ): Promise<void> {
     const ids: RowIds = {
       clientId: row.clientId,
       listItemId: row.listItemId,
@@ -531,7 +564,7 @@ export class ChannelInbox {
         tick.counts.deferred += 1;
         continue;
       }
-      const uploader = await this.uploaderVerdict(candidate, ids.teamId);
+      const uploader = await this.uploaderVerdict(candidate, row, clientAccountIds);
       if (uploader.verdict !== 'client') {
         if (uploader.verdict === 'unverified') tick.counts.skippedUnverified += 1;
         else tick.counts.skippedNotClient += 1;
@@ -554,48 +587,51 @@ export class ChannelInbox {
   }
 
   /**
-   * The inbox is for the client's own uploads: the file's creator must be a
-   * guest AND in this row's Team, and so must whoever changed it last — a
-   * guest's file that staff replaced holds staff's content. Anything that
-   * cannot be read is `unverified` (with Graph's status, when there was one),
-   * and the file waits.
+   * The inbox is for the row's client account's own uploads. The creator
+   * must be a Member the snapshot routes to THIS row, whose UPN is
+   * `{row NIP}@domain` (`clientAccountVerdict`), and whose Teams are exactly
+   * the row's; and whoever changed the file last must be that same id: at
+   * most one account per row passes the rule, so anyone else is someone else,
+   * and the modifier is never read. Anything that cannot be read is
+   * `unverified` (with Graph's status, when there was one), and the file
+   * waits.
    */
   private async uploaderVerdict(
     candidate: InboxCandidate,
-    teamId: string,
+    row: ClientDirectoryEntry,
+    clientAccountIds: ReadonlySet<string>,
   ): Promise<{ verdict: UploaderVerdict; status?: number }> {
-    const creator = await this.userVerdict(candidate.creatorId, teamId);
-    if (creator.verdict !== 'client' || candidate.modifierId === candidate.creatorId) {
-      return creator;
-    }
-    if (!candidate.modifierId) return { verdict: 'modified_by_other' };
-    const modifier = await this.userVerdict(candidate.modifierId, teamId);
-    if (modifier.verdict === 'client' || modifier.verdict === 'unverified') return modifier;
-    return { verdict: 'modified_by_other' };
-  }
-
-  /** One user: a guest, and a member of this row's Team? */
-  private async userVerdict(
-    userId: string,
-    teamId: string,
-  ): Promise<{ verdict: UploaderVerdict; status?: number }> {
-    let userType: string | null;
+    const creatorId = candidate.creatorId.trim().toLowerCase();
+    let account: UserAccount | null;
     try {
-      userType = await this.deps.users.userTypeOf(userId);
+      account = await this.deps.accounts.accountOf(creatorId);
     } catch (err) {
       return unverified(err);
     }
-    if (userType === null) return { verdict: 'unknown_user' };
-    if (userType.toLowerCase() !== 'guest') return { verdict: 'not_guest' };
+    if (account === null) return { verdict: 'unknown_user' };
+    const type = (account.userType ?? '').trim().toLowerCase();
+    if (type === 'guest') return { verdict: 'guest' };
+    if (type !== 'member') return { verdict: 'not_member' };
+    if (!clientAccountIds.has(creatorId)) return { verdict: 'not_bound' };
+    if (clientAccountVerdict(account, row.nip, this.domain) !== 'client') {
+      return { verdict: 'not_client_account' };
+    }
+
     let teams: ReadonlySet<string>;
     try {
-      teams = await this.deps.membership.teamsOf(userId);
+      teams = new Set(
+        [...(await this.deps.membership.teamsOf(creatorId))].map((t) => t.trim().toLowerCase()),
+      );
     } catch (err) {
       return unverified(err);
     }
-    const team = teamId.trim().toLowerCase();
-    const inTeam = team !== '' && [...teams].some((t) => t.trim().toLowerCase() === team);
-    return { verdict: inTeam ? 'client' : 'not_in_team' };
+    const team = (row.teamId ?? '').trim().toLowerCase();
+    if (team === '' || !teams.has(team)) return { verdict: 'not_in_team' };
+    if (teams.size > 1) return { verdict: 'other_teams' };
+
+    const modifierId = candidate.modifierId.trim().toLowerCase();
+    if (!modifierId || modifierId !== creatorId) return { verdict: 'modified_by_other' };
+    return { verdict: 'client' };
   }
 
   /** One line per skipped file and reason while this worker runs: ids only. */
@@ -1207,6 +1243,22 @@ function userIdOf(identity: { readonly user?: { readonly id?: string } } | undef
   return GUID.test(id) ? id : '';
 }
 
+/**
+ * The ids the snapshot routes to THIS row: the row's own ids only, looked up
+ * in the snapshot's id map (the sweep never reads another row). At most one
+ * of them can be the row's client account.
+ */
+function clientAccountIdsOf(
+  row: ClientDirectoryEntry,
+  snapshot: ClientDirectorySnapshot,
+): ReadonlySet<string> {
+  return new Set(
+    row.userAadObjectIds
+      .map((id) => id.trim().toLowerCase())
+      .filter((id) => snapshot.byUserAadObjectId.get(id)?.listItemId === row.listItemId),
+  );
+}
+
 /** One version of one file: the key of what shadow has already reported. */
 function versionKey(candidate: InboxCandidate): string {
   return `${candidate.item.id}|${candidate.eTag}`;
@@ -1296,7 +1348,7 @@ function describeError(err: unknown): Record<string, unknown> {
 /** An uploader that could not be read, with Graph's status when there was one. */
 function unverified(err: unknown): { verdict: 'unverified'; status?: number } {
   const status =
-    err instanceof TeamMembershipReadError || err instanceof UserTypeReadError
+    err instanceof TeamMembershipReadError || err instanceof UserAccountReadError
       ? err.status
       : undefined;
   return { verdict: 'unverified', ...(status !== undefined ? { status } : {}) };

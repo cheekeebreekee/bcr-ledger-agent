@@ -29,7 +29,6 @@ import {
   toSearchFilter,
   withoutReviewCategories,
 } from './searchResult';
-import type { UserTypeSource } from './userDirectory';
 
 /** Searches one worker runs at once: the index pool is 2 connections, shared with filing. */
 export const SEARCH_MAX_CONCURRENT = 2;
@@ -58,10 +57,12 @@ const MAX_CACHED_INTERPRETATIONS = 1000;
 export interface ClientSearchServiceOptions {
   /** Why search is off (`searchOffReason`); absent when it may run. */
   readonly offReason?: SearchOffReason;
-  /** The one resolver uploads use: search gets no routing of its own. */
+  /**
+   * The one resolver uploads use: search gets no routing of its own. It also
+   * confirms the client account (a Member whose UPN is `{row NIP}@bcr-group.pl`);
+   * a guest is refused there.
+   */
   readonly resolver: Pick<ClientResolver, 'resolve'>;
-  /** The asker's Entra `userType`: only a guest (a client) may search. */
-  readonly userTypes: UserTypeSource;
   /** The document index; only its client transaction is used. Absent: search is off. */
   readonly db?: Pick<LedgerDb, 'withClientTx'>;
   /** Absent: search is off (Claude is not configured). */
@@ -103,33 +104,37 @@ interface Answer {
 }
 
 /**
- * Client search (`POST /api/search`, design steps 7–16): a guest's question,
- * or a typed filter from the card, over their own client's documents.
+ * Client search (`POST /api/search`, design steps 7–16): a client account's
+ * question, or a typed filter from the card, over its own client's documents.
  *
  * Search is a second consumer of the routing uploads use; it has none of its
  * own. Who is asking is the authenticated `source.userAadObjectId`; which
- * client is decided by the same `ClientResolver` (bound row, exact Team,
- * membership read now), and only an Entra guest may search. The index scope
- * is then {@link clientIdForDirectoryRow} of the resolved row, computed before
- * any read, and nothing else: not the question, not the model's answer, not a
+ * client is decided by the same `ClientResolver` (the account read first, a
+ * Member bound on exactly one row whose UPN is `{row NIP}@bcr-group.pl`,
+ * exact Team, membership read now): a guest, staff or any other account is
+ * never the row's client account and never searches. The index scope is then
+ * {@link clientIdForDirectoryRow} of the resolved row, computed before any
+ * read, and nothing else: not the question, not the model's answer, not a
  * field of the request. Row-level security keeps every transaction to it.
  *
  * In order:
  *  1. off (`SEARCH_MODE`, no index, no Claude, no callers, callers shared with
  *     the bot's secret, membership check off) → `disabled`;
- *  2. not bound to exactly one client (every quarantine reason) → `no_access`;
- *  3. not a guest, or their type cannot be read → `no_access`;
- *  4. their row not in `SEARCH_ROWS` → `disabled`;
- *  5. the durable limits, in the client's scope (tx1: the client row, then the
+ *  2. not the client account of exactly one client: an account or membership
+ *     that could not be read → `unavailable`; every refusal (a guest, a
+ *     non-Member, a deleted user) and every other quarantine reason (staff,
+ *     `not_client_account`, unmapped, …) → `no_access`;
+ *  3. their row not in `SEARCH_ROWS` → `disabled`;
+ *  4. the durable limits, in the client's scope (tx1: the client row, then the
  *     reservation) → `rate_limited`;
- *  6. a question only: the model (per-worker hourly cap), then
+ *  5. a question only: the model (per-worker hourly cap), then
  *     `toSearchFilter`;
- *  7. the read, in a READ ONLY transaction (tx2): one page of client-view
+ *  6. the read, in a READ ONLY transaction (tx2): one page of client-view
  *     columns and the count, capped;
- *  8. best effort, the record (tx3): outcome, filter hash and field names,
+ *  7. best effort, the record (tx3): outcome, filter hash and field names,
  *     counts, tokens; never the question, never a filter value.
  *
- * Refusals 1–4 cost no model call and no transaction, nor does a search
+ * Refusals 1–3 cost no model call and no transaction, nor does a search
  * with too little of {@link SEARCH_DEADLINE_MS} left to finish (`unavailable`,
  * before anything is reserved); the model call is bounded by the time left.
  * At most
@@ -196,10 +201,26 @@ export class ClientSearchService {
     }
 
     // 2. Which client: the uploads' resolver, from the authenticated id alone.
+    //    It reads the account first and confirms the row's client account: a
+    //    guest, staff or anyone else never gets here. A read that failed is a
+    //    blip, not a refusal: a paying client is not told "no access" for it.
     const oid = payload.source.userAadObjectId.trim().toLowerCase();
     const resolved = await this.opts.resolver.resolve({ userAadObjectId: oid, purpose: 'search' });
     if (resolved.source !== 'directory') {
-      log.info({ event: 'search.no_access', reason: resolved.reason }, 'search.no_access');
+      if (
+        resolved.reason === 'identity_unverified' ||
+        resolved.reason === 'membership_unverified'
+      ) {
+        log.warn(
+          { event: 'search.unavailable', stage: 'identity', reason: resolved.reason },
+          'search.unavailable',
+        );
+        return { status: 'unavailable' };
+      }
+      log.info(
+        { event: 'search.no_access', resolution: resolved.source, reason: resolved.reason },
+        'search.no_access',
+      );
       return { status: 'no_access' };
     }
     const ids = {
@@ -208,14 +229,7 @@ export class ClientSearchService {
       teamId: resolved.teamId,
     };
 
-    // 3. Only a client's guest: a staff id on a client row never searches.
-    const refusedUser = await this.guestCheck(oid);
-    if (refusedUser) {
-      log.info({ event: 'search.no_access', reason: refusedUser, ...ids }, 'search.no_access');
-      return { status: 'no_access' };
-    }
-
-    // 4. A canary-first rollout.
+    // 3. A canary-first rollout.
     if (this.searchRows.size > 0 && !this.searchRows.has(resolved.listItemId)) {
       log.info({ event: 'search.disabled', reason: 'row_not_listed', ...ids }, 'search.disabled');
       return { status: 'disabled' };
@@ -269,7 +283,7 @@ export class ClientSearchService {
       const qLog = scopeLog.child({ queryId });
       const started = this.now().getTime();
 
-      // 5. tx1: the client row (the reservation's foreign key), then the limits.
+      // 4. tx1: the client row (the reservation's foreign key), then the limits.
       let reservation: searchQueriesRepo.ReserveResult;
       try {
         reservation = await db.withClientTx(scope, async (tx) => {
@@ -302,10 +316,10 @@ export class ClientSearchService {
         return { status: 'rate_limited', retryAfterSeconds: reservation.retryAfterSeconds };
       }
 
-      // 6–7.
+      // 5–6.
       const answer = await this.answer({ query, resolved, scope, interpreter, db, deadline }, qLog);
 
-      // 8. Best effort: the answer stands whatever the record does.
+      // 7. Best effort: the answer stands whatever the record does.
       const latencyMs = Math.max(0, this.now().getTime() - started);
       await this.record(db, scope, queryId, answer, latencyMs, qLog);
       return answer.response;
@@ -396,7 +410,7 @@ export class ClientSearchService {
       after = query.after;
     }
 
-    // 7. tx2: READ ONLY, the client-view columns only, in the scope alone.
+    // 6. tx2: READ ONLY, the client-view columns only, in the scope alone.
     let found: {
       readonly page: documentsRepo.SearchResult<documentsRepo.ClientViewRow>;
       readonly count: documentsRepo.MatchCount;
@@ -479,17 +493,6 @@ export class ClientSearchService {
       resultCount: found.count.total,
       ...spent,
     };
-  }
-
-  /** `null` when the asker is a guest; otherwise why not (a code). */
-  private async guestCheck(oid: string): Promise<'not_guest' | 'user_unverified' | null> {
-    let userType: string | null;
-    try {
-      userType = await this.opts.userTypes.userTypeOf(oid);
-    } catch {
-      return 'user_unverified';
-    }
-    return (userType ?? '').trim().toLowerCase() === 'guest' ? null : 'not_guest';
   }
 
   /** tx3: the reservation's row, finished. A failure is logged and changes nothing. */

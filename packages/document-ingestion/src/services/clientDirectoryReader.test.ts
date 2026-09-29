@@ -522,7 +522,7 @@ describe('buildSnapshot unbound rows (C3)', () => {
     expect(snapshot.excludedRows.size).toBe(0);
   });
 
-  it('closes the reused-guest window: a guest bound to A and written onto new row B routes nowhere', () => {
+  it('closes the reused-account window: an account bound to A and written onto new row B routes nowhere', () => {
     // Row B as onboarding writes it: B's own site, no RootFolder/DriveId/TeamId yet.
     const rowB = row({
       listItemId: '2',

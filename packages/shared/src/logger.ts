@@ -23,7 +23,8 @@ function rootLoggerOptions(): pino.LoggerOptions {
   // Secrets, plus the client data that turned App Insights into a register of
   // every client's uploads: file names (KSeF names embed a NIP), SharePoint
   // locations, client titles, extracted parties, invoice fields. Logs carry ids instead
-  // (documentId, clientId, listItemId, driveItemId). Pino redacts one level
+  // (documentId, clientId, listItemId, driveItemId). A user's UPN is redacted
+  // too: a client account's is `{NIP}@bcr-group.pl`. Pino redacts one level
   // deep with `*.x`; top-level keys are listed explicitly.
   redact: {
     paths: [
@@ -53,6 +54,10 @@ function rootLoggerOptions(): pino.LoggerOptions {
       '*.nip',
       'extraction',
       '*.extraction',
+      'userPrincipalName',
+      '*.userPrincipalName',
+      'upn',
+      '*.upn',
     ],
     censor: '[REDACTED]',
   },

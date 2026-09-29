@@ -30,7 +30,7 @@ import type { InboxItem } from './sharePointService';
 import type { ShadowMemoKey } from './shadowMemo';
 import { createSharePointWiring } from './sharePointWiring';
 import { TeamMembershipReader } from './teamMembership';
-import { UserTypeReader } from './userDirectory';
+import { UserAccountReader, type UserAccount } from './userDirectory';
 
 // ---------------------------------------------------------------------------
 // A fake tenant: sites, drives with folder trees, users and their Teams. It
@@ -57,11 +57,20 @@ const SITES: Record<string, { collection: string; drive: string }> = {
 
 const TEAM_A = 'aaaaaaaa-0000-4000-8000-00000000000a';
 const TEAM_B = 'bbbbbbbb-0000-4000-8000-00000000000b';
-const GUEST_A = 'a0000000-0000-4000-8000-000000000001';
+/** Client A's `{NIP}@bcr-group.pl` Member account, bound on row A. */
+const CLIENT_A = 'a0000000-0000-4000-8000-000000000001';
+/** A guest of client A's Team (onboarding still invites one). */
+const GUEST_A = 'e0000000-0000-4000-8000-000000000006';
+/** A guest of both Teams. */
 const GUEST_AB = 'ab000000-0000-4000-8000-000000000002';
-const GUEST_B = 'b0000000-0000-4000-8000-000000000003';
+/** Client B's `{NIP}@bcr-group.pl` Member account, bound on row B. */
+const CLIENT_B = 'b0000000-0000-4000-8000-000000000003';
+/** BCR staff: a Member whose UPN is no client's. */
 const STAFF = 'c0000000-0000-4000-8000-000000000004';
 const DELETED = 'd0000000-0000-4000-8000-000000000005';
+/** The rows' NIPs (synthetic); each client account's UPN is `{NIP}@bcr-group.pl`. */
+const NIP_A = '1111111111';
+const NIP_B = '2222222222';
 
 const CHANNEL = 'Dokumenty księgowe';
 const NOW = new Date('2026-09-26T10:00:00.000Z');
@@ -102,7 +111,10 @@ const graphError = (statusCode: number) =>
 class FakeTenant {
   readonly calls: Call[] = [];
   readonly items = new Map<string, FakeItem>();
-  readonly users = new Map<string, { userType: string; teams: string[] }>();
+  readonly users = new Map<
+    string,
+    { userType: string | null; userPrincipalName: string; teams: string[] }
+  >();
   /** Checked in order before the default answer; the first matching pattern wins. */
   readonly overrides: [RegExp, Override][] = [];
   pageSize = 200;
@@ -122,10 +134,31 @@ class FakeTenant {
       });
       this.addFolder(drive, `root-${drive}`, CHANNEL, `inbox-${drive.slice(-1)}`);
     }
-    this.users.set(GUEST_A, { userType: 'Guest', teams: [TEAM_A] });
-    this.users.set(GUEST_AB, { userType: 'Guest', teams: [TEAM_A, TEAM_B] });
-    this.users.set(GUEST_B, { userType: 'Guest', teams: [TEAM_B] });
-    this.users.set(STAFF, { userType: 'Member', teams: [TEAM_A, TEAM_B] });
+    this.users.set(CLIENT_A, {
+      userType: 'Member',
+      userPrincipalName: `${NIP_A}@bcr-group.pl`,
+      teams: [TEAM_A],
+    });
+    this.users.set(CLIENT_B, {
+      userType: 'Member',
+      userPrincipalName: `${NIP_B}@bcr-group.pl`,
+      teams: [TEAM_B],
+    });
+    this.users.set(GUEST_A, {
+      userType: 'Guest',
+      userPrincipalName: 'guest.a_example.com#EXT#@contoso.onmicrosoft.com',
+      teams: [TEAM_A],
+    });
+    this.users.set(GUEST_AB, {
+      userType: 'Guest',
+      userPrincipalName: 'guest.ab_example.com#EXT#@contoso.onmicrosoft.com',
+      teams: [TEAM_A, TEAM_B],
+    });
+    this.users.set(STAFF, {
+      userType: 'Member',
+      userPrincipalName: 'staff@bcr-group.pl',
+      teams: [TEAM_A, TEAM_B],
+    });
   }
 
   addFolder(driveId: string, parentId: string, name: string, id = this.nextId('folder')): string {
@@ -153,7 +186,7 @@ class FakeTenant {
       driveId: parent.driveId,
       mimeType: 'application/pdf',
       eTag: `"{${id}},1"`,
-      createdBy: GUEST_A,
+      createdBy: CLIENT_A,
       lastModifiedDateTime: OLD,
       size: content.length,
       content,
@@ -315,7 +348,7 @@ class FakeTenant {
     if (call.method === 'get' && (m = /^\/users\/([^/?]+)$/.exec(route))) {
       const user = this.users.get(m[1] ?? '');
       if (!user) throw graphError(404);
-      return { userType: user.userType };
+      return { userType: user.userType, userPrincipalName: user.userPrincipalName };
     }
     if (call.method === 'get' && (m = /^\/users\/([^/]+)\/memberOf$/.exec(route))) {
       const user = this.users.get(m[1] ?? '');
@@ -376,8 +409,6 @@ class FakeTenant {
 // Directory rows, classifications, the logger.
 // ---------------------------------------------------------------------------
 
-const NIP_A = '1111111111';
-
 function clientRow(
   listItemId: string,
   sitePath: string,
@@ -387,6 +418,7 @@ function clientRow(
     rootFolder?: string | null;
     nip?: string;
     isAdmin?: boolean;
+    users?: readonly string[];
   } = {},
 ): ClientDirectoryEntry {
   const site = SITES[sitePath];
@@ -399,7 +431,7 @@ function clientRow(
     clientId: `00${listItemId}`,
     nip: over.nip ?? '',
     companyNameAliases: [`Client ${listItemId} Sp. z o.o.`],
-    userAadObjectIds: [],
+    userAadObjectIds: over.users ?? [],
     target: {
       siteHostname: HOST,
       sitePath,
@@ -413,8 +445,8 @@ function clientRow(
   };
 }
 
-const rowA = clientRow('11', '/sites/ClientA', { teamId: TEAM_A, nip: NIP_A });
-const rowB = clientRow('12', '/sites/ClientB', { teamId: TEAM_B });
+const rowA = clientRow('11', '/sites/ClientA', { teamId: TEAM_A, nip: NIP_A, users: [CLIENT_A] });
+const rowB = clientRow('12', '/sites/ClientB', { teamId: TEAM_B, nip: NIP_B, users: [CLIENT_B] });
 
 function snapshotOf(rows: readonly ClientDirectoryEntry[]): ClientDirectorySnapshot {
   return buildSnapshot(rows, NOW.getTime(), {
@@ -506,7 +538,7 @@ function setup(opts: SetupOptions = {}) {
     mode: opts.mode ?? 'enforce',
     directory: { getSnapshot: async () => opts.snapshot ?? snapshotOf(opts.rows ?? [rowA]) },
     sharePointFactory: createSharePointWiring(tenant.client, wiringConfig).clientSharePointFactory,
-    users: new UserTypeReader(tenant.client, noRetry),
+    accounts: new UserAccountReader(tenant.client, noRetry),
     membership: new TeamMembershipReader(tenant.client, noRetry),
     classification: opts.classification ?? serviceOf({ name: 'claude', classify }),
     minAgeMs: 120_000,
@@ -524,7 +556,7 @@ function setup(opts: SetupOptions = {}) {
 // ---------------------------------------------------------------------------
 
 describe('ChannelInbox: filing a client upload', () => {
-  it("moves a guest's upload by id into its taxonomy folder inside the same channel folder", async () => {
+  it("moves the client account's upload by id into its taxonomy folder inside the same channel folder", async () => {
     const { tenant, inbox, events } = setup();
     const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
 
@@ -738,17 +770,6 @@ describe('ChannelInbox: filing a client upload', () => {
     expect(tenant.pathOf(id)).toBe(`${CHANNEL}/04_Umowy/umowa.pdf`);
   });
 
-  it('files the upload of a guest who is also in another Team within this row’s channel', async () => {
-    const { tenant, inbox } = setup({ rows: [rowA, rowB] });
-    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf', createdBy: GUEST_AB });
-
-    await inbox.sweep();
-
-    expect(tenant.item(id).driveId).toBe('drive-a');
-    expect(tenant.pathOf(id).startsWith(`${CHANNEL}/01_Faktury/`)).toBe(true);
-    expect(tenant.writes().some((c) => c.path.includes('drive-b'))).toBe(false);
-  });
-
   it('reads the file by id, only when the classifier asks for it', async () => {
     const { tenant, inbox } = setup({
       classification: serviceOf(contentReadingClassifier(invoice)),
@@ -787,7 +808,7 @@ describe('ChannelInbox: what is never touched', () => {
   it('never touches a file at the drive root or in another drive', async () => {
     const { tenant, inbox } = setup({ rows: [rowA] });
     const atRoot = tenant.addFile('root-drive-a', { name: 'root.pdf' });
-    const inB = tenant.addFile('inbox-b', { name: 'b.pdf', createdBy: GUEST_A });
+    const inB = tenant.addFile('inbox-b', { name: 'b.pdf', createdBy: CLIENT_A });
 
     await inbox.sweep();
 
@@ -810,7 +831,7 @@ describe('ChannelInbox: what is never touched', () => {
           file: { mimeType: 'application/pdf' },
           size: 10,
           eTag: 'x',
-          createdBy: { user: { id: GUEST_A } },
+          createdBy: { user: { id: CLIENT_A } },
           lastModifiedDateTime: OLD,
           parentReference: { driveId: 'drive-b', id: 'inbox-a' },
         };
@@ -826,10 +847,12 @@ describe('ChannelInbox: what is never touched', () => {
   });
 
   it.each([
-    ['a staff member', STAFF],
-    ['a guest of another Team', GUEST_B],
-    ['a user who no longer exists', DELETED],
-  ])('leaves the upload of %s untouched and unclassified', async (_label, creator) => {
+    ['a staff member', STAFF, 'not_bound'],
+    ["another row's client account", CLIENT_B, 'not_bound'],
+    ["a guest of this row's Team", GUEST_A, 'guest'],
+    ['a guest of both Teams', GUEST_AB, 'guest'],
+    ['a user who no longer exists', DELETED, 'unknown_user'],
+  ])('leaves the upload of %s untouched and unclassified', async (_label, creator, reason) => {
     const { tenant, inbox, classify, events } = setup({ rows: [rowA, rowB] });
     const id = tenant.addFile('inbox-a', { name: 'x.pdf', createdBy: creator });
 
@@ -840,19 +863,19 @@ describe('ChannelInbox: what is never touched', () => {
     expect(classify).not.toHaveBeenCalled();
     expect(summary.skippedNotClient).toBe(1);
     expect(events('inbox.skipped')).toEqual([
-      expect.objectContaining({ listItemId: '11', driveItemId: id }),
+      expect.objectContaining({ listItemId: '11', driveItemId: id, reason }),
     ]);
   });
 
   // createdBy survives a "Replace": staff dropping a same-named file over a
-  // guest's upload leaves the guest as creator and staff's content inside.
-  it('leaves a guest’s file that staff replaced: not classified, not read, not moved', async () => {
+  // client's upload leaves the client as creator and staff's content inside.
+  it('leaves a client’s file that staff replaced: not classified, not read, not moved', async () => {
     const { tenant, inbox, classify, events } = setup({
       classification: serviceOf(contentReadingClassifier(invoice)),
     });
     const id = tenant.addFile('inbox-a', {
       name: 'skan.pdf',
-      createdBy: GUEST_A,
+      createdBy: CLIENT_A,
       modifiedBy: STAFF,
     });
     const spy = jest.spyOn(ClassificationService.prototype, 'classify');
@@ -872,16 +895,47 @@ describe('ChannelInbox: what is never touched', () => {
   });
 
   it.each([
-    ['a guest of another Team', GUEST_B],
+    ["another row's client account", CLIENT_B],
+    ["a guest of this row's Team", GUEST_A],
+    ['staff', STAFF],
     ['no user (an application)', null],
     ['a user who no longer exists', DELETED],
-  ])('leaves a guest’s file last changed by %s', async (_label, modifier) => {
-    const { tenant, inbox, events } = setup({ rows: [rowA, rowB] });
-    const id = tenant.addFile('inbox-a', {
-      name: 'x.pdf',
-      createdBy: GUEST_A,
-      modifiedBy: modifier,
-    });
+  ])(
+    'a client file last changed by someone else (%s): modified_by_other, with no read of the modifier',
+    async (_label, modifier) => {
+      const { tenant, inbox, events, classify } = setup({ rows: [rowA, rowB] });
+      const id = tenant.addFile('inbox-a', {
+        name: 'x.pdf',
+        createdBy: CLIENT_A,
+        modifiedBy: modifier,
+      });
+
+      const summary = await inbox.sweep();
+
+      expect(tenant.writes()).toEqual([]);
+      expect(classify).not.toHaveBeenCalled();
+      expect(summary).toMatchObject({ skippedNotClient: 1, skippedUnverified: 0 });
+      expect(events('inbox.skipped')[0]).toMatchObject({
+        driveItemId: id,
+        reason: 'modified_by_other',
+      });
+      const userReads = tenant.calls
+        .filter((c) => c.path.startsWith('/users/'))
+        .map((c) => c.path.split(/[/?]/)[2]);
+      expect(new Set(userReads)).toEqual(new Set([CLIENT_A]));
+    },
+  );
+
+  it('no modifier: modified_by_other', async () => {
+    const { tenant, inbox, events } = setup();
+    const id = tenant.addFile('inbox-a', { name: 'x.pdf' });
+    tenant.overrides.push([
+      /^GET \/drives\/drive-a\/items\/inbox-a\/children/,
+      (_call, next) => {
+        const page = next() as { value: Record<string, unknown>[] };
+        return { value: page.value.map((v) => ({ ...v, lastModifiedBy: {} })) };
+      },
+    ]);
 
     await inbox.sweep();
 
@@ -892,26 +946,15 @@ describe('ChannelInbox: what is never touched', () => {
     });
   });
 
-  it('files a guest’s file that another guest of the same Team changed', async () => {
-    const { tenant, inbox } = setup();
-    const id = tenant.addFile('inbox-a', {
-      name: 'x.pdf',
-      createdBy: GUEST_A,
-      modifiedBy: GUEST_AB,
-    });
-    await inbox.sweep();
-    expect(tenant.pathOf(id)).toContain('/01_Faktury/');
-  });
-
-  it('waits when the last modifier cannot be read', async () => {
+  it('never reads the modifier, even one that cannot be read: modified_by_other', async () => {
     const { tenant, inbox, events } = setup();
     const id = tenant.addFile('inbox-a', {
       name: 'x.pdf',
-      createdBy: GUEST_A,
+      createdBy: CLIENT_A,
       modifiedBy: GUEST_AB,
     });
     tenant.overrides.push([
-      new RegExp(`^GET /users/${GUEST_AB}\\?`),
+      new RegExp(`^GET /users/${GUEST_AB}`),
       () => {
         throw graphError(503);
       },
@@ -919,9 +962,13 @@ describe('ChannelInbox: what is never touched', () => {
 
     const summary = await inbox.sweep();
 
-    expect(summary).toMatchObject({ skippedUnverified: 1, skippedNotClient: 0 });
+    expect(summary).toMatchObject({ skippedUnverified: 0, skippedNotClient: 1 });
     expect(tenant.writes()).toEqual([]);
-    expect(events('inbox.skipped')[0]).toMatchObject({ driveItemId: id, reason: 'unverified' });
+    expect(tenant.calls.some((c) => c.path.includes(GUEST_AB))).toBe(false);
+    expect(events('inbox.skipped')[0]).toMatchObject({
+      driveItemId: id,
+      reason: 'modified_by_other',
+    });
   });
 
   it('logs a skipped file once per worker, however many ticks see it', async () => {
@@ -933,12 +980,12 @@ describe('ChannelInbox: what is never touched', () => {
     expect(events('inbox.tick').map((t) => t['skippedNotClient'])).toEqual([1, 1]);
   });
 
-  it('leaves a file whose uploader cannot be read, and reads again next tick', async () => {
+  it('an unreadable account: unverified, the file waits and is read again next tick', async () => {
     const { tenant, inbox } = setup();
     const id = tenant.addFile('inbox-a', { name: 'x.pdf' });
     let failing = true;
     tenant.overrides.push([
-      /^GET \/users\/[^/]+\?\$select=userType$/,
+      /^GET \/users\/[^/]+\?\$select=userType,userPrincipalName$/,
       (_c, next) => {
         if (failing) throw graphError(503);
         return next();
@@ -954,7 +1001,7 @@ describe('ChannelInbox: what is never touched', () => {
     expect(second).toMatchObject({ skippedUnverified: 0, filed: 1 });
   });
 
-  it("leaves a guest's file whose Teams cannot be read, and says Graph's status", async () => {
+  it("leaves a client's file whose Teams cannot be read, and says Graph's status", async () => {
     const { tenant, inbox, events } = setup();
     const id = tenant.addFile('inbox-a', { name: 'x.pdf' });
     tenant.overrides.push([
@@ -1011,10 +1058,222 @@ describe('ChannelInbox: what is never touched', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The row's client account (owner's decision, 28 Sep 2026): a client is its
+// {NIP}@bcr-group.pl Member account, bound on the row; guests have no
+// capability, not even of the row's own Team.
+// ---------------------------------------------------------------------------
+
+describe("ChannelInbox: the row's client account", () => {
+  const skipped = (events: (name: string) => Record<string, unknown>[]) =>
+    events('inbox.skipped').map((l) => l['reason']);
+
+  it("files the row's client account's upload", async () => {
+    const docs: IndexedDocument[] = [];
+    const index: DocumentIndex = {
+      mode: 'write',
+      record: jest.fn(async (doc: IndexedDocument) => {
+        docs.push(doc);
+      }),
+    };
+    const { tenant, inbox, events } = setup({ deps: { index } });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
+
+    const summary = await inbox.sweep();
+
+    expect(summary).toMatchObject({ filed: 1, skippedNotClient: 0, skippedUnverified: 0 });
+    expect(events('inbox.filed')).toEqual([expect.objectContaining({ driveItemId: id })]);
+    expect(docs.map((d) => d.uploadedByOid)).toEqual([CLIENT_A]);
+  });
+
+  it("leaves a guest of this row's Team untouched: guest", async () => {
+    const { tenant, inbox, events, classify } = setup();
+    const id = tenant.addFile('inbox-a', { name: 'x.pdf', createdBy: GUEST_A });
+
+    const summary = await inbox.sweep();
+
+    expect(summary).toMatchObject({ skippedNotClient: 1, filed: 0 });
+    expect(skipped(events)).toEqual(['guest']);
+    expect(classify).not.toHaveBeenCalled();
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/x.pdf`);
+    // Never a Teams read for a guest.
+    expect(tenant.calls.some((c) => c.path.includes('memberOf'))).toBe(false);
+  });
+
+  // Regression: a guest still bound on a row (rows 2 and 10 before the rebind).
+  it('leaves a guest bound on this row untouched: guest', async () => {
+    const row = { ...rowA, userAadObjectIds: [GUEST_A] };
+    const { tenant, inbox, events, classify } = setup({ rows: [row] });
+    const id = tenant.addFile('inbox-a', { name: 'x.pdf', createdBy: GUEST_A });
+
+    await inbox.sweep();
+
+    expect(skipped(events)).toEqual(['guest']);
+    expect(classify).not.toHaveBeenCalled();
+    expect(tenant.writes()).toEqual([]);
+    expect(tenant.calls.some((c) => c.method === 'stream')).toBe(false);
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/x.pdf`);
+  });
+
+  it("leaves a staff Member's post untouched: not_bound", async () => {
+    const { tenant, inbox, events } = setup();
+    tenant.addFile('inbox-a', { name: 'x.pdf', createdBy: STAFF });
+    await inbox.sweep();
+    expect(skipped(events)).toEqual(['not_bound']);
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  // Regression: a staff id pasted onto a client row cannot file.
+  it('leaves a staff Member bound on this row untouched: not_client_account', async () => {
+    const row = { ...rowA, userAadObjectIds: [CLIENT_A, STAFF] };
+    const { tenant, inbox, events, classify } = setup({ rows: [row] });
+    tenant.addFile('inbox-a', { name: 'x.pdf', createdBy: STAFF });
+
+    await inbox.sweep();
+
+    expect(skipped(events)).toEqual(['not_client_account']);
+    expect(classify).not.toHaveBeenCalled();
+    expect(tenant.writes()).toEqual([]);
+    expect(tenant.calls.some((c) => c.path.includes('memberOf'))).toBe(false);
+  });
+
+  it("leaves another row's client account untouched: not_bound", async () => {
+    const { tenant, inbox, events } = setup({ rows: [rowA, rowB] });
+    const id = tenant.addFile('inbox-a', { name: 'b-in-a.pdf', createdBy: CLIENT_B });
+    await inbox.sweep();
+    expect(events('inbox.skipped')).toEqual([
+      expect.objectContaining({ listItemId: '11', driveItemId: id, reason: 'not_bound' }),
+    ]);
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  it('leaves the right UPN shape that is not bound to this row: not_bound', async () => {
+    const { tenant, inbox, events } = setup({ rows: [{ ...rowA, userAadObjectIds: [] }] });
+    tenant.addFile('inbox-a', { name: 'x.pdf' });
+    await inbox.sweep();
+    expect(skipped(events)).toEqual(['not_bound']);
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  it('leaves an account bound on two rows (routed nowhere): not_bound', async () => {
+    const rows = [
+      { ...rowA, userAadObjectIds: [CLIENT_A] },
+      { ...rowB, userAadObjectIds: [CLIENT_B, CLIENT_A] },
+    ];
+    const { tenant, inbox, events } = setup({ rows });
+    tenant.addFile('inbox-a', { name: 'x.pdf' });
+    await inbox.sweep();
+    expect(skipped(events)).toEqual(['not_bound']);
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  it("leaves another client's {NIP}@ account bound on this row: not_client_account", async () => {
+    const rows = [
+      { ...rowA, userAadObjectIds: [CLIENT_B] },
+      { ...rowB, userAadObjectIds: [] },
+    ];
+    const { tenant, inbox, events } = setup({ rows });
+    tenant.addFile('inbox-a', { name: 'x.pdf', createdBy: CLIENT_B });
+    await inbox.sweep();
+    expect(skipped(events)).toEqual(['not_client_account']);
+  });
+
+  it("leaves the client account when it is not in the row's Team: not_in_team", async () => {
+    const tenant = new FakeTenant();
+    tenant.users.set(CLIENT_A, { ...tenant.users.get(CLIENT_A)!, teams: [] });
+    const { inbox, events } = setup({ tenant });
+    tenant.addFile('inbox-a', { name: 'x.pdf' });
+    await inbox.sweep();
+    expect(skipped(events)).toEqual(['not_in_team']);
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  it('leaves the client account when it is also in another Team: other_teams', async () => {
+    const tenant = new FakeTenant();
+    tenant.users.set(CLIENT_A, { ...tenant.users.get(CLIENT_A)!, teams: [TEAM_A, TEAM_B] });
+    const { inbox, events, classify } = setup({ tenant, rows: [rowA, rowB] });
+    const id = tenant.addFile('inbox-a', { name: 'x.pdf' });
+
+    const summary = await inbox.sweep();
+
+    expect(skipped(events)).toEqual(['other_teams']);
+    expect(summary).toMatchObject({ skippedNotClient: 1, filed: 0 });
+    expect(classify).not.toHaveBeenCalled();
+    expect(tenant.pathOf(id)).toBe(`${CHANNEL}/x.pdf`);
+  });
+
+  it('compares Team ids case-insensitively', async () => {
+    const tenant = new FakeTenant();
+    tenant.users.set(CLIENT_A, { ...tenant.users.get(CLIENT_A)!, teams: [TEAM_A.toUpperCase()] });
+    const { inbox } = setup({ tenant, rows: [{ ...rowA, teamId: ` ${TEAM_A.toUpperCase()} ` }] });
+    tenant.addFile('inbox-a', { name: 'x.pdf' });
+    expect((await inbox.sweep()).filed).toBe(1);
+  });
+
+  it.each([
+    ['a Member with an unknown type', 'Other'],
+    ['a Member with no type', null],
+  ])('leaves %s untouched: not_member', async (_label, userType) => {
+    const tenant = new FakeTenant();
+    tenant.users.set(CLIENT_A, { ...tenant.users.get(CLIENT_A)!, userType });
+    const { inbox, events } = setup({ tenant });
+    tenant.addFile('inbox-a', { name: 'x.pdf' });
+    await inbox.sweep();
+    expect(skipped(events)).toEqual(['not_member']);
+  });
+
+  it('an unreadable account: unverified, with Graph status, never a Teams read', async () => {
+    const { tenant, inbox, events } = setup();
+    tenant.addFile('inbox-a', { name: 'x.pdf' });
+    tenant.overrides.push([
+      /^GET \/users\/[^/]+\?/,
+      () => {
+        throw graphError(403);
+      },
+    ]);
+    const summary = await inbox.sweep();
+    expect(summary).toMatchObject({ skippedUnverified: 1, skippedNotClient: 0 });
+    expect(events('inbox.skipped')[0]).toMatchObject({ reason: 'unverified', status: 403 });
+    expect(tenant.calls.some((c) => c.path.includes('memberOf'))).toBe(false);
+  });
+
+  it.each([
+    ['no NIP', ''],
+    ['a 9-digit NIP', '111111111'],
+  ])('a row with %s files nothing', async (_label, nip) => {
+    const { tenant, inbox, events, classify } = setup({ rows: [{ ...rowA, nip }] });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+    tenant.addFile('inbox-a', { name: 'b.pdf', createdBy: GUEST_A });
+
+    const summary = await inbox.sweep();
+
+    expect(summary).toMatchObject({ filed: 0, skippedNotClient: 2 });
+    expect(skipped(events).sort()).toEqual(['guest', 'not_client_account']);
+    expect(classify).not.toHaveBeenCalled();
+    expect(tenant.writes()).toEqual([]);
+  });
+
+  it("looks up only this row's ids in the snapshot", async () => {
+    const snapshot = snapshotOf([rowA, { ...rowB, userAadObjectIds: [CLIENT_B, GUEST_AB] }]);
+    const byUser = snapshot.byUserAadObjectId as Map<string, ClientDirectoryEntry>;
+    const asked: string[] = [];
+    const get = byUser.get.bind(byUser);
+    jest.spyOn(byUser, 'get').mockImplementation((key: string) => {
+      asked.push(key);
+      return get(key);
+    });
+    const { tenant, inbox } = setup({ snapshot, deps: { onlyRows: ['11'] } });
+    tenant.addFile('inbox-a', { name: 'a.pdf' });
+
+    expect((await inbox.sweep()).filed).toBe(1);
+    expect(asked).toEqual([CLIENT_A]);
+  });
+});
+
 // The listing is minutes old by the time a later file is moved. A person may
 // have filed it by hand, or staff may have moved it out of the channel (for
-// example a document of another client, posted by a guest in both Teams)
-// meanwhile. The id survives any move within the library; the eTag does not.
+// example a document of another client, posted by mistake) meanwhile. The id
+// survives any move within the library; the eTag does not.
 describe('ChannelInbox: it acts only on the version it listed', () => {
   it.each([
     ['moved into a sibling channel’s staff-only folder', 'staff-only'],
@@ -1024,7 +1283,7 @@ describe('ChannelInbox: it acts only on the version it listed', () => {
     const general = tenant.addFolder('drive-a', 'root-drive-a', 'General');
     const staffOnly = tenant.addFolder('drive-a', general, 'Staff only');
     const manual = tenant.addFolder('drive-a', 'inbox-a', 'Ręcznie');
-    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf', createdBy: GUEST_AB });
+    const id = tenant.addFile('inbox-a', { name: 'faktura.pdf' });
     const destination = where === 'staff-only' ? staffOnly : manual;
     const { inbox, events, classify } = setup({
       tenant,
@@ -1100,7 +1359,7 @@ describe('ChannelInbox: it acts only on the version it listed', () => {
     const classify = jest.fn(async () => {
       if (!replaced) {
         replaced = true;
-        tenant.item(id).eTag = '"replaced by the guest"';
+        tenant.item(id).eTag = '"replaced by the client"';
       }
       return invoice;
     });
@@ -1173,7 +1432,7 @@ describe('ChannelInbox: which rows are swept', () => {
       { ...clientRow('26', '/sites/ClientB', { teamId: TEAM_B }), active: false },
     ];
     const { tenant, inbox } = setup({ rows });
-    tenant.addFile('inbox-b', { name: 'b.pdf', createdBy: GUEST_B });
+    tenant.addFile('inbox-b', { name: 'b.pdf', createdBy: CLIENT_B });
 
     const summary = await inbox.sweep();
 
@@ -1201,7 +1460,7 @@ describe('ChannelInbox: which rows are swept', () => {
   it('with INBOX_SWEEP_ROWS, sweeps only the listed rows, and never another client’s channel', async () => {
     const { tenant, inbox } = setup({ rows: [rowA, rowB], deps: { onlyRows: ['12'] } });
     tenant.addFile('inbox-a', { name: 'a.pdf' });
-    const inB = tenant.addFile('inbox-b', { name: 'b.pdf', createdBy: GUEST_B });
+    const inB = tenant.addFile('inbox-b', { name: 'b.pdf', createdBy: CLIENT_B });
 
     const summary = await inbox.sweep();
 
@@ -1213,7 +1472,7 @@ describe('ChannelInbox: which rows are swept', () => {
   it('never sweeps a listed row the directory does not route to', async () => {
     const unbound = clientRow('20', '/sites/ClientB', { driveId: null, teamId: TEAM_B });
     const { tenant, inbox } = setup({ rows: [rowA, unbound], deps: { onlyRows: ['20'] } });
-    tenant.addFile('inbox-b', { name: 'b.pdf', createdBy: GUEST_B });
+    tenant.addFile('inbox-b', { name: 'b.pdf', createdBy: CLIENT_B });
 
     const summary = await inbox.sweep();
 
@@ -1436,7 +1695,7 @@ describe('ChannelInbox: modes', () => {
       },
       sharePointFactory: createSharePointWiring(tenant.client, wiringConfig)
         .clientSharePointFactory,
-      users: new UserTypeReader(tenant.client, noRetry),
+      accounts: new UserAccountReader(tenant.client, noRetry),
       membership: new TeamMembershipReader(tenant.client, noRetry),
       classification: serviceOf({ name: 'claude', classify: async () => invoice }),
       minAgeMs: 0,
@@ -2322,7 +2581,7 @@ describe('ChannelInbox: budget and deadline', () => {
     });
     const id = tenant.addFile('inbox-a', { name: 'a.pdf' });
     tenant.overrides.push([
-      /^GET \/users\/[^/]+\?\$select=userType$/,
+      /^GET \/users\/[^/]+\?\$select=userType,userPrincipalName$/,
       (_c, next) => {
         // A slow uploader read: 160 s in, 110 s are left, under the reserve.
         now = NOW.getTime() + INBOX_TICK_HARD_LIMIT_MS - CLASSIFY_RESERVE_MS + 10_000;
@@ -2391,10 +2650,10 @@ describe('ChannelInbox: budget and deadline', () => {
       deps: {
         now: () => new Date(now),
         maxAttempts: 1,
-        users: {
-          userTypeOf: async () => {
+        accounts: {
+          accountOf: async (): Promise<UserAccount> => {
             if (slowRead) now += INBOX_TICK_HARD_LIMIT_MS - WRITE_RESERVE_MS + 1;
-            return 'Guest';
+            return { userType: 'Member', userPrincipalName: `${NIP_A}@bcr-group.pl` };
           },
         },
       },
@@ -2420,7 +2679,7 @@ describe('ChannelInbox: budget and deadline', () => {
     const { tenant, inbox } = setup({ rows: [rowA, rowB], deps: { maxFilesPerTick: 1 } });
     tenant.addFile('inbox-a', { name: 'a1.pdf' });
     tenant.addFile('inbox-a', { name: 'a2.pdf' });
-    const inB = tenant.addFile('inbox-b', { name: 'b1.pdf', createdBy: GUEST_B });
+    const inB = tenant.addFile('inbox-b', { name: 'b1.pdf', createdBy: CLIENT_B });
 
     await inbox.sweep();
     await inbox.sweep();
@@ -2451,7 +2710,7 @@ describe('ChannelInbox: logs', () => {
     });
     const id = tenant.addFile('inbox-a', { name: secretName });
     tenant.addFile('inbox-a', { name: `staff-${secretName}`, createdBy: STAFF });
-    tenant.addFile('inbox-b', { name: `other-${secretName}`, createdBy: GUEST_A });
+    tenant.addFile('inbox-b', { name: `other-${secretName}`, createdBy: CLIENT_A });
     let failOnce = true;
     tenant.overrides.push([
       new RegExp(`^PATCH .*/${id}$`),
@@ -2519,7 +2778,7 @@ describe('selectCandidates', () => {
     size: 10,
     file: { mimeType: 'application/pdf' },
     eTag: 'e',
-    createdBy: { user: { id: GUEST_A.toUpperCase() } },
+    createdBy: { user: { id: CLIENT_A.toUpperCase() } },
     lastModifiedBy: { user: { id: GUEST_AB.toUpperCase() } },
     createdDateTime: OLD,
     lastModifiedDateTime: OLD,
@@ -2536,7 +2795,7 @@ describe('selectCandidates', () => {
       { now: NOW, minAgeMs: 120_000 },
     );
     expect(picked.candidates.map((c) => c.item.id)).toEqual(['c', 'a', 'b']);
-    expect(picked.candidates[0]).toMatchObject({ creatorId: GUEST_A, modifierId: GUEST_AB });
+    expect(picked.candidates[0]).toMatchObject({ creatorId: CLIENT_A, modifierId: GUEST_AB });
   });
 
   it('keeps an empty modifier id when the last change was not a user’s', () => {
@@ -2633,7 +2892,7 @@ describe('ChannelInbox: the document index', () => {
       },
       driveId: 'drive-a',
       driveItemId: id,
-      uploadedByOid: GUEST_A,
+      uploadedByOid: CLIENT_A,
       sizeBytes: content.length,
       contentSha256: createHash('sha256').update(content).digest('hex'),
       // The moved item's link, as Graph's PATCH answered it: for staff notices.

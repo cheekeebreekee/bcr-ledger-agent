@@ -58,6 +58,7 @@ describe('health', () => {
       expect(body.build).toEqual({
         phase: 'p0',
         routing: 'identity-only',
+        clientIdentity: 'nip-member',
         membershipCheck: m,
         inboxSweep: 'off',
         inboxSweepRows: 'all',
@@ -77,6 +78,7 @@ describe('health', () => {
       expect(body.build).toEqual({
         phase: 'p0',
         routing: 'identity-only',
+        clientIdentity: 'nip-member',
         membershipCheck: 'enforce',
         inboxSweep: m,
         inboxSweepRows: 'all',
@@ -85,6 +87,19 @@ describe('health', () => {
       });
     },
   );
+
+  // The account rule (owner's decision, 28 Sep 2026) is in this build; an
+  // operator checks it after the deploy.
+  it('says the client identity rule is nip-member, whatever the modes', async () => {
+    mockMode = 'off';
+    mockInbox = 'enforce';
+    const body = (await handleHealth()).jsonBody as ReturnType<typeof healthBody>;
+    expect(body.build).toMatchObject({
+      phase: 'p0',
+      routing: 'identity-only',
+      clientIdentity: 'nip-member',
+    });
+  });
 
   it('reports ledgerIndex=write without touching phase or routing', async () => {
     mockIndex = 'write';

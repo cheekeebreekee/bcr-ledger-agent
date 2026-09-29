@@ -349,7 +349,7 @@ describe('teamIdsIn', () => {
   });
 
   // The runtime and the binding tool must count the same groups as Teams, or
-  // a guest the tool binds could be held at upload, or the other way round.
+  // a client account the tool binds could be held at upload, or the other way round.
   it("uses the binding tool's client-Team marker, character for character", () => {
     const tool = readFileSync(join(__dirname, '../../../../tools/lib/bindings.mjs'), 'utf8');
     const match = /export const BCR_TEAM_DESCRIPTION = \/(.+)\/([a-z]*);/.exec(tool);

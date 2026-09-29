@@ -1,4 +1,13 @@
-import { DOWNLOAD_FAILED, INGESTION_FAILED, escapeMarkdown, rejectionText } from './cardText';
+import { CLIENT_ACCOUNT_REQUIRED } from '@bcr/shared';
+import {
+  DOWNLOAD_FAILED,
+  escapeMarkdown,
+  GATE_REFUSAL_TEXT,
+  INGESTION_FAILED,
+  QUARANTINED_TEXT,
+  rejectionText,
+  SEARCH_NO_ACCESS_TEXT,
+} from './cardText';
 
 describe('escapeMarkdown', () => {
   it('renders a markdown link in a filename literally', () => {
@@ -60,15 +69,51 @@ describe('escapeMarkdown', () => {
 
 describe('rejectionText', () => {
   it('has a distinct Polish message for each known code', () => {
-    const codes = [DOWNLOAD_FAILED, INGESTION_FAILED, 'ValidationError', 'SharePointError', 'RetryLater'];
+    const codes = [
+      DOWNLOAD_FAILED,
+      INGESTION_FAILED,
+      'ValidationError',
+      'SharePointError',
+      'RetryLater',
+      CLIENT_ACCOUNT_REQUIRED,
+    ];
     const texts = codes.map(rejectionText);
     expect(new Set(texts).size).toBe(codes.length);
     expect(texts).not.toContain(rejectionText('SomethingElse'));
+  });
+
+  it('tells a refused account (ClientAccountRequired) to sign in with the NIP@ account', () => {
+    expect(CLIENT_ACCOUNT_REQUIRED).toBe('ClientAccountRequired');
+    expect(rejectionText(CLIENT_ACCOUNT_REQUIRED)).toBe(
+      'Tego pliku nie mogę przyjąć z tego konta. Asystent działa tylko na koncie, które BCR ' +
+        'założyło dla Twojej firmy (login: NIP@bcr-group.pl) — zaloguj się na nie i wyślij plik ' +
+        'ponownie.',
+    );
+  });
+
+  it('keeps RetryLater’s text, which also answers an account ingestion could not read', () => {
+    expect(rejectionText('RetryLater')).toBe(
+      'Nie zdążyłem przetworzyć tego pliku. Wyślij go ponownie za chwilę.',
+    );
   });
 
   it('falls back to a generic message for unknown or missing codes', () => {
     expect(rejectionText(undefined)).toBe(rejectionText('InternalError'));
     expect(rejectionText('toString')).toBe(rejectionText(undefined));
     expect(rejectionText(undefined)).toMatch(/Spróbuj ponownie/);
+  });
+});
+
+describe('fixed texts after the account decision (28 Sep 2026)', () => {
+  it('gives search one no-access answer that names the NIP@ account and no reason', () => {
+    expect(SEARCH_NO_ACCESS_TEXT).toBe(
+      'Wyszukiwanie dokumentów działa tylko na koncie, które BCR założyło dla Twojej firmy ' +
+        '(login: NIP@bcr-group.pl). Jeśli korzystasz z tego konta, skontaktuj się z zespołem BCR.',
+    );
+  });
+
+  it('keeps the quarantine and gate texts as they were', () => {
+    expect(QUARANTINED_TEXT).toBe('Dokument przekazano do weryfikacji przez zespół BCR.');
+    expect(GATE_REFUSAL_TEXT).toBe('Nie mogę przyjąć tej wiadomości.');
   });
 });

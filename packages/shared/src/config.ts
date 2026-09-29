@@ -152,7 +152,7 @@ export const botConfigSchema = z.object({
    * not the BCR tenant, or no AAD object id). `log` records the rejection and
    * lets the turn through; `enforce` refuses it before any download. `log`
    * exists only for the first 24 h of the Phase-0 rollout, to prove real
-   * guest activities pass before anything is refused.
+   * client activities pass before anything is refused.
    */
   botGateMode: z
     .enum(['log', 'enforce'])
@@ -160,8 +160,9 @@ export const botConfigSchema = z.object({
     .transform((v) => v ?? 'enforce'),
   /**
    * `SEARCH_MODE` (bot): `off` (the default) keeps today's help card for text;
-   * `on` sends a guest's text to ingestion's `POST /api/search` with a token
-   * of the bot Function App's managed identity. Anything else fails at cold start.
+   * `on` sends a user's text to ingestion's `POST /api/search` with a token
+   * of the bot Function App's managed identity (ingestion answers only a
+   * row's client account). Anything else fails at cold start.
    */
   searchMode: z
     .preprocess(
@@ -267,12 +268,14 @@ export const ingestionConfigSchema = z.object({
   ),
   /**
    * Whether routing checks the uploader's Team membership at upload time.
-   * `enforce` (the default): a bound uploader's Teams, read from Entra, must
-   * be exactly their row's TeamId, or the upload is quarantined. `off` is an
-   * emergency escape only: it reopens R46 (a guest added to a second client's
-   * Team keeps filing into the first client's space), and is logged as a
-   * warning at every cold start. Empty means the default; anything else fails
-   * at cold start, so a typo can never switch the check off.
+   * `enforce` (the default): a bound client account's Teams, read from
+   * Entra, must be exactly their row's TeamId, or the upload is quarantined.
+   * `off` is an emergency escape only: it reopens R46 (a client account added
+   * to a second client's Team keeps filing into the first client's space),
+   * and is logged as a warning at every cold start. It switches off only the
+   * Teams read: the client account rule (Member, UPN `{row NIP}@bcr-group.pl`)
+   * has no mode. Empty means the default; anything else fails at cold start,
+   * so a typo can never switch the check off.
    */
   membershipCheckMode: z
     .preprocess(

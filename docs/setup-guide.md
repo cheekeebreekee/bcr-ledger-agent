@@ -461,10 +461,14 @@ equals `$INGEST_MI_APPID`, with the role from the table. An entry for the Ingest
 registration does not count: record it for deletion. Per-site grants take about 5 minutes to
 apply.
 
-3. **The Graph app role `Directory.Read.All`**, once for this identity, for the Team-membership
-   check (`MEMBERSHIP_CHECK_MODE=enforce`, the default): ingestion reads each bound uploader's
+3. **The Graph app role `Directory.Read.All`**, once for this identity, for the client-account
+   rule and the Team-membership check (`MEMBERSHIP_CHECK_MODE=enforce`, the default): ingestion
+   reads each uploader's account (`userType`, `userPrincipalName`) and each bound uploader's
    `memberOf`, and Microsoft Learn lists `Directory.Read.All` as the least privileged application
-   permission for that. Without it every bound upload is quarantined as `membership_unverified`.
+   permission for `memberOf`. Without it no account can be read: every bot upload is answered
+   `RetryLater` with nothing stored, and every channel post waits (`unverified`). (The build
+   before the client-account rule quarantined every bound upload as `membership_unverified`
+   instead.)
    Grant it with `infrastructure/identity/grant-ingestion-membership-read.sh` (dry run by
    default, then `--apply` by a Global Administrator; it uses a delegated `GRAPH_TOKEN`, see
    [`human-steps.md` H-8b](operations/human-steps.md#h-8b-grant-the-ingestion-identity-directoryreadall-then-verify)),
@@ -510,17 +514,20 @@ references for secrets).
 | `MICROSOFT_APP_PASSWORD` | teams-bot | Bot app reg → **Certificates & secrets → New client secret → Value** *(§2a)*. After deployment, paste into Key Vault as `bot-app-password` *(§4)*. |
 | `MICROSOFT_APP_TENANT_ID` | teams-bot | Same as `AZURE_TENANT_ID` |
 | `MICROSOFT_APP_TYPE` | teams-bot | **Required.** `SingleTenant` for the BCR bot, whose app registration is single-tenant. The other options are `MultiTenant` and `UserAssignedMSI`. |
-| `BOT_GATE_MODE` | teams-bot | `enforce` (default) or `log`. The gate refuses anything but a 1:1 chat from the BCR tenant with a valid user id. Use `log` only for the first 24 hours of a rollout, to prove real guests pass. |
+| `BOT_GATE_MODE` | teams-bot | `enforce` (default) or `log`. The gate refuses anything but a 1:1 chat from the BCR tenant with a valid user id. Use `log` only for the first 24 hours of a rollout, to prove real users' 1:1 chats pass. The gate cannot tell a guest from a member: whether an account may file is decided by ingestion (the client-account rule). |
 | `INGESTION_BASE_URL` | teams-bot | `http://localhost:7071` locally, `https://func-bcr-ingest-<env>-XXXX.azurewebsites.net` in Azure. |
 | `INGESTION_SCOPE` | teams-bot | `api://<INGESTION_APP_ID>/.default` — see §2b |
-| `SEARCH_MODE` | teams-bot | *(optional)* `off` (the default, also when empty) or `on`. Client search ([`ARCHITECTURE.md` §4.6](../ARCHITECTURE.md#46-client-search)): `on` sends a guest's text to ingestion's `/api/search` with the bot Function App's managed identity (§5). Anything else fails at cold start. |
+| `SEARCH_MODE` | teams-bot | *(optional)* `off` (the default, also when empty) or `on`. Client search ([`ARCHITECTURE.md` §4.6](../ARCHITECTURE.md#46-client-search)): `on` sends a user's text to ingestion's `/api/search` with the bot Function App's managed identity (§5); ingestion answers only the row's `{NIP}@` client account. Anything else fails at cold start. |
 
 ### 6c. Ingestion API auth & multi-tenant routing (`packages/document-ingestion/local.settings.json`)
 
 The ingest function serves many clients. It decides per upload which client's
 SharePoint site to use, **from the uploader's AAD id only**, looked up in the Client
-Directory list. The document's content never chooses the client. An uploader who
-cannot be tied to exactly one client goes to the staff-only quarantine site. See
+Directory list. The document's content never chooses the client. The uploader must be
+that row's client account: an Entra Member whose UPN is `<the row's NIP>@bcr-group.pl`
+(`CLIENT_ACCOUNT_DOMAIN` in `@bcr/shared`: a constant, not an app setting). A guest is
+refused and nothing is stored. Any other uploader who cannot be tied to
+exactly one client goes to the staff-only quarantine site. See
 [`docs/client-directory-admin-guide.md`](./client-directory-admin-guide.md)
 for the routing model, and [`ARCHITECTURE.md §4.2`](../ARCHITECTURE.md#42-client-routing-phase-0-identity-only)
 for the design.
@@ -540,7 +547,7 @@ for the design.
 | `QUARANTINE_DRIVE_NAME` | *(optional)* Default `Documents`. `Dokumenty` on Polish tenants. |
 | `QUARANTINE_ROOT_FOLDER` | *(optional)* Default `Kwarantanna`. |
 | `FORBIDDEN_TARGET_SITE_PATHS` | **Required.** Comma-separated site paths no Directory row may route to: at least the site that holds the Client Directory, e.g. `/sites/BCRGROUP`. Each entry exactly `/sites/<name>` or `/teams/<name>`; a URL or a sub-site fails at cold start. The quarantine path is added automatically. |
-| `MEMBERSHIP_CHECK_MODE` | *(optional)* `enforce` (the default, also when empty) or `off`. In `enforce`, a bound uploader routes only while their Teams, read from Entra at upload time, are exactly their row's `TeamId` (`membership_mismatch` / `membership_unverified` otherwise). Needs Graph `Directory.Read.All` on the ingestion managed identity (§5). `off` is an emergency escape only: it reopens R46, warns at every cold start and shows in `/api/health`. Any other value fails at cold start. |
+| `MEMBERSHIP_CHECK_MODE` | *(optional)* `enforce` (the default, also when empty) or `off`. In `enforce`, a bound uploader routes only while their Teams, read from Entra at upload time, are exactly their row's `TeamId` (`membership_mismatch` / `membership_unverified` otherwise). Needs Graph `Directory.Read.All` on the ingestion managed identity (§5). `off` is an emergency escape only: it reopens R46, warns at every cold start and shows in `/api/health`. It never switches off the client-account rule, which has no setting, and the channel inbox checks the Teams whatever it says. Any other value fails at cold start. |
 | `INBOX_SWEEP_MODE` | *(optional)* `off` (the default, also when empty), `shadow` or `enforce`. The channel-inbox timer ([`ARCHITECTURE.md` §4.4](../ARCHITECTURE.md#44-channel-inbox-intake-clients)): `off` returns at once; `shadow` lists each bound client's channel folder, checks uploaders and classifies, and only logs what it would move; `enforce` moves client uploads into their taxonomy folders inside the same channel folder. Shows in `/api/health` as `build.inboxSweep`. Any other value fails at cold start. Turn on as in `docs/operations/human-steps.md` H-12, the channel-inbox step after step 8. |
 | `INBOX_MIN_AGE_MS` | *(optional)* Default `120000` (2 minutes). A file changed more recently is left for a later tick. A whole number ≥ 0. |
 | `INBOX_MAX_FILES_PER_TICK` | *(optional)* Default `20`. Most files the sweep processes per tick, across all clients. A whole number ≥ 1. |
@@ -596,7 +603,7 @@ package built from [`teams-app/manifest.json`](../teams-app/manifest.json).
 
 ### 7a. Build the package
 
-The committed `teams-app/manifest.json` (version 0.2.1: personal scope only, no tab) holds two
+The committed `teams-app/manifest.json` (version 0.2.2: personal scope only, no tab) holds two
 `REPLACE-WITH-BOT-APP-ID` placeholders, `id` and `bots[0].botId`. Replace them in a staging copy,
 so no real id lands in the tracked file, check the result, then zip. The icons
 (`color.png` 192×192, `outline.png` 32×32) are already in `teams-app/`.
@@ -611,7 +618,7 @@ sed -i.bak "s/REPLACE-WITH-BOT-APP-ID/$BOT_APP_ID/g" "$STAGE/manifest.json" && r
 
 grep -c REPLACE-WITH "$STAGE/manifest.json"                         # 0
 jq -r '.id, .bots[0].botId' "$STAGE/manifest.json"                  # $BOT_APP_ID, twice
-jq -r '.version' "$STAGE/manifest.json"                             # 0.2.1
+jq -r '.version' "$STAGE/manifest.json"                             # 0.2.2
 jq -c '[.. | .scopes? // empty | .[]] | unique' "$STAGE/manifest.json"   # ["personal"]
 jq 'has("staticTabs")' "$STAGE/manifest.json"                       # false
 
@@ -630,12 +637,14 @@ build output: never commit `teams-app.zip`, or a `manifest.json` with a real id 
 2. Left rail → **Apps → Manage your apps → Upload an app → Upload a custom app**.
 3. Pick `artifacts/teams-app.zip`.
 4. Click **Add**.
-5. Open a 1:1 chat with the bot, as a guest bound to a test client, and send a synthetic
-   document, never a real one.
+5. Open a 1:1 chat with the bot, signed in as a test client's account (a Member whose UPN is
+   the test row's `<NIP>@bcr-group.pl`, bound to that row by the binding tool, in the test Team
+   only), and send a synthetic document, never a real one.
 
 You should see one card with a row for the file: **Dokument · Kategoria · Folder** and an
-"Otwórz" link into that client's space. An uploader who is not bound to exactly one client gets
-"Dokument przekazano do weryfikacji przez zespół BCR." instead, with no link.
+"Otwórz" link into that client's space. A Member who is not that row's client account gets
+"Dokument przekazano do weryfikacji przez zespół BCR." instead, with no link. A guest gets
+"Tego pliku nie mogę przyjąć z tego konta. …", and nothing is stored.
 
 ### 7c. Publish org-wide (Teams admin)
 
@@ -658,14 +667,15 @@ curl https://func-bcr-ingest-<env>-XXXX.azurewebsites.net/api/health
 # 2. Bot endpoint exists (returns 405 to a GET — that's expected)
 curl -i https://func-bcr-bot-<env>-XXXX.azurewebsites.net/api/messages
 
-# 3. End to end: the TEST guest sends a synthetic document to the bot in a 1:1 chat.
+# 3. End to end: the test client's account sends a synthetic document to the bot in a 1:1 chat.
 ```
 
 A direct call to ingestion with your own token is **refused by design** since Phase 0: only the
 bot's app id may call it (`BOT_CALLER_APP_IDS`), and the request must come from a 1:1 chat in the
-BCR tenant. Smoke-test through Teams, as the TEST guest, with a synthetic document. Never use a
-real client document, and never a staff account, because staff uploads go to quarantine by
-design. The canary procedure is in `docs/operations/human-steps.md`, H-12.
+BCR tenant. Smoke-test through Teams, as the test client's `<NIP>@bcr-group.pl` account, with a
+synthetic document. Never use a real client document; never a staff account, because staff
+uploads go to quarantine by design; and never a guest, which is refused with nothing stored.
+The canary procedure is in `docs/operations/human-steps.md`, H-12.
 
 If the bot does **not** respond in Teams, query Application Insights:
 

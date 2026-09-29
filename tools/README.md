@@ -7,7 +7,7 @@ without `yarn install`.
 
 | Tool | What it is for | Writes to the tenant? |
 |---|---|---|
-| `directory-bindings.mjs` | Binds each Client Directory row to its Team's "Dokumenty księgowe" folder and its guests (`RootFolder`, `UserAadObjectIds`, `DriveId`, `TeamId`) | Only with `--apply`, and only those four columns (plus two new columns with `--add-columns --apply`) |
+| `directory-bindings.mjs` | Binds each Client Directory row to its Team's "Dokumenty księgowe" folder and to the client's `{NIP}@bcr-group.pl` account (`RootFolder`, `UserAadObjectIds`, `DriveId`, `TeamId`) | Only with `--apply`, and only those four columns (plus two new columns with `--add-columns --apply`). Never a user: every `/users/*` request is a GET |
 | `inventory-misfiled.mjs` | IR-1: a register of every file the ingestion wrote, joined with the IR-0 log evidence | Never |
 | `ir0/export-appinsights.sh` | IR-0: exports the routing and upload traces, and the Personal Tab lookup requests (W5), before the component's retention (90 days here) deletes them | Never |
 | `ir0/export-purview.ps1` | IR-0: exports the Purview unified audit log (file reads, writes, moves, copies and deletions; group and sharing events; sign-ins of named accounts) | Never |
@@ -19,7 +19,8 @@ without `yarn install`.
 
 - **Read-only by default.** A change needs `--apply` (`-Apply` in PowerShell). Without it, a tool prints the change it would make, as the exact request or command.
 - **Before and after.** Every tool that writes prints the state it found and the state it left. `directory-bindings.mjs apply` also writes a log of both, which `rollback` restores from, after re-checking every id it would put back on a row.
-- **Ambiguity is skipped, never guessed.** A duplicate key (a site, `DriveId` or `TeamId` shared with another row included), a SitePath that is not canonical, a Public team, a non-standard or missing channel, a drive mismatch, an unknown write grant, a fact that could not be read: each one makes the row **SKIP**, with the reason. A guest who is also in any other Team is never bound. This follows invariant I3 of the plan.
+- **Ambiguity is skipped, never guessed.** A duplicate key (a NIP, a site, `DriveId` or `TeamId` shared with another row included), a SitePath that is not canonical, a Public team, a non-standard or missing channel, a drive mismatch, an unknown write grant, a fact that could not be read: each one makes the row **SKIP**, with the reason. A client account that is also in any other Team is never bound, and a guest is never bound at all. This follows invariant I3 of the plan.
+- **Nothing reads or changes whether an account may sign in, to act on it.** No tool here writes to `/users/*`. A disabled `{NIP}@` account is reported (`check` exits 5, "client locked out") and stays bound: never block, disable, unlicense or convert a client account (the 26–28 September lockout).
 - **Never BCR GROUP, never the quarantine.** `directory-bindings.mjs` requires the forbidden list, as the ingestion does, and skips a row on BCR GROUP's site collection whatever the list says. No tool here creates a site permission. A grant goes to the ingestion Function App's managed identity through [H-6/H-12](../docs/operations/human-steps.md), and checking one is a read.
 - **No real data leaves the tenant or reaches git.**
   - Outputs go to `tools/out/`. Git ignores it, and files there are owner-only (0600).
@@ -52,9 +53,9 @@ export GRAPH_TOKEN=$(node tools/graph-login.mjs)
 
 | Command | Delegated permissions |
 |---|---|
-| `directory-bindings.mjs check` / `propose` | `User.Read.All` (each id's `userType`), `GroupMember.Read.All` (a Team's members and owners, each guest's `memberOf`), `Group.Read.All` (the list of Teams), `Channel.ReadBasic.All` (the channels), `Sites.Read.All` (the Directory list, each Team's root site, the rows' sites, drives and channel folders). Optional: `Sites.FullControl.All`, to read site permissions. Without it the write grant is "unknown" until you verify it read-only (see [Unknown write grant](#propose)). |
-| `directory-bindings.mjs apply` | `Sites.ReadWrite.All` or `Sites.Manage.All`, plus edit rights on the Client Directory list (it has unique permissions). Also `User.Read.All`, `GroupMember.Read.All` and `Group.Read.All`: apply re-reads every guest it binds |
-| `directory-bindings.mjs rollback` | `Sites.ReadWrite.All` or `Sites.Manage.All`, plus edit rights on the Client Directory list. Also `User.Read.All`, `GroupMember.Read.All` and `Group.Read.All`: rollback re-reads every id it would put back |
+| `directory-bindings.mjs check` / `propose` | `User.Read.All` (each id's `userType` and UPN, and each row's `{NIP}@` account by its UPN), `GroupMember.Read.All` (a Team's members and owners, the client account's `memberOf`), `Group.Read.All` (the list of Teams), `Channel.ReadBasic.All` (the channels), `Sites.Read.All` (the Directory list, each Team's root site, the rows' sites, drives and channel folders). Optional: `Sites.FullControl.All`, to read site permissions. Without it the write grant is "unknown" until you verify it read-only (see [Unknown write grant](#propose)). |
+| `directory-bindings.mjs apply` | `Sites.ReadWrite.All` or `Sites.Manage.All`, plus edit rights on the Client Directory list (it has unique permissions). Also `User.Read.All`, `GroupMember.Read.All` and `Group.Read.All`: apply re-reads the client account it binds, and the Team's owners |
+| `directory-bindings.mjs rollback` | `Sites.ReadWrite.All` or `Sites.Manage.All`, plus edit rights on the Client Directory list. Also `User.Read.All`, `GroupMember.Read.All` and `Group.Read.All`: rollback re-reads every id it would put back, and the Team's owners |
 | `directory-bindings.mjs --add-columns --apply` | `Sites.Manage.All` (it creates the columns) |
 | `inventory-misfiled.mjs` | `Sites.Read.All` (or `Files.Read.All`), and the signed-in person must be an **Owner or site collection admin of every site walked**. After T-4/T-4b only the site Owners can open the root taxonomy folders, and SharePoint leaves a folder the caller cannot open out of a listing without an error: with a member's token the locked folders, and every file in them, are silently missing. See [IR-1](#inventory-misfiledmjs-ir-1) |
 
@@ -81,10 +82,25 @@ to and when it expires, and they refuse an expired token.
 
 ## `directory-bindings.mjs`
 
-Onboarding writes client rows with `RootFolder = ''` and no guest id. The first
+Onboarding writes client rows with `RootFolder = ''` and no user id. The first
 sends uploads to the library root, where the channel never shows them (R5). The
-second makes every client upload "unknown", so it goes to quarantine (R1). This
-tool fills both from Graph.
+second routes nobody, so the client's chat uploads go to quarantine (R1) and its
+channel posts wait. This tool fills both from Graph.
+
+**The client account** (the owner's decision of 28 Sep 2026). A client is its
+`{NIP}@bcr-group.pl` account: an Entra **Member**, licensed, created by BCR at
+onboarding and handed to the client. Guests have no capability in the ledger.
+The one id a row may carry in `UserAadObjectIds` is its client account, which
+qualifies when:
+- its `userPrincipalName` is exactly `<the row's 10-digit NIP>@<domain>` and its `userType` is `Member` (`clientAccountVerdict`, the same rule as `@bcr/shared`'s; `test/client-account-cases.json` is the one case table both test, so change both or neither);
+- it is a member of the row's Team, and never an owner (an owner can change the channel folder's permissions);
+- its Teams are exactly the row's `TeamId` (every Team counts, as below).
+
+The row is already chosen: the tool reads `GET /users/<NIP>@<domain>` for that
+row, and never looks a row up by a NIP or a UPN. `--client-domain` sets the
+domain (default `bcr-group.pl`; the tests use `contoso.example`). Whether the
+account is enabled is reported, never a reason not to bind (its licence is not
+read at all): the ledger must never act as a lock on a client.
 
 ```bash
 export DIRECTORY_SITE_ID='contoso.sharepoint.com,<siteGuid>,<webGuid>'   # or CLIENT_DIRECTORY_SITE_ID
@@ -94,8 +110,8 @@ export FORBIDDEN_TARGET_SITE_PATHS='/sites/BCRGROUP'                      # REQU
 export QUARANTINE_SITE_PATH='/sites/<quarantine site>'                    # always forbidden
 export QUARANTINE_SITE_HOSTNAME='contoso.sharepoint.com'                  # the only host a row may name
 
-node tools/directory-bindings.mjs check [--out <new report.json>]
-node tools/directory-bindings.mjs propose [--confirm-remove-staff <listItemId>] [--write-verified <sitePath|listItemId>] [--out <new plan.json>]
+node tools/directory-bindings.mjs check [--client-domain bcr-group.pl] [--out <new report.json>]
+node tools/directory-bindings.mjs propose [--client-domain bcr-group.pl] [--confirm-remove-staff <listItemId>] [--write-verified <sitePath|listItemId>] [--out <new plan.json>]
 node tools/directory-bindings.mjs apply --plan <plan.json> --health-url https://<ingestion-host>/api/health [--expect-health <key=value>]... [--only <listItemId>]... [--apply]
 node tools/directory-bindings.mjs rollback --log <apply-log.json> [--only <listItemId>]... [--apply]
 node tools/directory-bindings.mjs --add-columns [--apply]
@@ -104,6 +120,12 @@ node tools/directory-bindings.mjs --add-columns [--apply]
 Every `--out` names a **new** file: `check`, `propose`, `apply` and `rollback`
 all refuse a path that exists, so a path reused from shell history can never
 replace an apply log that `rollback` needs, or a reviewed plan.
+
+`--client-domain` is checked before any Graph call: a host name such as
+`bcr-group.pl`, trimmed and lower-cased; no `@`, scheme or path. `apply` takes
+the plan's domain and refuses a flag that differs. `rollback` takes the one its
+apply log records (a log from before the rule, version 1, is re-checked under
+`bcr-group.pl`); it does not take the flag.
 
 Use the values the ingestion runs with (its app settings of the same names),
 so the tool refuses exactly what the ingestion refuses.
@@ -141,8 +163,11 @@ to the path of the Team's root site.
 ### `check`
 
 Reports on each **Active** row:
-- **Staff on a client row.** Ids in `UserAadObjectIds` whose user is `userType = Member`.
-- **Drift.** An id on the row that is no longer a guest of this row's Team alone, because the guest has since joined another Team or left this one (`bound_guest_ineligible`). It still routes to this row until a PATCH takes it off.
+- **The ids on the row**, each judged by the client-account rule against the row's NIP:
+  - **a guest** (`guest_ids`): guests have no capability, so the PATCH takes it off, no flag needed;
+  - **staff, or another client's account** (`staff_ids`): a Member that is not this row's account. Another client's account (its UPN is the `{NIP}@` of another Active row) is named so in the detail. Removed only with `--confirm-remove-staff`;
+  - **the row's own account when it no longer qualifies** (`client_account_ineligible`): since added to another Team (R46), made an owner, or taken out of this Team; or a `{NIP}@`-shaped account for a NIP no Active row carries (the row's NIP edited by hand, or the account renamed). It routes to this row, or did on an older build, until a PATCH takes it off.
+- **The row's NIP.** It must be exactly 10 digits (`client_nip_invalid` otherwise: nobody routes to the row; its target may still be bound). A NIP that fails the NIP checksum is only a warning (`client_nip_checksum`; the canary row's `9000000000` fails it on purpose).
 - **Duplicates across rows.**
   - A shared ClientId, NIP, site, target (`host|path|drive|rootFolder`), `DriveId` or `TeamId` skips every row involved. The ingestion excludes every client row that shares a site, a `DriveId` or a `TeamId`, and quarantines their users as `conflict`.
   - A shared user id is reported. Ingestion drops that key for both rows.
@@ -151,21 +176,23 @@ Reports on each **Active** row:
   - A Team whose description does not follow `BCR Group — {recordNumber}` gets the **warning** `team_not_bcr`, not a skip. The Teams that predate onboarding (`[0000]`–`[0004]`, TEST and PESKOVOI among them) never had that description. The Team is already pinned down by the row's own site, so the marker adds nothing.
 - **The channel.** There must be exactly one "Dokumenty księgowe" channel, and its `membershipType` must be `standard`.
 - **The channel folder.** Its `filesFolder` name, id and `parentReference.driveId`, and whether its parent is the drive root. The drive id is compared with the drive the row's `DriveName` resolves to (`GET /sites/{id}/drives`, exact name, as ingestion matches it).
-- **The Team's guests.** A guest is eligible only if this Team is the **only** Team they belong to. `/users/{id}/memberOf` is read with `resourceProvisioningOptions`, and every group that is a Team counts, with or without the `BCR Group —` description. That includes the legacy client Teams and BCR GROUP. A group whose kind cannot be read counts as a Team. A guest who is also in another Team is excluded as `guest_in_other_team`, and the other Team is named. Binding them would file every upload of theirs into this client's channel, including another company's documents. Members and owners are never bound.
+- **The client account.** `GET /users/<NIP>@<domain>` for the row, then that account's own `memberOf`, read with `resourceProvisioningOptions`: every group that is a Team counts, with or without the `BCR Group —` description. That includes the legacy client Teams and BCR GROUP. A group whose kind cannot be read counts as a Team. An account that is also in another Team is not bound (`client_account_in_other_team`, the other Team named): a `{NIP}@` account belongs to one company, so this is always an anomaly, never a reused email. Everyone else on the Team's roster is listed as not bound, with the reason: `guest` (every guest, one of this Team alone included), `staff`, `other_client_account` or `owner`. No one's memberships but the client account's are read.
+- **Whether the account is enabled.** Reported, never acted on. A bound row whose client account is disabled is a client locked out: `check` exits 5.
 - **The write grant.** Whether the ingestion's managed identity (`--ingest-app-ids`, its app id `INGEST_MI_APPID`) can write to the site, from `/sites/{id}/permissions`. If the caller cannot read that, the grant is reported as **"unknown"**, to be verified read-only (see below). A forbidden or non-canonical site gets no grant advice at all.
 
 **Bound rows, unbound rows.** A row is **bound** when it is an Active client
 row (not `IsAdmin`) with `RootFolder`, `DriveId` and `TeamId` all set. Only a
 bound row routes anyone: the Phase-0 ingestion quarantines the users of any
 other row as `unbound_target`. So drift counts only on a bound row:
-- **Drift on a bound row** (`staff_ids`, `staff_ids_removed`, `bound_guest_ineligible`) routes an upload where it should not, today. `check` prints an ACTION line and exits 3.
+- **Drift on a bound row** (`staff_ids`, `staff_ids_removed`, `guest_ids`, `client_account_ineligible`) is an id on the row that is not its client account. The ingestion build with the client-account rule refuses or quarantines it, an older build may route it, and the Directory says otherwise either way. `check` prints an ACTION line and exits 3.
 - **The same codes on an unbound row** are printed as **not routing (unbound)**, on the row and in the summary, and do not make `check` exit 3. The PATCH that binds such a row also takes those ids off (staff ids only with `--confirm-remove-staff`). So at H-7, before any row is bound, a staff id on a client row is reported and recorded, not raised as an action. This holds for the Phase-0 ingestion build: the pre-Phase-0 build routes by `UserAadObjectIds` alone, so until H-12 those ids still route, which is why H-7 records them and H-12 removes them.
 
 **Incomplete rows.** "No drift found" only counts where drift could be looked
 for. A bound row that holds user ids is **incomplete** when one of these left
 its ids unassessed: `site_unresolved`, `no_team` (an unreadable Team site
-included), `team_lookup_failed`, `membership_lookup_failed` or
-`guest_memberships_unreadable`. `check` marks the row `incomplete`, names it on
+included), `team_lookup_failed`, `membership_lookup_failed`,
+`client_account_lookup_failed` or `client_account_memberships_unreadable`.
+`check` marks the row `incomplete`, names it on
 an ACTION line, and exits 4 unless there is drift elsewhere. Fix the read (the
 row's SKIP line says which; a 403 is missing consent, see
 [Authentication](#authentication)) and run `check` again. A bound row with no
@@ -173,19 +200,22 @@ user ids routes nobody and is never incomplete.
 
 `--out <file>` also writes the report as JSON (a new file: an existing one is
 refused before anything is read). Next to every row's problems it holds:
-- `exitCode`: 0, 3 or 4, as below;
+- `exitCode`: 0, 3, 4 or 5, as below;
+- `clientDomain`: the domain the accounts were read under;
 - `routingDrift`: the bound rows behind exit code 3;
 - `incomplete`: the bound rows behind exit code 4;
+- `lockedOut`: the bound rows behind exit code 5;
 - `notRoutingUnbound`: the unbound rows with a drift code, reported only.
 
 Exit codes:
-- `0`: every bound row that holds user ids was assessed, and none routes where it should not.
+- `0`: every bound row that holds user ids was assessed, none routes where it should not, and no bound client account is disabled.
 - `1`: refused (a missing or malformed input, an expired token, an `--out` file that exists, a 403 that stops the whole run).
-- `3`: **action needed**. A bound client row holds an id that routes there and should not: staff (`staff_ids`, `staff_ids_removed`) or a guest who is no longer a guest of that row's Team alone (`bound_guest_ineligible`). Run `propose` and apply the whole plan, the same day. A scheduled run alerts on this.
+- `3`: **action needed**. A bound client row holds an id that is not its client account: staff or another client's account (`staff_ids`, `staff_ids_removed`), a guest (`guest_ids`), or its own account that no longer qualifies (`client_account_ineligible`). Run `propose` and apply the whole plan, the same day. A scheduled run alerts on this.
 - `4`: **action needed**. No drift was found, but at least one bound row that holds user ids could not be fully assessed (`incomplete`, above). Fix the read and run `check` again; until then, drift on that row is unknown. A scheduled run alerts on this too.
+- `5`: **a client is locked out.** A bound row's client account is disabled (`client_account_disabled`), so that client cannot sign in to Teams. Tell Roman at once; re-enabling the account in Entra is his. Never unbind the row for it, and never block, disable, unlicense or convert a `{NIP}@` account.
 
-3 wins over 4: a run with drift on one row and an incomplete other row exits
-3, and the report lists both.
+3 wins over 4, and 4 over 5: a run with drift on one row and an incomplete
+or locked-out other row exits 3, and the report lists them all.
 
 ### Codes
 
@@ -200,16 +230,19 @@ not stop a PATCH. Each line also carries a detail with the ids involved.
 | `no_site` | skip | `SiteHostname` or `SitePath` is empty | Fill in the client's Team site |
 | `site_path_not_canonical` | skip | `SitePath` is not exactly `/sites/<name>` or `/teams/<name>` (see above). The ingestion excludes the row | Correct it by hand to the Team's root site path |
 | `forbidden_target` | skip | The row's site is forbidden: on the forbidden list or the quarantine path, on another host, or it resolves to BCR GROUP's site collection or to a forbidden site. The ingestion never files there | A client row never points there. Find the client's own site and correct the row, or set it Inactive. Never widen a guard to let it through |
-| `duplicate_clientId` / `duplicate_nip` | skip | Another Active row has the same ClientId or NIP | Decide which row is the client's; set the other Inactive (with Roman) |
+| `duplicate_clientId` / `duplicate_nip` | skip | Another Active row has the same ClientId or NIP. A shared NIP names one account for both rows, so neither gets it | Decide which row is the client's; set the other Inactive (with Roman) |
 | `duplicate_site` / `duplicate_target` | skip | Another Active client row names the same site (or the same host, path, drive and folder). The ingestion excludes both | As above: one site, one client row |
 | `duplicate_driveId` / `duplicate_teamId` | skip | Another Active client row already has this `DriveId` or `TeamId`. The ingestion excludes both | As above. A wrong binding on the other row is corrected by hand |
 | `duplicate_user_id` | warn | A user id is also on another row. The ingestion drops it for both, so that person's uploads go to quarantine | Decide whose it is; `propose` never adds an id that is on another row |
 | `invalid_user_ids` | warn | A `UserAadObjectIds` line is not a GUID | The PATCH rewrites the list without it |
 | `unknown_user_ids` | warn | An id on the row matches no user | The PATCH drops it |
 | `user_lookup_failed` | skip | An id on the row could not be read | Re-run; check the token's `User.Read.All` |
-| `staff_ids` | skip | A staff (Member) id on a client row: once the row is bound, it files that person's uploads into this client (exit 3 on a bound row; "not routing (unbound)" otherwise) | Re-run `propose` with `--confirm-remove-staff <listItemId>` |
-| `staff_ids_removed` | warn | Staff ids will be removed, as confirmed | Apply the plan |
-| `bound_guest_ineligible` | warn | An id on the row is not a guest of this Team alone any more: also in another Team, or no longer in this one. On a bound row it routes here until the PATCH removes it (exit 3); on an unbound row it routes nobody ("not routing (unbound)") | Run `propose` and apply the **whole** plan now |
+| `staff_ids` | skip | A Member id on a client row that is not its client account: staff, or another client's account (named so in the detail). The runtime quarantines its uploads (`not_client_account`); an older build files them into this client (exit 3 on a bound row; "not routing (unbound)" otherwise) | Re-run `propose` with `--confirm-remove-staff <listItemId>` |
+| `staff_ids_removed` | warn | Those ids will be removed, as confirmed | Apply the plan |
+| `guest_ids` | warn | A guest id on a client row. Guests have no capability in the ledger; the PATCH removes it, no flag needed. On a bound row: drift (exit 3) | Run `propose` and apply the **whole** plan |
+| `client_account_ineligible` | warn | This row's client account on the row no longer qualifies (in another Team, an owner, out of this Team), or a `{NIP}@` account for a NIP no Active row carries is on it (the NIP edited by hand, or the account renamed). On a bound row it routes here, or did on an older build, until the PATCH removes it (exit 3); on an unbound row it routes nobody | Run `propose` and apply the **whole** plan now; fix the membership, the NIP or the UPN |
+| `client_nip_invalid` | warn | The row's NIP is not 10 digits: it names no client account, so nobody routes to the row. The target may still be bound; nothing is guessed | Correct the NIP by hand, then `propose` again |
+| `client_nip_checksum` | warn | The NIP fails the NIP checksum. The account it names is still bound; the rule needs 10 digits only | Check the NIP for a typo. Expected on the canary row (`9000000000`) |
 | `unbound_target` | warn | `RootFolder`, `DriveId` or `TeamId` is empty: the row routes nobody (the ingestion quarantines as `unbound_target`) | Apply the plan's PATCH, which sets all three |
 | `site_unresolved` | skip | Graph could not resolve `SiteHostname` + `SitePath`. On a bound row with ids: `incomplete` (exit 4) | Correct the row, or check the token's site access |
 | `team_lookup_failed` | skip | More than one Team claims the site. On a bound row with ids: `incomplete` (exit 4) | Report it; Teams should never allow this |
@@ -230,36 +263,43 @@ not stop a PATCH. Each line also carries a detail with the ids involved.
 | `drive_id_conflict` | skip | The row already has a different `DriveId` (I10) | A person decides; change bindings by hand |
 | `root_folder_conflict` | skip | The row already has a different `RootFolder` (I10) | A person decides; change bindings by hand |
 | `membership_lookup_failed` | skip | The Team's members or owners could not be read. On a bound row with ids: `incomplete` (exit 4) | Re-run; check `GroupMember.Read.All` |
-| `guest_memberships_unreadable` | skip | A guest's own memberships could not be read, so they cannot be shown to be in this Team alone. On a bound row with ids: `incomplete` (exit 4) | Re-run; check `GroupMember.Read.All` |
-| `guest_in_other_team` | warn | A guest of this Team is also in another Team (named) and is not bound; their uploads go to quarantine | Record it (H-7). Binding them would file another company's documents here |
-| `guest_not_in_this_team` | warn | Listed as a member, but their memberships do not include this Team; not bound | Re-run later; the two reads disagree |
-| `no_eligible_guest` | warn | No guest belongs to this Team alone; the client's uploads go to quarantine | Record it; invite the client's contact to this Team only |
+| `client_account_lookup_failed` | skip | `GET /users/<NIP>@<domain>` failed (not a 404), so the row's account is unassessed. On a bound row with ids: `incomplete` (exit 4) | Re-run; check `User.Read.All` |
+| `client_account_memberships_unreadable` | skip | The client account's own memberships could not be read, so it cannot be shown to be in this Team alone. On a bound row with ids: `incomplete` (exit 4) | Re-run; check `GroupMember.Read.All` |
+| `client_account_missing` | warn | No account `<NIP>@<domain>` exists: nobody routes to the row | BCR creates it (a Member, licensed, a member of this Team only; onboarding O1), then `propose` and apply again |
+| `client_account_not_member` | warn | The account at that UPN is not a Member (a Guest, or no type); not bound | Report it; a client account is a Member created by BCR |
+| `client_account_not_in_team` | warn | The account is not on this Team's roster; not bound | Add it to the Team as a **member**, then `propose` again |
+| `client_account_not_in_this_team` | warn | On the roster, but its memberships do not include this Team; not bound | Re-run later; the two reads disagree |
+| `client_account_owner` | warn | The account is an owner of this Team; not bound. An owner can change the channel folder's permissions | Make it a member, never an owner; then `propose` again |
+| `client_account_in_other_team` | warn | The account is also in another Team (named); not bound. A `{NIP}@` account belongs to one company: the ingestion quarantines its uploads (`membership_mismatch`) and its channel posts wait (`other_teams`) | Take it out of the other Team (with Roman), then `propose` and apply again |
+| `client_account_disabled` | warn | The client account is disabled: the client cannot sign in. It is bound all the same. On a bound row: exit 5 | Tell Roman at once; he re-enables it in Entra. Never unbind the row for it |
 | `write_grant_missing` | skip | The ingestion's managed identity has no write on the site | Grant it through H-6/H-12 (this client's own site only), then re-run |
 | `write_grant_unknown` | skip | The caller cannot read site permissions | Verify read-only (below), then `--write-verified` |
 | `incomplete_facts` | skip | (propose) Not enough facts to propose values, with no other reason | Read `check` for that row |
 | `target_conflict` | skip | (propose) After the plan, this row would share a site, `DriveId` or `TeamId` with another row, which the ingestion would exclude | Resolve the other row first |
-| `user_id_conflict` | warn | (propose) A guest is already on another row, so is not added here | Decide whose guest it is |
+| `user_id_conflict` | warn | (propose) The client account is already on another row, so is not added here | Decide whose account it is |
 
-The plan also lists, per row, the guests left out (`excludedGuests`) and the
-ids a PATCH takes off (`removedUserIds`), each with a reason: `owner`,
-`not_a_guest`, `memberships_unreadable`, `guest_in_other_team` (with
-`otherTeams`), `guest_not_in_this_team`, `not_a_member_of_this_team`,
-`not_found`, `staff`, `not_a_guid`.
+The plan also lists, per row, who on the Team's roster is not bound
+(`notBound`) and the ids a PATCH takes off (`removedUserIds`), each with a
+reason. `notBound`: `guest`, `staff`, `other_client_account`, `owner`, and
+`client_account_ineligible` for the row's own account (with `why`, and
+`otherTeams` for a second Team). `removedUserIds`: `guest`, `staff`,
+`other_client_account`, `client_account_ineligible`, `not_found`,
+`not_a_guid`.
 
 ### `propose`
 
 Writes a plan: one row per Active row, with an action.
 - **PATCH** carries only the fields that change:
   - `RootFolder`: the channel folder name exactly as Graph returns it. Proposed only when the folder is in the row's drive, directly under the drive root, in a standard channel, and the ingestion path sanitiser would not rename it.
-  - `UserAadObjectIds`: the guests of this Team and of no other Team. Never Members or owners, and never an id already on another row.
+  - `UserAadObjectIds`: the row's client account, or nothing. At most one id: never a guest, staff, an owner, or an id already on another row.
   - `DriveId` and `TeamId`.
 - **NOOP** means the row is already bound.
 - **SKIP** gives every reason, and still shows the values the row would have had, marked "(not applied)".
 
-Every row also lists `excludedGuests`: the Team's guests who are not bound, with the reason and, for `guest_in_other_team`, the other Teams (`otherTeams`). Read these before applying. `eligibleGuests` is also in the plan: the guests of that Team alone, where the Team's people were read. IR-1 uses it (`inventory-misfiled.mjs --bindings-plan`). It is not what gets written; `patch` is.
+Every row also lists `notBound`: everyone on the Team's roster who is not bound, with the reason and, for a client account in another Team, those Teams (`otherTeams`). Read these before applying. `clientAccount` (`{ id, userPrincipalName, accountEnabled }`, or `null` when none qualifies) is also in the plan, where the account could be assessed. IR-1 uses it (`inventory-misfiled.mjs --bindings-plan`). It is not what gets written; `patch` is.
 
 Two decisions stay with a person:
-- **Staff ids.** A row with staff ids is skipped until you pass `--confirm-remove-staff <listItemId>` for that row. Then those ids are removed.
+- **Staff ids.** A row with staff ids (or another client's account) is skipped until you pass `--confirm-remove-staff <listItemId>` for that row. Then those ids are removed. Guest ids need no flag.
 - **Unknown write grant.** When the grant is unknown, the row is skipped until you check it. **Check it read-only**:
   1. In Graph Explorer, signed in with `Sites.FullControl.All`, run `GET https://graph.microsoft.com/v1.0/sites/{site-id}/permissions`.
   2. It must list a `write` role for the app id of the ingestion Function App's **system-assigned managed identity** (`INGEST_MI_APPID`). A grant to the ingestion API app registration does not count: the ingestion calls Graph only as its managed identity.
@@ -272,15 +312,20 @@ The row is skipped for a person to decide (I10).
 
 The plan is written to `tools/out/directory-bindings-plan-<UTC>.json`, or to
 `--out` (a new file: an existing one is refused before anything is read), and
-its sha256 is printed. It records the guards it was made with (`guards`), and
-carries a `digest` of **every other field**: `kind`, `version`, `createdAt`,
-`directory`, `ingestAppIds`, `guards` and `rows`. So a plan whose date, target
-list or guards were edited is refused as surely as one whose rows were.
+its sha256 is printed. It is version 2 and records the client domain its
+accounts were read under (`clientDomain`) and the guards it was made with
+(`guards`). It carries a `digest` of **every other field**: `kind`, `version`,
+`clientDomain`, `createdAt`, `directory`, `ingestAppIds`, `guards` and `rows`.
+So a plan whose domain, date, target list or guards were edited is refused as
+surely as one whose rows were.
 
 ### `apply`
 
 Before it writes anything, `apply` refuses a plan in any of these cases:
-- the plan's digest no longer matches: it was **edited** after `propose`, in its rows, its `createdAt`, its `directory` or its `guards`;
+- the plan is not **version 2**: a version-1 plan bound guests. Re-run `propose`;
+- `clientDomain` is missing or not a lower-case host name, or `--client-domain` is given and differs from it;
+- a PATCH's `UserAadObjectIds` holds more than one id: a row binds one client account;
+- the plan's digest no longer matches: it was **edited** after `propose`, in its rows, its `clientDomain`, its `createdAt`, its `directory` or its `guards`;
 - the plan is **older** than `--max-plan-age-hours`. The default is 72, and 72 is also the most it accepts: no flag widens it. Changing `createdAt` breaks the digest: an old plan needs a new `propose`;
 - the forbidden list is not given (`FORBIDDEN_TARGET_SITE_PATHS` or `--forbidden-site-paths`), or a guard value is malformed;
 - `--only` asks for a **SKIP** row;
@@ -290,17 +335,17 @@ Before it writes anything, `apply` refuses a plan in any of these cases:
 
 For each PATCH row, `apply`:
 1. reads the row again;
-2. refuses it if any binding field or guard field (`ClientId`, `SiteHostname`, `SitePath`, `DriveName`, `Status`, `IsAdmin`) changed since `propose` (**stale**);
+2. refuses it if any binding field or guard field (`ClientId`, `NIP`, `SiteHostname`, `SitePath`, `DriveName`, `Status`, `IsAdmin`) changed since `propose` (**stale**). The NIP names the client account, so a NIP edited after `propose` makes the row stale;
 3. resolves the row's site again and refuses it as **`forbidden_target`** if the guards it was given forbid it (see [Guards](#directory-bindingsmjs)), or as **stale** if `SitePath` now resolves to another site than at `propose`;
-4. re-reads every guest the row will route after the PATCH: each must still be a `Guest`, and the Teams in its `memberOf` must be exactly the row's `TeamId`. A guest who has since joined another Team, left this one, become a Member or been deleted makes the row **stale**; nothing is written for it;
+4. re-reads the id the row will route after the PATCH: it must still be the row's client account (a `Member` whose UPN is `<the row's NIP now>@<the plan's domain>`), not an owner of the row's Team (`GET /groups/{team}/owners`), and the Teams in its `memberOf` must be exactly the row's `TeamId`. An account that has since become a Guest, been made an owner, been renamed, joined a second Team, left this one or been deleted makes the row **stale**; nothing is written for it. Whether it is enabled is never checked: a disabled account is bound all the same;
 5. logs the row as `writing`, with its before-state, and writes the log to disk;
 6. PATCHes `/sites/{s}/lists/{l}/items/{id}/fields` with only the planned fields;
 7. reads the row back and compares.
 
 Without `--apply`, `apply` does all the checks and reads, and writes nothing.
 With `--apply`, it writes `tools/out/directory-bindings-apply-<UTC>.json` (or
-`--out`, a file that must not exist yet), which holds the before-state and
-after-state of every row. The log is on disk before each PATCH is sent and
+`--out`, a file that must not exist yet), version 2, which holds the plan's
+`clientDomain` and the before-state and after-state of every row. The log is on disk before each PATCH is sent and
 again after it. Every rewrite goes to a temporary file that is fsynced and
 renamed over the log, so a crash leaves the previous version whole, never a
 truncated file. If a run is interrupted, the log still names every row it may
@@ -331,23 +376,30 @@ row the log records no write to is refused.
 
 **Rolling back is not safe by default.** It is safe when the apply only bound
 rows that were unbound: the restore unbinds them, and they route nobody. It is
-not when the apply took ids **off** a row (a guest now in a second Team, staff
-removed with `--confirm-remove-staff`, a canary guest): the restore would put
-them back, and a guest in two Teams would route the second company's
-documents into the first client's channel again. So rollback re-checks every
-id the restore would **add** to `UserAadObjectIds` (the restored list minus
-the ids on the row now), as `apply` re-checks the guests it binds, against the
-`TeamId` the row will have after the restore: each must still be a `Guest`,
-and the Teams in its `memberOf` must be exactly that `TeamId`. A Member (staff)
-never passes, and neither does any id when the restore leaves the row without
-a `TeamId`. If one fails, the row is refused as **`guest_recheck_failed`**
-(with `readdedUserIds` and `recheckReasons` in the rollback log), nothing is
-written to it, and the run exits 2. A row whose restore adds no id is
-restored as before.
+not when the apply took ids **off** a row (a guest, staff removed with
+`--confirm-remove-staff`, a client account now in a second Team): the restore
+would put them back. So when the restore **adds** any id to
+`UserAadObjectIds` (the restored list minus the ids on the row now), rollback
+re-checks the restored list as `apply` re-checks the account it binds, against
+the `TeamId` the row will have after the restore, the row's NIP now and the
+log's `clientDomain`: at most one id, the row's client account (a `Member`
+whose UPN is `<NIP>@<domain>`), not an owner of the Team, in that Team alone.
+A guest or a staff Member never passes, and neither does any id when the
+restore leaves the row without a `TeamId`. If one fails, the row is refused as
+**`client_account_recheck_failed`** (with `readdedUserIds` and
+`recheckReasons` in the rollback log), nothing is written to it, and the run
+exits 2. A row whose restore adds no id is restored as before.
+
+A restore may take the row's client account **off** (it undoes the apply that
+bound it). That is allowed, and rollback says so on the row and records it
+(`unbindsClientAccount`): the client's chat uploads then go to quarantine
+(`unmapped`) and its channel posts wait, until `propose` and `apply` bind it
+again. A rollback never puts a guest back: no build routes a guest better
+than a `{NIP}@` account.
 
 To undo an apply that took ids off a row, **prefer re-running `propose` and
-applying the whole plan** over a rollback: the new plan binds exactly the
-guests of each Team alone. Never put a refused id back by hand.
+applying the whole plan** over a rollback: the new plan binds exactly each
+row's client account. Never put a refused id back by hand.
 
 For each row, rollback also refuses:
 - a row someone has changed since the apply (`changed_since_apply`), rather than overwrite it;
@@ -358,15 +410,15 @@ A `writing` or `write_unknown` row is checked against the live row:
 - if the live row holds the planned values, it is restored (after the re-check above);
 - anything else is refused.
 
-Without `--apply` it is a dry run: it does every read and check, the guest
-re-check included, and writes nothing. With `--apply` it writes its own log
-(`--out` must not exist yet), also flushed before each PATCH, in the same
-crash-safe way.
+Without `--apply` it is a dry run: it does every read and check, the
+client-account re-check included, and writes nothing. With `--apply` it writes
+its own log (version 2, with `clientDomain`; `--out` must not exist yet), also
+flushed before each PATCH, in the same crash-safe way.
 
 Exit codes:
 - `0`: every selected row was restored or found `not_written`.
-- `1`: refused before any write (not an apply log, `--only` naming a row the log did not write, an `--out` file that exists).
-- `2`: some rows were refused (`guest_recheck_failed`, `changed_since_apply`, `no_before_state`), failed, read back differently, or ended `write_unknown`. See the log.
+- `1`: refused before any write (not an apply log, a log with no valid `clientDomain`, `--only` naming a row the log did not write, an `--out` file that exists).
+- `2`: some rows were refused (`client_account_recheck_failed`, `changed_since_apply`, `no_before_state`), failed, read back differently, or ended `write_unknown`. See the log.
 
 ### `--add-columns`
 
@@ -378,43 +430,47 @@ different internal name, because ingestion reads internal names.
 
 1. `--add-columns --apply`.
 2. `check`. Fix what only a person can fix: DriveName, a Public client team, the channel, a non-canonical SitePath. `team_not_bcr` on a legacy Team is expected and does not block.
-3. `propose`, and review the plan file, including `excludedGuests`. Confirm staff removals and verified grants by re-running `propose` with the flags.
+3. `propose`, and review the plan file, including `clientAccount` and `notBound`. Confirm staff removals and verified grants by re-running `propose` with the flags.
 4. `apply --plan …` as a dry run, then with `--apply`, in the same change window as the P0 ingestion deploy.
 5. One canary upload per bound client. Then run `check` again.
 6. After the window, downgrade the ingestion grant on BCR GROUP to `read`.
 
 ### After every onboarding, and weekly
 
-A guest's binding is checked when it is proposed and again when it is
-applied. Onboarding a second company whose contact person is already a
-guest reuses that guest and adds them to the new Team; their row stays
-bound to the first client until someone applies a new plan. Ingestion's
-upload-time check (below) now quarantines their uploads meanwhile, instead
-of filing the second company's documents into the first client's channel,
-but the Directory still says otherwise. So, as a standing rule:
+A client account's binding is checked when it is proposed and again when it
+is applied. Its membership can change after that: a `{NIP}@` account added to
+a second Team, made an owner, or renamed; a NIP edited on the row. Ingestion's
+upload-time checks (below) quarantine or hold its uploads meanwhile, but the
+Directory still says otherwise. So, as a standing rule:
 
 - **After any onboarding**, run `propose` and apply the **whole** plan, never
-  `--only <new row>`. The PATCH that matters may be on another row: the one
-  that takes the reused guest off the first client. Once applied, a guest in
-  two Teams is on no row, and the ingestion quarantines their uploads.
-- **Run `check` at least weekly**, and after any onboarding that reuses an
-  existing guest. Exit code 3 (`bound_guest_ineligible` or `staff_ids` on a
-  bound row) means an id routes where it should not: propose and apply the
-  whole plan the same day. Exit code 4 means a bound row could not be
-  assessed (`incomplete`): fix the read and run `check` again the same day,
-  because 0 is the only "all clear".
+  `--only <new row>`. That binds the new client's `{NIP}@` account, and the
+  PATCH that matters may be on another row (a guest or an account that no
+  longer qualifies, taken off). The `{NIP}@` account must exist first, a
+  Member in its own Team only (onboarding O1); until it does, the row reads
+  `client_account_missing` and routes nobody.
+- **Run `check` at least weekly.** Exit code 3 (`staff_ids`, `guest_ids` or
+  `client_account_ineligible` on a bound row) means an id on a row is not its
+  client account: propose and apply the whole plan the same day. Exit code 4
+  means a bound row could not be assessed (`incomplete`): fix the read and run
+  `check` again the same day, because 0 is the only "all clear". Exit code 5
+  means a client is locked out (its bound account is disabled): call Roman at
+  once.
 - **Do not undo an onboarding with `rollback`.** Re-run `propose` and apply
   the whole plan instead (see [rollback](#rollback)).
 
-Ingestion now also checks membership at upload time (R46): a bound uploader
-whose Teams are not exactly the row's `TeamId` is quarantined as
-`membership_mismatch`. It counts Teams by the same rule as this tool
-(`isTeamGroup`, minus the tenant Team listing; the `BCR Group —` marker is
-kept identical by a test in the ingestion package), so change both or
+Ingestion applies the same rule at upload time (the client-account rule,
+`build.clientIdentity: 'nip-member'` in `/api/health`): a guest is refused, a
+Member bound on a row who is not its `{NIP}@` account is quarantined as
+`not_client_account`, and a client account whose Teams are not exactly the
+row's `TeamId` is quarantined as `membership_mismatch` (R46; in the channel
+inbox its posts wait as `other_teams`). It counts Teams by the same rule as
+this tool (`isTeamGroup`, minus the tenant Team listing; the `BCR Group —`
+marker is kept identical by a test in the ingestion package), and it tests
+the same case table (`test/client-account-cases.json`), so change both or
 neither. The rules above stay as defence in depth: they keep the Directory
-true, and catch drift on rows whose guests have not uploaded since.
-Onboarding writing the guest's id to the new row waits on Roman's re-ruling
-of Q21.
+true, and catch drift on rows whose accounts have not uploaded since.
+Onboarding writes no user ids (Q21 stays open); this tool binds the account.
 
 ## `inventory-misfiled.mjs` (IR-1)
 
@@ -493,13 +549,14 @@ uploads are candidates, and two different people make it ambiguous.
 **Whose site it is.** "Routed by identity" (resolution `directory`) means the
 upload went to the row that held the uploader's id. Before Phase 0 the only id
 on any client row was staff, so it does not mean "uploaded by that client". An
-identity-routed upload is clean only if every candidate uploader is a guest of
-the site's own Team. The guest lists come from:
-- `--bindings-plan <plan.json>`: a `directory-bindings.mjs propose` plan, which records each row's `eligibleGuests`, the guests of that Team alone. A site that two plan rows share is not used. The plan shows membership when it was made, not at upload time;
-- `--site-guests <label>=<oid,oid,...>`: the guests of one walked site, by `--site` label or path. Repeat it per site. It adds to the plan's list.
+identity-routed upload is clean only if every candidate uploader may upload
+for the site's own client. Those ids come from:
+- `--bindings-plan <plan.json>`: a `directory-bindings.mjs propose` plan. A **version-2** plan (the client-account rule) records each row's `clientAccount`, its `{NIP}@` account in that Team alone: an upload by it is clean, one by staff or another client's account is suspect, and a row whose account was `null` makes every upload there suspect. A **version-1** plan (before the rule) records `eligibleGuests`, the guests of that Team alone, and is read as before, so an IR-1 run made with one is reproducible. A site that two plan rows share is not used. The plan shows the Team as it was when it was made, not at upload time;
+- `--site-accounts <label>=<oid,oid,...>` (its older name, `--site-guests`, still works): the ids of one walked site, by `--site` label or path. Repeat it per site. It adds to the plan's list.
 
 Without either, every identity-routed upload is suspect
-(`uploader_guest_unverified`).
+(`uploader_guest_unverified`). The two flag names keep the word "guest",
+because registers already in the evidence store carry them.
 
 IR-1 does not read sharing links or join the Purview export: IR-2 checks those
 per item, for the suspect rows.
@@ -513,8 +570,8 @@ Flags that make a row suspect:
 | `promoted_by_content` | Moved into a client by a NIP found in the document (R3) |
 | `admin_uploader` | The uploader matched an admin row |
 | `uploader_ambiguous` / `uploader_unknown` | The uploader cannot be told from the log |
-| `uploader_not_site_guest` | Routed by identity, and an uploader is not a guest of the site's own Team (staff, most often) |
-| `uploader_guest_unverified` | Routed by identity, and no guest list was given for that site |
+| `uploader_not_site_guest` | Routed by identity, and an uploader is not on the site's list: not its client account (version-2 plan), or not a guest of its Team alone (version-1 plan). Staff, most often |
+| `uploader_guest_unverified` | Routed by identity, and no list was given for that site |
 | `ir0_site_mismatch` | The log says a different site than the one the file is on |
 | `ir0_batch_missing` | An `uploaded` line with no `client resolved` line for it |
 | `ir0_filename_repeated_in_batch` | Two documents of one name in one batch (the legacy bot named every unnamed attachment `attachment.bin`), uploaded or not: a sibling that was classified, even promoted, and then failed counts too. Their `classified`/`refined` lines cannot be told apart, so none takes one |
@@ -708,12 +765,14 @@ Node 22's `--test` takes files or glob patterns, not a directory. `node --test t
 fails with "Cannot find module …/tools", so quote the glob.
 
 The tests use synthetic fixtures only:
-- `test/tenant-fixture.mjs`: a fake tenant behind a fake `fetch`;
+- `test/tenant-fixture.mjs`: a fake tenant behind a fake `fetch`, with `{NIP}@contoso.example` client accounts, guests kept on rows and Teams, and a look-alike guest invited with a client's address;
+- `test/client-account-cases.json`: the client-account rule's cases. `@bcr/shared`'s `clientAccount.test.ts` reads the same file, and both sides check their `CLIENT_ACCOUNT_DOMAIN` against its `domain`; change both or neither;
 - `test/ir0-fixture.mjs`: fake pino traces;
 - `test/site-path-cases.mjs`: the site-path edge cases of contract C1. The ingestion's tests hold the same table; change both together.
 
 They drive the CLIs end to end, and assert that read-only commands issue only
-GET requests and that the token never reaches the output.
+GET requests, that nothing is ever sent to `/users/*` but a GET, and that the
+token never reaches the output.
 
 `test/runbook-az-postgres.test.mjs` reads the docs instead: every Azure CLI command for the
 index's PostgreSQL server in them must be one the CLI has, with flags it accepts (the table there is copied from each command's `--help`; `firewall-rule` and

@@ -46,7 +46,7 @@ export interface ClientDirectoryReaderOptions {
  *  - `unbound_target`: the row lacks RootFolder, DriveId or TeamId, so the
  *    binding tool (`tools/directory-bindings.mjs apply`, which writes all three
  *    together) has not bound it. Such a row would file into the library root,
- *    or route a guest the tool never checked.
+ *    or route an account the tool never checked.
  */
 export type ExcludedRowReason = 'forbidden_target' | 'target_conflict' | 'unbound_target';
 

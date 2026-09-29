@@ -61,12 +61,19 @@ unzip -p artifacts/teams-app.zip manifest.json | jq -r '
     (.bots | map(.scopes | join(",")) | join(";")),
     ((.staticTabs // []) | length),
     (.id == .bots[0].botId) ] | join(" ")'
-# must print:  0.2.1 personal 0 true
+# must print:  0.2.2 personal 0 true
 ```
 
-That is: manifest version `0.2.1`, the bot installable in `personal` scope only
+That is: manifest version `0.2.2`, the bot installable in `personal` scope only
 (no `team`, no `groupchat`), no static tabs, and `id` equal to `botId`. After the
-upload, the admin centre must show version 0.2.1 for the app.
+upload, the admin centre must show version 0.2.2 for the app.
+
+0.2.2 changes only the descriptions (the owner's decision of 28 September 2026: a
+client is its `{NIP}@bcr-group.pl` account, and guests have no capability): they
+offer the chat and the „Dokumenty księgowe” channel, and say the assistant works
+on the account BCR created for the company (`NIP@bcr-group.pl`). Upload it after
+the bot build with the matching help card is deployed; until then the catalogue
+keeps 0.2.1 (uploaded on 26 September, H-10).
 
 ## What you need to add before publishing
 
@@ -80,4 +87,6 @@ upload, the admin centre must show version 0.2.1 for the app.
 1. In Teams, click *Apps* → *Manage your apps* → *Upload a custom app* →
    *Upload for me*. The app is personal-scope only.
 2. Pick the .zip you just built.
-3. Open a new chat with the bot and drop a file like `Invoice_03_2026.pdf`.
+3. Open a new chat with the bot and drop a file like `Invoice_03_2026.pdf`. Only
+   a client account (`{NIP}@` of a bound Directory row) gets it filed; any other
+   account is refused or quarantined by ingestion (`ARCHITECTURE.md` §4.2).

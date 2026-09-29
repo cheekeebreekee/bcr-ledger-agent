@@ -21,14 +21,20 @@ export interface ClientDirectoryEntry {
   readonly title: string;
   /** Short stable business key, e.g. `0002`. */
   readonly clientId: string;
-  /** Digits-only NIP. Empty string if none. */
+  /**
+   * Digits-only NIP. Empty string if none. Confirms the row's client account
+   * (its UPN is `{nip}@bcr-group.pl`, `clientAccountVerdict`); never used to
+   * find a row.
+   */
   readonly nip: string;
   /** Company-name variants (already parsed from the multi-line SharePoint field). */
   readonly companyNameAliases: readonly string[];
   /**
-   * AAD object ids of users who are allowed to file documents for this
-   * client via 1:1 DMs with the bot. Parsed from the multi-line
-   * `UserAadObjectIds` SharePoint column. One id per line.
+   * The client's `{NIP}@` Member account id: the one id that routes for the
+   * row; any other id never routes (a guest is refused, a Member who is not
+   * the row's `{NIP}@bcr-group.pl` account is quarantined as
+   * `not_client_account`). Written only by the binding tool. Parsed from the
+   * multi-line `UserAadObjectIds` SharePoint column. One id per line.
    */
   readonly userAadObjectIds: readonly string[];
   /** Where documents for this client are filed. */
@@ -53,9 +59,11 @@ export interface ClientDirectoryEntry {
 
 /**
  * Why an upload was sent to the staff-only quarantine instead of a client's
- * space. Every case where the uploader cannot be tied to exactly one client
- * ends here — never in BCR GROUP, never in "the client whose NIP is in the
- * document".
+ * space. Quarantine is for Members only: a guest, a non-Member, a deleted
+ * user or an unreadable account is refused ({@link RefusalReason}) and
+ * nothing is stored for it. Every case where a Member cannot be tied to
+ * exactly one client ends here — never in BCR GROUP, never in "the client
+ * whose NIP is in the document".
  *
  *  - `unmapped`: the uploader's AAD id is on no active Directory row.
  *  - `staff`: the uploader is BCR staff (an `IsAdmin` row). Staff pick the
@@ -74,11 +82,15 @@ export interface ClientDirectoryEntry {
  *  - `unbound_target`: the uploader's one row lacks RootFolder, DriveId or
  *    TeamId — the binding tool, which writes all three together, has not
  *    bound it — so it routes nobody.
+ *  - `not_client_account`: a Member bound on the row who is not its client
+ *    account: their `userPrincipalName` is not `{row NIP}@bcr-group.pl`
+ *    (staff bound by mistake, another client's account), or the row has no
+ *    valid 10-digit NIP. Checked before the Teams read.
  *  - `membership_mismatch`: the uploader's Teams, read from Entra at upload
  *    time, are not exactly the row's `TeamId`: they are not in that Team, or
- *    they are also in another one. A guest added to a second client's Team
- *    after being bound would otherwise file that client's documents into the
- *    first client's space.
+ *    they are also in another one. A client account added to a second
+ *    client's Team after being bound would otherwise file that client's
+ *    documents into the first client's space.
  *  - `membership_unverified`: the uploader's Teams could not be read (no
  *    grant, not yet in the token, the user gone, Graph down after retries),
  *    so the row's Team cannot be shown to be their only one.
@@ -92,9 +104,30 @@ export type QuarantineReason =
   | 'target_unwritable'
   | 'unbound_target'
   | 'membership_mismatch'
-  | 'membership_unverified';
+  | 'membership_unverified'
+  | 'not_client_account';
 
-/** The uploader is bound to exactly one active client row. */
+/**
+ * Why nothing was done for a request: not a client account. Nothing is
+ * stored, classified, indexed or searched for these, and they are never a
+ * quarantine reason.
+ *
+ *  - `no_identity`: no user id, or not a GUID (validation already refuses it).
+ *  - `identity_unverified`: the account could not be read from Entra (the bot
+ *    path answers `RetryLater`, search `unavailable`).
+ *  - `unknown_user`: Entra has no such user (deleted).
+ *  - `guest`: an Entra Guest — bound on a row or not, of any Team. Guests have
+ *    no capability in the ledger.
+ *  - `not_member`: a `userType` that is neither Member nor Guest (or none).
+ */
+export type RefusalReason =
+  | 'no_identity'
+  | 'identity_unverified'
+  | 'unknown_user'
+  | 'guest'
+  | 'not_member';
+
+/** The uploader is the client account of exactly one active client row. */
 export interface DirectoryClientResolution {
   readonly source: 'directory';
   /** Short business key, e.g. `0002`. Not unique in the live list — log `listItemId` too. */
@@ -123,9 +156,16 @@ export interface QuarantineResolution {
   readonly target: SharePointTarget;
 }
 
+/** The request comes from no client account: refused, with nothing stored and no target. */
+export interface RefusedResolution {
+  readonly source: 'refused';
+  readonly reason: RefusalReason;
+}
+
 /**
  * The outcome of resolving an ingestion request. The client comes from the
  * authenticated uploader identity only — document content can never select or
- * change it.
+ * change it. A request that is not from a Member is refused before the
+ * Directory is consulted.
  */
-export type ResolvedClient = DirectoryClientResolution | QuarantineResolution;
+export type ResolvedClient = DirectoryClientResolution | QuarantineResolution | RefusedResolution;

@@ -1,28 +1,40 @@
 /**
  * A synthetic tenant for driving `directory-bindings.mjs` end to end.
  *
+ * The client-account domain here is `contoso.example` (the tests pass
+ * `--client-domain contoso.example`): a client's account is the Member
+ * `<its row's NIP>@contoso.example`.
+ *
  * Rows of the Client Directory:
- *   1  client A  — clean: private team, standard channel, one eligible guest,
- *                  ingestion write grant readable → PATCH
- *   2  client B  — a staff (Member) id on the row, site permissions
- *                  unreadable → SKIP until confirmed and verified. Its Team
+ *   1  client A  — clean: private team, standard channel, its client account
+ *                  0000000001@ a member of Team A alone, ingestion write
+ *                  grant readable → PATCH binding client A's account
+ *   2  client B  — a staff (Member) id and a guest id on the row, site
+ *                  permissions unreadable → SKIP until confirmed and
+ *                  verified; then the PATCH binds 0000000002@ and takes the
+ *                  staff id (confirmed) and the guest (no flag) off. Its Team
  *                  predates onboarding: no "BCR Group —" description, which
  *                  is a warning only
  *   3  admin row — IsAdmin → SKIP
- *   4  client C  — Public team → SKIP
+ *   4  client C  — Public team (with its account 0000000003@) → SKIP
  *   5  inactive  — not examined
  *
  * The Client Directory list lives on BCR GROUP's site (`/sites/BCRGROUP`,
  * the staff Team's root site), as it does in the tenant. `/sites/QUARANTINE`
  * is a site with no Team.
  *
- * Guests A and B are also in a security group that is not a Team; it must
- * not count against them. The "multi" guest is in Teams A and C, so it is
- * bound to neither. `memberOf` reports whether a group is a Team only when
- * `resourceProvisioningOptions` is selected, as Graph does.
+ * The guests stay on their rows and Teams: guest A (Team A alone), guest B
+ * (on row 2), the "multi" guest (Teams A and C), and a "look-alike" guest in
+ * Team A invited with client A's address, whose UPN is
+ * `0000000001_contoso.example#EXT#@contoso.onmicrosoft.com`. None is ever
+ * bound. `onboarding@contoso.example` is a staff Member of Team A. Guests A
+ * and B and client A's account are also in a security group that is not a
+ * Team; it must not count against them. `memberOf` reports whether a group is
+ * a Team only when `resourceProvisioningOptions` is selected, as Graph does.
+ * `GET /users/{id}` answers by object id or by UPN (case-insensitive).
  *
  * All identifiers are fake: `00000000-0000-4000-8000-…` GUIDs, NIPs
- * `000000000x`, `contoso.sharepoint.com`.
+ * `000000000x`, `contoso.sharepoint.com`, `contoso.example`.
  */
 
 import { fakeFetch, jsonResponse, notFound } from './fake-graph.mjs';
@@ -44,8 +56,13 @@ export const IDS = Object.freeze({
   guestA: g('b001'),
   guestB: g('b002'),
   guestMulti: g('b003'),
+  guestLookalike: g('b004'),
   staff: g('c001'),
   ownerA: g('c002'),
+  onboarding: g('c003'),
+  clientA: g('c0a1'),
+  clientB: g('c0a2'),
+  clientC: g('c0a3'),
   siteA: `${HOST},${g('5a1')},${g('5a2')}`,
   siteB: `${HOST},${g('5b1')},${g('5b2')}`,
   siteC: `${HOST},${g('5c1')},${g('5c2')}`,
@@ -61,6 +78,9 @@ export const IDS = Object.freeze({
 });
 
 const CHANNEL = 'Dokumenty księgowe';
+
+/** The client-account domain of this tenant. */
+export const CLIENT_DOMAIN = 'contoso.example';
 
 function initialItems() {
   const base = { Status: 'Active', SiteHostname: HOST, DriveName: 'Dokumenty', RootFolder: '' };
@@ -92,12 +112,24 @@ export function createTenant() {
     ],
   };
 
+  const account = (id, nip) => [
+    id,
+    { id, userType: 'Member', userPrincipalName: `${nip}@${CLIENT_DOMAIN}`, accountEnabled: true },
+  ];
   const users = new Map([
     [IDS.guestA, { id: IDS.guestA, userType: 'Guest', userPrincipalName: 'guest.a_example.com#EXT#@contoso.onmicrosoft.com' }],
     [IDS.guestB, { id: IDS.guestB, userType: 'Guest', userPrincipalName: 'guest.b_example.com#EXT#@contoso.onmicrosoft.com' }],
     [IDS.guestMulti, { id: IDS.guestMulti, userType: 'Guest', userPrincipalName: 'guest.m_example.com#EXT#@contoso.onmicrosoft.com' }],
+    [
+      IDS.guestLookalike,
+      { id: IDS.guestLookalike, userType: 'Guest', userPrincipalName: '0000000001_contoso.example#EXT#@contoso.onmicrosoft.com' },
+    ],
     [IDS.staff, { id: IDS.staff, userType: 'Member', userPrincipalName: 'staff@contoso.example' }],
     [IDS.ownerA, { id: IDS.ownerA, userType: 'Member', userPrincipalName: 'owner@contoso.example' }],
+    [IDS.onboarding, { id: IDS.onboarding, userType: 'Member', userPrincipalName: 'onboarding@contoso.example' }],
+    account(IDS.clientA, '0000000001'),
+    account(IDS.clientB, '0000000002'),
+    account(IDS.clientC, '0000000003'),
   ]);
   const teams = [
     { id: IDS.teamA, displayName: '0001 Client A', description: 'BCR Group — 0001', visibility: 'Private' },
@@ -125,11 +157,11 @@ export function createTenant() {
   const byDrive = new Map([...sites].map(([path, s]) => [s.drive, { ...s, path }]));
 
   const members = new Map([
-    [IDS.teamA, [IDS.guestA, IDS.guestMulti, IDS.staff, IDS.ownerA]],
-    [IDS.teamB, [IDS.guestB, IDS.staff]],
-    [IDS.teamC, [IDS.guestMulti]],
+    [IDS.teamA, [IDS.clientA, IDS.guestA, IDS.guestMulti, IDS.guestLookalike, IDS.staff, IDS.onboarding, IDS.ownerA]],
+    [IDS.teamB, [IDS.clientB, IDS.guestB, IDS.staff]],
+    [IDS.teamC, [IDS.clientC, IDS.guestMulti]],
     [IDS.teamStaff, [IDS.staff, IDS.ownerA]],
-    [IDS.groupNotTeam, [IDS.guestA, IDS.guestB]],
+    [IDS.groupNotTeam, [IDS.guestA, IDS.guestB, IDS.clientA]],
   ]);
   const owners = new Map([
     [IDS.teamA, [IDS.ownerA]],
@@ -144,10 +176,16 @@ export function createTenant() {
   ]);
 
   // Live views for a test that changes the tenant between two commands.
-  Object.assign(state, { users, members, sites });
+  Object.assign(state, { users, members, owners, sites });
 
   const listBase = `/sites/${IDS.dirSite}/lists/${IDS.list}`;
   const userOut = (id) => ({ '@odata.type': '#microsoft.graph.user', ...users.get(id), displayName: id.slice(-4) });
+  /** By object id, or by UPN as Graph resolves `/users/{upn}` (case-insensitive). */
+  const userIdOf = (key) => {
+    if (users.has(key)) return key;
+    const upn = String(key).toLowerCase();
+    return [...users.values()].find((u) => String(u.userPrincipalName).toLowerCase() === upn)?.id;
+  };
 
   const handler = ({ method, path, query, body }) => {
     let m;
@@ -198,7 +236,8 @@ export function createTenant() {
       });
     }
     if ((m = path.match(/^\/users\/([^/]+)$/))) {
-      return users.has(m[1]) ? jsonResponse(200, userOut(m[1])) : notFound('user');
+      const id = userIdOf(m[1]);
+      return id ? jsonResponse(200, userOut(id)) : notFound('user');
     }
     if ((m = path.match(/^\/sites\/([^/:]+):(\/sites\/[^/]+)$/))) {
       const s = sites.get(m[2]);

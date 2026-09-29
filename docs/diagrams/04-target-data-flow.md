@@ -3,6 +3,10 @@
 **Status: TARGET.** The reconciled v2 design, copied verbatim from the approved plan. None of it
 is built yet.
 
+**Amended 29 September 2026.** The client node said "client guest". Since the owner's decision
+of 28 September a client's identity is its `{NIP}@bcr-group.pl` account, an Entra Member created
+by BCR; guests have no capability in the ledger. The rest is the plan as approved.
+
 Each subgraph is a trust boundary. Each edge label says what crosses it:
 
 | Letter | Meaning |
@@ -20,7 +24,7 @@ flowchart LR
   classDef external fill:#fef3c7,stroke:#d97706,color:#5a3608
   classDef gate fill:#fee2e2,stroke:#dc2626,color:#6b1414
   subgraph TB1["Client device, untrusted input"]
-    CG["Client guest"]:::client
+    CG["Client account"]:::client
   end
   subgraph TB2["Microsoft 365 tenant BCR"]
     BSV["Bot Service"]:::system

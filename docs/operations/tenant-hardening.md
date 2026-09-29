@@ -15,17 +15,27 @@ of a comment: a pasted comment becomes a command, or an apostrophe in it opens a
 swallows the lines after it. For the same reason every comment in the blocks below sits on its
 own line.
 
-⚠️ **Three rules for every step on this page.**
+⚠️ **Four rules for every step on this page.**
 
+- **No step changes whether an account may sign in.** A client's `{NIP}@bcr-group.pl` account
+  is the client's own Teams sign-in: an Entra Member, licensed, created by BCR at onboarding and
+  handed to the client (owner's decision, 28 September 2026). Never block, disable, unlicense or
+  convert one, and never take one out of its client Team. T-1 blocked their sign-in on
+  26 September on the wrong premise that they were shared mailboxes nobody signs in with, and
+  locked three clients out of Teams until Roman re-enabled them on 28 September at 17:33Z
+  ([incident → Client lockout](incident-2026-09.md#client-lockout-2628-september-t-1-reversed)).
+  So [T-1](#t-1-withdrawn-never-block-sign-in-on-the-nip-client-accounts) and
+  [T-2](#t-2-withdrawn-never-convert-or-unlicense-the-nip-client-accounts) are withdrawn, and
+  [T-7](#t-7-authoriseme-a-read-only-record) is a read-only record: `AuthoriseMe@` is not changed
+  in any way. `BCROnboarding@` stays enabled ([the note after T-7](#bcronboarding-stays-enabled)).
 - **BCR GROUP stays Private, and its visibility, membership and channels never change.**
   [T-3](#t-3-confirm-bcr-group-is-private-read-only) only reads them.
   [T-4](#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root) and
   [T-5](#t-5-lock-and-version-the-client-directory-list) change permissions on two things *inside*
   its site: the ledger's own folders, and the routing list. T-4 may also create one of the
   ledger's own folders, `98_Nieposortowane`, empty, so that it is locked before anything is filed
-  in it. [T-7](#t-7-explain-authoriseme-or-block-its-sign-in) at most blocks the sign-in of
-  `AuthoriseMe@`, which leaves the team's membership as it is. Nothing else on this page, T-4b
-  included, touches BCR GROUP.
+  in it. [T-7](#t-7-authoriseme-a-read-only-record) only reads `AuthoriseMe@`, one of the team's
+  members. Nothing else on this page, T-4b included, touches BCR GROUP.
 - **Nothing here deletes or moves a client document.** Documents stay where IR-1 finds them, and
   IR-2 moves them later, with two people signing off.
 - **Save every "before" output.** The rollback needs it. Save it in the IR evidence store with the
@@ -65,82 +75,77 @@ a tool means a missing permission on the registration, or a right the signed-in 
 
 ---
 
-## T-1: Block sign-in on the {NIP}@ client addresses
+## T-1: Withdrawn. Never block sign-in on the {NIP}@ client accounts
 
 | Runs it | Decides | Closes |
 |---|---|---|
-| User Administrator or Global Admin | Agreed with Roman, 25 Sep | Window W3 in the incident |
+| Nobody: **withdrawn on 28 September 2026, never to be run** | The owner's decision of 28 Sep | Nothing. W3 is redefined (incident) |
 
-**Why.** A client address `{NIP}@bcr-group.pl` is meant to be a shared mailbox that nobody signs
-in as. On 23 September all three were enabled, licensed members. An enabled member is an
-internal account: it can join any Public team, it reaches Viva Engage Communities, and it can
-read the address list. Blocking sign-in is enough to stop all of that, and it is safe: the
-mailbox keeps receiving mail, and the onboarding app still reads it with its own application
-permission.
+⛔ **Withdrawn.** T-1 blocked sign-in on the three `{NIP}@bcr-group.pl` accounts (0002 PESKOVOI,
+0003, 0004) on 26 September at 12:18:09Z (Entra audit log), as agreed with Roman on
+25 September. Its premise was wrong: those accounts are not mailboxes nobody signs in with, they
+are the clients' own Teams sign-ins. The three clients could not sign in to Teams until Roman
+re-enabled the accounts on 28 September at 17:33Z. The record, with the times, is in
+[incident → Client lockout](incident-2026-09.md#client-lockout-2628-september-t-1-reversed).
 
-The onboarding repo's tool finds the addresses and blocks them. It does nothing else.
+**The premise it rested on, for the record** (from the onboarding repo's
+`tools/audit-client-access.mjs` and `docs/operations/client-access.md`, both of 23 September):
+that a client address `{NIP}@bcr-group.pl` is meant to be a shared mailbox nobody signs in as;
+that an enabled, licensed Member is an internal account that can join any Public team, reach Viva
+Engage Communities and read the address list; and that blocking sign-in would stop that and keep
+the mail flowing. The owner's decision of 28 September settles it the other way: the `{NIP}@`
+account is the client identity, for the channel, the bot's chat and search. What it can reach as
+a Member is bounded by Private client Teams, one Team per account, T-3, T-6, T-8 and T-9, and
+accepted as a risk in [`docs/security.md`](../security.md) (T22), never by blocking sign-in.
+
+**What stays: the audit, read-only.** The onboarding repo's `tools/audit-client-access.mjs`
+checks every `{ten digits}@bcr-group.pl` account: a `Member`, sign-in **enabled**, at least one
+licence, in exactly one group, which is its client Team. A disabled one is the most severe
+finding, *LOCKED OUT*, exit code 5. Its read-only version has no `--apply` and refuses it like
+any unknown flag. That version is in the onboarding working tree and is not merged yet (29
+September): until it is, never run the tool with `--apply` from any checkout.
 
 ```bash
 cd ../bcr-onboarding-agent
-
-# Before: read-only. Lists every {NIP}@ account, its sign-in state, licences and groups.
+# Read-only. Exit 5 means a client is locked out: tell Roman at once.
 GRAPH_TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv) \
-  node tools/audit-client-access.mjs > t1-before.txt
-
-# Apply: blocks sign-in on the accounts it marked RESTRICT, and nothing else.
-# Needs User.ReadWrite.All on the sign-in app, see human-steps H-4a. A 403 means it is missing.
-GRAPH_TOKEN=$(node tools/graph-login.mjs) node tools/audit-client-access.mjs --apply
+  node tools/audit-client-access.mjs
 ```
 
-**Verify.** Run the read-only command again. No account is marked `RESTRICT` for sign-in. For
-one account:
+For one account, read-only:
 
 ```bash
-# Must read "accountEnabled": false
-az rest --url "$G/users/<nip>@bcr-group.pl?\$select=accountEnabled"
+# Must read Member, true, and at least one licence.
+az rest --url "$G/users/<nip>@bcr-group.pl?\$select=userType,accountEnabled,assignedLicenses"
 ```
 
-**Rollback.** `g -X PATCH "$G/users/<nip>@bcr-group.pl" -d '{"accountEnabled":true}'`. You should
-not need it: a blocked shared mailbox still receives mail.
+**If an account reads disabled,** that client is locked out. Tell Roman at once: re-enabling it
+in the Entra admin centre is his, as Global Admin. Nothing in the ledger unbinds a row for it;
+`directory-bindings.mjs check` reports it on a bound row as `client_account_disabled` and exits 5.
 
-**Afterwards, optional.** Take each address out of its client Team:
-`g -X DELETE "$G/groups/<team-id>/members/<user-id>/\$ref"`. A mailbox has no reason to be a
-member of anything. Once sign-in is blocked this is tidying, not a fix. Undo it with
-`g -X POST "$G/groups/<team-id>/members/\$ref" -d '{"@odata.id":"https://graph.microsoft.com/v1.0/directoryObjects/<user-id>"}'`.
+**The optional follow-up T-1 once offered** (taking each address out of its client Team) must
+never run either: the account is the client's way into its Team.
 
-## T-2: Convert the mailboxes to shared, then remove the licences
+## T-2: Withdrawn. Never convert or unlicense the {NIP}@ client accounts
 
 | Runs it | Decides | Closes |
 |---|---|---|
-| Exchange Administrator (convert), then License or User Administrator (unlicense) | Agreed with Roman | W3, and gives back three paid seats |
+| Nobody: **withdrawn on 28 September 2026, never to be run** | The owner's decision of 28 Sep | Nothing |
 
-⚠️ **The order matters.** If you remove the licence from an account whose mailbox is still a
-*user* mailbox, Microsoft starts a 30-day clock that deletes the mailbox, and the client's
-documents in it. Convert first, confirm the conversion, and only then remove the licence.
+⛔ **Withdrawn, and never run.** T-2 would have converted the three `{NIP}@` mailboxes to shared
+mailboxes and then removed their licences. Yahor deferred it on 26 September; the owner's
+decision of 28 September withdraws it. A shared mailbox has no sign-in of its own, and an
+account without a licence has no Teams: either one ends the client's access to its Team, the
+bot and search, as T-1 did.
 
-```powershell
-Connect-ExchangeOnline
-Get-Mailbox -Identity <nip>@bcr-group.pl | Format-List RecipientTypeDetails   # before: UserMailbox
-Set-Mailbox -Identity <nip>@bcr-group.pl -Type Shared
-Get-Mailbox -Identity <nip>@bcr-group.pl | Format-List RecipientTypeDetails   # must read SharedMailbox
-```
-
-Only when all three read `SharedMailbox`, remove the licence. In the Microsoft 365 admin
-centre: **Users → Active users → the account → Licenses and apps**, untick, then **Save**. With
-Graph:
-
-```bash
-# Note the skuId.
-az rest --url "$G/users/<nip>@bcr-group.pl/licenseDetails?\$select=skuId,skuPartNumber"
-g -X POST "$G/users/<nip>@bcr-group.pl/assignLicense" -d '{"addLicenses":[],"removeLicenses":["<skuId>"]}'
-```
-
-**Verify.** `az rest --url "$G/users/<nip>@bcr-group.pl?\$select=accountEnabled,assignedLicenses"`
-returns `false` and `[]`. Send a test mail from a staff account to each address and check that
-it arrives. A shared mailbox holds up to 50 GB without a licence.
-
-**Rollback.** Assign the licence again, then `Set-Mailbox -Identity … -Type Regular`. Only do
-this if an address was converted by mistake.
+The onboarding repo carried the same conversion in its runbook
+`infrastructure/automation/New-ClientMailbox.ps1` (`Set-Mailbox -Type Shared` on a mailbox that
+already exists; in the repo only, the published runbook of 18 August never had it). The
+onboarding change that removes it is in that repo's working tree and not merged yet
+(29 September). Until it is, nobody runs the onboarding repo's `infrastructure/deploy.sh` from any
+checkout: it publishes the runbooks from the working tree, and the next step 13 that found a
+client's `{NIP}@` account already there (Roman creates it by hand before step 13) would convert
+it to a shared mailbox.
 
 ## T-3: Confirm BCR GROUP is Private (read-only)
 
@@ -294,7 +299,7 @@ again, so only do it if the lock broke something essential, and record why.
 **Out of scope for Phase 0: new members or channels in BCR GROUP.** Adding accountants to BCR
 GROUP, and creating the planned "Weryfikacja dokumentów" channel, would change its membership
 and its channels, which no Phase-0 step does. Both are later decisions, and even then not before
-this step and [T-7](#t-7-explain-authoriseme-or-block-its-sign-in) are done.
+this step and [T-7](#t-7-authoriseme-a-read-only-record) are done.
 
 ## T-4b: Lock the ledger folders at the library root of the client sites
 
@@ -304,7 +309,8 @@ this step and [T-7](#t-7-explain-authoriseme-or-block-its-sign-in) are done.
 
 **Why.** Content promotion (W4) filed documents in the ledger's taxonomy folders at the **library
 root** of the receiving client's site, because `RootFolder` was empty (R5). So did every upload
-made under Yahor's id, which sat on PESKOVOI's row (R4). The client's guest is a member of the
+made under Yahor's id, which sat on PESKOVOI's row (R4). The client's members — its
+`{NIP}@bcr-group.pl` account and the contact onboarding invited as a guest — are members of the
 client's Team, so they have Edit on the whole default library, root included: they can open,
 change, move or delete another client's document there, through "Open in SharePoint", the
 breadcrumb or search. T-4 covers only BCR GROUP, and IR-2 moves items one by one, possibly over
@@ -353,8 +359,10 @@ g "$G/groups/<client-team-id>/owners?\$select=userPrincipalName,userType" \
 
 Save the lists, and mark which root folders are taxonomy folders and which are channel folders.
 The taxonomy folders are IR-1's `--expect-root-folders` for this site. The Team's owners become
-the site's Owners group, which keeps access: every owner must read `Member`. **If a guest is an
-owner, stop and tell Roman**; locking would leave that guest with access.
+the site's Owners group, which keeps access: every owner must be BCR staff. **If a guest or a
+client's `{NIP}@` account is an owner, stop and tell Roman**; locking would leave that account
+with access. (A `{NIP}@` account also reads `Member`, so `userType` alone does not tell it from
+staff: its UPN is ten digits at `bcr-group.pl`.)
 
 **Change.** Exactly as in T-4: in the browser (the path to use), or scripted only if
 `AllSites.FullControl` is consented (H-4a leaves it out). Either way, set T-4's helpers again for
@@ -372,12 +380,14 @@ folder.
 
 **Verify,** for each locked folder: `HasUniqueRoleAssignments` is `true` and only the site's
 Owners group is listed (the T-4 commands). In the browser, **Manage access → Check permissions**
-for the client's guest returns *None*. As in T-4, IR-1 must still see the locked folders: it
+for the client's `{NIP}@` account and for its guest returns *None*. As in T-4, IR-1 must still
+see the locked folders: it
 runs with an Owner's or site collection admin's token and with `--expect-root-folders` naming
 the folders locked here. Record each site and the time of the lock in the status table.
 
 **Then, once IR-1 has run for this site: the items outside the locked folders.** Before the lock
-the client's guest could move a promoted document out of a taxonomy folder (into
+the client's members (its `{NIP}@` account, its guest) could move a promoted document out of a
+taxonomy folder (into
 `Dokumenty księgowe`, say), or copy it. Such an item stays readable after the lock. From IR-1's
 register and the IR-0 Purview export (`purview-file-operations.csv`, or the manual fallback's
 `ir0-purview-<site>.csv`), list:
@@ -418,7 +428,7 @@ only once this check is done for the site and leaves nothing unlocked.
 
 **Rollback.** As in T-4: **Delete unique permissions** in the browser, or scripted (needs
 `AllSites.FullControl`) `sp -X POST "$(item <folder>)/resetroleinheritance()"`. This gives the
-client's guest access to another client's documents again, so only with Roman's decision, and
+client's members access to another client's documents again, so only with Roman's decision, and
 recorded.
 
 ## T-5: Lock and version the Client Directory list
@@ -473,10 +483,13 @@ permissions**; scripted (needs `AllSites.FullControl`), `sp -X POST "$L/resetrol
 Leave versioning on; it costs nothing.
 
 ⚠️ **The row edits themselves do not happen here.** Taking Yahor's id off PESKOVOI's row, adding
-guest ids and setting `RootFolder` all happen with `tools/directory-bindings.mjs`, in the same
-change window as the Phase-0 ingestion deploy. The reason is that under the code running today,
-an id on an `IsAdmin` row sends that person's uploads to the fallback and then to content
-promotion. Editing rows before the new code is live would make things worse.
+the client's user id and setting `RootFolder` all happen with `tools/directory-bindings.mjs`, in
+the same change window as the Phase-0 ingestion deploy. The reason is that under the code
+running today, an id on an `IsAdmin` row sends that person's uploads to the fallback and then to
+content promotion. Editing rows before the new code is live would make things worse. (The user
+id was the client's guest until 28 September. Since the owner's decision it is the row's
+`{NIP}@` account, and the tool removes guest ids:
+[`human-steps.md` → Client identity release](human-steps.md#client-identity-release).)
 
 ## T-6: The Bricore team
 
@@ -504,17 +517,25 @@ needed. The ledger never wrote there, because it has no grant on that site. Then
 **Rollback.** Private: PATCH back to `Public`, which reopens the window. Deleted:
 `g -X POST "$G/directory/deletedItems/<bricore-id>/restore"` within 30 days.
 
-## T-7: Explain AuthoriseMe@, or block its sign-in
+## T-7: AuthoriseMe@, a read-only record
 
 | Runs it | Decides | Closes |
 |---|---|---|
-| User Administrator or Global Admin | **Roman** explains what the account is for | Part of W1's audience |
+| Anyone with directory read | Nothing: **`AuthoriseMe@` is not changed in any way** (owner's decision, 28 Sep 2026) | Nothing; it records part of W1's audience |
 
 **Why.** `AuthoriseMe@bcr-group.pl` is the third member of BCR GROUP, beside Roman and Yahor,
 and nobody has written down what it is for. It could read the fallback bucket (W1), so the
-incident has to account for it.
+incident has to account for it. Accounting for it is a read; the account itself is left alone.
 
-**Read.**
+**What happened, for the record.** T-7 as first written offered to block its sign-in if nobody
+explained it. On 26 September at 14:05:08Z (Entra audit log) its sign-in was blocked; Roman
+re-enabled it on 28 September between 17:33:38Z and 17:34:32Z, with the three `{NIP}@` accounts
+([incident → Client lockout](incident-2026-09.md#client-lockout-2628-september-t-1-reversed)).
+The owner's decision of 28 September withdraws the block: no block, no unblock, no change to its
+membership or licences. The commands that did it are gone from this page.
+
+**Read.** Its current state is read, not assumed, and recorded in the status table below (the
+state only: enabled or not, licensed or not, its groups; no reason is invented for it):
 
 ```bash
 az rest --url "$G/users/AuthoriseMe@bcr-group.pl?\$select=id,displayName,userType,accountEnabled,createdDateTime,assignedLicenses"
@@ -522,25 +543,21 @@ az rest --url "$G/users/AuthoriseMe@bcr-group.pl/memberOf?\$select=displayName"
 ```
 
 In the IR-0 Purview export, filter on this user: its file operations and its sign-in events.
-Any file access by it in the fallback bucket is evidence for IR-3.
+Any file access by it in the fallback bucket is evidence for IR-3. What the account is for is
+Roman's to say; record his answer in the incident's status table when he gives it, and check
+then that it is in no client Team (a read). Any change to the account, or to who is in BCR
+GROUP, is a separate, explicit decision by Roman and the team's owner, made and recorded outside
+this runbook.
 
-**Decide.**
+**Verify.** Nothing to verify: nothing changes. **Rollback.** None.
 
-- **Explained and needed:** record the reason in the incident's status table. Check that it is
-  in no client Team.
-- **Not needed:** block its sign-in, and nothing more: **Block sign-in** on the account in the
-  Entra admin centre, or `g -X PATCH "$G/users/<id>" -d '{"accountEnabled":false}'`
-  (`User.ReadWrite.All`, H-4a). A blocked account can no longer read the fallback bucket, and
-  BCR GROUP's membership, visibility and channels stay exactly as they are.
+## BCROnboarding@: stays enabled
 
-**Blocking sign-in is the whole of the Phase-0 action.** Taking `AuthoriseMe@` out of BCR GROUP,
-or any other change to who is in the team, is not part of Phase 0. If it is wanted, it is a
-separate, explicit decision by Roman and the team's owner, made and recorded outside this
-runbook.
-
-**Verify.** Read the account again: `accountEnabled` is `false` if it was blocked, and `memberOf`
-still lists BCR GROUP. **Rollback.** Enable it again:
-`g -X PATCH "$G/users/<id>" -d '{"accountEnabled":true}'`.
+`BCROnboarding@bcr-group.pl` is the onboarding agent's shared mailbox. Roman reads it, so it
+stays enabled. It is outside the ledger: no ledger path reads it or files for it, and no step on
+this page touches it. Its sign-in had been disabled since before 22 September, not by this
+response; Roman enabled it on 28 September (17:33:38Z–17:34:32Z) together with the accounts T-1
+and T-7 had blocked. Recorded in the status table below.
 
 ## T-8: Entra external collaboration
 
@@ -555,7 +572,16 @@ still lists BCR GROUP. **Rollback.** Enable it again:
   else BCR serves. The most restrictive level limits a guest to their own directory objects.
 - **Who can invite guests.** With the default setting, any member, and even a guest, can invite
   a guest straight into a client team. That bypasses onboarding, so the new guest is bound to
-  nothing. In Phase 0 their uploads go to quarantine, but they can still read that team's files.
+  nothing. In Phase 0 their uploads go to quarantine (with the client-identity build: refused,
+  nothing stored), but they can still read that team's files.
+
+**It matters more now that clients are Members** (owner's decision, 28 September 2026). A
+client's `{NIP}@bcr-group.pl` account is an internal Member, and with the default setting any
+Member can invite outsiders. This step's invite restriction is what stops a client account
+inviting a guest into its own Team. The guest-access restriction does not bind Members: a client
+account can read the directory and people search (another client's `{NIP}@` UPN shows its NIP,
+a display name its company). That exposure is accepted in [`docs/security.md`](../security.md)
+(T22), bounded by Private client Teams and one Team per account, and never by blocking sign-in.
 
 **Read.**
 
@@ -581,12 +607,15 @@ g -X PATCH "$G/policies/authorizationPolicy" \
 
 The role id is Microsoft's fixed id for *Restricted Guest User*. It is the same in every tenant.
 
-**Verify.** The read returns `2af84b1e-…` and `adminsAndGuestInviters`. Then run two checks on
-TEST:
+**Verify.** The read returns `2af84b1e-…` and `adminsAndGuestInviters`. Then two checks:
 
-- onboarding step 13 can still invite a guest. It uses the app permission `User.Invite.All`,
-  which this setting should not affect. **[verify]**
-- the TEST guest can still open the team, its files and the bot DM.
+- onboarding step 13 can still invite a guest (it keeps inviting the client's contact, for Team
+  access only). It uses the app permission `User.Invite.All`, which this setting should not
+  affect. **[verify]**
+- the canary client account (`9000000000@bcr-group.pl`,
+  [`human-steps.md` → Client identity release](human-steps.md#client-identity-release)) can
+  still open BCR Kanarek, its files and the bot DM. Verify with it, not with a guest: guests
+  have no capability in the ledger. (Before 29 September this check used the TEST guest.)
 
 **Rollback.** PATCH back to the values from the read. The defaults are
 `10dae51f-b6af-4016-8d66-8c2a99b929b3` and `everyone`.
@@ -600,11 +629,19 @@ needs Entra ID P1 **[verify]**. That is Roman's decision 5 in the plan.
 |---|---|---|
 | SharePoint Administrator | **Roman** confirms the tenant level (see the note) | Files leaving a client's space through links |
 
-**Why.** Client guests have Edit rights in their own team. With the defaults, a guest or a staff
-member can create an *Anyone* link to a client file, or share it with a new outside person.
-Setting links to *Specific people* by default means a share names its recipients. *Existing
-guests* on client sites means nobody new can be added by sharing: people arrive only through
-onboarding. The quarantine site allows no sharing at all.
+**Why.** A client's members — its `{NIP}@` account and its guest — have Edit rights in their own
+team. With the defaults, any of them, or a staff member, can create an *Anyone* link to a client
+file, or share it with a new outside person. Setting links to *Specific people* by default means
+a share names its recipients. *Existing guests* on client sites means nobody new can be added by
+sharing: people arrive only through onboarding. The quarantine site allows no sharing at all.
+
+**It matters more now that clients are Members** (owner's decision, 28 September 2026). A
+`{NIP}@` account is internal, so it opens any *People in your organization* link: such a link on
+one client's file is readable by every other client's account. The default link type *Specific
+people* (`Direct`, below) keeps new shares from being company-wide. Disabling company-wide links
+on the client sites altogether is recommended, and is Roman's decision (**[verify]** the
+setting's name before scripting it). It is never done by blocking a client's sign-in
+([`docs/security.md`](../security.md) T22).
 
 **Read.**
 
@@ -629,9 +666,11 @@ guests* means staff can no longer share a OneDrive file with an outside person w
 guest. If Roman does not want that, set the tenant to `ExternalUserSharingOnly` (new and
 existing guests, still no Anyone links) and keep the client sites at *Existing guests*.
 
-**Verify.** Read again. Then check on TEST that a guest added through onboarding can open the
-team's files. Guests reach those files through team membership, not through sharing, so this
-should still work. **[verify]** Lowering the capability also disables existing Anyone links.
+**Verify.** Read again. Then check that the canary client account can open BCR Kanarek's files
+(before 29 September this check used a guest on TEST), and that a contact invited as a guest
+through onboarding can still open its Team's files. Both reach those files through team
+membership, not through sharing, so this should still work. **[verify]** Lowering the capability
+also disables existing Anyone links.
 
 **Rollback.** Set each value back to what the read returned.
 
@@ -641,15 +680,19 @@ should still work. **[verify]** Lowering the capability also disables existing A
 |---|---|---|
 | Teams Administrator | *Everyone* in Phase 0; a restricted group only later, with the sub-steps below | Who can install the bot at all |
 
-**Why.** Client guests need the app in BCR's org catalog, and the app has to be allowed for them.
-Nobody else needs it. The real control is the bot's own gate, which refuses anything that is not
-a 1:1 chat from the BCR tenant with a valid user id. Availability narrows who can install the app
-in the first place.
+**Why.** Clients need the app in BCR's org catalog, and the app has to be allowed for their
+`{NIP}@bcr-group.pl` accounts (until 28 September this page said "client guests": guests have no
+capability in the ledger now). Nobody else needs it. The real controls are the bot's own gate,
+which refuses anything that is not a 1:1 chat from the BCR tenant with a valid user id, and
+ingestion, which files and searches for nobody but a Directory row's client account. Availability
+narrows who can install the app in the first place.
 
-**When.** Right after the Phase-0 bot deploy, and after [T-1](#t-1-block-sign-in-on-the-nip-client-addresses),
-with manifest 0.2.0 (see
-[`human-steps.md`](human-steps.md#h-10-upload-manifest-020-and-set-availability)). Step 2's case
-for *Everyone* relies on T-1 being done.
+**When.** Right after the Phase-0 bot deploy, with manifest 0.2.0 (see
+[`human-steps.md`](human-steps.md#h-10-upload-manifest-020-and-set-availability)); again for each
+new manifest version (0.2.2 with the
+[Client identity release](human-steps.md#client-identity-release)). This step once had to wait
+for T-1, and step 2's case for *Everyone* relied on it. It no longer does: T-1 is withdrawn, and
+that case rests on the gate and on ingestion alone.
 
 **Build the package first** (Yahor, from the repo root; the Teams Administrator only uploads
 it). There is no ready-made zip in the repo: the `artifacts/teams-app.zip` that used to be
@@ -679,8 +722,10 @@ unzip -p "$OUT" manifest.json | jq -r \
    (.id == .bots[0].botId and (.id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"; "i")))'
 ```
 
-The last command must print `0.2.1`, `personal`, `0` and `true`, one per line: `true` only when
-`id` and `botId` are the same GUID. Anything else: do not upload it.
+The last command must print the manifest's version, `personal`, `0` and `true`, one per line:
+`true` only when `id` and `botId` are the same GUID. The version is `0.2.2` from the client
+identity change on (0.2.1 was uploaded on 26 September, H-10); it must be higher than the version
+the admin centre shows. Anything else: do not upload it.
 
 **Change.** In the Teams admin centre:
 
@@ -689,34 +734,42 @@ The last command must print `0.2.1`, `personal`, `0` and `true`, one per line: `
    tab. If the app is not in the catalog yet, use **Upload new app** instead.
 2. **Asystent BCR → Users and groups → Available to**: choose **Everyone**. This is the
    Phase-0 choice. The gate is the control: it refuses anything that is not a 1:1 chat from the
-   BCR tenant with a valid user id, and T-1 has already blocked the `{NIP}@` accounts.
-   Do **not** restrict it to a group of client guests in Phase 0. Nothing fills such a group:
-   neither onboarding nor `directory-bindings.mjs` adds anyone to one, so PESKOVOI's guest and
-   the TEST guest would lose the bot on day 1, and H-11 and H-12 could not run.
+   BCR tenant with a valid user id. Behind it, ingestion files and searches only for a row's
+   client account: it refuses a guest with nothing stored, and quarantines any other Member's
+   upload. (Until 28 September this step also relied on T-1 having blocked the `{NIP}@`
+   accounts. T-1 is withdrawn: those accounts are the clients, and they need the app.)
+   Do **not** restrict it to a group in Phase 0. Nothing fills such a group: neither onboarding
+   nor `directory-bindings.mjs` adds anyone to one, so the clients would lose the bot the day
+   it was set.
 
-   If Roman later wants the restricted option, do these first, in this order, and only then
-   change *Available to*:
-   - create a security group for client guests;
-   - add the staff group, the TEST guest, every bound client guest and the canary guest to it:
-     `az ad group member add --group <group-id> --member-id <user-object-id>`;
-   - check the members with `az ad group member list --group <group-id> -o table`;
-   - from then on, add each newly bound guest by hand, before telling the client to use the bot
-     ([admin guide, Onboarding](../client-directory-admin-guide.md#onboarding-a-client-phase-0)).
-3. Optional: pin the app for guests in the global app setup policy, so they find it without
-   searching.
+   If Roman later wants the restricted option, keep the rule that a `{NIP}@` account belongs to
+   its client Team and to **no other group**: the weekly onboarding audit counts every group
+   (`many_groups`), and the ledger's own checks read Teams. So never add the client accounts to
+   a new security group. Instead, in this order, and only then change *Available to*:
+   - choose the client Teams' own Microsoft 365 groups (and the staff group) as the groups the
+     app is available to, if the Teams admin centre accepts Microsoft 365 groups there
+     **[verify]**; every client account is already a member of its Team's group;
+   - if it accepts only security groups, stop: that needs the audit to allow one named extra
+     group first (a code change in `audit-client-access.mjs`), and the documented rule to say so
+     everywhere it is stated;
+   - check with the canary client account that the bot is still offered to it.
+3. Optional: pin the app for client accounts in the global app setup policy, so they find it
+   without searching.
 4. Remove any team or group-chat installations. Version 0.2.0 cannot be added to a team, but
    older installs may remain. **[verify]** On each client team: **Manage team → Apps → Asystent
    BCR → Uninstall**. The gate already refuses those installs.
 
-**Verify.** The admin centre shows version **0.2.0** for Asystent BCR. The TEST guest finds
-"Asystent BCR", opens the chat and gets the help card, and so does PESKOVOI's guest when they
-next use it. Only if availability was later restricted: a staff account outside the groups
-cannot install the app.
+**Verify.** The admin centre shows the version just uploaded for Asystent BCR (**0.2.0** in
+Phase 0; 0.2.1 on 26 September; 0.2.2 with the client identity release). The canary client
+account finds "Asystent BCR", opens the chat and gets the help card, and so does PESKOVOI's
+`{NIP}@` account when it next uses it. (In Phase 0 this check used the TEST guest; a guest still
+gets the card, but has no other capability.) Only if availability was later restricted: a staff
+account outside the groups cannot install the app.
 
 **Rollback.** Set availability back to what it was. Do not upload an older package: 0.1.5
-brings back team and group-chat installs and the "Moje dokumenty" tab. If 0.2.0 itself is
-broken, fix `teams-app/manifest.json`, raise its `version` (0.2.1), and build, check (for the
-new version, still `personal` and `0`) and upload that the same way.
+brings back team and group-chat installs and the "Moje dokumenty" tab. If an uploaded version is
+broken, fix `teams-app/manifest.json`, raise its `version` to the next patch number, and build,
+check (for the new version, still `personal` and `0`) and upload that the same way.
 
 ---
 
@@ -731,14 +784,15 @@ laptops (`.env`) are an accepted risk, recorded in
 
 | Step | Owner | Done | Before-state saved as | Notes |
 |---|---|---|---|---|
-| T-1 | Yahor (Global Admin) | 2026-09-26, sign-in blocked on the three `{NIP}@` accounts (0002, 0003, 0004); `accountEnabled=false` verified | audit output kept off-repo (holds NIPs) | Licences not removed yet: convert to shared mailboxes first (T-2) |
-| T-2 | Yahor | deferred by Yahor's decision (2026-09-26) | — | Not converted: the three `{NIP}@` accounts stay licensed user mailboxes with sign-in blocked (T-1). Cost: three licences; residual risk: an admin re-enabling sign-in reopens W2/W3. Revisit to save the licences or before the next security review |
+| T-1 | Yahor (Global Admin) | 2026-09-26, sign-in blocked on the three `{NIP}@` accounts (0002, 0003, 0004); `accountEnabled=false` verified. **Reversed** 2026-09-28 17:33Z by Roman; **withdrawn** by the owner's decision of 28 Sep, never to be run again | audit output kept off-repo (holds NIPs) | ~~Licences not removed yet: convert to shared mailboxes first (T-2).~~ *Withdrawn 28 September. Corrected 2026-09-28:* the premise (shared mailboxes nobody signs in with) was wrong; the accounts are the clients' Teams sign-ins, and the block locked three clients out from 26 Sep 12:18:09Z to 28 Sep about 17:34Z ([incident → Client lockout](incident-2026-09.md#client-lockout-2628-september-t-1-reversed)) |
+| T-2 | Yahor | deferred by Yahor's decision (2026-09-26); **withdrawn** by the owner's decision of 28 Sep, never run | — | ~~Not converted: the three `{NIP}@` accounts stay licensed user mailboxes with sign-in blocked (T-1). Cost: three licences; residual risk: an admin re-enabling sign-in reopens W2/W3. Revisit to save the licences or before the next security review.~~ *Withdrawn 28 September. Corrected 2026-09-28:* the licences are the clients' Teams access and stay; sign-in is enabled again, and that is the intended state, not a residual risk (W3 is redefined in the incident) |
 | T-3 | | | | Time made Private, from Purview |
 | T-4 | Yahor | not needed | — | IR-1 (26 Sep) found no ledger-written file left in BCR GROUP, and H-6b stops new ones |
 | T-4b | | | | Per client site: folders locked and the time of the lock; H-3's time; any re-check after H-3; the check after IR-1 of the items outside the locked folders, done or not, and how many it locked (each item and its lock time are in the evidence store). W4 ends, for items already moved, at the latest of these that applies to the item |
 | T-5 | | | | |
 | T-6 | Yahor (for Roman) | 2026-09-26 | — | Private, via `tools/ops/phase0-admin.sh bricore` |
-| T-7 | Yahor (for Roman) | 2026-09-26 14:05Z | — | Sign-in blocked: purpose unknown (account created 2026-09-21); membership unchanged |
-| T-8 | | | | TEST invite checked |
-| T-9 | Roman confirms tenant level | | | TEST guest checked |
-| T-10 | | | | Everyone (Phase 0); version 0.2.0 shown; sha256 of the uploaded zip |
+| T-7 | Yahor (for Roman) | 2026-09-26 14:05Z | — | Sign-in blocked: purpose unknown (account created 2026-09-21); membership unchanged. **Reversed** 2026-09-28 17:33:38Z–17:34:32Z by Roman. Since the owner's decision of 28 Sep a read-only record: `AuthoriseMe@` is not changed in any way. Its state as read (enabled, licensed, groups), and Roman's answer on its purpose when given: *record* |
+| `BCROnboarding@` | Roman | enabled 2026-09-28 17:33:38Z–17:34:32Z | — | The onboarding shared mailbox, disabled since before 22 Sep (not by this response). Stays enabled: Roman reads it. Outside the ledger |
+| T-8 | | | | TEST invite checked; the canary client account opens BCR Kanarek, its files and the bot DM (not a guest) |
+| T-9 | Roman confirms tenant level | | | Checked with the canary client account (not a guest); a contact's guest still opens its Team's files; Roman's decision on company-wide links on client sites |
+| T-10 | | | | Everyone (Phase 0); version 0.2.0 shown; sha256 of the uploaded zip. 0.2.1 uploaded 2026-09-26 (H-10); 0.2.2 with the client identity release: *record* the date and the zip's sha256 |

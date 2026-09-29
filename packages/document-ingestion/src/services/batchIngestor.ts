@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  CLIENT_ACCOUNT_REQUIRED,
   LedgerAgentError,
   ValidationError,
   type ClassifierContext,
@@ -9,7 +10,7 @@ import {
   type IngestionDocument,
   type Logger,
   type QuarantineReason,
-  type ResolvedClient,
+  type QuarantineResolution,
   type SharePointTarget,
 } from '@bcr/shared';
 import {
@@ -91,10 +92,15 @@ export interface BatchIngestorDeps {
 /**
  * Files every document of one Teams activity.
  *
- * The client is decided once per batch from the uploader's identity. Each
- * document then either:
+ * The client is decided once per batch from the uploader's identity. When
+ * the uploader is not a client account (a guest, a non-Member, a deleted
+ * user, or an account that could not be read), the whole batch is refused
+ * before anything is decoded: every document is `rejected`
+ * ({@link CLIENT_ACCOUNT_REQUIRED}, or {@link RETRY_LATER} when the account
+ * could not be read), and nothing is stored, classified or indexed — not
+ * even in the quarantine. Otherwise each document either:
  *  - goes into that client's own space (classified, filed, `uploaded`), or
- *  - goes to the staff-only quarantine (`quarantined`) when the uploader is
+ *  - goes to the staff-only quarantine (`quarantined`) when the Member is
  *    not tied to exactly one client, or when the client's space turns out to
  *    be unusable. Quarantined documents are never sent to the model, and the
  *    response for them carries no link, folder or name.
@@ -152,9 +158,34 @@ export class BatchIngestor {
             listItemId: resolved.listItemId,
             teamId: resolved.teamId,
           }
-        : { resolution: 'quarantine', quarantineReason: resolved.reason },
+        : resolved.source === 'refused'
+          ? { resolution: 'refused', refusalReason: resolved.reason }
+          : { resolution: 'quarantine', quarantineReason: resolved.reason },
       'client resolved',
     );
+
+    // Not a client account: nothing is decoded, classified, stored or
+    // indexed, and nothing reaches either SharePoint factory.
+    if (resolved.source === 'refused') {
+      const code =
+        resolved.reason === 'identity_unverified' ? RETRY_LATER : CLIENT_ACCOUNT_REQUIRED;
+      log.info(
+        {
+          event: 'batch.refused',
+          resolution: 'refused',
+          refusalReason: resolved.reason,
+          uploaderOid: batch.uploaderOid,
+          documentCount: payload.documents.length,
+          code,
+        },
+        'batch.refused',
+      );
+      return payload.documents.map((d) => ({
+        filename: d.filename,
+        status: 'rejected',
+        error: { code, message: rejectionMessage(code) },
+      }));
+    }
 
     const results: IngestionBatchItemResult[] = [];
     let notStarted = 0;
@@ -186,7 +217,7 @@ export class BatchIngestor {
 
   private async ingestOne(
     document: IngestionDocument,
-    resolved: ResolvedClient,
+    resolved: DirectoryClientResolution | QuarantineResolution,
     batch: BatchContext,
     at: Date,
   ): Promise<IngestionBatchItemResult> {
@@ -476,6 +507,8 @@ function rejectionMessage(code: string): string {
       return 'The document could not be stored; try again later';
     case RETRY_LATER:
       return 'The document was not processed now; send it again later';
+    case CLIENT_ACCOUNT_REQUIRED:
+      return 'This account may not file documents';
     default:
       return 'The document could not be processed';
   }

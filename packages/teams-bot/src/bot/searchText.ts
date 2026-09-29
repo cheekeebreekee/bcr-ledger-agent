@@ -11,7 +11,7 @@ import {
 } from '@bcr/shared';
 
 /**
- * What a guest sends to search, read before anything is called: the question
+ * What a client sends to search, read before anything is called: the question
  * they typed, or the value of one of our own card buttons. SDK-agnostic on
  * purpose, like the gate: it reads strings and plain objects only.
  *
@@ -69,7 +69,7 @@ const NAMED_ENTITIES: Readonly<Record<string, string>> = {
 };
 
 /**
- * A guest's message as a search question: the bot's mention and any HTML
+ * A client's message as a search question: the bot's mention and any HTML
  * tags dropped, the common entities decoded (once), NFC, control characters
  * turned into spaces, invisible and bidi characters removed, whitespace
  * collapsed and trimmed. The caller checks the length (1–300) afterwards.

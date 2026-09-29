@@ -145,7 +145,7 @@ describe('inventory-misfiled', () => {
     assert.match(out.text(), /sha256  [0-9a-f]{64}/);
   });
 
-  test('an identity-routed upload is clean only against a guest list: none, a plan, --no-versions', async () => {
+  test('an identity-routed upload is clean only against a list of who may upload: none, a plan, --no-versions', async () => {
     const outDir = mkdtempSync(join(tmpdir(), 'ir1-test-'));
     const ir0File = join(outDir, 'ir0.json');
     writeFileSync(ir0File, JSON.stringify(traces()));
@@ -168,8 +168,9 @@ describe('inventory-misfiled', () => {
     const none = await registerOf([]);
     assert.ok(none.row.d3.flags.includes('uploader_guest_unverified'));
     assert.equal(none.row.d3.suspect, true);
-    assert.match(none.out.text(), /no --site-guests or --bindings-plan/);
+    assert.match(none.out.text(), /no --site-accounts, --site-guests or --bindings-plan/);
 
+    // A version-1 plan (before the client-account rule): the guests of each Team alone.
     const planFile = join(outDir, 'plan.json');
     writeFileSync(
       planFile,
@@ -183,9 +184,37 @@ describe('inventory-misfiled', () => {
     assert.ok(fromPlan.row.d3.flags.includes('uploader_not_site_guest'), 'U3 is not a guest of that Team');
     assert.deepEqual(fromPlan.reg.parameters.siteGuests, { '/sites/0001clienta': [U4] });
     assert.match(fromPlan.reg.parameters.bindingsPlan.sha256, /^[0-9a-f]{64}$/);
+    assert.equal(fromPlan.reg.parameters.bindingsPlan.version, 1);
+    assert.match(fromPlan.out.text(), /guests of each Team \(version 1\)/);
 
     const both = await registerOf(['--bindings-plan', planFile, '--site-guests', `0001CLIENTA=${U3}`]);
     assert.equal(both.row.d3.suspect, false);
+
+    // A version-2 plan: the site's own client account. The upload by it is clean; by anyone else, suspect.
+    const v2 = (id) => {
+      const f = join(outDir, `plan-v2-${id}.json`);
+      writeFileSync(
+        f,
+        JSON.stringify({
+          kind: PLAN_KIND,
+          version: 2,
+          clientDomain: 'contoso.example',
+          createdAt: '2026-09-28T09:00:00Z',
+          rows: [{ sitePath: '/sites/0001CLIENTA', clientAccount: { id, userPrincipalName: '0000000001@contoso.example' } }],
+        }),
+      );
+      return f;
+    };
+    const own = await registerOf(['--bindings-plan', v2(U3)]);
+    assert.equal(own.row.d3.suspect, false, "the site's own client account uploaded it");
+    assert.match(own.out.text(), /made 2026-09-28T09:00:00Z: client accounts/);
+    const other = await registerOf(['--bindings-plan', v2(U4)]);
+    assert.ok(other.row.d3.flags.includes('uploader_not_site_guest'), 'staff or another client uploaded it');
+
+    // --site-accounts is --site-guests by its new name.
+    const alias = await registerOf(['--site-accounts', `0001CLIENTA=${U3}`]);
+    assert.equal(alias.row.d3.suspect, false);
+    assert.deepEqual(alias.reg.parameters.siteGuests, { '/sites/0001clienta': [U3] });
 
     const noVersions = await registerOf(['--site-guests', `0001CLIENTA=${U3}`, '--no-versions']);
     assert.ok(noVersions.row.d3.flags.includes('versions_unreadable'));
@@ -267,6 +296,10 @@ describe('inventory-misfiled', () => {
     await assert.rejects(
       run(['--site', 'a=contoso.sharepoint.com:/sites/X', '--ingest-app-ids', INGEST, '--site-guests', `b=${U3}`], fetch, outDir).promise,
       /--site-guests b: not one of the --site values/,
+    );
+    await assert.rejects(
+      run(['--site', 'a=contoso.sharepoint.com:/sites/X', '--ingest-app-ids', INGEST, '--site-accounts', 'a=nope'], fetch, outDir).promise,
+      /--site-accounts a: not GUIDs: nope/,
     );
     const notAPlan = join(outDir, 'not-a-plan.json');
     writeFileSync(notAPlan, JSON.stringify({ kind: 'something else', rows: [] }));

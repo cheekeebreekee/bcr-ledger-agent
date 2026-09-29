@@ -16,10 +16,13 @@ documents already filed in the wrong place are found and moved back.
 export, the inventory and the relocation register contain file names, client names and user
 ids. They live in the IR evidence store (see [IR-0](#ir-0-preserve-the-evidence-first)), readable by
 Roman, the IOD and `yahor.simak@bcr-group.pl` only. Nothing from them is pasted here, and no
-NIP, object id or file name should ever be added to this page. The one exception is the canary
-guest's object id ([H-5b](human-steps.md#h-5b-invite-the-canary-guest)): a BCR-controlled test
-account, not a client's or a person's, recorded in the status table because every negative
-canary checks against it.
+NIP, object id or file name should ever be added to this page. The exceptions are BCR's two
+canary accounts, BCR-controlled test accounts, not a client's or a person's: the canary guest's
+object id ([H-5b](human-steps.md#h-5b-invite-the-canary-guest)), and, since 29 September, the
+canary client account's object id and its synthetic NIP `9000000000`, which fails the NIP
+checksum, so no company can hold it
+([Client identity release](human-steps.md#client-identity-release)). Both are recorded in the
+status table because the canaries check against them.
 
 ---
 
@@ -35,11 +38,16 @@ appeared anywhere in it**, in any role: a client's bank statement could land in 
 supplier's team. Nothing checked the result. Roman reported that isolation between clients was
 broken; the audit confirmed it and found the mechanism.
 
+*Corrected 28 September:* the paragraph takes the guest for the client, as everyone did then. A
+client's identity is its `{NIP}@bcr-group.pl` account, a Member created by BCR; guests have no
+capability in the ledger (the owner's decision; [R1's correction](#root-causes) and
+[Client lockout](#client-lockout-2628-september-t-1-reversed)).
+
 ## How it was found
 
 | When | What |
 |---|---|
-| 23 Sep | Roman asked whether onboarded clients could reach the `Onboarding klientów` channel. The tenant audit (`bcr-onboarding-agent/docs/operations/client-access.md`) found the three `{NIP}@` client addresses enabled and licensed, and the BCR GROUP and Bricore teams Public. |
+| 23 Sep | Roman asked whether onboarded clients could reach the `Onboarding klientów` channel. The tenant audit (`bcr-onboarding-agent/docs/operations/client-access.md`) found the three `{NIP}@` client addresses enabled and licensed, and the BCR GROUP and Bricore teams Public. *Corrected 28 Sep:* the audit took the enabled, licensed `{NIP}@` accounts for a finding; they are the clients' own Teams sign-ins, and acting on that premise locked the clients out ([Client lockout](#client-lockout-2628-september-t-1-reversed)). |
 | 23–25 Sep | A read-only audit of both repos: 33 security findings, each re-checked by an independent reviewer, all 33 held. They reduce to the six root causes below. |
 | between 23 and 25 Sep | BCR GROUP was made Private. **Record the exact time here from the Purview `Update group` event** once IR-0 is exported. It stays Private; this response never changes its visibility, its membership or its channels. |
 | 25 Sep | Automatic deploys to "dev" (which is production: it serves PESKOVOI, `0002`) were stopped, commit `f5a2bd4` (gate G0). The Phase-0 contract was committed, `21b0883`. Roman agreed the GDPR option in [IR-3](#ir-3-gdpr). |
@@ -63,6 +71,18 @@ to `bcr-onboarding-agent` as of 25 September 2026.
 | **R4** | The "fail-closed" de-duplication fails open once three rows share a key: the third row wins. A duplicate `ClientId` makes a lookup return the wrong row. A staff id sits on a client row: Yahor's id is on PESKOVOI's row, so every upload of his is filed there whatever it is. | `clientDirectoryReader.ts:275-292` (`putUnique` deletes on the second row and re-adds on the third); `clientResolver.ts:211-212` (`entries.find` by ClientId); `bcr-onboarding-agent/…/caseRepository.ts:471` records that two live rows carry `0002`. |
 | **R5** | Files land at the **library root**, because `RootFolder` is `''`. They never appear in the channel's Shared tab, which is where the client is told to look. | `clientDirectory.ts:92-94` (onboarding); `sharePointService.ts:48` (ledger joins the path onto the drive root). |
 | **R6** | Other gaps: routing lives in an editable SharePoint list; an anonymous Personal Tab maps any user id to their client (IDOR); the ingestion API trusts a user id sent in the body; the bot accepts any conversation type and any tenant; model text is rendered as Markdown in the result card. | `teams-bot/src/functions/mydocs.ts:33-51`; `document-ingestion/src/functions/validation.ts:21-28`; `teams-app/manifest.json:28`; `teams-bot/src/bot/responseBuilder.ts:140`. |
+
+**Corrections of 28 September 2026** (the owner's decision on the client identity; the rows
+above stay as first written):
+
+- **R1.** The id onboarding threw away was the guest's, and at the time the guest was taken for
+  the client. The client identity is the client's `{NIP}@bcr-group.pl` account, a Member created
+  by BCR; guests have no capability in the ledger. Onboarding still writes no user id (Q21 stays
+  open): `tools/directory-bindings.mjs` binds each row's `{NIP}@` account, and the ingestion
+  build of the [Client identity release](human-steps.md#client-identity-release) refuses guests.
+- **R2.** The exposure was that **BCR GROUP was Public** (W2), so any internal account could join
+  it and read the fallback bucket. It was not that the three `{NIP}@` accounts could sign in:
+  they are the clients' sign-ins, and should.
 
 ### How they combined
 
@@ -90,8 +110,8 @@ whether anyone used it. Dates marked *record* are filled in from the IR-0 export
 |---|---|---|---|---|---|
 | W1 | **Fallback bucket** at the BCR GROUP library root | Every unrouted upload, from every client, plus staff uploads | Members of BCR GROUP: Roman, Yahor and `AuthoriseMe@` | Multi-tenant routing go-live, on or before 16 Jul 2026 (*record* the deploy date) | New uploads: the fallback re-pointed at the quarantine ([H-6b](human-steps.md#h-6b-point-the-running-builds-fallback-at-the-quarantine)), then the Phase-0 ingestion deploy. Existing items: the folder lock in [tenant hardening T-4](tenant-hardening.md#t-4-lock-the-ledger-folders-at-the-bcr-group-library-root), checked again after H-6b, then IR-2 moves them out. |
 | W2 | **BCR GROUP was Public** | Everything in W1, and the `Onboarding klientów` channel | Any internal account, including the three `{NIP}@` accounts, which could sign in | Unknown (*record* from the group's history) | Made Private between 23 and 25 Sep (*record*) |
-| W3 | **`{NIP}@` accounts could sign in** | Their own client team (added by hand), any Public team, Viva Engage Communities | Whoever held those credentials | Account creation, by hand | Sign-in blocked: [tenant hardening T-1](tenant-hardening.md#t-1-block-sign-in-on-the-nip-client-addresses) |
-| W4 | **Content promotion** | A document moved into the site of whichever client's NIP it named, at that site's library root | Members of that client's Team, including the client's guest | Go-live (as W1) | New moves: `ANTHROPIC_ENABLED=false` ([H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy)), then the Phase-0 ingestion deploy (P0-1). Items already moved: the client-site folder lock ([tenant hardening T-4b](tenant-hardening.md#t-4b-lock-the-ledger-folders-at-the-library-root-of-the-client-sites), after H-3), and a lock of its own on each such item found outside those folders (T-4b's Verify), then IR-2 moves them. For an item, W4 ends at the later of its lock and H-3. |
+| W3 | **Client accounts are tenant Members** (redefined 28 Sep; first recorded as "`{NIP}@` accounts could sign in") | Beyond their own client Team: any Public team, Viva Engage "All Company" and Communities, the directory and people search, any *People in your organization* link | The client holding the account | Account creation, by hand | Not closed: signing in is how a client works. Bounded by T-3 and T-6 (no Public team), T-8, T-9 and `docs/security.md` T22, never by blocking sign-in. First recorded as closed by [T-1](tenant-hardening.md#t-1-withdrawn-never-block-sign-in-on-the-nip-client-accounts), which blocked sign-in on 26 Sep and was reversed on 28 Sep ([Client lockout](#client-lockout-2628-september-t-1-reversed)) |
+| W4 | **Content promotion** | A document moved into the site of whichever client's NIP it named, at that site's library root | Members of that client's Team, including the client's guest (*28 Sep:* and its `{NIP}@` account, also a member) | Go-live (as W1) | New moves: `ANTHROPIC_ENABLED=false` ([H-3](human-steps.md#h-3-stop-promotion-now-without-a-deploy)), then the Phase-0 ingestion deploy (P0-1). Items already moved: the client-site folder lock ([tenant hardening T-4b](tenant-hardening.md#t-4b-lock-the-ledger-folders-at-the-library-root-of-the-client-sites), after H-3), and a lock of its own on each such item found outside those folders (T-4b's Verify), then IR-2 moves them. For an item, W4 ends at the later of its lock and H-3. |
 | W5 | **Personal Tab IDOR** | The client name, ClientId and SharePoint URL of any user whose object id is known | Anyone on the internet with the URL | Manifest 0.1.5 and `/api/mydocs` (about 16 Jul) | The Phase-0 bot deploy (the page becomes static), manifest 0.2.0, and the Phase-0 ingestion deploy (`/api/user-target` deleted) |
 | W6 | **The upload register in App Insights** | File names, client titles, site paths, user ids | Anyone with read on the App Insights resource | First deploy | P0-9 logs ids only. Old lines age out after 30 days, except the copy IR-0 takes deliberately. |
 | W7 | **Bricore team Public** | Its `Dokumenty księgowe` channel | Any internal account | Unknown | [Tenant hardening T-6](tenant-hardening.md#t-6-the-bricore-team) |
@@ -102,6 +122,8 @@ Purview unified audit log is the longer record: it holds file-level events and t
 `UserLoggedIn` / `UserLoginFailed` sign-in events for about 180 days on Audit Standard
 **[verify]**. IR-0 exports both, and the 7 days of Entra sign-ins, first. Whether the `{NIP}@`
 accounts and `AuthoriseMe@` signed in (W2, W3) is answered from those exports, not assumed.
+(*28 Sep:* a `{NIP}@` sign-in is the client's own. What matters for W2 is whether one of them
+joined BCR GROUP, or opened its files, while it was Public.)
 
 ---
 
@@ -124,8 +146,8 @@ item closes a named root cause. The human-run steps and their order are in
 | P0-7 | Uploads never overwrite (`conflictBehavior=fail`); path segments are encoded. | R4 (overwrite race) |
 | P0-8 | Ingestion accepts only the bot's app id; the single-document route is deleted. | R6 |
 | P0-9 | Logs carry ids only (after IR-0 has copied the old ones). | W6 |
-| Bindings | `tools/directory-bindings.mjs` writes each row's guest ids, channel folder, `DriveId` and `TeamId` from Graph, and removes staff ids from client rows. | R1, R4, R5 |
-| Tenant | `{NIP}@` sign-in blocked and mailboxes unlicensed; ledger folders on BCR GROUP locked to Owners (T-4); the same folders at the library root of every client site the ingestion identity could write to locked to Owners (T-4b); the Directory list locked and versioned; guest and sharing defaults tightened. | R2, W2, W3, W4 (items already moved), W7 |
+| Bindings | `tools/directory-bindings.mjs` writes each row's guest ids, channel folder, `DriveId` and `TeamId` from Graph, and removes staff ids from client rows. *Since 28 Sep:* the one user id it writes is the row's `{NIP}@` account, and it removes guest ids ([Client identity release](human-steps.md#client-identity-release)). | R1, R4, R5 |
+| Tenant | ~~`{NIP}@` sign-in blocked and mailboxes unlicensed~~ (T-1 done 26 Sep and reversed 28 Sep, T-2 never run; both withdrawn: [Client lockout](#client-lockout-2628-september-t-1-reversed)); ledger folders on BCR GROUP locked to Owners (T-4); the same folders at the library root of every client site the ingestion identity could write to locked to Owners (T-4b); the Directory list locked and versioned; guest and sharing defaults tightened. | R2, W2, W4 (items already moved), W7; W3 bounded, not closed (redefined) |
 
 **Until the Phase-0 build is live, without a deploy** (mandatory, from day 0; promotion is stopped
 at once, without waiting for IR-0, because stopping it deletes no past log data):
@@ -414,9 +436,14 @@ IR-2.
 
 Run it with the `directory-bindings.mjs propose` plan from
 [`human-steps.md` H-7](human-steps.md#h-7-check-the-directory-before-the-deploy-and-add-the-new-columns)
-(H-12's plan, once it exists). The plan gives each site's guests, and without it the tool cannot
-tell a client guest's upload from anyone else's. `--site-guests <label>=<oid,…>` is the manual
-alternative. The flags are described in [`tools/README.md`](../../tools/README.md).
+(H-12's plan, once it exists). The plan gives the ids that may upload for each site's own
+client, and without it the tool cannot tell the client's upload from anyone else's. A
+**version-2** plan (the client-account rule, from 29 September) records each row's
+`clientAccount`, its `{NIP}@` account in that Team alone. A **version-1** plan (every plan made
+before 29 September, H-12's included) records each site's guests (`eligibleGuests`) and is still
+read that way, so a run made with one is reproducible. `--site-accounts <label>=<oid,…>` is the
+manual alternative (its older name, `--site-guests`, still works). The flags are described in
+[`tools/README.md`](../../tools/README.md).
 
 ```bash
 node tools/inventory-misfiled.mjs \
@@ -442,7 +469,9 @@ For each item it records:
 - **every IR-0 log line for that `driveItemId`**, and the uploader id that the join above
   yields, or `unknown`;
 - whether the logs show it as promoted, fallback, or routed by identity;
-- whether the uploader is a guest of that site's own client (`uploader_not_site_guest` when not).
+- whether the uploader may upload for that site's own client: its `{NIP}@` account (version-2
+  plan) or a guest of its Team alone (version-1 plan). `uploader_not_site_guest` when not; the
+  flag keeps its name, because registers already in the evidence store carry it.
   Before Phase 0 the only id on a client row was staff, so every upload routed "by identity"
   into PESKOVOI was a staff upload, whatever its content. This flag is what brings those items
   into IR-2.
@@ -455,7 +484,7 @@ locked folders
 
 The output is a register of client documents, so it goes to the evidence store and nowhere
 else. Items it flags as *suspect* (promoted, fallback, uploader unknown or ambiguous, uploader
-not a guest of the site's own client, and the other flags in `tools/README.md`) are the input to
+not on the site's list, and the other flags in `tools/README.md`) are the input to
 IR-2. An item with more than one version goes through IR-2's version rule whether or not it is
 flagged. Later jobs process only what IR-2 has cleared ([the allow-list](#the-allow-list)).
 
@@ -486,9 +515,12 @@ produced.
    PESKOVOI's among them, predate onboarding and carry no such description.
    - A **guest of exactly one** client Team: that client is the candidate owner.
    - A guest of **several** client Teams: those clients are the candidates.
-   - **Staff** (a `Member` of the tenant): membership does not narrow it, because staff belong
-     to many Teams. The staff member who uploaded states in writing which client the document
-     was for; that client is the candidate.
+   - A client's **`{NIP}@` account** (a `Member` whose UPN is ten digits at `bcr-group.pl`, the
+     client identity since the owner's decision of 28 September): the client of its one Team is
+     the candidate; in several Teams, those clients are. IR-0 found no upload by one (IR-0 A).
+   - **Staff** (any other `Member` of the tenant): membership does not narrow it, because staff
+     belong to many Teams. The staff member who uploaded states in writing which client the
+     document was for; that client is the candidate.
    - **Unknown uploader** (no log line, older than the 90-day retention, or sampled away): there is no
      candidate. The item goes to quarantine.
 3. **Use the content only as a tie-breaker, and as a check.**
@@ -517,7 +549,8 @@ IR-1 does not do these, so the person deciding does, before signing:
   `Reason`, and a live link is removed before the item is moved.
 - **Access events.** Filter the IR-0 Purview file-operations export for the item (its URL or
   `ObjectId`). Count the events by anyone other than staff and the ingestion identity into
-  `NonStaffAccess`. For an item in W4 that includes the receiving client's guest.
+  `NonStaffAccess`. For an item in W4 that includes the receiving client's members: its guest
+  and its `{NIP}@` account.
 
 ### Versions before any move
 
@@ -625,7 +658,7 @@ The per-client list of affected documents is sent separately, over a secure chan
 |---|---|
 | Items in W1 only, and no access event by anyone other than staff | Processor notice (phase 1) and breach-register entry. The controller will likely record rather than notify; that is their decision. |
 | A non-staff identity (a `{NIP}@` account, or another client's guest) could reach the item and **did** (an access event), and it holds personal data | Processor notice with that fact; the controller's 72 hours run from it. If the data is BCR's own: BCR notifies UODO. |
-| An item was promoted into another client's site (W4) | Processor notice to the **owning** client; the receiving client's guest is a third party who had access. |
+| An item was promoted into another client's site (W4) | Processor notice to the **owning** client; the receiving client's members (its guest, its `{NIP}@` account) are third parties who had access. |
 | High risk to individuals | Art. 34 through the controller. |
 
 ---
@@ -664,19 +697,104 @@ export. Counts only here; the register is in the evidence.
   staff members), so no client could open them there. IR-2 decides whether they move to PESKOVOI
   (two-person sign-off).
 - **Who can read where:** PESKOVOI's Team holds its own guest, its own `{NIP}@` mailbox (sign-in
-  blocked in T-1) and staff. BCR GROUP holds Roman, Yahor and `AuthoriseMe@` (T-7); it was Public
-  until 23 September, so while the fallback files were there any internal account could have
-  joined. None of the other clients' `{NIP}@` accounts is a member now.
+  blocked in T-1) and staff. (*Corrected 28 Sep:* the `{NIP}@` account is not a mailbox nobody
+  signs in with but PESKOVOI's own Teams sign-in; T-1 was reversed that day.) BCR GROUP holds
+  Roman, Yahor and `AuthoriseMe@` (T-7); it was Public until 23 September, so while the fallback
+  files were there any internal account could have joined. None of the other clients' `{NIP}@`
+  accounts is a member now.
 - **The Microsoft 365 unified audit log was off** until 26 September (Purview showed "Start
   recording user and admin activity"). There is no Purview record of who opened, moved or deleted
   any file before that date, so H-2 step 2 has nothing to export for the past. Yahor and Roman
   opened the July documents themselves (Yahor, 26 September); nobody can show from the logs that
   nobody else did. Roman and the IOD weigh that in IR-3.
 
+## Client lockout, 26–28 September (T-1 reversed)
+
+A tenant step of this response locked three clients out of Teams for about two days. Times are
+UTC, from the Entra audit log, read-only. Clients are named by their record number.
+
+| When | What |
+|---|---|
+| 25 Sep | Tenant step T-1, "block sign-in on the `{NIP}@` client addresses", agreed with Roman. |
+| 26 Sep 12:18:09 | `yahor.simak` disabled the three `{NIP}@bcr-group.pl` client accounts, of 0002 (PESKOVOI), 0003 and 0004: T-1, run by Claude with Yahor's approval. |
+| 26 Sep 14:05:08 | `yahor.simak` disabled `AuthoriseMe@` (T-7 as then written). |
+| 28 Sep 07:34 | Roman reset 0002's password. The account was still disabled, so the reset could not help. The new password went to the client over Telegram, in plain text. |
+| 28 Sep 11:58 | The channel inbox began filing for row 2 (PESKOVOI, `enforce`). |
+| 28 Sep 17:33:38–17:34:32 | Roman re-enabled all four accounts, and also `BCROnboarding@`, the onboarding shared mailbox, which had been disabled since before 22 September, not by this response. |
+
+**The premise.** The `{NIP}@` accounts were taken for shared mailboxes nobody signs in with. The
+sources were the onboarding repo's `tools/audit-client-access.mjs` and
+`docs/operations/client-access.md`, both of 23 September: the audit reported an enabled,
+licensed `{NIP}@` account as a finding and offered `--apply` to block it. In fact these accounts
+are how the clients sign in to Teams.
+
+**The impact.** The three clients could not sign in to Teams from 26 September 12:18Z until
+about 17:34Z on 28 September: no Team, no channel, no files, no bot. The channel inbox shows no
+PESKOVOI upload since it began filing for row 2 (28 September 11:58Z). No document was lost:
+nothing was moved or deleted. 0003 and 0004 have no Directory row, so the ledger routed nothing
+for them either way. The password sent over Telegram is a credential-handover risk of its own:
+the client should change it (or the account is set to change it at next sign-in).
+
+**The cause.** How clients sign in was never confirmed with the owner before a tenant change that
+depended on it. The 23 September audit inferred it, the plan of 25 September adopted it, and T-1
+acted on it, with no step in between that asked the owner.
+
+**The owner's decision** (Yahor, 28 September):
+
+- the `{NIP}@bcr-group.pl` Member account is the client identity: for classification in both
+  intakes, for search and for the bot;
+- guests have **no** ledger capability: they are not onboarded as clients and do not pay.
+  Onboarding keeps inviting the client's contact as a guest, for Team access only;
+- Roman keeps creating, enabling and licensing the `{NIP}@` login by hand;
+- `BCROnboarding@` stays enabled (Roman reads it); `AuthoriseMe@` is not changed in any way;
+- nothing may ever block, disable, unlicense or convert a `{NIP}@` account.
+
+**Done.**
+
+- The accounts re-enabled by Roman (28 September, 17:33–17:34Z).
+- [Tenant hardening](tenant-hardening.md): T-1 and T-2 withdrawn, never to be run; T-7 a
+  read-only record; a note that `BCROnboarding@` stays enabled; T-10 no longer depends on T-1.
+- On this page: W3 redefined and R2 corrected (dated corrections above).
+- The canary client account `9000000000@bcr-group.pl`, created by Roman on 29 September: a
+  Member with Business Basic, usage location PL, a member (not an owner) of BCR Kanarek only.
+  Row 10's NIP was set to `9000000000` on 29 September at 09:44:54Z (the old value, BCR GROUP's
+  NIP used for the classifier re-tests, is saved off-repo). The canary guest stays, as the
+  negative canary. Its object id is in the status table.
+
+**Planned, not done** (as of 29 September):
+
+- The ledger code for the decision is in the working tree, uncommitted and not deployed:
+  ingestion refuses a guest on every path with nothing stored, files and searches only for a
+  row's `{NIP}@` account, and quarantines any other Member; the bot's texts name the `{NIP}@`
+  login; the binding tool binds the `{NIP}@` account, removes guest ids and exits 5 when a bound
+  client account is disabled. Until it is deployed, the running build still serves guests.
+- Rows 2 and 10 are not re-bound yet: each still holds its guest. The re-bind puts 0002's
+  `{NIP}@` account on row 2 and the canary client account on row 10.
+- The onboarding change (the audit tool read-only, step 13 no longer refusing an enabled
+  `{NIP}@` account, the mailbox runbook never converting one) is in that repo's working tree,
+  not merged and not deployed. Until it is, nobody runs the onboarding audit with `--apply`, or
+  the onboarding repo's `infrastructure/deploy.sh`.
+- The rollout, in order, is the
+  [Client identity release](human-steps.md#client-identity-release): re-bind the two rows, then
+  ingestion, then the bot, then the canaries.
+
+**Redefined** (28 September; the rows above keep their first wording beside the correction):
+
+- **W3** is now "client accounts are Members and reach tenant-wide surfaces": the directory,
+  Viva Engage, organisation-wide links, any Public team. It is bounded by T-3 and T-6 (no Public
+  team), T-8, T-9 and `docs/security.md` T22, and never by blocking sign-in.
+- **R2**: the exposure was BCR GROUP being Public, not the `{NIP}@` accounts being able to sign in.
+
+**GDPR.** Each template in [`gdpr/`](gdpr/) carries a dated correction at its top: the
+"sign-in blocked (T-1, T-2)" measure is withdrawn, and the processor notice drops "which should
+not have been able to sign in". The lockout itself is an availability event for three clients
+(0002, 0003, 0004). Whether it needs its own view in the breach register is the IOD's call: an
+open question, recorded in the status table.
+
 ## Status
 
 Update this table as steps complete. Evidence columns hold hashes, commit ids and dates only,
-plus the canary guest's object id (H-5b).
+plus the object ids of BCR's two canary accounts (H-5b; the canary client account).
 
 The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 
@@ -694,13 +812,14 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | H-2: evidence store created, readers verified, uploader write removed, laptop copies deleted | Roman, Yahor | todo | | |
 | H-3: `ANTHROPIC_ENABLED=false` (mandatory) | Yahor | done | 2026-09-26 11:58:09Z | H-5/H-6/H-6b not done the same day (Saturday): interim writes to BCR GROUP's `98_Nieposortowane` accepted until H-6b, pending Roman's confirmation |
 | BCR GROUP made Private (time from Purview) | — | done | *record* | T-3 |
-| H-4: tenant hardening T-1 … T-9 | per step | todo | | [`tenant-hardening.md`](tenant-hardening.md#status) |
+| H-4: tenant hardening T-1 … T-9 | per step | T-1 done 26 Sep 12:18:09Z, then **reversed** 28 Sep 17:33Z (Roman) and **withdrawn**; T-2 **withdrawn**, never run; T-6 done; T-7 done 26 Sep 14:05:08Z, reversed 28 Sep, now a **read-only** record; the rest todo | 2026-09-28 | [`tenant-hardening.md`](tenant-hardening.md#status); [Client lockout](#client-lockout-2628-september-t-1-reversed) |
 | T-4 checked again after H-6b | BCR GROUP site owner | todo | | time, and any folder locked, in [`tenant-hardening.md`](tenant-hardening.md#status) |
 | T-4b: client-site root folders locked after H-3 (end of W4 for the items in them: the later of the lock and H-3) | SharePoint Admin | todo | | sites, lock times and H-3's time in [`tenant-hardening.md`](tenant-hardening.md#status) |
 | IR-1 inventory: run with an Owner's or site collection admin's token and `--expect-root-folders` for every site; `--ir0` restored from the store; exit 0 | Yahor | done before T-4/T-4b (so nothing was hidden), `--all-drives`, `--ir0` = the 90-day export; exit 0 | 2026-09-26 13:50Z | `ir1-inventory-2026-09-26T13-50-09Z.json` sha256 `b79b2cdc91d3a614…`; see [IR-1 findings](#ir-1-findings-26-september) |
 | T-4b: items outside the locked folders checked after IR-1, and locked one by one | SharePoint Admin | todo | | per site: done, and the number of items locked (the items themselves in the evidence store) |
 | H-5, H-6: quarantine site and ingestion write grant | Yahor (Global Admin) | done | 2026-09-26 | communication site, Polish, sharing off, owners Yahor + Roman; four columns; Grant-TeamSiteAccess job `eced5ff6` → `granted` to the ingestion managed identity |
-| H-5b: canary guest invited, in no Team; whether it reached the bot before H-10 | Global Admin | todo | | the canary guest's object id (the one object id this page holds; see the top) |
+| H-5b: canary guest invited, in no Team; whether it reached the bot before H-10 | Global Admin | todo | | the canary guest's object id (one of the two object ids this page holds; see the top). Since 28 Sep it is the **negative** canary: guests have no ledger capability |
+| Canary client account `9000000000@bcr-group.pl`: Member, Business Basic, usage location PL, a member (not an owner) of BCR Kanarek only; row 10's NIP set to `9000000000` ([Client identity release](human-steps.md#client-identity-release)) | Roman (the account), Yahor (the row) | created, row 10's NIP set; **not yet bound** to row 10 | 2026-09-29 | object id `d7367154-a2e7-4246-8cda-4cf7b47639da`; row 10's NIP set 09:44:54Z (the old value, BCR GROUP's NIP used for the classifier re-tests, saved off-repo); the positive canary from the client identity release on |
 | H-6b: running build's fallback re-pointed at the quarantine | Yahor | done 13:12:17Z; superseded by H-12 (the Phase-0 build uses QUARANTINE_* and was proven by the 14:11Z canary) | 2026-09-26 | names `FALLBACK_CLIENT_ID`, `FALLBACK_SITE_HOSTNAME`, `FALLBACK_SITE_PATH`, `FALLBACK_DRIVE_NAME` saved locally (mode 600) until the store exists; no ingestion traffic between H-3 and H-6b |
 | H-7: Directory check; duplicate `0002` resolved; per-row decisions, incl. which sites get a grant in H-12 | Yahor, Roman | check done (exit 0); decisions pending | 2026-09-26 | one Active row (0002), no duplicate; unbound (`not routing`); staff id to remove at H-12; PESKOVOI write grant `unknown` (verify at H-12 step 3); new columns not yet added |
 | H-8: app settings added | Yahor | done | 2026-09-26 | shape check clean; `MICROSOFT_APP_TYPE` was already `SingleTenant` (no live change) |
@@ -722,6 +841,11 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | Client search release step 2: the question reader's evaluation | Yahor | GO | 2026-09-28 18:37Z | `eval:search` with BCR's key from ingestion's `local.settings.json` (hash-equal to Key Vault's; `.env` holds another key and was not used). First run 18:31Z: every call refused (400, the output schema had 18 union-typed parameters, the API's limit is 16), nothing billed: search would have been `unavailable` for good. Fixed (groups always present, `structuredOutput.test.ts` counts every schema) and two prompt rules (invoice direction for „od”/„dla”; an example that taught dropping categories): 42/42 exact, 0 invented on the 12 injection cases, 0 keys outside the schema, prompt 4,147 tokens (`tools/out/search-eval-20260928T183747Z.md`, `45b40f26…`). About $0.30 of credit for three runs |
 | Client search release step 3: migration `0003_search_queries` | Yahor (Entra admin) | done | 2026-09-28 18:42:34Z | Applied from `7069856` with a dated operator rule (`operator-20260928T1840`, deleted right after; one rule left, the Azure-services one): `applied 1, already applied 2`, `verify.sql: no problems` (its first run with `guard_trigger_missing` and `app_role_can_delete`) |
 | Client search release steps 4–5: ingestion and bot builds, search off | Yahor | done | 2026-09-28 18:46:43Z / 18:50:53Z | Ingestion: previous package saved as `document-ingestion-p6-20260928T184416Z.zip` (`f3ef7894…`), deployed zip `10bf0709…` (running hash matches), triggers synced: five functions incl. `clientSearch`; `/api/health` `search: off`, everything else unchanged; `POST /api/search` without a token 401; `search.config` `off` `mode_off`; inbox ticks after it `failed 0`, `rowsFailed 0`; notices `on`. Bot: previous package saved as `teams-bot-p1-20260928T184416Z.zip` (`19662ceb…`), deployed zip `0e008e53…` (running hash matches): channel tokens only (`bot/channelAuth.ts`), gate `enforce`, `search.config` `off`. `SEARCH_MODE=off` set on both (matches the parameter file); `--live` shows only `SEARCH_ROWS` and `SEARCH_CALLER_APP_IDS` still to add (step 6). Verified 19:18:44Z: the canary guest's `pomoc` from Teams passed the channel-token check (`messages` 200) and got the help card without „Wyszukiwanie”; the only refusal logged (18:52:08Z, 500) was the operator's own unauthenticated probe |
+| Client lockout: T-1 reversed, the three `{NIP}@` accounts, `AuthoriseMe@` and `BCROnboarding@` enabled ([Client lockout](#client-lockout-2628-september-t-1-reversed)) | Roman | done | 2026-09-28 17:33:38Z–17:34:32Z | Entra audit log (read-only). Clients locked out 26 Sep 12:18:09Z → 28 Sep about 17:34Z; no PESKOVOI upload in the channel inbox since row 2's filing began (28 Sep 11:58Z); no document lost |
+| Owner's decision: the `{NIP}@bcr-group.pl` Member account is the client identity; guests have no ledger capability; never block, disable, unlicense or convert a `{NIP}@` account | Yahor (owner) | decided; T-1, T-2 withdrawn and T-7 made a read-only record in [`tenant-hardening.md`](tenant-hardening.md) | 2026-09-28 | [Client lockout](#client-lockout-2628-september-t-1-reversed) |
+| 0002's new password, sent over Telegram in plain text on 28 Sep 07:34Z: the client changes it | Roman | todo | | the date it was changed (no password, no address) |
+| IR-3: the lockout as an availability event for 0002, 0003 and 0004: does it need its own view in the breach register? | IOD | todo: open question | | the IOD's answer |
+| Client identity release: ledger code committed, CI green; onboarding change merged; rows 2 and 10 re-bound; ingestion, then the bot, deployed; manifest 0.2.2; canaries ([`human-steps.md`](human-steps.md#client-identity-release)) | Yahor; the Teams admin for the manifest | todo: the code is uncommitted and undeployed, the rows are not re-bound, the onboarding change is not deployed (29 Sep) | | the commit; the apply log's hash; the saved `document-ingestion-p7-*` and `teams-bot-p2-*` packages' sha256 and the deployed zips'; `/api/health` `clientIdentity` `nip-member`; each canary's times |
 | H-13: ingestion grant on BCR GROUP downgraded to `read` | Yahor (Global Admin) | done | 2026-09-26 | Graph Explorer PATCH → `roles: ["read"]` for the ingestion managed identity. The only other application entry is the onboarding Function App (`write`), which writes the Client Directory rows: kept |
 | H-14: `FALLBACK_*` settings removed, pre-Phase-0 packages deleted | Yahor | done (early, by Yahor's decision) | 2026-09-26 18:10:32Z | all five `FALLBACK_*` deleted; `*-before-p0.zip` removed; health OK |
 | IR-2 relocation complete, allow-lists issued | Roman + second person | todo | | |
@@ -729,9 +853,9 @@ The `H-` references are the steps in [`human-steps.md`](human-steps.md#phase-0).
 | IR-3 (3): UODO decision for BCR-controlled data recorded | Roman + IOD | todo | | |
 | H-12 channel-inbox step: build deployed; canary Team and row; canary `shadow`, then `enforce`; same-name `_1`; what the moved attachment's post showed | Yahor | todo | | sha256 of the `*-p0-<stamp>.zip` packages saved; the canary row's list item id; times of the canary's `inbox.filed` and of its `nameSuffix` `1`; whether the post's attachment still opened; `check \| grep -ci <canary id>` `0` after clean-up |
 | H-12 channel-inbox step: PESKOVOI's older channel attachments (all moved, or kept with `INBOX_CREATED_AFTER`), and what the client was told | Roman decides | todo | | the decision; the cutoff time, if any; PESKOVOI's `shadow` count and first `inbox.filed` time; `INBOX_SWEEP_ROWS` removed |
-| H-12/H-15: bot-path proofs dropped, because no guest can send a file through the bot: (1) a TEST canary routed with `membership: verified` (H-12 step 7; the R46 exit criterion), (2) a same-name bot upload stored as `_1`. Replaced by the channel-inbox canary: its guest and Team read (H-8b's grant in the token) and its same-name move `_1` | Roman accepts | todo | | who accepted, and when |
+| H-12/H-15: bot-path proofs dropped, because no guest can send a file through the bot: (1) a TEST canary routed with `membership: verified` (H-12 step 7; the R46 exit criterion), (2) a same-name bot upload stored as `_1`. Replaced by the channel-inbox canary: its guest and Team read (H-8b's grant in the token) and its same-name move `_1` | Roman accepts; from 29 Sep Yahor (the proofs) | **reopened** 29 Sep: both proofs can be produced, because the canary client account, a Member, can attach in the 1:1 chat; todo, in the client identity release's canaries | 2026-09-29 | the times of the canary account's `routed to client via userAadObjectId` (`account: verified`, `membership: verified`) and of its same-name upload's `nameSuffix` `1` ([Client identity release](human-steps.md#client-identity-release), the canaries) |
 | H-15: Phase-0 exit criteria signed off | Yahor, Roman | todo | | |
-| Standing checks: whole plan applied after each onboarding; weekly `check` | Yahor | from H-12 | | date of each run; apply-log hash ([`human-steps.md`](human-steps.md#standing-checks)) |
+| Standing checks: whole plan applied after each onboarding; weekly `check` (exit `5`: a client is locked out, call Roman at once); a read-only look at the `{NIP}@` accounts (enabled, licensed, one Team) | Yahor | from H-12; the `5` and the account look from 29 Sep | | date of each run; apply-log hash ([`human-steps.md`](human-steps.md#standing-checks)) |
 
 ## What this changes permanently
 
@@ -741,3 +865,8 @@ to quarantine and never to a guess (I3), nothing identifies the user from a requ
 nothing shows another client's URL, name or file name (I7), and uploads never overwrite (I8).
 The ledger's `CLAUDE.md` is rewritten in the same change as the promotion removal, so that no
 future change restores it.
+
+The client lockout adds one more (28 September): nothing in either repo acts on whether an
+account may sign in, or changes it (a disabled client account is reported, never acted on), and
+nobody blocks, disables, unlicenses or converts a client's `{NIP}@` account. How clients sign in
+is confirmed with the owner before any tenant change that depends on it.

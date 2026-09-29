@@ -260,7 +260,7 @@ describe('indexIr0', () => {
   });
 });
 
-describe('guests of each site', () => {
+describe('who may upload for each site', () => {
   const sites = [
     { label: 'A', sitePath: '/sites/0001CLIENTA' },
     { label: 'B', sitePath: '/sites/0002CLIENTB' },
@@ -272,6 +272,7 @@ describe('guests of each site', () => {
     assert.throws(() => parseSiteGuests([`Z=${U3}`], sites), /not one of the --site values/);
     assert.throws(() => parseSiteGuests(['A=nope'], sites), /not GUIDs/);
     assert.throws(() => parseSiteGuests([U3], sites), /expected/);
+    assert.throws(() => parseSiteGuests([`Z=${U3}`], sites, '--site-accounts'), /^Error: --site-accounts Z:/);
   });
 
   test('siteGuestsFromPlan takes each row\'s Team guests, and drops a site two rows share', () => {
@@ -291,6 +292,24 @@ describe('guests of each site', () => {
     assert.deepEqual([...guests.get('/sites/0002clientb')].sort(), [U4, U5].sort());
     assert.deepEqual(sharedSites, ['/sites/0003shared']);
     assert.throws(() => siteGuestsFromPlan({ kind: 'other', rows: [] }), /not a directory-bindings plan/);
+  });
+
+  test("siteGuestsFromPlan takes a version-2 plan's client account per site, never its guests", () => {
+    const plan = {
+      kind: PLAN_KIND,
+      version: 2,
+      rows: [
+        // A v2 row never has eligibleGuests; if one did, it would not count.
+        { sitePath: '/sites/0001CLIENTA', clientAccount: { id: U3.toUpperCase() }, eligibleGuests: [{ id: U4 }] },
+        { sitePath: '/sites/0002CLIENTB', clientAccount: null },
+        // Not assessed (an unreadable account): no entry, so the site stays unverified.
+        { sitePath: '/sites/0003NOACCOUNT', proposed: { UserAadObjectIds: U5 } },
+      ],
+    };
+    const { guests } = siteGuestsFromPlan(plan);
+    assert.deepEqual([...guests.keys()].sort(), ['/sites/0001clienta', '/sites/0002clientb']);
+    assert.deepEqual([...guests.get('/sites/0001clienta')], [U3]);
+    assert.deepEqual([...guests.get('/sites/0002clientb')], [], 'no client account qualified: every uploader is suspect');
   });
 });
 
@@ -327,6 +346,18 @@ describe('register', () => {
     const r = classifyItem(file('d3', '', 'c.pdf'), cliA, ctx);
     assert.deepEqual(r.flags, ['ingest_created', 'library_root']);
     assert.equal(r.suspect, false);
+  });
+
+  test("a v2 plan: an upload by the site's own client account is clean; staff or another client's account is suspect", () => {
+    const v2 = (id) =>
+      siteGuestsFromPlan({ kind: PLAN_KIND, version: 2, rows: [{ sitePath: '/sites/0001CLIENTA', clientAccount: { id } }] }).guests;
+    const own = classifyItem(file('d3', '', 'c.pdf'), cliA, { ...ctx, siteGuests: v2(U3) });
+    assert.deepEqual([own.flags, own.suspect], [['ingest_created', 'library_root'], false]);
+    for (const other of [U4, U5]) {
+      const r = classifyItem(file('d3', '', 'c.pdf'), cliA, { ...ctx, siteGuests: v2(other) });
+      assert.ok(r.flags.includes('uploader_not_site_guest'), other);
+      assert.equal(r.suspect, true, other);
+    }
   });
 
   test('a directory upload by anyone else, or with no guest list, is suspect', () => {

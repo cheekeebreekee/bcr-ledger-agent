@@ -12,6 +12,7 @@ export * from './parsers/folderTaxonomy';
 export * from './parsers/invoiceFields';
 export * from './parsers/linkText';
 export * from './sitePath';
+export * from './clientAccount';
 export * from './config';
 export * from './logger';
 export * from './errors';
