@@ -161,9 +161,9 @@ that cannot be read is refused the same way with `RetryLater`. Guests have no ca
 ledger, whether bound on a row or not. Next build.
 
 If the quarantine write itself fails, the user gets a rejected row asking them to try again, a
-`document.quarantine_failed` error is logged, and the file is not written anywhere else. No alert
-rule exists yet: alerting comes with the monitoring work in Phase 1. Until then an operator
-watches for that event
+`document.quarantine_failed` error is logged, and the file is not written anywhere else. The
+`filing` alert (29 September) emails the operator when that event is logged; the operator also
+watches for it
 ([`human-steps.md` H-12](../operations/human-steps.md#h-12-the-change-window-ingestion-deploy-bindings-canaries),
 the watch query and "After the window").
 

@@ -153,7 +153,7 @@ step 1). No Graph, SharePoint, Key Vault or database permission changes.
 | Azure Bot resource | `bot-bcr-dev-vyyintffz6ehq` (Teams channel enabled) |
 | Key Vault | `kv-bcr-dev-vyyintffz6ehq` (RBAC mode) |
 | App Insights | `appi-bcr-dev-vyyintffz6ehq` |
-| Alerts (not deployed yet) | Action group `ag-bcr-dev-vyyintffz6ehq` (email to `yahor.simak@bcr-group.pl`) and eight log alert rules `alert-bcr-<rule>-dev-vyyintffz6ehq` on App Insights, from `infrastructure/alerts.bicep`: USD 4.00 a month (`docs/operations/human-steps.md` → Alerts) |
+| Alerts (deployed 29 Sep 2026) | Action group `ag-bcr-dev-vyyintffz6ehq` (email to `yahor.simak@bcr-group.pl`) and eight log alert rules `alert-bcr-<rule>-dev-vyyintffz6ehq` on App Insights, from `infrastructure/alerts.bicep`: USD 4.00 a month (`docs/operations/human-steps.md` → Alerts) |
 | Storage | `stbcrdevvyyintffz6ehq` |
 | SharePoint sites | `/sites/0002PESKOVOISp.zo.o.-Ksigowo` (PESKOVOI), `/sites/0000TESTSp.zo.o.-Ksigowo` (TEST), `/sites/BCRLedgerKwarantanna` (quarantine, created in Phase 0), `/sites/BCRGROUPSp.zo.o` (hosts the Client Directory list; never a target). All on `bcrgroupeu.sharepoint.com`. |
 | SharePoint drive | **Dokumenty** (Polish locale, NOT "Documents"). Per client from the Directory's `DriveName`; the quarantine's from `QUARANTINE_DRIVE_NAME`. |

@@ -774,7 +774,7 @@ first.
   checked 26 September; `appInsights.bicep` now pins 90, and the Log Analytics workspace's own
   30 days is a separate setting). From Phase 0 it
   holds ids and codes, not names, file names or URLs.
-- **Alert emails** (`infrastructure/alerts.bicep`; not deployed yet,
+- **Alert emails** (`infrastructure/alerts.bicep`; deployed 29 September 2026,
   [Alerts](operations/human-steps.md#alerts)): Azure Monitor emails `yahor.simak@bcr-group.pl`.
   An email carries a rule's description, its query text, a fixed signal code and a count, never
   a log line, id, file name, NIP or UPN: every query returns only codes and counts, and a tool

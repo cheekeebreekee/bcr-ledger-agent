@@ -154,7 +154,7 @@ group's name is typed back; it refuses a template or a what-if touching anything
 not held by gate G1. The index's app settings (`LEDGER_INDEX_MODE`, `LEDGER_DB_*`) live in
 `main.bicep` and the parameter files like every other.
 
-`infrastructure/alerts.bicep` (the email alerts; not deployed yet) is likewise **not**
+`infrastructure/alerts.bicep` (the email alerts; deployed 29 September 2026) is likewise **not**
 `main.bicep`. It declares one action group (`ag-bcr-<env>-<sfx>`, with the recipients from
 `alerts.<env>.parameters.json`) and eight log alert rules (`alert-bcr-*`) on the App Insights
 component's `traces`. `infrastructure/alerts-deploy.sh <env>` deploys it alone, in incremental

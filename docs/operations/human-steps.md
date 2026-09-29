@@ -72,9 +72,11 @@ database. The containment has three strands, and this checklist puts them in one
   `az functionapp config appsettings set … -o none`, which merges rather than replaces. **Record
   every such change in `infrastructure/main.dev.parameters.json` (and `main.bicep` for a new
   setting) in the same change**, or the first Bicep deploy reverts it; `--live` shows any
-  difference. The one Bicep deploy allowed is `infrastructure/db-deploy.sh` in the
-  [Document index release](#document-index-release): it deploys `infrastructure/db.bicep`, which
-  is **not** `main.bicep` — PostgreSQL resources only, incremental, no app and no app setting.
+  difference. Two Bicep deploys are allowed, and neither is `main.bicep`:
+  `infrastructure/db-deploy.sh` in the [Document index release](#document-index-release)
+  (`infrastructure/db.bicep`, PostgreSQL resources only) and `infrastructure/alerts-deploy.sh`
+  in [Alerts](#alerts) (`infrastructure/alerts.bicep`, the action group and the `alert-bcr-*`
+  rules only). Both are incremental and touch no app and no app setting.
 - ⚠️ **Never roll ingestion back to a pre-Phase-0 build.** That build contains content promotion,
   the cross-client write path. A rollback reverts individual commits and is deployed as a new
   build. For an emergency there is a stop switch that files nothing anywhere
@@ -1844,8 +1846,9 @@ A batch that runs longer than 150 seconds returns the documents it had not start
 with the generic "spróbuj ponownie" code, rather than uploading them late. The user resends
 those.
 
-**After the window.** Phase 0 has **no alert rule**: alerting comes with the monitoring work in
-Phase 1. Until then the [standing checks](#standing-checks) stand in for it.
+**After the window.** The [alerts](#alerts) (deployed 29 September) email the operator when the
+logs show a watched state, such as `document.quarantine_failed`. They do not replace the
+[standing checks](#standing-checks), which still run.
 
 **Rollback.**
 
@@ -2008,9 +2011,10 @@ read, uploads are quarantined as `membership_unverified`.
 does, it catches drift on rows whose accounts have not uploaded since, and it is the only check
 left if `MEMBERSHIP_CHECK_MODE=off` is ever set in an emergency. So still: `check` and an apply of
 the **whole** plan after **every** onboarding, a `check` at least weekly, and action the same day
-whenever `check` exits `3`, `4` or `5`. Phase 0 still has no alert rule. Onboarding writing the
-client account's id into the new row itself (R1; first planned as the guest's id) waits on
-Roman's re-ruling of Q21.
+whenever `check` exits `3`, `4` or `5`. The `bindings` alert ([Alerts](#alerts), since
+29 September) emails when routing meets a binding problem, but names no row: `check` does.
+Onboarding writing the client account's id into the new row itself (R1; first planned as the
+guest's id) waits on Roman's re-ruling of Q21.
 
 ⚠️ **Nothing here acts on whether an account may sign in.** A disabled `{NIP}@` account is a
 client locked out: call Roman, whose job it is to re-enable it. Never unbind its row for it, and
@@ -3759,8 +3763,9 @@ recipient (`yahor.simak@bcr-group.pl`; another recipient is one more address in 
 file and a redeploy). **When:** outside the 1st–10th freeze (29–30 September, or from
 11 October), and not in the same window as another change.
 
-Until the steps below are done the ledger has no alert rule, and the
-[standing checks](#standing-checks) are the only way anyone learns of a failure. The alerts do
+Deployed on 29 September (the [status table](incident-2026-09.md#status)). Before that the ledger
+had no alert rule, and the [standing checks](#standing-checks) were the only way anyone learned of
+a failure. The alerts do
 not replace those checks. They read the logs every 15 minutes and send an email when something
 needs a look the same day.
 
@@ -3799,9 +3804,9 @@ aiq 'traces | where cloud_RoleName startswith "func-bcr-ingest"
 Until that build runs, `bindings` sees these states only in the lines said once per worker or per
 upload, and `review_notice.webhook_unresolved` cannot fire.
 
-The Phase 0 standing rules still call `db-deploy.sh` "the one Bicep deploy allowed". The first
-run of this script is therefore the owner's go. The docs change that records the deploy updates
-that rule, and the "no alert rule" lines in H-12 and the standing checks (step 7).
+The first run of this script was the owner's go (29 September). The docs change that recorded it
+updated the Phase 0 standing rule, which now names both allowed Bicep deploys, and the "no alert
+rule" lines in H-12 and the standing checks (step 7).
 
 **Cost: USD 4.00 a month.** A rule evaluated every 15 minutes costs USD 0.50 a month ("Alerts
 System Log Monitored at 15 Minute Frequency", Azure Retail Prices API, West Europe, checked

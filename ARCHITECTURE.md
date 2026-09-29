@@ -1192,7 +1192,7 @@ rg-bcr-ledger-<env>
 ├── kv-bcr-<env>-<sfx>        (Key Vault, RBAC mode)
 ├── appi-bcr-<env>-<sfx>      (Application Insights)
 ├── log-bcr-<env>-<sfx>       (Log Analytics workspace)
-├── ag-bcr-<env>-<sfx>, alert-bcr-*-<env>-<sfx>  (email alerts on App Insights: alerts.bicep; not deployed yet)
+├── ag-bcr-<env>-<sfx>, alert-bcr-*-<env>-<sfx>  (email alerts on App Insights: alerts.bicep; deployed 29 Sep 2026)
 └── psql-bcr-<env>-<sfx>      (PostgreSQL Flexible Server, the document index: db.bicep)
 ```
 
