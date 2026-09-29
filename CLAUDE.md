@@ -31,7 +31,7 @@ Every document filed into a client's space also gets a row in the **document ind
 PostgreSQL database whose row-level security keeps each client's rows to that client
 (`packages/ledger-db`; billing reads it later). A client's `{NIP}@` account can **search** their
 own client's rows by asking in the bot's 1:1 chat ([Client search](#client-search-post-apisearch);
-off until its release).
+on for the canary row since 29 September 2026, other clients after the owner's go).
 
 > The client-account rule is live since 29 September 2026 (rows 2 and 10 re-bound, then ingestion
 > and the bot deployed). The onboarding repo's matching change deploys with that repo's next push.
@@ -392,8 +392,9 @@ every run, for the alert). **A migration goes in before the build that uses it**
 ### Client search (`POST /api/search`)
 
 The client's `{NIP}@` account asks in the bot's 1:1 chat ("faktury od X z września") and gets
-their own client's filed documents from the index, 10 to a card. Off until the *Client search
-release* (`docs/operations/human-steps.md`): `SEARCH_MODE` on both apps; on ingestion also
+their own client's filed documents from the index, 10 to a card. On since 29 September 2026 for
+the canary row only; each further client after the owner's go (*Client search release*,
+`docs/operations/human-steps.md`): `SEARCH_MODE` on both apps; on ingestion also
 `SEARCH_ROWS` (list item ids, canary first; `/api/health` `build.search`: `off`|`listed`|`all`)
 and `SEARCH_CALLER_APP_IDS`. The contract is `@bcr/shared` `types/search.ts`: strict zod, so a body
 naming a client, row, scope or limit is a 400.

@@ -603,7 +603,7 @@ package built from [`teams-app/manifest.json`](../teams-app/manifest.json).
 
 ### 7a. Build the package
 
-The committed `teams-app/manifest.json` (version 0.2.2: personal scope only, no tab) holds two
+The committed `teams-app/manifest.json` (version 0.2.3: personal scope only, no tab) holds two
 `REPLACE-WITH-BOT-APP-ID` placeholders, `id` and `bots[0].botId`. Replace them in a staging copy,
 so no real id lands in the tracked file, check the result, then zip. The icons
 (`color.png` 192×192, `outline.png` 32×32) are already in `teams-app/`.
@@ -618,7 +618,7 @@ sed -i.bak "s/REPLACE-WITH-BOT-APP-ID/$BOT_APP_ID/g" "$STAGE/manifest.json" && r
 
 grep -c REPLACE-WITH "$STAGE/manifest.json"                         # 0
 jq -r '.id, .bots[0].botId' "$STAGE/manifest.json"                  # $BOT_APP_ID, twice
-jq -r '.version' "$STAGE/manifest.json"                             # 0.2.2
+jq -r '.version' "$STAGE/manifest.json"                             # 0.2.3
 jq -c '[.. | .scopes? // empty | .[]] | unique' "$STAGE/manifest.json"   # ["personal"]
 jq 'has("staticTabs")' "$STAGE/manifest.json"                       # false
 

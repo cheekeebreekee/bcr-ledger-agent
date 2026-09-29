@@ -112,7 +112,7 @@ sequenceDiagram
 
 **Bot delivery model.** Only 1:1 chats deliver file attachments to a bot. Files posted in a
 channel bypass the bot (drag-drop), or arrive as mention HTML with no file. Since manifest 0.2.0
-the app has `"scopes": ["personal"]` only (0.2.2 is the current one), and the gate refuses any
+the app has `"scopes": ["personal"]` only (0.2.3 is the current one: 0.2.2 with working privacy and terms links), and the gate refuses any
 other conversation type from older installs. A client's `{NIP}@` account is a Member of BCR's
 tenant and can attach files in this chat. A guest cannot attach here at all, and if a guest's
 upload ever arrived, ingestion would refuse it with nothing stored. Clients use either intake
@@ -931,8 +931,9 @@ builder.
 
 A client's `{NIP}@` account asks, in Polish, in the bot's 1:1 chat ("faktury od X z
 września"), and gets their own client's filed documents, 10 to a card. It is point 5 of the v2
-plan, and it is off until the [Client search release](docs/operations/human-steps.md#client-search-release)
-(`SEARCH_MODE` on both apps).
+plan. It has been on since 29 September for the canary row only, and each further client joins
+after the owner's go ([Client search release](docs/operations/human-steps.md#client-search-release):
+`SEARCH_MODE` on both apps, `SEARCH_ROWS` on ingestion).
 
 ```
 client account ─▶ bot: gate (§5.1), text not a file, SEARCH_MODE=on, 20 a minute per user

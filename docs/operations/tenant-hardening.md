@@ -690,7 +690,8 @@ narrows who can install the app in the first place.
 **When.** Right after the Phase-0 bot deploy, with manifest 0.2.0 (see
 [`human-steps.md`](human-steps.md#h-10-upload-manifest-020-and-set-availability)); again for each
 new manifest version (0.2.2 with the
-[Client identity release](human-steps.md#client-identity-release)). This step once had to wait
+[Client identity release](human-steps.md#client-identity-release); 0.2.3 for the privacy and terms
+links). This step once had to wait
 for T-1, and step 2's case for *Everyone* relied on it. It no longer does: T-1 is withdrawn, and
 that case rests on the gate and on ingestion alone.
 
@@ -723,8 +724,8 @@ unzip -p "$OUT" manifest.json | jq -r \
 ```
 
 The last command must print the manifest's version, `personal`, `0` and `true`, one per line:
-`true` only when `id` and `botId` are the same GUID. The version is `0.2.2` from the client
-identity change on (0.2.1 was uploaded on 26 September, H-10); it must be higher than the version
+`true` only when `id` and `botId` are the same GUID. The version is `0.2.3` from 29 September on
+(0.2.2 was uploaded with the client identity change, 0.2.1 on 26 September, H-10); it must be higher than the version
 the admin centre shows. Anything else: do not upload it.
 
 **Change.** In the Teams admin centre:
@@ -760,7 +761,7 @@ the admin centre shows. Anything else: do not upload it.
    BCR → Uninstall**. The gate already refuses those installs.
 
 **Verify.** The admin centre shows the version just uploaded for Asystent BCR (**0.2.0** in
-Phase 0; 0.2.1 on 26 September; 0.2.2 with the client identity release). The canary client
+Phase 0; 0.2.1 on 26 September; 0.2.2 with the client identity release; 0.2.3 next). The canary client
 account finds "Asystent BCR", opens the chat and gets the help card, and so does PESKOVOI's
 `{NIP}@` account when it next uses it. (In Phase 0 this check used the TEST guest; a guest still
 gets the card, but has no other capability.) Only if availability was later restricted: a staff

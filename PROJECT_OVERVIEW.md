@@ -263,7 +263,7 @@ bcr-ledger-agent/
 │   └── ir/                              # IR evidence store
 ├── tools/                               # operator tools: directory-bindings, inventory-misfiled, ir0/
 ├── teams-app/
-│   ├── manifest.json                    # Teams app manifest 0.2.2 (personal scope only, no tab)
+│   ├── manifest.json                    # Teams app manifest 0.2.3 (personal scope only, no tab)
 │   └── …
 ├── docs/
 │   ├── operations/                      # incident, human steps, tenant hardening, GDPR drafts
@@ -354,7 +354,7 @@ their fixed strings live in [`cardText.ts`](packages/teams-bot/src/bot/cardText.
   Every inserted value is escaped. The model's reasoning is never shown.
 - **Gate refusal.** One fixed line in a 1:1 chat; silence in any other conversation.
 
-Teams app metadata ([`teams-app/manifest.json`](teams-app/manifest.json), version 0.2.2; its
+Teams app metadata ([`teams-app/manifest.json`](teams-app/manifest.json), version 0.2.3; its
 descriptions name the chat and the channel, and the `NIP@bcr-group.pl` account):
 
 - App name: **Asystent BCR** / **Asystent Archiwizacji Dokumentów BCR**
