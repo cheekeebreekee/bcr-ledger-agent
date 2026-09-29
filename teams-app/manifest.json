@@ -1,13 +1,13 @@
 {
   "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
   "manifestVersion": "1.17",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "id": "REPLACE-WITH-BOT-APP-ID",
   "developer": {
     "name": "BCR Platform",
     "websiteUrl": "https://www.bcr-group.pl/",
-    "privacyUrl": "https://www.bcr-group.pl/privacy",
-    "termsOfUseUrl": "https://www.bcr-group.pl/terms"
+    "privacyUrl": "https://www.bcr-group.pl/pl/polityka-prywatnosci",
+    "termsOfUseUrl": "https://www.bcr-group.pl/pl/regulamin"
   },
   "name": {
     "short": "Asystent BCR",

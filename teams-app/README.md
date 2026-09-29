@@ -61,14 +61,18 @@ unzip -p artifacts/teams-app.zip manifest.json | jq -r '
     (.bots | map(.scopes | join(",")) | join(";")),
     ((.staticTabs // []) | length),
     (.id == .bots[0].botId) ] | join(" ")'
-# must print:  0.2.2 personal 0 true
+# must print:  0.2.3 personal 0 true
 ```
 
-That is: manifest version `0.2.2`, the bot installable in `personal` scope only
+That is: manifest version `0.2.3`, the bot installable in `personal` scope only
 (no `team`, no `groupchat`), no static tabs, and `id` equal to `botId`. After the
-upload, the admin centre must show version 0.2.2 for the app.
+upload, the admin centre must show version 0.2.3 for the app.
 
-0.2.2 changes only the descriptions (the owner's decision of 28 September 2026: a
+0.2.3 (29 September 2026) changes only the privacy and terms links, which pointed at pages that
+do not exist (`/privacy`, `/terms`, 404); they now point at `/pl/polityka-prywatnosci` and
+`/pl/regulamin`.
+
+0.2.2 changed only the descriptions (the owner's decision of 28 September 2026: a
 client is its `{NIP}@bcr-group.pl` account, and guests have no capability): they
 offer the chat and the „Dokumenty księgowe” channel, and say the assistant works
 on the account BCR created for the company (`NIP@bcr-group.pl`). Upload it after
