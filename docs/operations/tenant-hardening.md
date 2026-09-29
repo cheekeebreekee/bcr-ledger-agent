@@ -795,4 +795,4 @@ laptops (`.env`) are an accepted risk, recorded in
 | `BCROnboarding@` | Roman | enabled 2026-09-28 17:33:38Z–17:34:32Z | — | The onboarding shared mailbox, disabled since before 22 Sep (not by this response). Stays enabled: Roman reads it. Outside the ledger |
 | T-8 | | | | TEST invite checked; the canary client account opens BCR Kanarek, its files and the bot DM (not a guest) |
 | T-9 | Roman confirms tenant level | | | Checked with the canary client account (not a guest); a contact's guest still opens its Team's files; Roman's decision on company-wide links on client sites |
-| T-10 | | | | Everyone (Phase 0); version 0.2.0 shown; sha256 of the uploaded zip. 0.2.1 uploaded 2026-09-26 (H-10); 0.2.2 with the client identity release: *record* the date and the zip's sha256 |
+| T-10 | | | | Everyone (Phase 0); version 0.2.0 shown; sha256 of the uploaded zip. 0.2.1 uploaded 2026-09-26 (H-10); 0.2.2 uploaded 2026-09-29 by Yahor (zip `32ff2cf8…`, built from `5beb0b9` with the bot's app id) |
